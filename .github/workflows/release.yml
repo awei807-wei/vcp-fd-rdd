@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build with cross
+        run: |
+          cd fd-rdd
+          cross build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          cd fd-rdd/target/${{ matrix.target }}/release
+          tar -czvf fd-rdd-${{ matrix.target }}.tar.gz fd-rdd
+          
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: fd-rdd/target/${{ matrix.target }}/release/fd-rdd-${{ matrix.target }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

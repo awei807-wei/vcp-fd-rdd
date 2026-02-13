@@ -1,0 +1,16 @@
+[Unit]
+Description=fd-rdd: RDD-based elastic file indexer
+After=network.target local-fs.target
+
+[Service]
+Type=simple
+ExecStart=%h/.vcp/bin/fd-rdd
+Restart=always
+RestartSec=5
+
+# 资源限制
+CPUQuota=80%
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target
