@@ -1,5 +1,6 @@
 use crate::core::adaptive::AdaptiveScheduler;
 use crate::core::rdd::FileEntry;
+use crate::query::matcher::Matcher;
 use ignore::WalkBuilder;
 
 /// L3: 冷全量（弹性扫描）
@@ -14,8 +15,10 @@ impl L3Cold {
         }
     }
     
-    pub async fn scan(&self, keyword: &str, roots: &[std::path::PathBuf]) -> Vec<FileEntry> {
+    pub async fn scan(&self, matcher: &dyn Matcher, roots: &[std::path::PathBuf]) -> Vec<FileEntry> {
         let mut results = Vec::new();
+        let prefix = matcher.prefix();
+
         for root in roots {
             let walker = WalkBuilder::new(root)
                 .hidden(true)
@@ -26,7 +29,16 @@ impl L3Cold {
             for entry in walker.filter_map(|e| e.ok()) {
                 if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                     let path = entry.path();
-                    if path.to_string_lossy().contains(keyword) {
+                    let path_str = path.to_string_lossy();
+
+                    // 前缀启发式过滤
+                    if let Some(p) = prefix {
+                        if !path_str.contains(p) {
+                            continue;
+                        }
+                    }
+
+                    if matcher.matches(&path_str) {
                         let metadata = entry.metadata().ok();
                         results.push(FileEntry {
                             path: path.to_path_buf(),

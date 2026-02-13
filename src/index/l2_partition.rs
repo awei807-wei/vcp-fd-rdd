@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::core::rdd::{RDD, FileIndexRDD, FileEntry};
+use crate::query::matcher::Matcher;
 
 /// L2: 温索引（分区 RDD）
 pub struct L2Partition {
@@ -14,11 +15,8 @@ impl L2Partition {
         }
     }
 
-    pub async fn query(&self, keyword: &str) -> Vec<FileEntry> {
+    pub async fn query(&self, matcher: &dyn Matcher) -> Vec<FileEntry> {
         let rdd = self.rdd.read().await;
-        rdd.collect()
-            .into_iter()
-            .filter(|e| e.path.to_string_lossy().contains(keyword))
-            .collect()
+        rdd.collect_with_filter(matcher)
     }
 }

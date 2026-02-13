@@ -1,0 +1,9 @@
+[2m2026-02-13T15:47:40.482578Z[0m [32m INFO[0m [2mfd_rdd[0m[2m:[0m Starting fd-rdd: RDD-based elastic file indexer
+[2m2026-02-13T15:47:42.061024Z[0m [33m WARN[0m [2mfd_rdd::event::watcher[0m[2m:[0m Failed to watch "/home/shiyi": Permission denied (os error 13) about ["/home/shiyi/.local/share/Steam/steamapps/compatdata/1493710/pfx/dosdevices/z:/home/.snapshots"]
+[2m2026-02-13T15:47:42.061466Z[0m [32m INFO[0m [2mfd_rdd::query::server[0m[2m:[0m HTTP Query Server listening on 6060
+[2m2026-02-13T15:47:42.094778Z[0m [32m INFO[0m [2mfd_rdd[0m[2m:[0m fd-rdd ready. Query via: http://localhost:6060/search?q=keyword
+[2m2026-02-13T15:48:31.878339Z[0m [32m INFO[0m [2mfd_rdd::index::tiered[0m[2m:[0m L3 miss, triggering cold scan for: *vcp in roots: ["/home/shiyi", "/tmp/vcp_test_data"]
+[2m2026-02-13T15:48:31.950615Z[0m [32m INFO[0m [2mfd_rdd::index::tiered[0m[2m:[0m L3 miss, triggering cold scan for: vcp* in roots: ["/home/shiyi", "/tmp/vcp_test_data"]
+[2m2026-02-13T15:48:32.018781Z[0m [32m INFO[0m [2mfd_rdd::index::tiered[0m[2m:[0m L3 miss, triggering cold scan for: vc*p in roots: ["/home/shiyi", "/tmp/vcp_test_data"]
+[2m2026-02-13T15:48:42.238744Z[0m [32m INFO[0m [2mfd_rdd::index::tiered[0m[2m:[0m L3 miss, triggering cold scan for: src* in roots: ["/home/shiyi", "/tmp/vcp_test_data"]
+[2m2026-02-13T15:48:42.305000Z[0m [32m INFO[0m [2mfd_rdd::index::tiered[0m[2m:[0m L3 miss, triggering cold scan for: src*rs in roots: ["/home/shiyi", "/tmp/vcp_test_data"]

@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use crate::core::rdd::FileEntry;
+use crate::query::matcher::Matcher;
 
 /// L1: 内存热缓存（DashMap实现）
 pub struct L1Cache {
@@ -17,12 +18,23 @@ impl L1Cache {
         }
     }
     
-    pub fn query(&self, keyword: &str) -> Option<Vec<FileEntry>> {
+    pub fn query(&self, matcher: &dyn Matcher) -> Option<Vec<FileEntry>> {
+        let prefix = matcher.prefix();
+        
         let results: Vec<FileEntry> = self.inner
             .iter()
-            .filter(|e| e.key().to_string_lossy().contains(keyword))
+            .filter(|e| {
+                let path_str = e.key().to_string_lossy();
+                // 前缀启发式过滤
+                if let Some(p) = prefix {
+                    if !path_str.contains(p) {
+                        return false;
+                    }
+                }
+                matcher.matches(&path_str)
+            })
             .map(|e| {
-                self.access_count.insert(e.key().clone(), 
+                self.access_count.insert(e.key().clone(),
                     self.access_count.get(e.key()).map(|v| *v + 1).unwrap_or(1));
                 e.value().clone()
             })

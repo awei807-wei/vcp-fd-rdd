@@ -22,6 +22,7 @@
 
 ## ✨ 关键特性
 
+*   **模式感知搜索 (v0.2.0)**: 原生支持通配符匹配（如 `*vcp`、`vcp*`、`vc*p`），通过算子下推与前缀启发式过滤确保性能。
 *   **实时感知**: 集成 `notify` 库，毫秒级捕获文件创建、删除、重命名（自动追踪路径移动）。
 *   **VCP 深度集成**: 内置基于 `Axum` 的高性能 HTTP 服务，完美适配 VCP 插件调用。
 *   **低资源占用**: 默认配置下内存占用极低，支持通过 Systemd 限制 CPU 权重。
@@ -62,7 +63,12 @@ systemctl --user enable --now fd-rdd
 
 **HTTP API:**
 ```bash
+# 精确/包含匹配
 curl "http://127.0.0.1:6060/search?q=main.rs&limit=5"
+
+# 通配符匹配 (v0.2.0)
+curl "http://127.0.0.1:6060/search?q=src*rs"
+curl "http://127.0.0.1:6060/search?q=*vcp*"
 ```
 
 **命令行工具:**

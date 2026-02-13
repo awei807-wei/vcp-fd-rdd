@@ -1,5 +1,6 @@
 use crate::core::{FileEntry, EventRecord, EventType};
 use crate::index::{L1Cache, L2Partition, L3Cold};
+use crate::query::matcher::create_matcher;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 三级索引：L1热缓存 → L2分区RDD → L3冷扫描
@@ -24,14 +25,16 @@ impl TieredIndex {
     
     /// 查询入口：三级漏斗
     pub async fn query(&self, keyword: &str) -> Vec<FileEntry> {
+        let matcher = create_matcher(keyword);
+
         // L1: 热缓存查询
-        if let Some(results) = self.l1.query(keyword) {
+        if let Some(results) = self.l1.query(matcher.as_ref()) {
             tracing::debug!("L1 hit: {} results", results.len());
             return results;
         }
         
         // L2: 分区RDD查询
-        let l2_results = self.l2.query(keyword).await;
+        let l2_results = self.l2.query(matcher.as_ref()).await;
         
         if !l2_results.is_empty() {
             tracing::debug!("L2 hit: {} results", l2_results.len());
@@ -44,7 +47,7 @@ impl TieredIndex {
         
         // L3: 冷扫描
         tracing::info!("L3 miss, triggering cold scan for: {} in roots: {:?}", keyword, self.roots);
-        let l3_results = self.l3.scan(keyword, &self.roots).await;
+        let l3_results = self.l3.scan(matcher.as_ref(), &self.roots).await;
         
         // 异步更新L2（简化实现：直接回填L1）
         if !l3_results.is_empty() {

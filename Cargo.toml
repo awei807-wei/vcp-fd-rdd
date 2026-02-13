@@ -43,6 +43,7 @@ num_cpus = "1.16"
 # CLI 与交互
 clap = { version = "4.4", features = ["derive"] }
 fuzzy-matcher = "0.3"
+wildmatch = "2.1"
 
 # 错误处理
 anyhow = "1.0"

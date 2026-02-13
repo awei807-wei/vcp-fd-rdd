@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 use crate::core::partition::Partition;
+use crate::query::matcher::Matcher;
 use crate::core::lineage::EventRecord;
 
 /// RDD 特质：弹性分布式数据集的核心抽象
@@ -21,6 +22,29 @@ pub trait RDD<T: Send + Sync + 'static>: Send + Sync {
             .par_iter()
             .flat_map(|p| self.compute(p))
             .collect()
+    }
+
+    /// 算子下推：带过滤条件的收集
+    fn collect_with_filter(&self, matcher: &dyn Matcher) -> Vec<T> {
+        use rayon::prelude::*;
+        self.partitions()
+            .par_iter()
+            .flat_map(|p| {
+                self.compute(p)
+                    .into_iter()
+                    .filter(|item| {
+                        // 这里需要 T 能够转换为字符串进行匹配，或者 Matcher 支持 T
+                        // 对于 FileEntry，我们知道它有 path
+                        self.filter_item(item, matcher)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// 默认过滤逻辑，子类可重写
+    fn filter_item(&self, _item: &T, _matcher: &dyn Matcher) -> bool {
+        true
     }
 }
 
@@ -48,6 +72,10 @@ impl RDD<FileEntry> for FileIndexRDD {
     
     fn dependencies(&self) -> Vec<Arc<dyn RDD<FileEntry>>> {
         vec![]  // 根 RDD，无父依赖
+    }
+
+    fn filter_item(&self, item: &FileEntry, matcher: &dyn Matcher) -> bool {
+        matcher.matches(&item.path.to_string_lossy())
     }
 }
 
