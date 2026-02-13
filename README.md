@@ -10,10 +10,10 @@
   - **L1 (Hot)**: 基于 `DashMap` 的内存热缓存，响应时间 < 1ms。
   - **L2 (Warm)**: 分区 RDD 索引，支持并行过滤，响应时间 < 10ms。
   - **L3 (Cold)**: 基于 `ignore` 库（fd 核心）的弹性扫描，确保结果 100% 覆盖。
-- **实时事件驱动**：集成 `notify` 库，毫秒级感知文件创建、删除、重命名事件，索引自动同步。
-- **自适应执行 (AQE)**：根据系统 CPU 负载和内存压力动态调整并行扫描强度，不影响系统正常工作。
-- **VCP 友好**：内置 Axum HTTP 服务，提供标准 JSON 接口，完美适配 VCP 插件调用。
-- **零依赖分发**：支持 Musl 静态编译，单个二进制文件即可运行。
+- **实时事件驱动**：集成 `notify` 库，毫秒级感知文件变动，索引自动同步。
+- **自适应执行 (AQE)**：根据系统负载动态调整并行扫描强度。
+- **VCP 友好**：内置 Axum HTTP 服务，提供标准 JSON 接口。
+- **零依赖分发**：支持 Musl 静态编译。
 
 ## 🛠️ 快速开始
 
@@ -22,18 +22,17 @@
 # 编译 release 版本
 cargo build --release
 
-# 启动服务 (默认监听 127.0.0.1:8080)
+# 启动服务 (默认监听 127.0.0.1:6060)
 ./target/release/fd-rdd
 ```
 
 ### 2. 搜索接口
 ```bash
-# 使用 curl 搜索
-curl "http://127.0.0.1:8080/search?q=main.rs&limit=10"
+# 使用 curl 搜索 (端口已修正为 6060)
+curl "http://127.0.0.1:6060/search?q=main.rs&limit=10"
 ```
 
 ### 3. 交互式查询
-我们提供了一个基于 `fzf` 的交互式脚本：
 ```bash
 ./scripts/fd-query.sh
 ```
@@ -45,10 +44,6 @@ curl "http://127.0.0.1:8080/search?q=main.rs&limit=10"
 - `src/event/`: 基于 `notify` 的文件系统监听器。
 - `src/query/`: Axum HTTP 服务与搜索逻辑。
 - `src/storage/`: Checkpoint 持久化机制。
-
-## ⚙️ 配置
-
-服务默认扫描用户家目录。如需自定义扫描路径，请修改 `src/main.rs` 中的 `roots` 配置。
 
 ## 📜 许可证
 
