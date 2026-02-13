@@ -43,7 +43,7 @@ impl TieredIndex {
         }
         
         // L3: 冷扫描
-        tracing::info!("L3 miss, triggering cold scan for: {}", keyword);
+        tracing::info!("L3 miss, triggering cold scan for: {} in roots: {:?}", keyword, self.roots);
         let l3_results = self.l3.scan(keyword, &self.roots).await;
         
         // 异步更新L2（简化实现：直接回填L1）

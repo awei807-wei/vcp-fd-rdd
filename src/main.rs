@@ -13,12 +13,12 @@ async fn main() -> anyhow::Result<()> {
     
     // 初始化三级索引
     let mut roots = Vec::new();
+    let home_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+    roots.push(home_dir);
+    
     let test_data = std::path::PathBuf::from("/tmp/vcp_test_data");
     if test_data.exists() {
         roots.push(test_data);
-    } else {
-        let home_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-        roots.push(home_dir);
     }
     
     let l1 = L1Cache::with_capacity(1000);
@@ -30,7 +30,9 @@ async fn main() -> anyhow::Result<()> {
     
     // 启动事件流
     let event_stream = EventStream::new(index.clone());
-    event_stream.start_watcher(roots).await?;
+    if let Err(e) = event_stream.start_watcher(roots).await {
+        tracing::error!("Failed to start watcher: {}", e);
+    }
     
     // 启动查询服务 (HTTP)
     let query_server = QueryServer::new(index.clone());

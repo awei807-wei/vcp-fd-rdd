@@ -25,7 +25,9 @@ impl EventWatcher {
         )?;
 
         for root in roots {
-            watcher.watch(&root, RecursiveMode::Recursive)?;
+            if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
+                tracing::warn!("Failed to watch {:?}: {}", root, e);
+            }
         }
 
         tokio::spawn(async move {

@@ -19,6 +19,8 @@ impl L3Cold {
         for root in roots {
             let walker = WalkBuilder::new(root)
                 .hidden(true)
+                .ignore(true)
+                .git_ignore(true)
                 .build();
             
             for entry in walker.filter_map(|e| e.ok()) {
