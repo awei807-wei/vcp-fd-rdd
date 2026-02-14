@@ -1,14 +1,16 @@
-use std::path::{Path, PathBuf};
-use std::io::Write;
+use crate::index::l2_partition::IndexSnapshotV2;
+use crate::index::l2_partition::IndexSnapshotV3;
+use crate::index::l2_partition::IndexSnapshotV4;
 use std::io::Seek;
 use std::io::SeekFrom;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use tokio::fs;
-use crate::index::l2_partition::IndexSnapshot;
-use crate::index::l2_partition::IndexSnapshotV2;
 
 /// 索引文件 Header
 const MAGIC: u32 = 0xFDDD_0002;
-const VERSION_CURRENT: u32 = 3;
+const VERSION_CURRENT: u32 = 4;
+const VERSION_COMPAT_V3: u32 = 3;
 const VERSION_COMPAT_V2: u32 = 2;
 const STATE_COMMITTED: u32 = 0x0000_0001;
 const STATE_INCOMPLETE: u32 = 0xFFFF_FFFF;
@@ -33,6 +35,13 @@ pub struct SnapshotStore {
     path: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub enum LoadedSnapshot {
+    V4(IndexSnapshotV4),
+    V3(IndexSnapshotV3),
+    V2(IndexSnapshotV2),
+}
+
 struct SimpleChecksum {
     hash: u32,
     pending: [u8; 4],
@@ -52,8 +61,7 @@ impl SimpleChecksum {
         if self.pending_len > 0 {
             let need = 4 - self.pending_len;
             let take = need.min(data.len());
-            self.pending[self.pending_len..self.pending_len + take]
-                .copy_from_slice(&data[..take]);
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&data[..take]);
             self.pending_len += take;
             data = &data[take..];
 
@@ -134,7 +142,7 @@ impl SnapshotStore {
     }
 
     /// 加载快照（校验 magic/version/state/checksum）
-    pub async fn load_if_valid(&self) -> anyhow::Result<Option<IndexSnapshot>> {
+    pub async fn load_if_valid(&self) -> anyhow::Result<Option<LoadedSnapshot>> {
         if !self.path.exists() {
             return Ok(None);
         }
@@ -156,11 +164,15 @@ impl SnapshotStore {
             tracing::warn!("Snapshot magic mismatch: {:#x} != {:#x}", magic, MAGIC);
             return Ok(None);
         }
-        if version != VERSION_CURRENT && version != VERSION_COMPAT_V2 {
+        if version != VERSION_CURRENT
+            && version != VERSION_COMPAT_V3
+            && version != VERSION_COMPAT_V2
+        {
             tracing::warn!(
-                "Snapshot version mismatch: {} not in [{}, {}]",
+                "Snapshot version mismatch: {} not in [{}, {}, {}]",
                 version,
                 VERSION_COMPAT_V2,
+                VERSION_COMPAT_V3,
                 VERSION_CURRENT
             );
             return Ok(None);
@@ -179,26 +191,35 @@ impl SnapshotStore {
         // 校验 checksum（简单 CRC32 替代）
         let computed = simple_checksum(body);
         if computed != stored_checksum {
-            tracing::warn!("Snapshot checksum mismatch: {} != {}", computed, stored_checksum);
+            tracing::warn!(
+                "Snapshot checksum mismatch: {} != {}",
+                computed,
+                stored_checksum
+            );
             return Ok(None);
         }
 
         if version == VERSION_COMPAT_V2 {
             match bincode::deserialize::<IndexSnapshotV2>(body) {
-                Ok(v2) => Ok(Some(IndexSnapshot {
-                    files: v2.files,
-                    tombstones: v2.tombstones,
-                })),
+                Ok(v2) => Ok(Some(LoadedSnapshot::V2(v2))),
                 Err(e) => {
                     tracing::warn!("Snapshot v2 deserialize failed: {}", e);
                     Ok(None)
                 }
             }
-        } else {
-            match bincode::deserialize::<IndexSnapshot>(body) {
-                Ok(snap) => Ok(Some(snap)),
+        } else if version == VERSION_COMPAT_V3 {
+            match bincode::deserialize::<IndexSnapshotV3>(body) {
+                Ok(snap) => Ok(Some(LoadedSnapshot::V3(snap))),
                 Err(e) => {
-                    tracing::warn!("Snapshot deserialize failed: {}", e);
+                    tracing::warn!("Snapshot v3 deserialize failed: {}", e);
+                    Ok(None)
+                }
+            }
+        } else {
+            match bincode::deserialize::<IndexSnapshotV4>(body) {
+                Ok(snap) => Ok(Some(LoadedSnapshot::V4(snap))),
+                Err(e) => {
+                    tracing::warn!("Snapshot v4 deserialize failed: {}", e);
                     Ok(None)
                 }
             }
@@ -206,7 +227,7 @@ impl SnapshotStore {
     }
 
     /// 原子写入快照（纯顺序写，无 seek）
-    pub async fn write_atomic(&self, snap: &IndexSnapshot) -> anyhow::Result<()> {
+    pub async fn write_atomic(&self, snap: &IndexSnapshotV4) -> anyhow::Result<()> {
         // 确保目录存在
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).await?;
@@ -265,7 +286,7 @@ impl SnapshotStore {
 
         tracing::info!(
             "Snapshot written: {} files, {} bytes",
-            snap.files.len(),
+            snap.metas.len(),
             HEADER_SIZE + data_len as usize
         );
         Ok(())

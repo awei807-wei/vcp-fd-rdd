@@ -1,9 +1,12 @@
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
 
-/// 文件身份：Linux 上用 (dev, ino) 做主键，rename 时 ino 不变
+/// 文件身份：Linux 上用 (dev, ino) 做主键，rename 时 ino 不变。
+///
+/// 说明：阶段 A 引入 `DocId(u32)` 作为 L2 内部的紧凑主键；
+/// `FileKey` 仍用于扫描/事件输入与“同 inode 去重”。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct FileId {
+pub struct FileKey {
     pub dev: u64,
     pub ino: u64,
 }
@@ -11,7 +14,7 @@ pub struct FileId {
 /// 文件元数据
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileMeta {
-    pub file_id: FileId,
+    pub file_key: FileKey,
     pub path: PathBuf,
     pub size: u64,
     pub mtime: Option<std::time::SystemTime>,
@@ -83,7 +86,7 @@ impl BuildRDD<FileMeta> for FsScanRDD {
             .filter_map(|e| {
                 let meta = e.metadata().ok()?;
                 Some(FileMeta {
-                    file_id: FileId {
+                    file_key: FileKey {
                         dev: meta.dev(),
                         ino: meta.ino(),
                     },
