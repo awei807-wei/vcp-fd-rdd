@@ -3,3 +3,4 @@ pub mod index;
 pub mod event;
 pub mod storage;
 pub mod query;
+pub mod stats;

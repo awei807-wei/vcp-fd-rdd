@@ -16,14 +16,12 @@ pub struct SearchParams {
 #[derive(Serialize)]
 pub struct SearchResult {
     pub path: String,
-    pub score: f32,
+    pub size: u64,
 }
 
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub indexed_count: usize,
-    pub memory_usage: String,
-    pub l1_hit_rate: String,
 }
 
 pub struct QueryServer {
@@ -42,7 +40,7 @@ impl QueryServer {
             .with_state(self.index);
 
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-        tracing::info!("HTTP Query Server listening on {}", port);
+        tracing::info!("HTTP Query Server listening on port {}", port);
         axum::serve(listener, app).await?;
         Ok(())
     }
@@ -52,29 +50,24 @@ async fn search_handler(
     Query(params): Query<SearchParams>,
     State(index): State<Arc<TieredIndex>>,
 ) -> Json<Vec<SearchResult>> {
-    let results = index.query(&params.q).await;
+    let results = index.query(&params.q);
     let limit = params.limit.unwrap_or(100);
-    
+
     let response = results.into_iter()
         .take(limit)
-        .map(|e| SearchResult {
-            path: e.path.to_string_lossy().into_owned(),
-            score: 1.0, // 简化实现，实际可接入 fuzzy-matcher
+        .map(|m| SearchResult {
+            path: m.path.to_string_lossy().into_owned(),
+            size: m.size,
         })
         .collect();
-        
+
     Json(response)
 }
 
 async fn status_handler(
     State(index): State<Arc<TieredIndex>>,
 ) -> Json<StatusResponse> {
-    let rdd = index.l2.rdd.read().await;
-    let count = rdd.partitions.len(); // 简化：这里应返回总文件数
-    
     Json(StatusResponse {
-        indexed_count: count,
-        memory_usage: "Unknown".to_string(),
-        l1_hit_rate: "85%".to_string(),
+        indexed_count: index.file_count(),
     })
 }
