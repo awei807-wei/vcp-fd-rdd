@@ -1,12 +1,2 @@
-use serde::{Serialize, Deserialize};
-use crate::core::lineage::EventRecord;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Partition {
-    pub id: usize,
-    pub root: std::path::PathBuf,
-    pub depth: usize,
-    pub created_at: std::time::SystemTime,
-    pub modified_at: Option<std::time::SystemTime>,
-    pub last_event: Option<EventRecord>,
-}
+// v0.2: Partition 定义已移至 rdd.rs，此文件保留为兼容重导出
+pub use crate::core::rdd::Partition;

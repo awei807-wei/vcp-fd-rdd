@@ -3,6 +3,7 @@ use tokio::net::UnixListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::index::TieredIndex;
 
+/// Unix Socket 查询服务（供 fd-query.sh / fzf 使用）
 pub struct SocketServer {
     pub index: Arc<TieredIndex>,
 }
@@ -26,15 +27,13 @@ impl SocketServer {
                 if let Ok(n) = socket.read(&mut buf).await {
                     let request = String::from_utf8_lossy(&buf[..n]);
                     let parts: Vec<&str> = request.trim().splitn(2, ':').collect();
-                    
+
                     if parts.len() == 2 {
-                        let _cmd = parts[0];
                         let keyword = parts[1];
-                        
-                        let results = index.query(keyword).await;
+                        let results = index.query(keyword);
                         let mut response = String::new();
-                        for entry in results.iter().take(50) {
-                            response.push_str(&entry.path.to_string_lossy());
+                        for meta in results.iter().take(200) {
+                            response.push_str(&meta.path.to_string_lossy());
                             response.push('\n');
                         }
                         let _ = socket.write_all(response.as_bytes()).await;

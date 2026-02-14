@@ -1,6 +1,6 @@
 [package]
 name = "fd-rdd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Piko & Aegis"]
 description = "Event-driven elastic file indexer with RDD lineage"
@@ -23,14 +23,12 @@ notify = "6.1"
 # 扫描引擎 (fd 的心脏)
 ignore = "0.4"
 
-# 高性能 io
-io-uring = "0.6"
+# 内存映射（保留备用）
 memmap2 = "0.9"
 
-# 序列化（checkpoint）
+# 序列化（snapshot）
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
-flatbuffers = "23.5"
 
 # 内存数据结构
 dashmap = "5.5"

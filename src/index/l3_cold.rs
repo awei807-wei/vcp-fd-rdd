@@ -1,60 +1,43 @@
-use crate::core::adaptive::AdaptiveScheduler;
-use crate::core::rdd::FileEntry;
-use crate::query::matcher::Matcher;
-use ignore::WalkBuilder;
+use std::path::PathBuf;
+use crate::core::{FsScanRDD, BuildRDD, FileMeta};
+use crate::index::l2_partition::PersistentIndex;
 
-/// L3: 冷全量（弹性扫描）
-pub struct L3Cold {
-    pub adaptive: AdaptiveScheduler,
+/// L3: IndexBuilder — 仅用于启动全扫/补扫/重建，不进入查询链路
+pub struct IndexBuilder {
+    pub roots: Vec<PathBuf>,
 }
 
-impl L3Cold {
-    pub fn adaptive() -> Self {
-        Self {
-            adaptive: AdaptiveScheduler::new(),
-        }
+impl IndexBuilder {
+    pub fn new(roots: Vec<PathBuf>) -> Self {
+        Self { roots }
     }
-    
-    pub async fn scan(&self, matcher: &dyn Matcher, roots: &[std::path::PathBuf]) -> Vec<FileEntry> {
-        let mut results = Vec::new();
-        let prefix = matcher.prefix();
 
-        for root in roots {
-            let walker = WalkBuilder::new(root)
-                .hidden(true)
-                .ignore(true)
-                .git_ignore(true)
-                .build();
-            
-            for entry in walker.filter_map(|e| e.ok()) {
-                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                    let path = entry.path();
-                    let path_str = path.to_string_lossy();
+    /// 全量构建：扫描所有 roots，流式灌入 PersistentIndex
+    pub fn full_build(&self, index: &PersistentIndex) {
+        let rdd = FsScanRDD::from_roots(self.roots.clone());
+        let mut count = 0usize;
 
-                    // 前缀启发式过滤
-                    if let Some(p) = prefix {
-                        if !path_str.contains(p) {
-                            continue;
-                        }
-                    }
-
-                    if matcher.matches(&path_str) {
-                        let metadata = entry.metadata().ok();
-                        results.push(FileEntry {
-                            path: path.to_path_buf(),
-                            size: metadata.as_ref().map(|m| m.len()).unwrap_or(0),
-                            modified: metadata.and_then(|m| m.modified().ok()),
-                        });
-                    }
-                }
+        rdd.for_each(|meta: FileMeta| {
+            index.upsert(meta);
+            count += 1;
+            if count % 10000 == 0 {
+                tracing::info!("IndexBuilder: scanned {} files...", count);
             }
-        }
-        results
+        });
+
+        tracing::info!("IndexBuilder: full build complete, {} files indexed", count);
     }
-    
-    pub async fn parallel_build(&self, shards: usize, streaming: bool) -> anyhow::Result<()> {
-        tracing::info!("L3 parallel build: {} shards, streaming={}", shards, streaming);
-        // 实际实现中这里会调用 ignore 库进行并行扫描
-        Ok(())
+
+    /// 增量补扫：扫描指定目录，补充缺失条目
+    pub fn incremental_scan(&self, index: &PersistentIndex, dirs: Vec<PathBuf>) {
+        let rdd = FsScanRDD::from_roots(dirs);
+        let mut count = 0usize;
+
+        rdd.for_each(|meta: FileMeta| {
+            index.upsert(meta);
+            count += 1;
+        });
+
+        tracing::info!("IndexBuilder: incremental scan complete, {} files updated", count);
     }
 }
