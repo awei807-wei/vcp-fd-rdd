@@ -40,3 +40,8 @@ Vec posting 的删除为线性 `retain`，在 delete/rename 频率远低于查�
 
 - tombstone + 定期 compaction 重建 posting
 - 或升级为压缩位图（RoaringBitmap）/doc_id 方案
+
+## 后续演进（阶段 A）
+
+阶段 A 已将 posting 升级为 `DocId(u32) + RoaringBitmap`，并配套引入 path blob arena（offset/len）。
+详见：`helloagents/wiki/memory-docid-roaring-patharena.md`。

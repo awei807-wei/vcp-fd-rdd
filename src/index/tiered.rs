@@ -1,14 +1,14 @@
-use std::sync::Arc;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
-use crate::core::{FileMeta, EventRecord, EventType};
+use crate::core::{EventRecord, EventType, FileMeta};
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::query::matcher::create_matcher;
-use crate::storage::snapshot::SnapshotStore;
-use crate::stats::{MemoryReport, EventPipelineStats};
+use crate::stats::{EventPipelineStats, MemoryReport};
+use crate::storage::snapshot::{LoadedSnapshot, SnapshotStore};
 
 /// 三级索引：L1 热缓存 → L2 持久索引（内存常驻）→ L3 构建器（不在查询链路）
 pub struct TieredIndex {
@@ -46,9 +46,17 @@ impl TieredIndex {
         let l3 = IndexBuilder::new(roots.clone());
 
         let l2 = match store.load_if_valid().await {
-            Ok(Some(snap)) => {
-                tracing::info!("Loaded index snapshot: {} files", snap.files.len());
-                PersistentIndex::from_snapshot(snap)
+            Ok(Some(LoadedSnapshot::V4(snap))) => {
+                tracing::info!("Loaded index snapshot v4: {} docs", snap.metas.len());
+                PersistentIndex::from_snapshot_v4(snap)
+            }
+            Ok(Some(LoadedSnapshot::V3(snap))) => {
+                tracing::info!("Loaded index snapshot v3: {} files", snap.files.len());
+                PersistentIndex::from_snapshot_v3(snap)
+            }
+            Ok(Some(LoadedSnapshot::V2(snap))) => {
+                tracing::info!("Loaded index snapshot v2: {} files", snap.files.len());
+                PersistentIndex::from_snapshot_v2(snap)
             }
             Ok(None) => {
                 tracing::info!("No valid snapshot, starting with empty index");
@@ -79,7 +87,10 @@ impl TieredIndex {
             tracing::info!("Starting background full build...");
             idx.l3.full_build(&idx.l2);
             idx.rebuild_in_progress.store(false, Ordering::SeqCst);
-            tracing::info!("Background full build complete: {} files", idx.l2.file_count());
+            tracing::info!(
+                "Background full build complete: {} files",
+                idx.l2.file_count()
+            );
         });
     }
 
@@ -90,7 +101,10 @@ impl TieredIndex {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            tracing::debug!("Background rebuild already in progress, skipping ({})", reason);
+            tracing::debug!(
+                "Background rebuild already in progress, skipping ({})",
+                reason
+            );
             return;
         }
 
@@ -150,7 +164,8 @@ impl TieredIndex {
             }
         }
 
-        self.event_seq.fetch_add(events.len() as u64, Ordering::Relaxed);
+        self.event_seq
+            .fetch_add(events.len() as u64, Ordering::Relaxed);
     }
 
     /// 原子快照
@@ -159,7 +174,7 @@ impl TieredIndex {
             tracing::debug!("Index not dirty, skipping snapshot");
             return Ok(());
         }
-        let snap = self.l2.export_snapshot();
+        let snap = self.l2.export_snapshot_v4();
         store.write_atomic(&snap).await
     }
 
@@ -182,7 +197,9 @@ impl TieredIndex {
         MemoryReport {
             l1: self.l1.memory_stats(),
             l2: self.l2.memory_stats(),
-            event_pipeline: pipeline_stats,process_rss_bytes: MemoryReport::read_process_rss(),}
+            event_pipeline: pipeline_stats,
+            process_rss_bytes: MemoryReport::read_process_rss(),
+        }
     }
 
     /// 定期内存报告循环

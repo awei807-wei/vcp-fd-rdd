@@ -15,7 +15,7 @@ pub struct MemoryReport {
 
 #[derive(Clone, Debug, Default)]
 pub struct L1Stats {
-    /// DashMap<FileId, FileMeta> 条目数
+    /// DashMap<FileKey, FileMeta> 条目数
     pub entry_count: usize,
     /// path_index 条目数
     pub path_index_count: usize,
@@ -33,7 +33,7 @@ pub struct L2Stats {
     pub path_to_id_count: usize,
     /// trigram 倒排索引：不同 trigram 数量
     pub trigram_distinct: usize,
-    /// trigram 倒排索引：所有 posting list 的 FileId 总数
+    /// trigram 倒排索引：所有 posting list 的 DocId 总数
     pub trigram_postings_total: usize,
     /// tombstone 数量
     pub tombstone_count: usize,
@@ -92,26 +92,85 @@ impl fmt::Display for MemoryReport {
         writeln!(f, "╔══════════════════════════════════════════════════╗")?;
         writeln!(f, "║           fd-rdd Memory Report                  ║")?;
         writeln!(f, "╠══════════════════════════════════════════════════╣")?;
-        writeln!(f, "║ Process RSS: {:>35} ║", human_bytes(self.process_rss_bytes))?;
+        writeln!(
+            f,
+            "║ Process RSS: {:>35} ║",
+            human_bytes(self.process_rss_bytes)
+        )?;
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ L1 Cache:                                        ║")?;
-        writeln!(f, "║   entries:      {:>10}                       ║", self.l1.entry_count)?;
-        writeln!(f, "║   path_index:   {:>10}                       ║", self.l1.path_index_count)?;
-        writeln!(f, "║   access_count: {:>10}                       ║", self.l1.access_count_entries)?;
-        writeln!(f, "║   estimated:    {:>10}                       ║", human_bytes(self.l1.estimated_bytes))?;
+        writeln!(
+            f,
+            "║   entries:      {:>10}                       ║",
+            self.l1.entry_count
+        )?;
+        writeln!(
+            f,
+            "║   path_index:   {:>10}                       ║",
+            self.l1.path_index_count
+        )?;
+        writeln!(
+            f,
+            "║   access_count: {:>10}                       ║",
+            self.l1.access_count_entries
+        )?;
+        writeln!(
+            f,
+            "║   estimated:    {:>10}                       ║",
+            human_bytes(self.l1.estimated_bytes)
+        )?;
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ L2 PersistentIndex:                              ║")?;
-        writeln!(f, "║   files:        {:>10}  ({:>10})          ║", self.l2.file_count, human_bytes(self.l2.files_bytes))?;
-        writeln!(f, "║   path_to_id:   {:>10}  ({:>10})          ║", self.l2.path_to_id_count, human_bytes(self.l2.path_to_id_bytes))?;
-        writeln!(f, "║   trigram keys: {:>10}                       ║", self.l2.trigram_distinct)?;
-        writeln!(f, "║   trigram posts:{:>10}  ({:>10})          ║", self.l2.trigram_postings_total, human_bytes(self.l2.trigram_bytes))?;
-        writeln!(f, "║   tombstones:   {:>10}                       ║", self.l2.tombstone_count)?;
-        writeln!(f, "║   L2 total:     {:>10}                       ║", human_bytes(self.l2.estimated_bytes))?;
+        writeln!(
+            f,
+            "║   files:        {:>10}  ({:>10})          ║",
+            self.l2.file_count,
+            human_bytes(self.l2.files_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   path_to_id:   {:>10}  ({:>10})          ║",
+            self.l2.path_to_id_count,
+            human_bytes(self.l2.path_to_id_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   trigram keys: {:>10}                       ║",
+            self.l2.trigram_distinct
+        )?;
+        writeln!(
+            f,
+            "║   trigram posts:{:>10}  ({:>10})          ║",
+            self.l2.trigram_postings_total,
+            human_bytes(self.l2.trigram_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   tombstones:   {:>10}                       ║",
+            self.l2.tombstone_count
+        )?;
+        writeln!(
+            f,
+            "║   L2 total:     {:>10}                       ║",
+            human_bytes(self.l2.estimated_bytes)
+        )?;
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ Event Pipeline:                  ║")?;
-        writeln!(f, "║   last batch:   {:>10}                       ║", self.event_pipeline.last_batch_size)?;
-        writeln!(f, "║   total events: {:>10}                       ║", self.event_pipeline.total_events_processed)?;
-        writeln!(f, "║   overflow:     {:>10}                       ║", self.event_pipeline.overflow_drops)?;
+        writeln!(
+            f,
+            "║   last batch:   {:>10}                       ║",
+            self.event_pipeline.last_batch_size
+        )?;
+        writeln!(
+            f,
+            "║   total events: {:>10}                       ║",
+            self.event_pipeline.total_events_processed
+        )?;
+        writeln!(
+            f,
+            "║   overflow:     {:>10}                       ║",
+            self.event_pipeline.overflow_drops
+        )?;
         writeln!(f, "╚══════════════════════════════════════════════════╝")?;
         Ok(())
     }

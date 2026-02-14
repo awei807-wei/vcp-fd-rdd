@@ -1,25 +1,25 @@
-use std::path::Path;
-use dashmap::DashMap;
-use crate::core::{FileId, FileMeta};
-use crate::query::matcher::{Matcher, GlobMode};
+use crate::core::{FileKey, FileMeta};
+use crate::query::matcher::{GlobMode, Matcher};
 use crate::stats::L1Stats;
+use dashmap::DashMap;
+use std::path::Path;
 
 /// L1: 查询结果热缓存（有界 DashMap，LRU 淘汰）
 ///
 /// ## 语义说明
 /// L1 是**查询结果缓存**，不是 L2 主索引的子集。
 /// 它缓存最近被查询命中的 `FileMeta` 条目，以加速重复查询。
-/// 主键为 `FileId`（与 L2 一致），辅以 `path_index` 反查。
+/// 主键为 `FileKey(dev,ino)`（与扫描/事件输入一致），辅以 `path_index` 反查。
 ///
 /// L1 不参与索引构建流程，仅在 `TieredIndex::query()` 命中时回填。
 /// 容量有限，超出时按 LRU 策略淘汰。
 pub struct L1Cache {
-    /// 主存储：FileId -> FileMeta（查询缓存，非主索引）
-    pub inner: DashMap<FileId, FileMeta>,
-    /// 路径反查：path -> FileId（用于按路径失效）
-    pub path_index: DashMap<std::path::PathBuf, FileId>,
+    /// 主存储：FileKey -> FileMeta（查询缓存，非主索引）
+    pub inner: DashMap<FileKey, FileMeta>,
+    /// 路径反查：path -> FileKey（用于按路径失效）
+    pub path_index: DashMap<std::path::PathBuf, FileKey>,
     pub capacity: usize,
-    access_count: DashMap<FileId, u64>,
+    access_count: DashMap<FileKey, u64>,
 }
 
 impl L1Cache {
@@ -36,14 +36,17 @@ impl L1Cache {
         let is_segment = matcher.glob_mode() == Some(GlobMode::Segment);
         let prefix = matcher.prefix();
 
-        let results: Vec<FileMeta> = self.inner
+        let results: Vec<FileMeta> = self
+            .inner
             .iter()
             .filter(|e| {
                 let meta = e.value();
                 // 前缀启发式过滤
                 if let Some(p) = prefix {
                     if is_segment {
-                        let basename = meta.path.file_name()
+                        let basename = meta
+                            .path
+                            .file_name()
                             .map(|n| n.to_string_lossy())
                             .unwrap_or_default();
                         if !basename.contains(p) {
@@ -60,20 +63,26 @@ impl L1Cache {
             })
             .map(|e| {
                 let fid = *e.key();
-                self.access_count.entry(fid)
+                self.access_count
+                    .entry(fid)
                     .and_modify(|v| *v += 1)
                     .or_insert(1);
                 e.value().clone()
             })
             .collect();
 
-        if results.is_empty() { None } else { Some(results) }
+        if results.is_empty() {
+            None
+        } else {
+            Some(results)
+        }
     }
 
     pub fn insert(&self, meta: FileMeta) {
         if self.inner.len() >= self.capacity {
             // LRU 淘汰
-            let lru_key = self.access_count
+            let lru_key = self
+                .access_count
                 .iter()
                 .min_by_key(|e| *e.value())
                 .map(|e| *e.key());
@@ -86,7 +95,7 @@ impl L1Cache {
             }
         }
 
-        let fid = meta.file_id;
+        let fid = meta.file_key;
         self.path_index.insert(meta.path.clone(), fid);
         self.inner.insert(fid, meta);
     }
@@ -98,7 +107,7 @@ impl L1Cache {
         }
     }
 
-    pub fn remove(&self, fid: &FileId) {
+    pub fn remove(&self, fid: &FileKey) {
         if let Some((_, meta)) = self.inner.remove(fid) {
             self.path_index.remove(&meta.path);
         }
@@ -119,7 +128,9 @@ impl L1Cache {
 
         // DashMap 每条 entry 开销 ≈ 数据 + ~64 bytes 控制结构
         let avg_path_len: u64 = if entry_count > 0 {
-            let total: u64 = self.inner.iter()
+            let total: u64 = self
+                .inner
+                .iter()
                 .map(|e| e.value().path.as_os_str().len() as u64)
                 .sum();
             total / entry_count as u64
