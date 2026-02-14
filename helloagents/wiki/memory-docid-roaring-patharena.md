@@ -15,6 +15,7 @@
 - `trigram_index: HashMap<Trigram, RoaringBitmap>`。
 - 查询时对多个 trigram 的 bitmap 做交集，得到候选 DocId 集合，再进行 matcher 精确过滤。
 - 读路径加锁顺序保持：先读取 trigram 索引得到候选集，再读取元数据/arena，避免死锁。
+- 内存统计口径：优先以 `RoaringBitmap::serialized_size()` 近似 posting 的压缩存储量，并叠加 HashMap/Vec 的 capacity 级开销（仍无法覆盖 allocator 碎片导致的 RSS 高水位）。
 
 ## 3) Path Blob Arena（offset/len）
 
@@ -28,4 +29,3 @@
 - 新增快照 v4：落盘 `arena + metas + tombstones(DocId)`，派生结构（trigram/path_hash 映射）启动时重建。
 - loader 兼容：
   - v2/v3 仍可读取；加载后以内存结构重建为阶段 A 的 L2（并在后续写快照时自然迁移为 v4）。
-

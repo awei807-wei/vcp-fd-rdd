@@ -661,6 +661,8 @@ impl PersistentIndex {
 
     /// 内存占用统计（粗估）
     pub fn memory_stats(&self) -> L2Stats {
+        use std::mem::size_of;
+
         let metas = self.metas.read();
         let filekey_to_docid = self.filekey_to_docid.read();
         let path_hash_to_id = self.path_hash_to_id.read();
@@ -676,22 +678,52 @@ impl PersistentIndex {
         let trigram_distinct = trigram_index.len();
 
         let mut trigram_postings_total: usize = 0;
+        let mut trigram_heap_bytes: u64 = 0;
         for posting in trigram_index.values() {
             trigram_postings_total += posting.len() as usize;
+            // serialized_size 更接近 Roaring 的真实压缩存储量（但仍不等同于实际 heap bytes）
+            trigram_heap_bytes += posting.serialized_size() as u64;
         }
 
-        // metas: 每条近似 (FileKey 16 + off/len 6 + size 8 + mtime 16 + padding) ~= 56
-        let metas_bytes = total_docs as u64 * 56;
-        // mapping: HashMap<FileKey, DocId>（粗估）
-        let map_bytes = filekey_to_docid.len() as u64 * (16 + 4 + 16);
-        // arena：真实字节数
-        let arena_bytes = arena.data.len() as u64;
-        // path hash 反查：key(8)+value(4) 乘以候选数，粗估控制开销
-        let path_to_id_bytes = path_to_id_count as u64 * (8 + 4 + 16);
-        // trigram：Roaring 估算按 docid 数 * 4（低估），加桶控制开销
-        let trigram_bytes = trigram_distinct as u64 * 64 + trigram_postings_total as u64 * 4;
-        // tombstones：Roaring 按 docid 数 * 4
-        let tomb_bytes = tombstone_count as u64 * 4;
+        // ── 更贴近真实的估算策略（以 capacity 为主，避免 len 低估） ──
+        //
+        // 说明：
+        // - 这是“近似占用”，不包含 allocator 产生的碎片/空闲块（RSS 高水位常驻的主要来源）。
+        // - HashMap 的真实 bucket/ctrl 布局由 hashbrown 决定，这里按“entry + 1B ctrl”做近似。
+
+        // metas: Vec<CompactMeta>
+        let metas_bytes = metas.capacity() as u64 * size_of::<CompactMeta>() as u64
+            + size_of::<Vec<CompactMeta>>() as u64;
+
+        // mapping: HashMap<FileKey, DocId>
+        let map_entry_bytes = size_of::<(FileKey, DocId)>() as u64;
+        let map_bytes = filekey_to_docid.capacity() as u64 * (map_entry_bytes + 1)
+            + size_of::<HashMap<FileKey, DocId>>() as u64;
+
+        // arena：Vec<u8>
+        let arena_bytes = arena.data.capacity() as u64 + size_of::<Vec<u8>>() as u64;
+
+        // path hash 反查：HashMap<u64, OneOrManyDocId> + Many 的 Vec<DocId> 堆分配
+        let path_entry_bytes = size_of::<(u64, OneOrManyDocId)>() as u64;
+        let mut path_many_bytes: u64 = 0;
+        for v in path_hash_to_id.values() {
+            if let OneOrManyDocId::Many(ids) = v {
+                path_many_bytes += ids.capacity() as u64 * size_of::<DocId>() as u64
+                    + size_of::<Vec<DocId>>() as u64;
+            }
+        }
+        let path_to_id_bytes = path_hash_to_id.capacity() as u64 * (path_entry_bytes + 1)
+            + size_of::<HashMap<u64, OneOrManyDocId>>() as u64
+            + path_many_bytes;
+
+        // trigram：HashMap<Trigram, RoaringBitmap> 的 entry + Roaring 的压缩存储量（serialized_size）
+        let trigram_entry_bytes = size_of::<(Trigram, RoaringBitmap)>() as u64;
+        let trigram_map_bytes = trigram_index.capacity() as u64 * (trigram_entry_bytes + 1)
+            + size_of::<HashMap<Trigram, RoaringBitmap>>() as u64;
+        let trigram_bytes = trigram_map_bytes + trigram_heap_bytes;
+
+        // tombstones：RoaringBitmap
+        let tomb_bytes = size_of::<RoaringBitmap>() as u64 + tombstones.serialized_size() as u64;
 
         let estimated_bytes =
             metas_bytes + map_bytes + arena_bytes + path_to_id_bytes + trigram_bytes + tomb_bytes;
