@@ -13,4 +13,5 @@
 - `202602152230_watch-ignore-overlay-pending`：轻量迭代（默认忽略 snapshot 路径避免 watcher 反馈回路；MemoryReport 增加 overlay/pending 影子内存；pending_events 按路径去重）
 - `202602152315_events-wal`：阶段 C 补齐（events.wal 追加日志：seal + manifest checkpoint + 启动回放；降低 overflow/重启后的全量 rebuild）
 - `202602152340_docs-readme-help-git`：轻量迭代（同步 README/--help/回忆录，并提交 git 作为阶段性锚点）
+- `202602152420_chronicle-architecture`：轻量迭代（输出编年史；生成立项架构书 SSOT；对外副本需手动拷贝到项目上层目录）
 - `202602150226_dynamic-memory-vs-rss`：动态内存与 RSS 优化清单（阶段 A/A+/B 任务汇总；fanotify 延后）

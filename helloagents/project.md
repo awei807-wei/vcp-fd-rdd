@@ -27,3 +27,9 @@
 - `helloagents/wiki/`：项目知识库（架构/性能/可靠性笔记）
 - `helloagents/plan/`：方案包（设计阶段产物）
 - `helloagents/history/`：已执行方案包归档
+
+## 当前持久化形态（2026-02-15）
+
+- v6 段式容器：legacy `index.db`（兼容读取 v2~v6；v6 以 mmap 为主要加载方式）
+- LSM 目录布局：`index.d/`（`MANIFEST.bin` + `seg-*.db` + `seg-*.del`）
+- events.wal：`index.d/events.wal` + `events.wal.seal-*`，配合 manifest 的 `wal_seal_id` checkpoint 做启动回放
