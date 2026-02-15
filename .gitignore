@@ -1,1 +1,5 @@
 /target
+
+# local scratch files
+/posting_list
+.github/workflows/release(1).yml
