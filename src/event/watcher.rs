@@ -1,7 +1,7 @@
-use notify::{Watcher, RecursiveMode, Config};
-use tokio::sync::mpsc;
-use std::sync::Arc;
+use notify::{Config, RecursiveMode, Watcher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// 文件系统事件监听器
 /// 使用 bounded channel 做背压，避免无限堆积
@@ -23,7 +23,10 @@ impl EventWatcher {
                     if tx.try_send(event).is_err() {
                         let drops = overflow_drops.fetch_add(1, Ordering::Relaxed);
                         if drops % 1000 == 0 {
-                            eprintln!("[fd-rdd] event channel overflow, total drops: {}", drops + 1);
+                            eprintln!(
+                                "[fd-rdd] event channel overflow, total drops: {}",
+                                drops + 1
+                            );
                         }
                     }
                 }
@@ -37,10 +40,7 @@ impl EventWatcher {
 }
 
 /// 注册监听路径（分离出来方便错误处理）
-pub fn watch_roots(
-    watcher: &mut notify::RecommendedWatcher,
-    roots: &[std::path::PathBuf],
-) {
+pub fn watch_roots(watcher: &mut notify::RecommendedWatcher, roots: &[std::path::PathBuf]) {
     for root in roots {
         if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
             tracing::warn!("Failed to watch {:?}: {}", root, e);

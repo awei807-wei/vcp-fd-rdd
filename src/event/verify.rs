@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use crate::index::TieredIndex;
+use std::sync::Arc;
 
 /// 弹性校验：检测事件流缺口，触发补扫
 pub struct ElasticVerifier {

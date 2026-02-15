@@ -31,9 +31,29 @@ notify 事件在高频变更下会出现 channel 满导致丢弃（overflow）�
 
 - 允许丢弃（背压优先，避免 OOM），但必须记录 `overflow_drops`
 - **一旦发生 overflow**，触发“兜底重建”以恢复一致性：
-  - 清空 L1/L2（避免旧状态残留）
-  - 后台全量扫描 roots 重建索引
-  - 为避免风暴下频繁重建，添加最小重建冷却时间（cooldown）
+  - **不再原地清空 L2**：后台构建 *新* 索引（new L2），构建完成后 **ArcSwap 原子切换**
+  - rebuild 期间的事件先进入 pending 缓冲，切换前回放到 new L2，避免丢事件
+  - 切换时清空 L1（避免返回过期缓存）
+  - 为避免风暴下频繁重建，添加最小重建冷却时间（cooldown），并在冷却期内合并 rebuild 请求（merge/coalesce）
+
+### 2.1 “自触发”事件风暴（索引写入反哺 watcher）
+
+如果 watch roots 覆盖了 fd-rdd 自己写入的路径（例如 snapshot 的 `index.db/index.d`，或将日志重定向到被 watch 的目录内），会形成反馈回路：
+
+- fd-rdd 写 snapshot/segment/log
+- watcher 捕获 Modify/Create
+- 事件管道合并并 apply → 继续写日志/快照
+
+表现：
+
+- `Event Pipeline.total events` 快速增长
+- `overflow` 频繁出现，进而触发 rebuild
+- RSS/Anonymous 高水位长期不回落（本质是“事件风暴 + 临时分配”的高水位常驻）
+
+缓解（已落地）：
+
+- 事件管道默认忽略 `snapshot_path` 与派生 `index.d/`，避免索引自身写入反哺 watcher
+- CLI 支持 `--ignore-path`（可重复）手动排除日志文件等路径
 
 ## 3. 快照写入的内存峰值（OOM 风险）
 
@@ -43,8 +63,8 @@ notify 事件在高频变更下会出现 channel 满导致丢弃（overflow）�
 
 ### 处理原则
 
-- 采用流式序列化写入（`bincode::serialize_into(file)`），避免先构建超大 `Vec<u8>` body
-- header 采用 INCOMPLETE → COMMITTED 两阶段（写完 body 后 seek 回头覆盖 header）
+- v5（bincode）采用流式序列化写入（`bincode::serialize_into(file)`），避免先构建超大 `Vec<u8>` body
+- v6（段式）写入为 manifest + segments（按 8B 对齐），并为每段计算 checksum；仍保留 INCOMPLETE → COMMITTED 两阶段 header
 - 仍保留 atomic replacement（tmp + fsync + rename + fsync(dir)）语义
 
 ## 4. 删除/重建后 RSS 不下降（高水位效应）
@@ -63,6 +83,7 @@ notify 事件在高频变更下会出现 channel 满导致丢弃（overflow）�
 
 - 正确性优先：索引一致性靠“overflow → rebuild/补扫”闭环，不以 RSS 变化作为一致性判断
 - 稳态回收手段（按代价递增）：
-  - 重建关键结构并替换旧结构（通过 drop 释放旧 capacity）
+  - 重建关键结构并替换旧结构（通过 drop 释放旧 capacity；配合 ArcSwap 可避免“原地 reset”导致查询不可用）
+  - 可选：切换 `mimalloc` 作为全局分配器（用于动态更新场景下的碎片回吐对照，隔离 allocator 噪声）
   - 可选：`malloc_trim(0)`（glibc 环境下尝试回吐 RSS，可能带来性能波动）
   - 进程级回收：worker 子进程/自重启（最可靠的 RSS 回落方式）

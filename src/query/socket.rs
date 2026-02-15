@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use tokio::net::UnixListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::index::TieredIndex;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
 
 /// Unix Socket 查询服务（供 fd-query.sh / fzf 使用）
 pub struct SocketServer {

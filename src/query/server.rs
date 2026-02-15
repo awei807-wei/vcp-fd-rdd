@@ -1,11 +1,11 @@
+use crate::index::TieredIndex;
 use axum::{
     extract::{Query, State},
     routing::get,
     Json, Router,
 };
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use crate::index::TieredIndex;
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 pub struct SearchParams {
@@ -53,7 +53,8 @@ async fn search_handler(
     let results = index.query(&params.q);
     let limit = params.limit.unwrap_or(100);
 
-    let response = results.into_iter()
+    let response = results
+        .into_iter()
         .take(limit)
         .map(|m| SearchResult {
             path: m.path.to_string_lossy().into_owned(),
@@ -64,9 +65,7 @@ async fn search_handler(
     Json(response)
 }
 
-async fn status_handler(
-    State(index): State<Arc<TieredIndex>>,
-) -> Json<StatusResponse> {
+async fn status_handler(State(index): State<Arc<TieredIndex>>) -> Json<StatusResponse> {
     Json(StatusResponse {
         indexed_count: index.file_count(),
     })
