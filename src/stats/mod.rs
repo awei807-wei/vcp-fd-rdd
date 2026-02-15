@@ -7,8 +7,14 @@ pub struct MemoryReport {
     pub l1: L1Stats,
     /// L2 持久索引
     pub l2: L2Stats,
+    /// 磁盘只读 segments（mmap 基座 + delta 段数量）
+    pub disk_segments: usize,
     /// 事件管道
     pub event_pipeline: EventPipelineStats,
+    /// overlay（跨段 delete/upsert 屏蔽集合）
+    pub overlay: OverlayStats,
+    /// rebuild（pending 事件队列）
+    pub rebuild: RebuildStats,
     /// 进程级 RSS（从 /proc/self/statm 读取）
     pub process_rss_bytes: u64,
 }
@@ -27,9 +33,9 @@ pub struct L1Stats {
 
 #[derive(Clone, Debug, Default)]
 pub struct L2Stats {
-    /// files HashMap 条目数
+    /// files 条目数（活跃文档数，不含 tombstone）
     pub file_count: usize,
-    /// path_to_id HashMap 条目数
+    /// path_to_id（hash(path)->DocId）条目数（含冲突列表展开后的 DocId 计数）
     pub path_to_id_count: usize,
     /// trigram 倒排索引：不同 trigram 数量
     pub trigram_distinct: usize,
@@ -37,12 +43,31 @@ pub struct L2Stats {
     pub trigram_postings_total: usize,
     /// tombstone 数量
     pub tombstone_count: usize,
-    /// files 估算内存（字节）
-    pub files_bytes: u64,
+    /// metas(Vec<CompactMeta>) capacity
+    pub metas_capacity: usize,
+    /// filekey_to_docid(HashMap<FileKey,DocId>) capacity
+    pub filekey_to_docid_capacity: usize,
+    /// path_hash_to_id(HashMap<u64, OneOrManyDocId>) capacity
+    pub path_hash_to_id_capacity: usize,
+    /// trigram_index(HashMap<Trigram, RoaringBitmap>) capacity
+    pub trigram_index_capacity: usize,
+    /// arena(Vec<u8>) capacity
+    pub arena_capacity: usize,
+
+    /// metas + filekey_to_docid 估算内存（字节，不含 arena 与派生索引）
+    pub core_table_bytes: u64,
+    /// metas(Vec<CompactMeta>) 估算内存（字节）
+    pub metas_bytes: u64,
+    /// filekey_to_docid(HashMap<FileKey,DocId>) 估算内存（字节）
+    pub filekey_to_docid_bytes: u64,
+    /// arena 估算内存（字节）
+    pub arena_bytes: u64,
     /// path_to_id 估算内存（字节）
     pub path_to_id_bytes: u64,
     /// trigram 倒排索引估算内存（字节）
     pub trigram_bytes: u64,
+    /// RoaringBitmap serialized_size 总和（更接近压缩后数据体量；不等于真实 heap）
+    pub roaring_serialized_bytes: u64,
     /// 总估算内存（字节）
     pub estimated_bytes: u64,
 }
@@ -55,6 +80,20 @@ pub struct EventPipelineStats {
     pub total_events_processed: u64,
     /// channel 溢出丢弃次数
     pub overflow_drops: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OverlayStats {
+    pub deleted_paths: usize,
+    pub upserted_paths: usize,
+    pub deleted_bytes: u64,
+    pub upserted_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RebuildStats {
+    pub in_progress: bool,
+    pub pending_paths: usize,
 }
 
 impl MemoryReport {
@@ -123,9 +162,26 @@ impl fmt::Display for MemoryReport {
         writeln!(f, "║ L2 PersistentIndex:                              ║")?;
         writeln!(
             f,
-            "║   files:        {:>10}  ({:>10})          ║",
+            "║   files:        {:>10}                       ║",
             self.l2.file_count,
-            human_bytes(self.l2.files_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   metas cap:    {:>10}  ({:>10})          ║",
+            self.l2.metas_capacity,
+            human_bytes(self.l2.metas_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   filekey cap:  {:>10}  ({:>10})          ║",
+            self.l2.filekey_to_docid_capacity,
+            human_bytes(self.l2.filekey_to_docid_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   arena:        {:>10}  ({:>10})          ║",
+            self.l2.arena_capacity,
+            human_bytes(self.l2.arena_bytes)
         )?;
         writeln!(
             f,
@@ -135,14 +191,29 @@ impl fmt::Display for MemoryReport {
         )?;
         writeln!(
             f,
+            "║   path cap:     {:>10}                       ║",
+            self.l2.path_hash_to_id_capacity
+        )?;
+        writeln!(
+            f,
             "║   trigram keys: {:>10}                       ║",
             self.l2.trigram_distinct
+        )?;
+        writeln!(
+            f,
+            "║   trigram cap:  {:>10}                       ║",
+            self.l2.trigram_index_capacity
         )?;
         writeln!(
             f,
             "║   trigram posts:{:>10}  ({:>10})          ║",
             self.l2.trigram_postings_total,
             human_bytes(self.l2.trigram_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   roaring data: {:>10}                       ║",
+            human_bytes(self.l2.roaring_serialized_bytes)
         )?;
         writeln!(
             f,
@@ -154,6 +225,8 @@ impl fmt::Display for MemoryReport {
             "║   L2 total:     {:>10}                       ║",
             human_bytes(self.l2.estimated_bytes)
         )?;
+        writeln!(f, "╠──────────────────────────────────────────────────╣")?;
+        writeln!(f, "║ Disk Segments (mmap): {:>24} ║", self.disk_segments)?;
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ Event Pipeline:                  ║")?;
         writeln!(
@@ -170,6 +243,25 @@ impl fmt::Display for MemoryReport {
             f,
             "║   overflow:     {:>10}                       ║",
             self.event_pipeline.overflow_drops
+        )?;
+        writeln!(f, "╠──────────────────────────────────────────────────╣")?;
+        writeln!(f, "║ Shadow Memory (Overlay/Rebuild):                 ║")?;
+        writeln!(
+            f,
+            "║   overlay del:  {:>10}  ({:>10})          ║",
+            self.overlay.deleted_paths,
+            human_bytes(self.overlay.deleted_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   overlay up:   {:>10}  ({:>10})          ║",
+            self.overlay.upserted_paths,
+            human_bytes(self.overlay.upserted_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   rebuild pend: {:>10}  (in_progress={})      ║",
+            self.rebuild.pending_paths, self.rebuild.in_progress
         )?;
         writeln!(f, "╚══════════════════════════════════════════════════╝")?;
         Ok(())

@@ -1,20 +1,27 @@
-use fd_rdd::index::TieredIndex;
+use clap::Parser;
 use fd_rdd::event::EventPipeline;
+use fd_rdd::index::TieredIndex;
 use fd_rdd::query::QueryServer;
 use fd_rdd::storage::snapshot::SnapshotStore;
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
-use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "fd-rdd", version, about = "fd-rdd: atomic-snapshot file indexer")]
+#[command(
+    name = "fd-rdd",
+    version,
+    about = "fd-rdd: atomic-snapshot file indexer"
+)]
 struct Args {
     /// 要索引的根目录（可重复传入）；未传入则默认使用 $HOME（以及存在时的 /tmp/vcp_test_data）
     #[arg(long = "root", value_name = "PATH")]
     roots: Vec<PathBuf>,
 
-    /// 快照文件路径（默认: $XDG_DATA_HOME/fd-rdd/index.db 或 /tmp/fd-rdd/index.db）
+    /// 快照路径（默认: $XDG_DATA_HOME/fd-rdd/index.db 或 /tmp/fd-rdd/index.db）
+    ///
+    /// - legacy 单文件：index.db（兼容读取 v2~v6；v6 为 mmap 段式容器）
+    /// - LSM 目录：同路径派生的 index.d/（MANIFEST.bin + seg-*.db/.del + events.wal）
     #[arg(long, value_name = "PATH")]
     snapshot_path: Option<PathBuf>,
 
@@ -49,6 +56,12 @@ struct Args {
     /// watcher 事件 debounce 窗口（毫秒）
     #[arg(long, default_value_t = 100)]
     debounce_ms: u64,
+
+    /// watcher 忽略路径前缀（可重复）；用于排除 snapshot/log 等“自触发”路径
+    ///
+    /// 说明：fd-rdd 会默认忽略 `--snapshot-path` 以及派生的 `index.d/`；这里用于补充额外忽略项。
+    #[arg(long = "ignore-path", value_name = "PATH")]
+    ignore_paths: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -86,6 +99,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Arc::new(TieredIndex::load_or_empty(&store, roots).await?)
     };
+    // WAL：即使 --no_snapshot，也允许记录后续事件（仅不回放历史）。
+    let _ = index.attach_wal(&store);
 
     // 4) 若索引为空，后台全量构建
     if index.file_count() == 0 && !args.no_build {
@@ -96,7 +111,18 @@ async fn main() -> anyhow::Result<()> {
     let pipeline = if args.no_watch {
         None
     } else {
-        let pipeline = EventPipeline::new_with_config(index.clone(), args.debounce_ms, args.event_channel_size);
+        // 默认忽略索引自身的 snapshot/segment 写入路径，避免 watcher 反馈循环。
+        // 额外忽略项可通过 --ignore-path 传入（例如将日志重定向到了被 watch 的目录下）。
+        let mut ignores = args.ignore_paths.clone();
+        ignores.push(store.path().to_path_buf());
+        ignores.push(store.derived_lsm_dir_path());
+
+        let pipeline = EventPipeline::new_with_config_and_ignores(
+            index.clone(),
+            args.debounce_ms,
+            args.event_channel_size,
+            ignores,
+        );
         pipeline.start().await?;
         Some(pipeline)
     };
@@ -115,7 +141,9 @@ async fn main() -> anyhow::Result<()> {
     let snap_store = store.clone();
     let snapshot_interval_secs = args.snapshot_interval_secs;
     tokio::spawn(async move {
-        snap_index.snapshot_loop(snap_store, snapshot_interval_secs).await;
+        snap_index
+            .snapshot_loop(snap_store, snapshot_interval_secs)
+            .await;
     });
 
     // 8) 启动内存报告循环（每 60 秒）
@@ -132,7 +160,9 @@ async fn main() -> anyhow::Result<()> {
         });
 
         tokio::spawn(async move {
-            report_index.memory_report_loop(stats_fn, report_interval_secs).await;
+            report_index
+                .memory_report_loop(stats_fn, report_interval_secs)
+                .await;
         });
     }
 

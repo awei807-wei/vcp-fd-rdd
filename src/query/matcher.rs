@@ -1,6 +1,6 @@
-use wildmatch::WildMatch;
 use std::path::Path;
 use std::sync::Arc;
+use wildmatch::WildMatch;
 
 /// Glob 匹配模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

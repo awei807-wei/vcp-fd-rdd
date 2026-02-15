@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// 文件身份：Linux 上用 (dev, ino) 做主键，rename 时 ino 不变。
 ///
@@ -47,6 +48,7 @@ pub trait BuildRDD<T: Send + Sync + 'static>: Send + Sync {
 /// FsScanRDD：启动全量扫描/补扫时使用
 pub struct FsScanRDD {
     pub parts: Vec<Partition>,
+    parallelism: usize,
 }
 
 impl FsScanRDD {
@@ -60,7 +62,37 @@ impl FsScanRDD {
                 max_depth: 255,
             })
             .collect();
-        Self { parts }
+        Self {
+            parts,
+            parallelism: 1,
+        }
+    }
+
+    /// 设置扫描并行度（仅影响 `for_each_meta` 的并行 walker）。
+    pub fn with_parallelism(mut self, parallelism: usize) -> Self {
+        self.parallelism = parallelism.max(1);
+        self
+    }
+
+    /// 按指定并行度遍历所有文件元数据（用于冷启动/重建的弹性构建）。
+    ///
+    /// 注意：这是 FsScanRDD 的专用入口，不改变 `BuildRDD` 的 Iterator 抽象，
+    /// 避免牵涉面过大。`parallelism==1` 时行为与原 for_each 等价。
+    pub fn for_each_meta(&self, sink: impl Fn(FileMeta) + Send + Sync + 'static) {
+        let sink: Arc<dyn Fn(FileMeta) + Send + Sync> = Arc::new(sink);
+
+        if self.parallelism <= 1 {
+            for p in self.partitions() {
+                for item in self.compute(p) {
+                    sink(item);
+                }
+            }
+            return;
+        }
+
+        for p in self.partitions() {
+            scan_partition_parallel(p, self.parallelism, sink.clone());
+        }
     }
 }
 
@@ -98,6 +130,50 @@ impl BuildRDD<FileMeta> for FsScanRDD {
 
         Box::new(iter)
     }
+}
+
+fn scan_partition_parallel(
+    part: &Partition,
+    parallelism: usize,
+    sink: Arc<dyn Fn(FileMeta) + Send + Sync>,
+) {
+    use ignore::{WalkBuilder, WalkState};
+    use std::os::unix::fs::MetadataExt;
+
+    let walker = WalkBuilder::new(&part.root)
+        .max_depth(Some(part.max_depth))
+        .hidden(true)
+        .ignore(true)
+        .git_ignore(true)
+        .threads(parallelism)
+        .build_parallel();
+
+    walker.run(|| {
+        let sink = sink.clone();
+        Box::new(move |entry| {
+            let Ok(e) = entry else {
+                return WalkState::Continue;
+            };
+            if !e.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                return WalkState::Continue;
+            }
+            let Ok(meta) = e.metadata() else {
+                return WalkState::Continue;
+            };
+
+            sink(FileMeta {
+                file_key: FileKey {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                },
+                path: e.path().to_path_buf(),
+                size: meta.len(),
+                mtime: meta.modified().ok(),
+            });
+
+            WalkState::Continue
+        })
+    });
 }
 
 /// BuildLineage：仅记录构建流水线的阶段性记录，有硬上限（环形缓冲区）
