@@ -29,6 +29,9 @@ build() {
     cd "$_pkgname"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
+    # Strip LTO from CFLAGS — GCC LTO bitcode is incompatible with rust-lld
+    CFLAGS="${CFLAGS//-flto=auto/}"
+    CXXFLAGS="${CXXFLAGS//-flto=auto/}"
     cargo build --release --frozen
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "fd-rdd"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 authors = ["Piko & Aegis"]
 description = "Event-driven elastic file indexer with RDD lineage"
