@@ -378,8 +378,10 @@ impl SnapshotStore {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
+            let is_tmp = name.ends_with(".tmp");
             if let Some(id) = parse_lsm_seg_id(&name) {
-                if !live_ids.contains(&id) {
+                // `.tmp` 属于崩溃/异常残留，始终视为孤儿文件（即使 id 仍在 manifest 中也应清理）。
+                if is_tmp || !live_ids.contains(&id) {
                     let path = entry.path();
                     match std::fs::remove_file(&path) {
                         Ok(()) => removed += 1,
@@ -1030,8 +1032,16 @@ fn lsm_write_manifest_atomic(path: &Path, m: &LsmManifest) -> anyhow::Result<()>
     Ok(())
 }
 
-fn parse_lsm_seg_id(name: &str) -> Option<u64> {
+/// 解析 LSM segment 文件名中的 id（hex）。
+///
+/// 支持的形式（含崩溃残留的临时文件）：
+/// - `seg-<hex>.db`
+/// - `seg-<hex>.del`
+/// - `seg-<hex>.db.tmp`
+/// - `seg-<hex>.del.tmp`
+pub fn parse_lsm_seg_id(name: &str) -> Option<u64> {
     let s = name.strip_prefix("seg-")?;
+    let s = s.strip_suffix(".tmp").unwrap_or(s);
     let s = s.strip_suffix(".db").or_else(|| s.strip_suffix(".del"))?;
     if s.is_empty() || s.len() > 16 {
         return None;
@@ -1357,10 +1367,21 @@ mod tests {
             std::fs::write(store.lsm_seg_db_path(id), b"db").unwrap();
             std::fs::write(store.lsm_seg_del_path(id), b"del").unwrap();
         }
+        // 崩溃/异常残留的临时文件：即使 id 仍在 manifest 中也应被清理。
+        std::fs::write(
+            store.lsm_dir_path().join("seg-0000000000000001.db.tmp"),
+            b"tmp",
+        )
+        .unwrap();
+        std::fs::write(
+            store.lsm_dir_path().join("seg-0000000000000002.del.tmp"),
+            b"tmp",
+        )
+        .unwrap();
         std::fs::write(store.lsm_dir_path().join("unrelated.tmp"), b"x").unwrap();
 
         let removed = store.gc_stale_segments().unwrap();
-        assert_eq!(removed, 4);
+        assert_eq!(removed, 6);
 
         assert!(store.lsm_seg_db_path(1).exists());
         assert!(store.lsm_seg_del_path(1).exists());
@@ -1373,5 +1394,13 @@ mod tests {
         assert!(!store.lsm_seg_del_path(4).exists());
 
         assert!(store.lsm_dir_path().join("unrelated.tmp").exists());
+        assert!(!store
+            .lsm_dir_path()
+            .join("seg-0000000000000001.db.tmp")
+            .exists());
+        assert!(!store
+            .lsm_dir_path()
+            .join("seg-0000000000000002.del.tmp")
+            .exists());
     }
 }
