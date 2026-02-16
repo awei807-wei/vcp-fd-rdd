@@ -1,7 +1,6 @@
-pub mod watcher;
 pub mod stream;
 pub mod verify;
+pub mod watcher;
 
-pub use watcher::*;
-pub use stream::*;
-pub use verify::*;
+pub use stream::EventPipeline;
+pub use verify::ElasticVerifier;
