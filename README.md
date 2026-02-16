@@ -43,6 +43,13 @@
 cargo build --release
 ```
 
+默认启用 `mimalloc` 作为全局分配器（用于降低多线程 ptmalloc arena 导致的碎片与 RSS 回吐问题）。
+如需回退到系统分配器：
+
+```bash
+cargo build --release --no-default-features
+```
+
 启动（示例）：
 
 ```bash
@@ -59,13 +66,6 @@ cargo build --release
 curl "http://127.0.0.1:6060/search?q=main.rs&limit=20"
 ```
 
-可选：使用 mimalloc（用于动态更新场景下的碎片/回吐对照）：
-
-```bash
-cargo build --release --features mimalloc
-```
-
 ## 许可证
 
 MIT License (c) 2026 fd-rdd Contributors
-
