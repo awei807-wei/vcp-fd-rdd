@@ -29,6 +29,8 @@ build() {
     cd "$_pkgname"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
+    CFLAGS="${CFLAGS//-flto=auto/}"
+    CXXFLAGS="${CXXFLAGS//-flto=auto/}"
     cargo build --release --frozen
 }
 
