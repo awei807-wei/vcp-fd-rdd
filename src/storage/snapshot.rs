@@ -4,6 +4,7 @@ use crate::index::l2_partition::IndexSnapshotV4;
 use crate::index::l2_partition::IndexSnapshotV5;
 use crate::index::l2_partition::V6Segments;
 use memmap2::Mmap;
+use std::collections::HashSet;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
@@ -334,6 +335,16 @@ impl SnapshotStore {
         self.lsm_dir_path().join("MANIFEST.bin")
     }
 
+    /// 读取 LSM manifest 的 last_build_ns（用于冷启动离线变更检测）。
+    pub fn lsm_last_build_ns(&self) -> anyhow::Result<Option<u64>> {
+        let p = self.lsm_manifest_path();
+        if !p.exists() {
+            return Ok(None);
+        }
+        let m = lsm_read_manifest(&p)?;
+        Ok(Some(m.last_build_ns))
+    }
+
     /// 读取当前 LSM manifest 的 wal_seal_id（用于 compaction 时保持 checkpoint 不回退）。
     pub fn lsm_manifest_wal_seal_id(&self) -> anyhow::Result<u64> {
         let p = self.lsm_manifest_path();
@@ -349,6 +360,39 @@ impl SnapshotStore {
 
     fn lsm_seg_del_path(&self, id: u64) -> PathBuf {
         self.lsm_dir_path().join(format!("seg-{id:016x}.del"))
+    }
+
+    /// Compaction 完成后，清理不再被 manifest 引用的旧 segment 文件。
+    ///
+    /// 说明:
+    /// - 只会删除 LSM 目录下形如 `seg-{id:016x}.db` / `seg-{id:016x}.del` 的文件。
+    /// - 删除单个文件失败不会中断（避免 compaction 因清理失败而失败）。
+    pub fn gc_stale_segments(&self) -> anyhow::Result<usize> {
+        let manifest = lsm_read_manifest(&self.lsm_manifest_path())?;
+        let live_ids: HashSet<u64> = std::iter::once(manifest.base_id)
+            .chain(manifest.delta_ids.iter().copied())
+            .collect();
+
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(self.lsm_dir_path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(id) = parse_lsm_seg_id(&name) {
+                if !live_ids.contains(&id) {
+                    let path = entry.path();
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => removed += 1,
+                        Err(e) => {
+                            // 删除失败不应阻断 compaction；保守地记录并继续。
+                            tracing::warn!("LSM gc stale segment remove failed: {:?}: {}", path, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(removed)
     }
 
     pub fn load_v6_mmap_if_valid(
@@ -853,7 +897,7 @@ impl SnapshotStore {
 // LSM directory layout (Manifest + segments)
 
 const LSM_MANIFEST_MAGIC: u32 = 0x314D_534C; // "LSM1" little-endian
-const LSM_MANIFEST_VERSION: u32 = 2;
+const LSM_MANIFEST_VERSION: u32 = 3;
 const LSM_MANIFEST_HEADER_SIZE: usize = 4 + 4 + 4 + 4; // magic + ver + body_len + checksum
 
 #[derive(Clone, Debug, Default)]
@@ -862,6 +906,10 @@ struct LsmManifest {
     base_id: u64,
     delta_ids: Vec<u64>,
     wal_seal_id: u64,
+    /// 上次认为“索引与磁盘现实一致”的时间戳（Unix epoch nanos）。
+    ///
+    /// 用途：冷启动时用于检测停机期间的离线变更（目录 mtime crawl）。
+    last_build_ns: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -879,7 +927,7 @@ pub struct LsmLoadedLayers {
 }
 
 fn lsm_encode_manifest_body(m: &LsmManifest) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + 8 + 4 + m.delta_ids.len() * 8 + 8);
+    let mut out = Vec::with_capacity(8 + 8 + 4 + m.delta_ids.len() * 8 + 8 + 8);
     out.extend_from_slice(&m.next_id.to_le_bytes());
     out.extend_from_slice(&m.base_id.to_le_bytes());
     let n: u32 = m.delta_ids.len().try_into().unwrap_or(u32::MAX);
@@ -888,6 +936,7 @@ fn lsm_encode_manifest_body(m: &LsmManifest) -> Vec<u8> {
         out.extend_from_slice(&id.to_le_bytes());
     }
     out.extend_from_slice(&m.wal_seal_id.to_le_bytes());
+    out.extend_from_slice(&m.last_build_ns.to_le_bytes());
     out
 }
 
@@ -910,6 +959,14 @@ fn lsm_decode_manifest_body(body: &[u8]) -> anyhow::Result<LsmManifest> {
     }
     // v2: trailing wal_seal_id；v1: missing -> 0
     let wal_seal_id = if off + 8 <= body.len() {
+        let v = u64::from_le_bytes(body[off..off + 8].try_into()?);
+        off += 8;
+        v
+    } else {
+        0
+    };
+    // v3: trailing last_build_ns；v2/v1: missing -> 0
+    let last_build_ns = if off + 8 <= body.len() {
         u64::from_le_bytes(body[off..off + 8].try_into()?)
     } else {
         0
@@ -919,6 +976,7 @@ fn lsm_decode_manifest_body(body: &[u8]) -> anyhow::Result<LsmManifest> {
         base_id,
         delta_ids,
         wal_seal_id,
+        last_build_ns,
     })
 }
 
@@ -931,7 +989,7 @@ fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
     let ver = u32::from_le_bytes(hdr[4..8].try_into()?);
     let body_len = u32::from_le_bytes(hdr[8..12].try_into()?) as usize;
     let checksum = u32::from_le_bytes(hdr[12..16].try_into()?);
-    if magic != LSM_MANIFEST_MAGIC || !(ver == 1 || ver == LSM_MANIFEST_VERSION) {
+    if magic != LSM_MANIFEST_MAGIC || !(ver == 1 || ver == 2 || ver == LSM_MANIFEST_VERSION) {
         anyhow::bail!("LSM manifest magic/version mismatch");
     }
     let mut body = vec![0u8; body_len];
@@ -940,6 +998,14 @@ fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
         anyhow::bail!("LSM manifest checksum mismatch");
     }
     lsm_decode_manifest_body(&body)
+}
+
+fn now_unix_nanos() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 fn lsm_write_manifest_atomic(path: &Path, m: &LsmManifest) -> anyhow::Result<()> {
@@ -962,6 +1028,15 @@ fn lsm_write_manifest_atomic(path: &Path, m: &LsmManifest) -> anyhow::Result<()>
         }
     }
     Ok(())
+}
+
+fn parse_lsm_seg_id(name: &str) -> Option<u64> {
+    let s = name.strip_prefix("seg-")?;
+    let s = s.strip_suffix(".db").or_else(|| s.strip_suffix(".del"))?;
+    if s.is_empty() || s.len() > 16 {
+        return None;
+    }
+    u64::from_str_radix(s, 16).ok()
 }
 
 const LSM_DEL_MAGIC: u32 = 0x314C_4544; // "DEL1"
@@ -1094,6 +1169,7 @@ impl SnapshotStore {
                 base_id: 0,
                 delta_ids: Vec::new(),
                 wal_seal_id: 0,
+                last_build_ns: 0,
             }
         };
 
@@ -1101,6 +1177,7 @@ impl SnapshotStore {
         manifest.next_id = id.saturating_add(1);
         manifest.delta_ids.push(id);
         manifest.wal_seal_id = wal_seal_id;
+        manifest.last_build_ns = now_unix_nanos();
 
         // 先写 segment 与 sidecar；manifest 最后写入（崩溃时最多留下孤儿段）。
         let seg_path = self.lsm_seg_db_path(id);
@@ -1139,6 +1216,7 @@ impl SnapshotStore {
                 base_id: 0,
                 delta_ids: Vec::new(),
                 wal_seal_id: 0,
+                last_build_ns: 0,
             }
         };
 
@@ -1153,6 +1231,7 @@ impl SnapshotStore {
         manifest.base_id = id;
         manifest.delta_ids.clear();
         manifest.wal_seal_id = wal_seal_id;
+        manifest.last_build_ns = now_unix_nanos();
 
         let seg_path = self.lsm_seg_db_path(id);
         SnapshotStore::new(seg_path.clone())
@@ -1254,5 +1333,45 @@ mod tests {
         let other_root = unique_tmp_dir("other");
         let snap = store.load_v6_mmap_if_valid(&[other_root]).unwrap();
         assert!(snap.is_none());
+    }
+
+    #[test]
+    fn gc_stale_segments_removes_unreferenced_files() {
+        let root = unique_tmp_dir("lsm-gc");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store = SnapshotStore::new(root.join("index.db"));
+        std::fs::create_dir_all(store.lsm_dir_path()).unwrap();
+
+        let manifest = LsmManifest {
+            next_id: 5,
+            base_id: 1,
+            delta_ids: vec![2],
+            wal_seal_id: 0,
+            last_build_ns: 1,
+        };
+        lsm_write_manifest_atomic(&store.lsm_manifest_path(), &manifest).unwrap();
+
+        // live: 1,2; stale: 3,4
+        for id in [1u64, 2, 3, 4] {
+            std::fs::write(store.lsm_seg_db_path(id), b"db").unwrap();
+            std::fs::write(store.lsm_seg_del_path(id), b"del").unwrap();
+        }
+        std::fs::write(store.lsm_dir_path().join("unrelated.tmp"), b"x").unwrap();
+
+        let removed = store.gc_stale_segments().unwrap();
+        assert_eq!(removed, 4);
+
+        assert!(store.lsm_seg_db_path(1).exists());
+        assert!(store.lsm_seg_del_path(1).exists());
+        assert!(store.lsm_seg_db_path(2).exists());
+        assert!(store.lsm_seg_del_path(2).exists());
+
+        assert!(!store.lsm_seg_db_path(3).exists());
+        assert!(!store.lsm_seg_del_path(3).exists());
+        assert!(!store.lsm_seg_db_path(4).exists());
+        assert!(!store.lsm_seg_del_path(4).exists());
+
+        assert!(store.lsm_dir_path().join("unrelated.tmp").exists());
     }
 }

@@ -1,4 +1,4 @@
-# fd-rdd 编年史（立项 -> 2026-02-15）
+# fd-rdd 编年史（立项 -> 2026-02-16）
 
 > 目的：把“为什么这么做、先后顺序、关键分歧与落地结果”按时间线写清楚，便于对外讨论。
 
@@ -106,3 +106,47 @@
 - 更工业化 compaction（leveled/代际）：平滑写放大与合并抖动
 - 更强 WAL 语义：fsync 策略、序列号与去重、gap verify、以及与 watcher 的边界定义
 
+## 5. 2026-02-16：段物理回收闭环 + THP(always) 下的“空壳 RSS”治理
+
+### 5.1 Compaction 后的物理段回收（GC stale segments）
+
+观察到的现象：即使 compaction 产生了新的 base，旧的 `seg-*.db/.del` 若仍留在磁盘上，会在后续重启/运维中造成“历史垃圾段”累积，占用不必要的磁盘与潜在的加载/校验成本。
+
+落地策略：
+
+- 在 compaction/replace-base 成功更新 `MANIFEST.bin` 后，扫描 `index.d/`，删除 manifest 未引用的旧段文件（best-effort）。
+- 单个文件删除失败不应阻断 compaction 主流程：只记录告警并继续，避免“清理失败 = compaction 失败”的级联风险。
+
+这一步把“LSM 合并”从逻辑层推进到物理层闭环：manifest 是 SSOT，磁盘上只保留 live 段。
+
+### 5.2 THP(always) 与 mimalloc：为什么空索引也能吃 100MB
+
+在 `THP=always` 的系统配置下，发现即使启动为“空索引（no-snapshot/no-watch/no-build）”，进程 RSS 仍可能达到 100MB 量级。进一步拆分 `smaps_rollup` 后发现 RSS 主要由匿名大页（THP）贡献：
+
+- mimalloc 的 segment/arena 可能以大虚拟区间（例如 1GB）管理；
+- THP(always) 会以 2MB 粒度 commit；
+- 只要触碰到少量页，也会把整张 2MB 大页计入 RSS（例如 50 个大页 ~= 100MB）。
+
+治理策略（更可靠的方案）：
+
+- 通过 mimalloc 的编译期开关禁用 THP 提示路径（`no_thp` -> `MI_NO_THP=1`），避免依赖“进入 main() 后再 set_var”的时序。
+
+### 5.3 启动参数语义澄清（避免误判）
+
+- `--no-build` 只禁用“空索引时的后台全量扫描”，不影响快照/LSM 段的加载。
+- `--no-snapshot` 才会跳过快照加载；若不想 watcher 注入实时事件，还需 `--no-watch`。
+
+### 5.4 冷启动离线变更检测：目录 mtime crawl → stale 则跳过 disk segments 并重建
+
+在“百万文件时代写入的大段仍在磁盘，但实际上文件已离线删除”的场景下，仅靠“段格式校验 + roots 匹配”会把旧段挂载进查询链路：
+
+- 查询触页（mmap）会把历史大段从磁盘读入物理内存，表现为 RSS 突发暴涨（而内存索引结构统计仍很小）。
+- 旧段中的幽灵记录还可能返回脏结果（已不存在的路径）。
+
+核心事实：inotify/fanotify 只能覆盖“在线”事件，停机期间的变更没有内核级事件账本可回放，必须在冷启动阶段主动检测。
+
+落地兜底（Level 1，保守但正确）：
+
+- 在 manifest 中记录 `last_build_ts`（实现上为 `last_build_ns`）。
+- 冷启动加载 LSM 段之前，递归遍历 roots 下的目录树，仅对目录做 `stat`（不对文件做 `stat`），并在发现任意目录 `mtime > last_build_ns` 时 early-exit。
+- 一旦判 stale：不把旧 disk segments 挂载进查询链路（避免触页与脏结果），并触发后台 full rebuild 重建一致性。

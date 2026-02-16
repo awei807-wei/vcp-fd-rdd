@@ -1,6 +1,6 @@
 [package]
 name = "fd-rdd"
-version = "0.2.0"
+version = "0.3.4"
 edition = "2021"
 authors = ["Piko & Aegis"]
 description = "Event-driven elastic file indexer with RDD lineage"
@@ -63,11 +63,17 @@ tracing-subscriber = "0.3"
 # 路径处理
 dirs = "5.0"
 
-# 可选全局分配器：用于动态更新场景下的 RSS/碎片回吐对照实验
-mimalloc = { version = "0.1", optional = true }
+# 全局分配器：默认使用 mimalloc（降低多线程 ptmalloc arena 导致的碎片与 RSS 回吐问题）
+# 如需回退到系统分配器：`cargo build --release --no-default-features`
+#
+# 额外说明：
+# - Linux 上若系统 THP=always，mimalloc 可能因透明大页导致空壳 RSS 暴涨。
+# - 启用 mimalloc 的 `no_thp` 特性会在编译期定义 `MI_NO_THP=1`，从根源禁用 THP 提示路径。
+mimalloc = { version = "0.1", optional = true, default-features = false, features = ["no_thp"] }
 
 [features]
-# 通过 `--features mimalloc` 启用
+# 默认启用 mimalloc；可用 `--no-default-features` 关闭
+default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
 
 [profile.release]

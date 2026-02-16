@@ -88,12 +88,29 @@ pub struct OverlayStats {
     pub upserted_paths: usize,
     pub deleted_bytes: u64,
     pub upserted_bytes: u64,
+    pub deleted_arena_len: usize,
+    pub deleted_arena_cap: usize,
+    pub upserted_arena_len: usize,
+    pub upserted_arena_cap: usize,
+    pub deleted_map_len: usize,
+    pub deleted_map_cap: usize,
+    pub upserted_map_len: usize,
+    pub upserted_map_cap: usize,
+    /// overlay 估算堆占用（arena + map + collision 列表；粗估、偏保守）
+    pub estimated_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct RebuildStats {
     pub in_progress: bool,
     pub pending_paths: usize,
+    pub pending_map_cap: usize,
+    /// PathBuf 路径字节总量（下界估算：len，不含容量与 allocator 开销）
+    pub pending_key_bytes: u64,
+    /// rename-from 路径字节总量（下界估算）
+    pub pending_from_bytes: u64,
+    /// rebuild pending 估算堆占用（HashMap 结构 + 下界路径字节；粗估、偏保守）
+    pub estimated_bytes: u64,
 }
 
 impl MemoryReport {
@@ -248,20 +265,54 @@ impl fmt::Display for MemoryReport {
         writeln!(f, "║ Shadow Memory (Overlay/Rebuild):                 ║")?;
         writeln!(
             f,
-            "║   overlay del:  {:>10}  ({:>10})          ║",
+            "║   overlay del:  {:>10}  (logic={:>10})     ║",
             self.overlay.deleted_paths,
             human_bytes(self.overlay.deleted_bytes)
         )?;
         writeln!(
             f,
-            "║   overlay up:   {:>10}  ({:>10})          ║",
+            "║   overlay up:   {:>10}  (logic={:>10})     ║",
             self.overlay.upserted_paths,
             human_bytes(self.overlay.upserted_bytes)
         )?;
+        let overlay_arena_len =
+            (self.overlay.deleted_arena_len + self.overlay.upserted_arena_len) as u64;
+        let overlay_arena_cap =
+            (self.overlay.deleted_arena_cap + self.overlay.upserted_arena_cap) as u64;
         writeln!(
             f,
-            "║   rebuild pend: {:>10}  (in_progress={})      ║",
-            self.rebuild.pending_paths, self.rebuild.in_progress
+            "║   overlay arena:{:>10}  (cap={:>10})       ║",
+            human_bytes(overlay_arena_len),
+            human_bytes(overlay_arena_cap),
+        )?;
+        let overlay_map_len = self.overlay.deleted_map_len + self.overlay.upserted_map_len;
+        let overlay_map_cap = self.overlay.deleted_map_cap + self.overlay.upserted_map_cap;
+        writeln!(
+            f,
+            "║   overlay map:  {:>10}  (cap={:>10})       ║",
+            overlay_map_len, overlay_map_cap
+        )?;
+        writeln!(
+            f,
+            "║   overlay est:  {:>10}                       ║",
+            human_bytes(self.overlay.estimated_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   rebuild pend: {:>10}  (cap={:>10})       ║",
+            self.rebuild.pending_paths, self.rebuild.pending_map_cap
+        )?;
+        writeln!(
+            f,
+            "║   rebuild keys: {:>10}  (from={:>10})      ║",
+            human_bytes(self.rebuild.pending_key_bytes),
+            human_bytes(self.rebuild.pending_from_bytes),
+        )?;
+        writeln!(
+            f,
+            "║   rebuild est:  {:>10}  (in_progress={})   ║",
+            human_bytes(self.rebuild.estimated_bytes),
+            self.rebuild.in_progress
         )?;
         writeln!(f, "╚══════════════════════════════════════════════════╝")?;
         Ok(())

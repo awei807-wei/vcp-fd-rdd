@@ -62,6 +62,14 @@ struct Args {
     /// 说明：fd-rdd 会默认忽略 `--snapshot-path` 以及派生的 `index.d/`；这里用于补充额外忽略项。
     #[arg(long = "ignore-path", value_name = "PATH")]
     ignore_paths: Vec<PathBuf>,
+
+    /// overlay 强制 flush 阈值（路径数）。达到阈值会唤醒 snapshot_loop 立即执行一次 snapshot_now（0=禁用）
+    #[arg(long, default_value_t = 250_000)]
+    auto_flush_overlay_paths: u64,
+
+    /// overlay 强制 flush 阈值（arena 字节数，近似“物理路径字节池”体量）（0=禁用）
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    auto_flush_overlay_bytes: u64,
 }
 
 #[tokio::main]
@@ -70,7 +78,10 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    info!("Starting fd-rdd v0.2: atomic-snapshot file indexer");
+    info!(
+        "Starting fd-rdd v{}: atomic-snapshot file indexer",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // 1) 确定索引根目录
     let mut roots = args.roots;
@@ -99,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Arc::new(TieredIndex::load_or_empty(&store, roots).await?)
     };
+    index.set_auto_flush_limits(args.auto_flush_overlay_paths, args.auto_flush_overlay_bytes);
     // WAL：即使 --no_snapshot，也允许记录后续事件（仅不回放历史）。
     let _ = index.attach_wal(&store);
 
