@@ -1,162 +1,200 @@
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
-use serde::{Serialize, Deserialize};
-use crate::core::partition::Partition;
-use crate::query::matcher::Matcher;
-use crate::core::lineage::EventRecord;
 
-/// RDD 特质：弹性分布式数据集的核心抽象
-pub trait RDD<T: Send + Sync + 'static>: Send + Sync {
-    /// 获取分区列表
+/// 文件身份：Linux 上用 (dev, ino) 做主键，rename 时 ino 不变。
+///
+/// 说明：阶段 A 引入 `DocId(u32)` 作为 L2 内部的紧凑主键；
+/// `FileKey` 仍用于扫描/事件输入与“同 inode 去重”。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct FileKey {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// 文件元数据
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileMeta {
+    pub file_key: FileKey,
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime: Option<std::time::SystemTime>,
+}
+
+/// 分区定义（用于构建流水线）
+#[derive(Clone, Debug)]
+pub struct Partition {
+    pub id: usize,
+    pub root: PathBuf,
+    pub max_depth: usize,
+}
+
+/// BuildRDD：面向"构建索引"的数据集抽象
+/// - compute 返回迭代器（流式），由下游 builder 消费
+/// - 仅用于启动全扫/补扫/重建，不参与在线查询路径
+pub trait BuildRDD<T: Send + Sync + 'static>: Send + Sync {
     fn partitions(&self) -> &[Partition];
-    
-    /// 计算指定分区（惰性）
-    fn compute(&self, partition: &Partition) -> Vec<T>;
-    
-    /// 获取父 RDD（血缘）
-    fn dependencies(&self) -> Vec<Arc<dyn RDD<T>>>;
-    
-    /// 执行操作（触发计算）
-    fn collect(&self) -> Vec<T> {
-        use rayon::prelude::*;
-        self.partitions()
-            .par_iter()
-            .flat_map(|p| self.compute(p))
-            .collect()
-    }
+    fn compute(&self, part: &Partition) -> Box<dyn Iterator<Item = T> + Send>;
 
-    /// 算子下推：带过滤条件的收集
-    fn collect_with_filter(&self, matcher: &dyn Matcher) -> Vec<T> {
-        use rayon::prelude::*;
-        self.partitions()
-            .par_iter()
-            .flat_map(|p| {
-                self.compute(p)
-                    .into_iter()
-                    .filter(|item| {
-                        // 这里需要 T 能够转换为字符串进行匹配，或者 Matcher 支持 T
-                        // 对于 FileEntry，我们知道它有 path
-                        self.filter_item(item, matcher)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    /// 默认过滤逻辑，子类可重写
-    fn filter_item(&self, _item: &T, _matcher: &dyn Matcher) -> bool {
-        true
-    }
-}
-
-/// 文件索引专用 RDD
-#[derive(Clone, Serialize, Deserialize)]
-pub struct FileIndexRDD {
-    pub partitions: Vec<Partition>,
-    pub lineage: Vec<EventRecord>,  // 不可变事件血缘
-    #[serde(skip)]
-    pub compute_fn: Option<Arc<dyn Fn(&Partition) -> Vec<FileEntry> + Send + Sync>>,
-}
-
-impl RDD<FileEntry> for FileIndexRDD {
-    fn partitions(&self) -> &[Partition] {
-        &self.partitions
-    }
-    
-    fn compute(&self, partition: &Partition) -> Vec<FileEntry> {
-        if let Some(ref f) = self.compute_fn {
-            f(partition)
-        } else {
-            scan_partition(partition)
+    fn for_each(&self, mut sink: impl FnMut(T) + Send) {
+        for p in self.partitions() {
+            for item in self.compute(p) {
+                sink(item);
+            }
         }
     }
-    
-    fn dependencies(&self) -> Vec<Arc<dyn RDD<FileEntry>>> {
-        vec![]  // 根 RDD，无父依赖
-    }
-
-    fn filter_item(&self, item: &FileEntry, matcher: &dyn Matcher) -> bool {
-        matcher.matches(&item.path.to_string_lossy())
-    }
 }
 
-impl FileIndexRDD {
-    /// 从目录构建初始 RDD（类 Spark sc.parallelize）
-    pub fn from_dirs(dirs: Vec<std::path::PathBuf>) -> Self {
-        let partitions = dirs.into_iter()
+/// FsScanRDD：启动全量扫描/补扫时使用
+pub struct FsScanRDD {
+    pub parts: Vec<Partition>,
+    parallelism: usize,
+}
+
+impl FsScanRDD {
+    pub fn from_roots(roots: Vec<PathBuf>) -> Self {
+        let parts = roots
+            .into_iter()
             .enumerate()
             .map(|(id, root)| Partition {
                 id,
                 root,
-                depth: 255,
-                created_at: std::time::SystemTime::now(),
-                modified_at: None,
-                last_event: None,
+                max_depth: 255,
             })
             .collect();
-        
         Self {
-            partitions,
-            lineage: Vec::new(),
-            compute_fn: Some(Arc::new(|part| scan_partition(part))),
+            parts,
+            parallelism: 1,
         }
     }
-    
-    /// 增量更新：应用事件，返回新 RDD（不可变）
-    pub fn apply_event(&self, event: EventRecord) -> Self {
-        let mut new_partitions = self.partitions.clone();
-        let mut new_lineage = self.lineage.clone();
-        new_lineage.push(event.clone());
-        
-        // 定位受影响分区（窄依赖）
-        if let Some(part_id) = self.locate_partition(&event.path) {
-            // 仅重算该分区（弹性恢复）
-            new_partitions[part_id] = self.recompute_partition(part_id, &event);
-        }
-        
-        Self {
-            partitions: new_partitions,
-            lineage: new_lineage,
-            compute_fn: self.compute_fn.clone(),
-        }
-    }
-    
-    fn locate_partition(&self, path: &std::path::Path) -> Option<usize> {
-        self.partitions.iter()
-            .position(|p| path.starts_with(&p.root))
-    }
-    
-    fn recompute_partition(&self, id: usize, event: &EventRecord) -> Partition {
-        let mut part = self.partitions[id].clone();
-        part.modified_at = Some(std::time::SystemTime::now());
-        part.last_event = Some(event.clone());
-        part
-    }
-}
 
-/// 分区扫描实现（调用 ignore 逻辑）
-pub fn scan_partition(part: &Partition) -> Vec<FileEntry> {
-    use ignore::WalkBuilder;
-    
-    WalkBuilder::new(&part.root)
-        .max_depth(Some(part.depth))
-        .hidden(true)
-        .build()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
-        .map(|e| {
-            let metadata = e.metadata().ok();
-            FileEntry {
-                path: e.path().to_path_buf(),
-                size: metadata.as_ref().map(|m| m.len()).unwrap_or(0),
-                modified: metadata.and_then(|m| m.modified().ok()),
+    /// 设置扫描并行度（仅影响 `for_each_meta` 的并行 walker）。
+    pub fn with_parallelism(mut self, parallelism: usize) -> Self {
+        self.parallelism = parallelism.max(1);
+        self
+    }
+
+    /// 按指定并行度遍历所有文件元数据（用于冷启动/重建的弹性构建）。
+    ///
+    /// 注意：这是 FsScanRDD 的专用入口，不改变 `BuildRDD` 的 Iterator 抽象，
+    /// 避免牵涉面过大。`parallelism==1` 时行为与原 for_each 等价。
+    pub fn for_each_meta(&self, sink: impl Fn(FileMeta) + Send + Sync + 'static) {
+        let sink: Arc<dyn Fn(FileMeta) + Send + Sync> = Arc::new(sink);
+
+        if self.parallelism <= 1 {
+            for p in self.partitions() {
+                for item in self.compute(p) {
+                    sink(item);
+                }
             }
-        })
-        .collect()
+            return;
+        }
+
+        for p in self.partitions() {
+            scan_partition_parallel(p, self.parallelism, sink.clone());
+        }
+    }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FileEntry {
-    pub path: std::path::PathBuf,
-    pub size: u64,
-    pub modified: Option<std::time::SystemTime>,
+impl BuildRDD<FileMeta> for FsScanRDD {
+    fn partitions(&self) -> &[Partition] {
+        &self.parts
+    }
+
+    fn compute(&self, part: &Partition) -> Box<dyn Iterator<Item = FileMeta> + Send> {
+        use ignore::WalkBuilder;
+        use std::os::unix::fs::MetadataExt;
+
+        let walker = WalkBuilder::new(&part.root)
+            .max_depth(Some(part.max_depth))
+            .hidden(true)
+            .ignore(true)
+            .git_ignore(true)
+            .build();
+
+        let iter = walker
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .filter_map(|e| {
+                let meta = e.metadata().ok()?;
+                Some(FileMeta {
+                    file_key: FileKey {
+                        dev: meta.dev(),
+                        ino: meta.ino(),
+                    },
+                    path: e.path().to_path_buf(),
+                    size: meta.len(),
+                    mtime: meta.modified().ok(),
+                })
+            });
+
+        Box::new(iter)
+    }
+}
+
+fn scan_partition_parallel(
+    part: &Partition,
+    parallelism: usize,
+    sink: Arc<dyn Fn(FileMeta) + Send + Sync>,
+) {
+    use ignore::{WalkBuilder, WalkState};
+    use std::os::unix::fs::MetadataExt;
+
+    let walker = WalkBuilder::new(&part.root)
+        .max_depth(Some(part.max_depth))
+        .hidden(true)
+        .ignore(true)
+        .git_ignore(true)
+        .threads(parallelism)
+        .build_parallel();
+
+    walker.run(|| {
+        let sink = sink.clone();
+        Box::new(move |entry| {
+            let Ok(e) = entry else {
+                return WalkState::Continue;
+            };
+            if !e.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                return WalkState::Continue;
+            }
+            let Ok(meta) = e.metadata() else {
+                return WalkState::Continue;
+            };
+
+            sink(FileMeta {
+                file_key: FileKey {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                },
+                path: e.path().to_path_buf(),
+                size: meta.len(),
+                mtime: meta.modified().ok(),
+            });
+
+            WalkState::Continue
+        })
+    });
+}
+
+/// BuildLineage：仅记录构建流水线的阶段性记录，有硬上限（环形缓冲区）
+#[derive(Clone, Debug)]
+pub struct BuildLineage {
+    pub max_records: usize,
+    pub records: std::collections::VecDeque<String>,
+}
+
+impl BuildLineage {
+    pub fn new(max_records: usize) -> Self {
+        Self {
+            max_records,
+            records: std::collections::VecDeque::with_capacity(max_records),
+        }
+    }
+
+    pub fn push(&mut self, record: String) {
+        if self.records.len() >= self.max_records {
+            self.records.pop_front();
+        }
+        self.records.push_back(record);
+    }
 }

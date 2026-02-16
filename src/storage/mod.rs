@@ -1,5 +1,6 @@
-pub mod checkpoint;
 pub mod mmap;
 pub mod serde;
+pub mod snapshot;
+pub mod wal;
 
-pub use checkpoint::*;
+pub use snapshot::SnapshotStore;

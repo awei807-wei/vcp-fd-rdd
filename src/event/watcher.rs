@@ -1,44 +1,49 @@
-use notify::{Watcher, RecursiveMode, Config};
+use notify::{Config, RecursiveMode, Watcher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use crate::index::TieredIndex;
+use tokio::sync::mpsc;
 
-pub struct EventWatcher {
-    pub index: Arc<TieredIndex>,
-}
+/// 文件系统事件监听器
+/// 使用 bounded channel 做背压，避免无限堆积
+pub struct EventWatcher;
 
 impl EventWatcher {
-    pub fn new(index: Arc<TieredIndex>) -> Self {
-        Self { index }
-    }
+    /// 启动监听，返回事件接收端
+    pub fn start(
+        _roots: &[std::path::PathBuf],
+        channel_size: usize,
+        overflow_drops: Arc<AtomicU64>,
+    ) -> anyhow::Result<(mpsc::Receiver<notify::Event>, notify::RecommendedWatcher)> {
+        let (tx, rx) = mpsc::channel(channel_size);
 
-    pub async fn watch(&self, roots: Vec<std::path::PathBuf>) -> anyhow::Result<()> {
-        let index = self.index.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-
-        let mut watcher = notify::RecommendedWatcher::new(
+        let watcher = notify::RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
-                    let _ = tx.blocking_send(event);
+                    // 非阻塞发送：队列满时丢弃并计数
+                    if tx.try_send(event).is_err() {
+                        let drops = overflow_drops.fetch_add(1, Ordering::Relaxed);
+                        if drops % 1000 == 0 {
+                            eprintln!(
+                                "[fd-rdd] event channel overflow, total drops: {}",
+                                drops + 1
+                            );
+                        }
+                    }
                 }
             },
             Config::default(),
         )?;
 
-        for root in roots {
-            if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
-                tracing::warn!("Failed to watch {:?}: {}", root, e);
-            }
+        // 注意：watcher 必须由调用方持有，否则会被 drop
+        Ok((rx, watcher))
+    }
+}
+
+/// 注册监听路径（分离出来方便错误处理）
+pub fn watch_roots(watcher: &mut notify::RecommendedWatcher, roots: &[std::path::PathBuf]) {
+    for root in roots {
+        if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
+            tracing::warn!("Failed to watch {:?}: {}", root, e);
         }
-
-        tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                index.apply_event(event).await;
-            }
-        });
-
-        // 保持 watcher 存活
-        Box::leak(Box::new(watcher));
-        
-        Ok(())
     }
 }

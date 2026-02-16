@@ -1,6 +1,6 @@
-use fuzzy_matcher::FuzzyMatcher;
+use crate::core::FileMeta;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use crate::core::FileEntry;
+use fuzzy_matcher::FuzzyMatcher;
 
 pub struct FzfIntegration {
     matcher: SkimMatcherV2,
@@ -13,10 +13,13 @@ impl FzfIntegration {
         }
     }
 
-    pub fn match_query(&self, keyword: &str, entries: Vec<FileEntry>) -> Vec<(FileEntry, i64)> {
+    pub fn match_query(&self, keyword: &str, entries: Vec<FileMeta>) -> Vec<(FileMeta, i64)> {
         let mut results = Vec::new();
         for entry in entries {
-            if let Some(score) = self.matcher.fuzzy_match(&entry.path.to_string_lossy(), keyword) {
+            if let Some(score) = self
+                .matcher
+                .fuzzy_match(&entry.path.to_string_lossy(), keyword)
+            {
                 results.push((entry, score));
             }
         }
