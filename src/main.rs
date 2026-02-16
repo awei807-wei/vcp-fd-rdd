@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
     let index = if args.no_snapshot {
         Arc::new(TieredIndex::empty(roots))
     } else {
-        Arc::new(TieredIndex::load_or_empty(&store, roots).await?)
+        TieredIndex::load(store.as_ref(), roots).await?
     };
     index.set_auto_flush_limits(args.auto_flush_overlay_paths, args.auto_flush_overlay_bytes);
     // WAL：即使 --no_snapshot，也允许记录后续事件（仅不回放历史）。

@@ -19,7 +19,8 @@ use crate::storage::snapshot::{LoadedSnapshot, SnapshotStore};
 use crate::storage::wal::WalStore;
 
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
-const COMPACTION_DELTA_THRESHOLD: usize = 4;
+// 更激进的合并阈值：用于百万文件后的“瘦身期”，加速 delta 段收敛。
+const COMPACTION_DELTA_THRESHOLD: usize = 2;
 
 fn dir_tree_changed_since(roots: &[PathBuf], ignore_prefixes: &[PathBuf], cutoff_ns: u64) -> bool {
     use std::time::{Duration, UNIX_EPOCH};
@@ -428,6 +429,21 @@ impl TieredIndex {
         let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
         let l3 = IndexBuilder::new(roots.clone());
         Self::new(l1, l2, l3, roots, Vec::new())
+    }
+
+    /// 从快照加载（或回退为空），并在返回前执行启动清扫：
+    /// 1) 物理清理 manifest 未引用的孤儿段文件（best-effort）
+    /// 2) 若现有 delta 段达到阈值则触发后台 compaction（best-effort）
+    pub async fn load(store: &SnapshotStore, roots: Vec<PathBuf>) -> anyhow::Result<Arc<Self>> {
+        let index = Arc::new(Self::load_or_empty(store, roots).await?);
+
+        // 1) 物理清理不在 MANIFEST 里的孤儿文件（best-effort）
+        let _ = store.gc_stale_segments();
+
+        // 2) 检查是否需要合并现有的碎片段（best-effort）
+        index.maybe_spawn_compaction(store.path().to_path_buf());
+
+        Ok(index)
     }
 
     /// 从快照加载或空索引启动
