@@ -8,11 +8,14 @@ use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Notify;
 
-use crate::core::{AdaptiveScheduler, EventRecord, EventType, FileMeta, Task};
+use crate::core::{
+    AdaptiveScheduler, EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Task,
+};
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::index::mmap_index::MmapIndex;
+use crate::index::IndexLayer;
 use crate::query::matcher::create_matcher;
 use crate::stats::{EventPipelineStats, MemoryReport, OverlayStats, RebuildStats};
 use crate::storage::snapshot::{LoadedSnapshot, SnapshotStore};
@@ -339,7 +342,7 @@ struct DiskLayer {
 #[derive(Debug)]
 struct RebuildState {
     in_progress: bool,
-    pending_events: std::collections::HashMap<PathBuf, PendingEvent>,
+    pending_events: std::collections::HashMap<FileIdentifier, PendingEvent>,
     /// 最近一次 rebuild 开始时间（用于冷却/合并）
     last_started_at: Option<Instant>,
     /// 冷却期内收到 rebuild 请求时，设置该标记；在冷却到期后合并执行一次
@@ -365,6 +368,7 @@ struct PendingEvent {
     seq: u64,
     timestamp: std::time::SystemTime,
     event_type: EventType,
+    path_hint: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -672,11 +676,12 @@ impl TieredIndex {
                 let mut v = st
                     .pending_events
                     .drain()
-                    .map(|(path, ev)| EventRecord {
+                    .map(|(id, ev)| EventRecord {
                         seq: ev.seq,
                         timestamp: ev.timestamp,
                         event_type: ev.event_type,
-                        path,
+                        id,
+                        path_hint: ev.path_hint,
                     })
                     .collect::<Vec<_>>();
                 v.sort_by_key(|e| e.seq);
@@ -772,7 +777,9 @@ impl TieredIndex {
 
         use std::os::unix::ffi::OsStrExt;
 
-        // blocked：newest→oldest 合并语义的“屏蔽集合”（delete + 已输出路径）
+        // blocked：path 维度的屏蔽集合（delete + 已输出路径）
+        // - delete 语义仍以路径为准（LSM sidecar `.del`），用于屏蔽更老 segment 的同路径记录
+        // - 同一路径只返回最新版本：用于处理 inode 复用/旧段残留等场景（即使 FileKey 不同也应屏蔽）
         let mut blocked: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         {
             let st = self.overlay_state.lock();
@@ -781,11 +788,18 @@ impl TieredIndex {
             });
         }
 
+        // seen：FileKey 维度的“先到先得”去重（rename/覆盖语义）
+        let mut seen: std::collections::HashSet<FileKey> = std::collections::HashSet::new();
+
         let mut results: Vec<FileMeta> = Vec::new();
 
         // L2: 内存 Delta（newest）
         let l2 = self.l2.load_full();
-        for r in l2.query(matcher.as_ref()) {
+        for key in l2.query_keys(matcher.as_ref()) {
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(r) = l2.get_meta(key) else { continue };
             let pb = r.path.as_os_str().as_bytes();
             if blocked.contains(pb) {
                 continue;
@@ -800,7 +814,13 @@ impl TieredIndex {
             for p in &layer.deleted_paths {
                 blocked.insert(p.clone());
             }
-            for r in layer.idx.query(matcher.as_ref()) {
+            for key in layer.idx.query_keys(matcher.as_ref()) {
+                if !seen.insert(key) {
+                    continue;
+                }
+                let Some(r) = layer.idx.get_meta(key) else {
+                    continue;
+                };
                 let pb = r.path.as_os_str().as_bytes();
                 if blocked.contains(pb) {
                     continue;
@@ -877,18 +897,30 @@ impl TieredIndex {
         let l2 = {
             let mut st = self.rebuild_state.lock();
             if st.in_progress {
-                // 有界化：按 path 去重，只保留每条路径的最新事件（避免 rebuild 期间无限堆积）。
+                // 有界化：按身份去重，只保留每条身份的最新事件（避免 rebuild 期间无限堆积）。
                 for ev in events {
-                    let key = ev.path.clone();
-                    match st.pending_events.get(&key) {
-                        Some(old) if old.seq >= ev.seq => {}
-                        _ => {
+                    let key = ev.id.clone();
+                    match st.pending_events.get_mut(&key) {
+                        Some(old) if old.seq >= ev.seq => {
+                            // 旧记录更新：忽略（避免乱序覆盖）。
+                        }
+                        Some(old) => {
+                            // 新事件覆盖旧事件；path_hint 仅在新事件提供时覆盖（“最后一次非空覆盖”）。
+                            old.seq = ev.seq;
+                            old.timestamp = ev.timestamp;
+                            old.event_type = ev.event_type.clone();
+                            if ev.path_hint.is_some() {
+                                old.path_hint = ev.path_hint.clone();
+                            }
+                        }
+                        None => {
                             st.pending_events.insert(
                                 key,
                                 PendingEvent {
                                     seq: ev.seq,
                                     timestamp: ev.timestamp,
                                     event_type: ev.event_type.clone(),
+                                    path_hint: ev.path_hint.clone(),
                                 },
                             );
                         }
@@ -900,7 +932,11 @@ impl TieredIndex {
             {
                 let mut ov = self.overlay_state.lock();
                 for ev in events {
-                    let path_bytes = ev.path.as_os_str().as_bytes();
+                    let Some(path) = ev.best_path() else {
+                        // FID-only 且无路径：阶段 1 保守跳过 overlay 更新（后续 fanotify 反查完善）。
+                        continue;
+                    };
+                    let path_bytes = path.as_os_str().as_bytes();
                     match &ev.event_type {
                         EventType::Delete => {
                             let _ = ov.upserted_paths.remove(path_bytes);
@@ -910,10 +946,16 @@ impl TieredIndex {
                             let _ = ov.deleted_paths.remove(path_bytes);
                             let _ = ov.upserted_paths.insert(path_bytes);
                         }
-                        EventType::Rename { from } => {
-                            let from_bytes = from.as_os_str().as_bytes();
-                            let _ = ov.upserted_paths.remove(from_bytes);
-                            let _ = ov.deleted_paths.insert(from_bytes);
+                        EventType::Rename {
+                            from,
+                            from_path_hint,
+                        } => {
+                            let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
+                            if let Some(from_path) = from_best {
+                                let from_bytes = from_path.as_os_str().as_bytes();
+                                let _ = ov.upserted_paths.remove(from_bytes);
+                                let _ = ov.deleted_paths.insert(from_bytes);
+                            }
 
                             let _ = ov.deleted_paths.remove(path_bytes);
                             let _ = ov.upserted_paths.insert(path_bytes);
@@ -938,10 +980,22 @@ impl TieredIndex {
         for ev in events {
             match &ev.event_type {
                 EventType::Delete => {
-                    self.l1.remove_by_path(&ev.path);
+                    if let Some(p) = ev.best_path() {
+                        self.l1.remove_by_path(p);
+                    } else if let Some(fid) = ev.id.as_file_key() {
+                        self.l1.remove(&fid);
+                    }
                 }
-                EventType::Rename { from } => {
-                    self.l1.remove_by_path(from);
+                EventType::Rename {
+                    from,
+                    from_path_hint,
+                } => {
+                    let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
+                    if let Some(p) = from_best {
+                        self.l1.remove_by_path(p);
+                    } else if let Some(fid) = from.as_file_key() {
+                        self.l1.remove(&fid);
+                    }
                 }
                 _ => {}
             }
@@ -1131,13 +1185,29 @@ impl TieredIndex {
             let mut key_bytes = 0u64;
             let mut from_bytes = 0u64;
             for (k, v) in st.pending_events.iter() {
-                key_bytes += k.as_os_str().as_bytes().len() as u64;
-                if let EventType::Rename { from } = &v.event_type {
-                    from_bytes += from.as_os_str().as_bytes().len() as u64;
+                key_bytes += match k {
+                    FileIdentifier::Path(p) => p.as_os_str().as_bytes().len() as u64,
+                    FileIdentifier::Fid { .. } => 16,
+                };
+                if let EventType::Rename {
+                    from,
+                    from_path_hint,
+                } = &v.event_type
+                {
+                    from_bytes += match from {
+                        FileIdentifier::Path(p) => p.as_os_str().as_bytes().len() as u64,
+                        FileIdentifier::Fid { .. } => 16,
+                    };
+                    if let Some(p) = from_path_hint {
+                        from_bytes += p.as_os_str().as_bytes().len() as u64;
+                    }
+                }
+                if let Some(p) = &v.path_hint {
+                    key_bytes += p.as_os_str().as_bytes().len() as u64;
                 }
             }
             let cap = st.pending_events.capacity();
-            let entry = size_of::<(PathBuf, PendingEvent)>() as u64;
+            let entry = size_of::<(FileIdentifier, PendingEvent)>() as u64;
             let estimated = cap as u64 * (entry + 16) + key_bytes + from_bytes;
 
             RebuildStats {
@@ -1307,7 +1377,7 @@ fn lsm_dir_from_store_path(path: &PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{EventRecord, EventType};
+    use crate::core::{EventRecord, EventType, FileIdentifier};
     use crate::stats::EventPipelineStats;
     use crate::storage::snapshot::SnapshotStore;
     use std::path::PathBuf;
@@ -1317,7 +1387,8 @@ mod tests {
             seq,
             timestamp: std::time::SystemTime::now(),
             event_type,
-            path,
+            id: FileIdentifier::Path(path.clone()),
+            path_hint: Some(path),
         }
     }
 
@@ -1394,7 +1465,10 @@ mod tests {
         let idx = TieredIndex::empty(vec![root.clone()]);
         idx.apply_events(&[mk_event(
             1,
-            EventType::Rename { from: from.clone() },
+            EventType::Rename {
+                from: FileIdentifier::Path(from.clone()),
+                from_path_hint: Some(from.clone()),
+            },
             to.clone(),
         )]);
 
@@ -1424,7 +1498,8 @@ mod tests {
         idx.apply_events(&[mk_event(
             3,
             EventType::Rename {
-                from: old_path.clone(),
+                from: FileIdentifier::Path(old_path.clone()),
+                from_path_hint: Some(old_path.clone()),
             },
             new_path.clone(),
         )]);

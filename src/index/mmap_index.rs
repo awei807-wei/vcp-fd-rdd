@@ -5,6 +5,7 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 
 use crate::core::{FileKey, FileMeta};
+use crate::index::IndexLayer;
 use crate::query::matcher::Matcher;
 use crate::storage::snapshot::MmapSnapshotV6;
 
@@ -12,10 +13,14 @@ use crate::storage::snapshot::MmapSnapshotV6;
 const META_REC_SIZE: usize = 40;
 // TrigramEntryV6：3 + 1 + 4 + 4 = 12B
 const TRI_REC_SIZE: usize = 12;
+// FileKeyMap：dev(8) + ino(8) + docid(4) = 20B
+const FILEKEY_MAP_REC_SIZE: usize = 20;
 
 pub struct MmapIndex {
     snap: Arc<MmapSnapshotV6>,
     tomb_cache: parking_lot::Mutex<Option<RoaringBitmap>>,
+    // 兼容旧段：若缺少 mmap 内的 file_key_map 段，则按需构建一次排序 map（以 bytes 形式存储，便于二分查找）。
+    filekey_map_cache: parking_lot::Mutex<Option<Arc<Vec<u8>>>>,
 }
 
 impl MmapIndex {
@@ -23,6 +28,7 @@ impl MmapIndex {
         Self {
             snap: Arc::new(snap),
             tomb_cache: parking_lot::Mutex::new(None),
+            filekey_map_cache: parking_lot::Mutex::new(None),
         }
     }
 
@@ -44,6 +50,22 @@ impl MmapIndex {
         let b = RoaringBitmap::deserialize_from(&mut cur).unwrap_or_else(|_| RoaringBitmap::new());
         *g = Some(b.clone());
         b
+    }
+
+    fn compose_abs_path_bytes(&self, root_id: u16, rel_bytes: &[u8]) -> Vec<u8> {
+        let root = self
+            .snap
+            .roots
+            .get(root_id as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(b"/");
+        let mut out = Vec::with_capacity(root.len() + 1 + rel_bytes.len());
+        out.extend_from_slice(root);
+        if !out.ends_with(b"/") {
+            out.push(b'/');
+        }
+        out.extend_from_slice(rel_bytes);
+        out
     }
 
     fn compose_abs_path(&self, root_id: u16, rel_bytes: &[u8]) -> PathBuf {
@@ -96,6 +118,80 @@ impl MmapIndex {
         ))
     }
 
+    fn lookup_docid_in_filekey_map(bytes: &[u8], key: FileKey) -> Option<u32> {
+        let n = bytes.len() / FILEKEY_MAP_REC_SIZE;
+        if n == 0 {
+            return None;
+        }
+
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let off = mid * FILEKEY_MAP_REC_SIZE;
+            let rec = &bytes[off..off + FILEKEY_MAP_REC_SIZE];
+            let dev = u64::from_le_bytes(rec[0..8].try_into().ok()?);
+            let ino = u64::from_le_bytes(rec[8..16].try_into().ok()?);
+            if (dev, ino) < (key.dev, key.ino) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= n {
+            return None;
+        }
+        let off = lo * FILEKEY_MAP_REC_SIZE;
+        let rec = &bytes[off..off + FILEKEY_MAP_REC_SIZE];
+        let dev = u64::from_le_bytes(rec[0..8].try_into().ok()?);
+        let ino = u64::from_le_bytes(rec[8..16].try_into().ok()?);
+        if (dev, ino) != (key.dev, key.ino) {
+            return None;
+        }
+        let docid = u32::from_le_bytes(rec[16..20].try_into().ok()?);
+        Some(docid)
+    }
+
+    fn lookup_docid_by_filekey(&self, key: FileKey) -> Option<u32> {
+        if let Some(bytes) = self.snap.file_key_map_bytes() {
+            // 兼容：测试/旧数据可能出现空 range（0..0）。空表等价于“缺失”，走 fallback。
+            if !bytes.is_empty() {
+                return Self::lookup_docid_in_filekey_map(bytes, key);
+            }
+        }
+
+        // 旧段兼容：按需构建一次 bytes map（live keys only）
+        let cached = { self.filekey_map_cache.lock().clone() };
+        if let Some(arc) = cached {
+            return Self::lookup_docid_in_filekey_map(arc.as_slice(), key);
+        }
+
+        tracing::info!("MmapIndex: missing/empty file_key_map, building fallback cache");
+
+        let tomb = self.tombstones();
+        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u32;
+        let mut pairs: Vec<(FileKey, u32)> = Vec::with_capacity(n as usize);
+        for docid in 0..n {
+            if tomb.contains(docid) {
+                continue;
+            }
+            let Some((file_key, ..)) = self.meta_at(docid) else {
+                continue;
+            };
+            pairs.push((file_key, docid));
+        }
+        pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino));
+        let mut bytes = Vec::with_capacity(pairs.len() * FILEKEY_MAP_REC_SIZE);
+        for (k, docid) in pairs {
+            bytes.extend_from_slice(&k.dev.to_le_bytes());
+            bytes.extend_from_slice(&k.ino.to_le_bytes());
+            bytes.extend_from_slice(&docid.to_le_bytes());
+        }
+        let arc = Arc::new(bytes);
+        *self.filekey_map_cache.lock() = Some(arc.clone());
+        Self::lookup_docid_in_filekey_map(arc.as_slice(), key)
+    }
+
     fn posting_for_trigram(&self, tri: [u8; 3]) -> Option<RoaringBitmap> {
         let table = self.snap.trigram_table_bytes();
         let n = table.len() / TRI_REC_SIZE;
@@ -141,6 +237,106 @@ impl MmapIndex {
             return Vec::new();
         }
         bytes.windows(3).map(|w| [w[0], w[1], w[2]]).collect()
+    }
+
+    pub fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
+        let candidates = matcher.prefix().and_then(|p| {
+            let tris = Self::basename_trigrams(p);
+            if tris.is_empty() {
+                return None;
+            }
+
+            let mut bitmaps: Vec<RoaringBitmap> = Vec::with_capacity(tris.len());
+            for tri in tris {
+                bitmaps.push(self.posting_for_trigram(tri)?);
+            }
+            bitmaps.sort_by_key(|b| b.len());
+            let mut iter = bitmaps.into_iter();
+            let mut acc = iter.next().unwrap_or_else(RoaringBitmap::new);
+            for b in iter {
+                acc &= &b;
+                if acc.is_empty() {
+                    break;
+                }
+            }
+            Some(acc)
+        });
+
+        let tomb = self.tombstones();
+        let arena = self.snap.path_arena_bytes();
+
+        let mut out = Vec::new();
+
+        if let Some(bm) = candidates {
+            for docid in bm.iter() {
+                if tomb.contains(docid) {
+                    continue;
+                }
+                let Some((file_key, root_id, path_off, path_len, ..)) = self.meta_at(docid) else {
+                    continue;
+                };
+                let start = path_off as usize;
+                let end = start.saturating_add(path_len as usize);
+                let Some(rel) = arena.get(start..end) else {
+                    continue;
+                };
+                let abs = self.compose_abs_path_bytes(root_id, rel);
+                let s = std::str::from_utf8(&abs)
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&abs));
+                if matcher.matches(&s) {
+                    out.push(file_key);
+                }
+            }
+            return out;
+        }
+
+        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u32;
+        for docid in 0..n {
+            if tomb.contains(docid) {
+                continue;
+            }
+            let Some((file_key, root_id, path_off, path_len, ..)) = self.meta_at(docid) else {
+                continue;
+            };
+            let start = path_off as usize;
+            let end = start.saturating_add(path_len as usize);
+            let Some(rel) = arena.get(start..end) else {
+                continue;
+            };
+            let abs = self.compose_abs_path_bytes(root_id, rel);
+            let s = std::str::from_utf8(&abs)
+                .map(std::borrow::Cow::Borrowed)
+                .unwrap_or_else(|_| String::from_utf8_lossy(&abs));
+            if matcher.matches(&s) {
+                out.push(file_key);
+            }
+        }
+
+        out
+    }
+
+    pub fn get_meta_by_key(&self, key: FileKey) -> Option<FileMeta> {
+        let docid = self.lookup_docid_by_filekey(key)?;
+        let tomb = self.tombstones();
+        if tomb.contains(docid) {
+            return None;
+        }
+
+        let arena = self.snap.path_arena_bytes();
+        let Some((file_key, root_id, path_off, path_len, size, mtime)) = self.meta_at(docid) else {
+            return None;
+        };
+        let start = path_off as usize;
+        let end = start.saturating_add(path_len as usize);
+        let rel = arena.get(start..end)?;
+        let path = self.compose_abs_path(root_id, rel);
+        Some(FileMeta {
+            file_key,
+            path,
+            size,
+            mtime,
+        })
     }
 
     pub fn query(&self, matcher: &dyn Matcher) -> Vec<FileMeta> {
@@ -278,5 +474,66 @@ impl MmapIndex {
                 .collect::<Vec<_>>()
         };
         self.snap.roots == encoded
+    }
+}
+
+impl IndexLayer for MmapIndex {
+    fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
+        self.query_keys(matcher)
+    }
+
+    fn get_meta(&self, key: FileKey) -> Option<FileMeta> {
+        self.get_meta_by_key(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::PersistentIndex;
+    use crate::storage::snapshot::SnapshotStore;
+
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("fd-rdd-mmap-{}-{}", tag, nanos))
+    }
+
+    #[tokio::test]
+    async fn missing_file_key_map_range_falls_back_and_returns_correct_meta() {
+        let root = unique_tmp_dir("no-filekey-map");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        let p = root.join("alpha_test.txt");
+        std::fs::write(&p, b"a").unwrap();
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: p.clone(),
+            size: 1,
+            mtime: None,
+        });
+
+        let store = SnapshotStore::new(root.join("index.db"));
+        let segs = idx.export_segments_v6();
+        store.write_atomic_v6(&segs).await.unwrap();
+
+        let mut snap = store
+            .load_v6_mmap_if_valid(&[root.clone()])
+            .unwrap()
+            .expect("load v6");
+
+        // 人工制造“缺失 FileKeyMap”的段：强行把 range 设为 0..0。
+        snap.file_key_map = Some(0..0);
+
+        let mmap_idx = MmapIndex::new(snap);
+
+        // 预期：触发 lookup_docid_by_filekey 的 fallback 路径，并返回正确 meta。
+        let meta = mmap_idx
+            .get_meta_by_key(FileKey { dev: 1, ino: 1 })
+            .expect("get_meta_by_key");
+        assert!(meta.path.to_string_lossy().contains("alpha_test"));
     }
 }
