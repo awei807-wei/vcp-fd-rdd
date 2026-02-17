@@ -7,7 +7,7 @@ description = "Event-driven elastic file indexer with RDD lineage"
 license = "MIT"
 
 [dependencies]
-rkyv = { version = "0.7", features = ["validation", "check_bytes", "size_32"] }
+rkyv = { version = "0.7", optional = true, features = ["validation", "size_32"] }
 # 并行计算（类 Spark executor）
 rayon = "1.8"
 crossbeam = "0.8"
@@ -76,6 +76,7 @@ mimalloc = { version = "0.1", optional = true, default-features = false, feature
 # 默认启用 mimalloc；可用 `--no-default-features` 关闭
 default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
+rkyv = ["dep:rkyv"]
 
 [profile.release]
 lto = true
