@@ -59,6 +59,7 @@ pub struct MmapSnapshotV6 {
     pub trigram_table: std::ops::Range<usize>,
     pub postings_blob: std::ops::Range<usize>,
     pub tombstones: std::ops::Range<usize>,
+    pub file_key_map: Option<std::ops::Range<usize>>,
 }
 
 impl std::fmt::Debug for MmapSnapshotV6 {
@@ -70,6 +71,10 @@ impl std::fmt::Debug for MmapSnapshotV6 {
             .field("trigram_table_len", &self.trigram_table.len())
             .field("postings_blob_len", &self.postings_blob.len())
             .field("tombstones_len", &self.tombstones.len())
+            .field(
+                "file_key_map_len",
+                &self.file_key_map.as_ref().map(|r| r.len()),
+            )
             .finish()
     }
 }
@@ -102,6 +107,10 @@ impl MmapSnapshotV6 {
     pub fn tombstones_bytes(&self) -> &[u8] {
         self.slice(self.tombstones.clone())
     }
+
+    pub fn file_key_map_bytes(&self) -> Option<&[u8]> {
+        self.file_key_map.clone().map(|r| self.slice(r))
+    }
 }
 
 // v6 manifest（简单二进制，不依赖第三方；后续可替换为 rkyv archived）
@@ -117,6 +126,7 @@ enum V6SegKind {
     TrigramTable = 4,
     PostingsBlob = 5,
     Tombstones = 6,
+    FileKeyMap = 7,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -485,6 +495,7 @@ impl SnapshotStore {
                 4 => V6SegKind::TrigramTable,
                 5 => V6SegKind::PostingsBlob,
                 6 => V6SegKind::Tombstones,
+                7 => V6SegKind::FileKeyMap,
                 _ => continue,
             };
             segs.insert(
@@ -588,6 +599,7 @@ impl SnapshotStore {
                 .unwrap()
                 .clone(),
             tombstones: ranges.get(&(V6SegKind::Tombstones as u32)).unwrap().clone(),
+            file_key_map: ranges.get(&(V6SegKind::FileKeyMap as u32)).cloned(),
         }))
     }
 
@@ -787,6 +799,7 @@ impl SnapshotStore {
             (V6SegKind::TrigramTable, 1, segs.trigram_table_bytes.clone()),
             (V6SegKind::PostingsBlob, 1, segs.postings_blob_bytes.clone()),
             (V6SegKind::Tombstones, 1, segs.tombstones_bytes.clone()),
+            (V6SegKind::FileKeyMap, 1, segs.filekey_map_bytes.clone()),
         ];
 
         // 先计算 offsets/len/checksum，得到 manifest
@@ -1316,11 +1329,18 @@ mod tests {
             .unwrap()
             .expect("load v6");
 
+        assert!(snap.file_key_map.is_some());
+
         let mmap_idx = MmapIndex::new(snap);
         let m = create_matcher("alpha");
         let r = mmap_idx.query(m.as_ref());
         assert_eq!(r.len(), 1);
         assert!(r[0].path.to_string_lossy().contains("alpha_test"));
+
+        let m2 = mmap_idx
+            .get_meta_by_key(FileKey { dev: 1, ino: 1 })
+            .expect("get_meta_by_key");
+        assert!(m2.path.to_string_lossy().contains("alpha_test"));
     }
 
     #[tokio::test]

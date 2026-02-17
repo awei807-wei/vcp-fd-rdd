@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::core::{EventRecord, EventType};
+use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::event::watcher::{watch_roots, EventWatcher};
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
@@ -180,7 +180,7 @@ fn should_ignore_event(ev: &notify::Event, ignore_prefixes: &[PathBuf]) -> bool 
 
 /// 合并事件：同一路径的多个事件合并为最终状态
 fn merge_events(seq: &mut u64, raw: Vec<notify::Event>) -> Vec<EventRecord> {
-    let mut merged: HashMap<PathBuf, EventRecord> = HashMap::new();
+    let mut merged: HashMap<FileIdentifier, EventRecord> = HashMap::new();
     let now = std::time::SystemTime::now();
 
     for ev in raw {
@@ -194,16 +194,21 @@ fn merge_events(seq: &mut u64, raw: Vec<notify::Event>) -> Vec<EventRecord> {
             let to = ev.paths[1].clone();
 
             // 移除 from 的旧事件
-            merged.remove(&from);
+            merged.remove(&FileIdentifier::Path(from.clone()));
 
             *seq += 1;
+            let key = FileIdentifier::Path(to.clone());
             merged.insert(
-                to.clone(),
+                key.clone(),
                 EventRecord {
                     seq: *seq,
                     timestamp: now,
-                    event_type: EventType::Rename { from },
-                    path: to,
+                    event_type: EventType::Rename {
+                        from: FileIdentifier::Path(from.clone()),
+                        from_path_hint: Some(from),
+                    },
+                    id: key.clone(),
+                    path_hint: Some(to),
                 },
             );
             continue;
@@ -219,13 +224,16 @@ fn merge_events(seq: &mut u64, raw: Vec<notify::Event>) -> Vec<EventRecord> {
 
         // 合并策略：后到的事件覆盖先到的
         *seq += 1;
+        let key = FileIdentifier::Path(path.clone());
+        let new_hint = Some(path);
         merged.insert(
-            path.clone(),
+            key.clone(),
             EventRecord {
                 seq: *seq,
                 timestamp: now,
                 event_type,
-                path,
+                id: key.clone(),
+                path_hint: new_hint,
             },
         );
     }
