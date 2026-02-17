@@ -4,10 +4,15 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
+#[cfg(feature = "rkyv")]
+use crate::core::FileKeyEntry;
 use crate::core::{FileKey, FileMeta};
 use crate::index::IndexLayer;
 use crate::query::matcher::Matcher;
 use crate::storage::snapshot::MmapSnapshotV6;
+
+#[cfg(feature = "rkyv")]
+use std::sync::OnceLock;
 
 // MetaRecordV6：与 PersistentIndex::export_segments_v6 的编码保持一致（LE，40B）
 const META_REC_SIZE: usize = 40;
@@ -16,11 +21,18 @@ const TRI_REC_SIZE: usize = 12;
 // FileKeyMap：dev(8) + ino(8) + docid(4) = 20B
 const FILEKEY_MAP_REC_SIZE: usize = 20;
 
+const FKM_MAGIC: [u8; 4] = *b"FKM\0";
+const FKM_HDR_SIZE: usize = 8;
+const FKM_FLAG_LEGACY: u16 = 0;
+const FKM_FLAG_RKYV: u16 = 1;
+
 pub struct MmapIndex {
     snap: Arc<MmapSnapshotV6>,
     tomb_cache: parking_lot::Mutex<Option<RoaringBitmap>>,
     // 兼容旧段：若缺少 mmap 内的 file_key_map 段，则按需构建一次排序 map（以 bytes 形式存储，便于二分查找）。
     filekey_map_cache: parking_lot::Mutex<Option<Arc<Vec<u8>>>>,
+    #[cfg(feature = "rkyv")]
+    validated_rkyv: OnceLock<anyhow::Result<()>>,
 }
 
 impl MmapIndex {
@@ -29,6 +41,8 @@ impl MmapIndex {
             snap: Arc::new(snap),
             tomb_cache: parking_lot::Mutex::new(None),
             filekey_map_cache: parking_lot::Mutex::new(None),
+            #[cfg(feature = "rkyv")]
+            validated_rkyv: OnceLock::new(),
         }
     }
 
@@ -118,7 +132,7 @@ impl MmapIndex {
         ))
     }
 
-    fn lookup_docid_in_filekey_map(bytes: &[u8], key: FileKey) -> Option<u32> {
+    fn lookup_docid_in_legacy_map(bytes: &[u8], key: FileKey) -> Option<u32> {
         let n = bytes.len() / FILEKEY_MAP_REC_SIZE;
         if n == 0 {
             return None;
@@ -152,18 +166,105 @@ impl MmapIndex {
         Some(docid)
     }
 
+    #[cfg(feature = "rkyv")]
+    fn lookup_docid_in_rkyv_map(&self, payload: &[u8], key: FileKey) -> Option<u32> {
+        let res = self.validated_rkyv.get_or_init(|| {
+            // 只在首次访问校验一次（O(N)），后续查询走 archived_root + O(logN) 二分。
+            rkyv::check_archived_root::<Vec<FileKeyEntry>>(payload)
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("rkyv check_archived_root failed: {e}"))
+        });
+        if res.is_err() {
+            return None;
+        }
+
+        let archived = unsafe { rkyv::archived_root::<Vec<FileKeyEntry>>(payload) };
+        let slice = archived.as_slice();
+        let mut lo = 0usize;
+        let mut hi = slice.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let e = &slice[mid];
+            let dev = e.key.dev;
+            let ino = e.key.ino;
+            if (dev, ino) < (key.dev, key.ino) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= slice.len() {
+            return None;
+        }
+        let e = &slice[lo];
+        if (e.key.dev, e.key.ino) != (key.dev, key.ino) {
+            return None;
+        }
+        Some(e.doc_id)
+    }
+
     fn lookup_docid_by_filekey(&self, key: FileKey) -> Option<u32> {
         if let Some(bytes) = self.snap.file_key_map_bytes() {
             // 兼容：测试/旧数据可能出现空 range（0..0）。空表等价于“缺失”，走 fallback。
             if !bytes.is_empty() {
-                return Self::lookup_docid_in_filekey_map(bytes, key);
+                // 新格式：magic + header
+                if bytes.len() >= FKM_HDR_SIZE && bytes[0..4] == FKM_MAGIC {
+                    let ver = u16::from_le_bytes(bytes[4..6].try_into().ok()?);
+                    let flags = u16::from_le_bytes(bytes[6..8].try_into().ok()?);
+                    let payload = &bytes[FKM_HDR_SIZE..];
+                    if ver != 1 {
+                        tracing::warn!(
+                            "MmapIndex: unsupported file_key_map version {}, falling back",
+                            ver
+                        );
+                    } else {
+                        match flags {
+                            FKM_FLAG_LEGACY => {
+                                if payload.len() % FILEKEY_MAP_REC_SIZE != 0 {
+                                    tracing::warn!(
+                                        "MmapIndex: legacy file_key_map length not aligned, falling back"
+                                    );
+                                } else {
+                                    return Self::lookup_docid_in_legacy_map(payload, key);
+                                }
+                            }
+                            FKM_FLAG_RKYV => {
+                                #[cfg(feature = "rkyv")]
+                                {
+                                    return self.lookup_docid_in_rkyv_map(payload, key);
+                                }
+                                #[cfg(not(feature = "rkyv"))]
+                                {
+                                    tracing::info!(
+                                        "MmapIndex: rkyv file_key_map found but rkyv feature disabled; falling back"
+                                    );
+                                }
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    "MmapIndex: unknown file_key_map flags {}, falling back",
+                                    flags
+                                );
+                            }
+                        }
+                    }
+
+                    // magic 命中但无法解析：走 fallback（不要尝试当 legacy 裸表解析，避免误读）。
+                } else if bytes.len() % FILEKEY_MAP_REC_SIZE != 0 {
+                    tracing::warn!(
+                        "MmapIndex: legacy file_key_map length not aligned, falling back"
+                    );
+                } else {
+                    // 旧段：裸 legacy 表
+                    return Self::lookup_docid_in_legacy_map(bytes, key);
+                }
             }
         }
 
         // 旧段兼容：按需构建一次 bytes map（live keys only）
         let cached = { self.filekey_map_cache.lock().clone() };
         if let Some(arc) = cached {
-            return Self::lookup_docid_in_filekey_map(arc.as_slice(), key);
+            return Self::lookup_docid_in_legacy_map(arc.as_slice(), key);
         }
 
         tracing::info!("MmapIndex: missing/empty file_key_map, building fallback cache");
@@ -189,7 +290,7 @@ impl MmapIndex {
         }
         let arc = Arc::new(bytes);
         *self.filekey_map_cache.lock() = Some(arc.clone());
-        Self::lookup_docid_in_filekey_map(arc.as_slice(), key)
+        Self::lookup_docid_in_legacy_map(arc.as_slice(), key)
     }
 
     fn posting_for_trigram(&self, tri: [u8; 3]) -> Option<RoaringBitmap> {

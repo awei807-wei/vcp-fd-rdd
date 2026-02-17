@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "rkyv")]
+use crate::core::FileKeyEntry;
 use crate::core::{EventRecord, EventType, FileKey, FileMeta};
 use crate::index::IndexLayer;
 use crate::query::matcher::Matcher;
@@ -951,9 +953,14 @@ impl PersistentIndex {
             trigram_table_bytes.extend_from_slice(&len.to_le_bytes());
         }
 
-        // FileKeyMap 段：按 (dev,ino) 排序的 FileKey -> DocId 映射，用于 mmap layer 的二分查找。
+        // FileKeyMap 段：按 (dev,ino) 排序的 FileKey -> DocId 映射，用于 mmap layer 的反查。
         //
-        // 记录大小固定 20B（little-endian）：
+        // 统一 header（8B，LE）：
+        //   magic [u8;4] = b"FKM\0"
+        //   version u16  = 1
+        //   flags u16    = 0 legacy table | 1 rkyv bytes
+        //
+        // legacy payload：固定记录 20B（LE）：
         //   dev u64
         //   ino u64
         //   docid u32
@@ -964,11 +971,39 @@ impl PersistentIndex {
             m.iter().map(|(k, v)| (*k, *v)).collect()
         };
         pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino));
-        let mut filekey_map_bytes = Vec::with_capacity(pairs.len() * 20);
-        for (k, docid) in pairs {
-            filekey_map_bytes.extend_from_slice(&k.dev.to_le_bytes());
-            filekey_map_bytes.extend_from_slice(&k.ino.to_le_bytes());
-            filekey_map_bytes.extend_from_slice(&docid.to_le_bytes());
+        const FKM_MAGIC: [u8; 4] = *b"FKM\0";
+        const FKM_VERSION: u16 = 1;
+        #[cfg(not(feature = "rkyv"))]
+        const FKM_FLAG_LEGACY: u16 = 0;
+        #[cfg(feature = "rkyv")]
+        const FKM_FLAG_RKYV: u16 = 1;
+
+        let mut filekey_map_bytes = Vec::new();
+        filekey_map_bytes.extend_from_slice(&FKM_MAGIC);
+        filekey_map_bytes.extend_from_slice(&FKM_VERSION.to_le_bytes());
+
+        #[cfg(feature = "rkyv")]
+        {
+            // rkyv：写入 Vec<FileKeyEntry> 的 archived bytes（可扩展）。
+            filekey_map_bytes.extend_from_slice(&FKM_FLAG_RKYV.to_le_bytes());
+            let entries: Vec<FileKeyEntry> = pairs
+                .into_iter()
+                .map(|(key, doc_id)| FileKeyEntry { key, doc_id })
+                .collect();
+            let bytes = rkyv::to_bytes::<_, 1024>(&entries).expect("rkyv to_bytes");
+            filekey_map_bytes.extend_from_slice(bytes.as_ref());
+        }
+
+        #[cfg(not(feature = "rkyv"))]
+        {
+            // 默认：仍写 legacy 定长表（极致性能），但带 header 便于未来平滑切换。
+            filekey_map_bytes.extend_from_slice(&FKM_FLAG_LEGACY.to_le_bytes());
+            filekey_map_bytes.reserve(pairs.len() * 20);
+            for (k, docid) in pairs {
+                filekey_map_bytes.extend_from_slice(&k.dev.to_le_bytes());
+                filekey_map_bytes.extend_from_slice(&k.ino.to_le_bytes());
+                filekey_map_bytes.extend_from_slice(&docid.to_le_bytes());
+            }
         }
 
         V6Segments {

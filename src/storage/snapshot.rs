@@ -1344,6 +1344,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v6_filekey_map_legacy_without_header_still_loads() {
+        let root = unique_tmp_dir("v6-filekey-legacy-nohdr");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+
+        let p1 = root.join("alpha_test.txt");
+        std::fs::write(&p1, b"a").unwrap();
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: p1.clone(),
+            size: 1,
+            mtime: None,
+        });
+
+        let store = SnapshotStore::new(root.join("index.db"));
+        let mut segs = idx.export_segments_v6();
+
+        // 模拟旧段：FileKeyMap 为裸 20B 定长表（无 magic/header）
+        if segs.filekey_map_bytes.len() >= 8 {
+            segs.filekey_map_bytes = segs.filekey_map_bytes[8..].to_vec();
+        }
+
+        store.write_atomic_v6(&segs).await.unwrap();
+
+        let snap = store
+            .load_v6_mmap_if_valid(&[root.clone()])
+            .unwrap()
+            .expect("load v6");
+
+        let mmap_idx = MmapIndex::new(snap);
+        let m2 = mmap_idx
+            .get_meta_by_key(FileKey { dev: 1, ino: 1 })
+            .expect("get_meta_by_key");
+        assert!(m2.path.to_string_lossy().contains("alpha_test"));
+    }
+
+    #[tokio::test]
     async fn v6_roots_mismatch_rejects_load() {
         let root = unique_tmp_dir("v6-roots");
         std::fs::create_dir_all(&root).unwrap();
