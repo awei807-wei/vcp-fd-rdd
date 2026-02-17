@@ -1,4 +1,5 @@
-use rkyv::{Archive, Serialize as RkyvSerialize, Deserialize as RkyvDeserialize};
+#[cfg(feature = "rkyv")]
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,19 +8,21 @@ use std::sync::Arc;
 ///
 /// 说明：阶段 A 引入 `DocId(u32)` 作为 L2 内部的紧凑主键；
 /// `FileKey` 仍用于扫描/事件输入与“同 inode 去重”。
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug, PartialEq, Eq))]]
-#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug)]
-#[archive(check_bytes)]
-pub struct FileKeyEntry {
-    pub key: FileKey,
-    pub doc_id: u32,
-}
-
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "rkyv", derive(Archive, RkyvSerialize, RkyvDeserialize))]
+#[cfg_attr(feature = "rkyv", archive(check_bytes))]
 pub struct FileKey {
     pub dev: u64,
     pub ino: u64,
+}
+
+/// FileKeyMap 段的条目：稳定身份 -> docid（仅用于磁盘结晶与 mmap 反查）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "rkyv", derive(Archive, RkyvSerialize, RkyvDeserialize))]
+#[cfg_attr(feature = "rkyv", archive(check_bytes))]
+pub struct FileKeyEntry {
+    pub key: FileKey,
+    pub doc_id: u32,
 }
 
 /// 文件元数据
