@@ -765,7 +765,7 @@ impl TieredIndex {
         });
     }
 
-    /// 查询入口：L1 → L2，不扫盘
+    /// 查询入口：L1 → L2 → DiskSegments（mmap），不扫真实文件系统
     pub fn query(&self, keyword: &str) -> Vec<FileMeta> {
         let matcher = create_matcher(keyword);
 
@@ -1076,7 +1076,7 @@ impl TieredIndex {
             // 最后灌入本次 delta（newest）。
             old_delta.for_each_live_meta(|m| merged.upsert_rename(m));
 
-            let segs = merged.export_segments_v6();
+            let segs = merged.export_segments_v6_compacted();
             let base = store
                 .lsm_replace_base_v6(&segs, None, &roots, wal_seal_id)
                 .await?;
@@ -1228,6 +1228,8 @@ impl TieredIndex {
             overlay,
             rebuild,
             process_rss_bytes: MemoryReport::read_process_rss(),
+            process_smaps_rollup: MemoryReport::read_smaps_rollup(),
+            process_faults: MemoryReport::read_faults(),
         }
     }
 
@@ -1299,7 +1301,7 @@ impl TieredIndex {
             layer.idx.for_each_live_meta(|m| merged.upsert_rename(m));
         }
 
-        let segs = merged.export_segments_v6();
+        let segs = merged.export_segments_v6_compacted();
         let store = SnapshotStore::new(store_path.clone());
         let wal_seal_id = store.lsm_manifest_wal_seal_id().unwrap_or(0);
 
@@ -1648,6 +1650,179 @@ mod tests {
         let r = idx.query("alpha");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].size, 2);
+    }
+
+    #[tokio::test]
+    async fn query_same_path_different_filekey_prefers_newest_segment() {
+        use crate::core::{FileKey, FileMeta};
+        use crate::index::PersistentIndex;
+
+        let root = unique_tmp_dir("q-samepath-newest");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let a = root.join("a.txt");
+        std::fs::write(&a, b"x").unwrap();
+
+        let store = SnapshotStore::new(root.join("index.db"));
+
+        // seg1 (older): (dev=1, ino=100, path=/a.txt)
+        let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
+        seg1.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 100 },
+            path: a.clone(),
+            size: 1,
+            mtime: None,
+        });
+        store
+            .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
+            .await
+            .unwrap();
+
+        // seg2 (newer): (dev=1, ino=200, path=/a.txt) -- no delete sidecar
+        let seg2 = PersistentIndex::new_with_roots(vec![root.clone()]);
+        seg2.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 200 },
+            path: a.clone(),
+            size: 2,
+            mtime: None,
+        });
+        store
+            .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], &[root.clone()], 0)
+            .await
+            .unwrap();
+
+        let idx = TieredIndex::load_or_empty(&store, vec![root.clone()])
+            .await
+            .unwrap();
+
+        let r = idx.query("a.txt");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].file_key.ino, 200);
+    }
+
+    #[tokio::test]
+    async fn query_rename_from_tombstone_blocks_old_path() {
+        use crate::core::{FileKey, FileMeta};
+        use crate::index::PersistentIndex;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = unique_tmp_dir("q-rename-tombstone");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let old = root.join("old.txt");
+        let newp = root.join("new.txt");
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&newp, b"new").unwrap();
+
+        let store = SnapshotStore::new(root.join("index.db"));
+
+        // seg1 (older): /old.txt
+        let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
+        seg1.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 10 },
+            path: old.clone(),
+            size: 1,
+            mtime: None,
+        });
+        store
+            .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
+            .await
+            .unwrap();
+
+        // seg2 (newer): /new.txt + tombstone(/old.txt)
+        let seg2 = PersistentIndex::new_with_roots(vec![root.clone()]);
+        seg2.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 11 },
+            path: newp.clone(),
+            size: 1,
+            mtime: None,
+        });
+        let deleted = vec![old.as_os_str().as_bytes().to_vec()];
+        store
+            .lsm_append_delta_v6(&seg2.export_segments_v6(), &deleted, &[root.clone()], 0)
+            .await
+            .unwrap();
+
+        let idx = TieredIndex::load_or_empty(&store, vec![root.clone()])
+            .await
+            .unwrap();
+
+        assert!(idx.query("old.txt").is_empty());
+        assert_eq!(idx.query("new.txt").len(), 1);
+
+        // Query wide pattern that would match both paths: old must remain blocked.
+        let all = idx.query(".txt");
+        assert_eq!(all.len(), 1);
+        assert!(all[0].path.to_string_lossy().ends_with("new.txt"));
+    }
+
+    #[tokio::test]
+    async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
+        use crate::core::{FileKey, FileMeta};
+        use crate::index::PersistentIndex;
+
+        let root = unique_tmp_dir("q-samekey-newestpath");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let p1 = root.join("ghost_v1.txt");
+        let p2 = root.join("ghost_v2.txt");
+        let p3 = root.join("ghost_v3.txt");
+        std::fs::write(&p1, b"1").unwrap();
+        std::fs::write(&p2, b"2").unwrap();
+        std::fs::write(&p3, b"3").unwrap();
+
+        let store = SnapshotStore::new(root.join("index.db"));
+
+        let k = FileKey { dev: 1, ino: 999 };
+
+        // seg1 (older): k -> p1
+        let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
+        seg1.upsert(FileMeta {
+            file_key: k,
+            path: p1.clone(),
+            size: 1,
+            mtime: None,
+        });
+        store
+            .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
+            .await
+            .unwrap();
+
+        // seg2: k -> p2
+        let seg2 = PersistentIndex::new_with_roots(vec![root.clone()]);
+        seg2.upsert(FileMeta {
+            file_key: k,
+            path: p2.clone(),
+            size: 2,
+            mtime: None,
+        });
+        store
+            .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], &[root.clone()], 0)
+            .await
+            .unwrap();
+
+        // seg3 (newest): k -> p3
+        let seg3 = PersistentIndex::new_with_roots(vec![root.clone()]);
+        seg3.upsert(FileMeta {
+            file_key: k,
+            path: p3.clone(),
+            size: 3,
+            mtime: None,
+        });
+        store
+            .lsm_append_delta_v6(&seg3.export_segments_v6(), &[], &[root.clone()], 0)
+            .await
+            .unwrap();
+
+        let idx = TieredIndex::load_or_empty(&store, vec![root.clone()])
+            .await
+            .unwrap();
+
+        // 如果 seen(FileKey) 去重语义回退，这里会返回 3 条（路径不同，blocked 兜不住）。
+        let r = idx.query("ghost_");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].file_key.ino, 999);
+        assert!(r[0].path.to_string_lossy().ends_with("ghost_v3.txt"));
     }
 
     #[tokio::test]
