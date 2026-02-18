@@ -331,8 +331,42 @@ impl MmapIndex {
         RoaringBitmap::deserialize_from(&mut cur).ok()
     }
 
-    fn basename_trigrams(s: &str) -> Vec<[u8; 3]> {
-        let lower = s.to_lowercase();
+    fn trigram_key_exists(&self, tri: [u8; 3]) -> bool {
+        let table = self.snap.trigram_table_bytes();
+        let n = table.len() / TRI_REC_SIZE;
+        if n == 0 {
+            return false;
+        }
+
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let off = mid * TRI_REC_SIZE;
+            let rec = &table[off..off + TRI_REC_SIZE];
+            let key = [rec[0], rec[1], rec[2]];
+            if key < tri {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= n {
+            return false;
+        }
+        let off = lo * TRI_REC_SIZE;
+        let rec = &table[off..off + TRI_REC_SIZE];
+        let key = [rec[0], rec[1], rec[2]];
+        key == tri
+    }
+
+    fn has_trigram_sentinel(&self) -> bool {
+        // 哨兵 key：b"\0\0\0"
+        self.trigram_key_exists([0, 0, 0])
+    }
+
+    fn hint_trigrams(hint: &[u8]) -> Vec<[u8; 3]> {
+        let lower = String::from_utf8_lossy(hint).to_lowercase();
         let bytes = lower.as_bytes();
         if bytes.len() < 3 {
             return Vec::new();
@@ -340,28 +374,36 @@ impl MmapIndex {
         bytes.windows(3).map(|w| [w[0], w[1], w[2]]).collect()
     }
 
-    pub fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
-        let candidates = matcher.prefix().and_then(|p| {
-            let tris = Self::basename_trigrams(p);
-            if tris.is_empty() {
-                return None;
-            }
+    fn trigram_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringBitmap> {
+        let hint = matcher.literal_hint()?;
+        let tris = Self::hint_trigrams(hint);
+        if tris.is_empty() {
+            return None;
+        }
 
-            let mut bitmaps: Vec<RoaringBitmap> = Vec::with_capacity(tris.len());
-            for tri in tris {
-                bitmaps.push(self.posting_for_trigram(tri)?);
+        let mut bitmaps: Vec<RoaringBitmap> = Vec::with_capacity(tris.len());
+        for tri in tris {
+            bitmaps.push(self.posting_for_trigram(tri)?);
+        }
+        bitmaps.sort_by_key(|b| b.len());
+        let mut iter = bitmaps.into_iter();
+        let mut acc = iter.next().unwrap_or_else(RoaringBitmap::new);
+        for b in iter {
+            acc &= &b;
+            if acc.is_empty() {
+                break;
             }
-            bitmaps.sort_by_key(|b| b.len());
-            let mut iter = bitmaps.into_iter();
-            let mut acc = iter.next().unwrap_or_else(RoaringBitmap::new);
-            for b in iter {
-                acc &= &b;
-                if acc.is_empty() {
-                    break;
-                }
-            }
-            Some(acc)
-        });
+        }
+        Some(acc)
+    }
+
+    pub fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
+        // 能力感知：无哨兵视为旧段（trigram 不覆盖目录组件），禁用预过滤避免假阴性。
+        let candidates = if self.has_trigram_sentinel() {
+            self.trigram_candidates(matcher)
+        } else {
+            None
+        };
 
         let tomb = self.tombstones();
         let arena = self.snap.path_arena_bytes();
@@ -441,27 +483,12 @@ impl MmapIndex {
     }
 
     pub fn query(&self, matcher: &dyn Matcher) -> Vec<FileMeta> {
-        let candidates = matcher.prefix().and_then(|p| {
-            let tris = Self::basename_trigrams(p);
-            if tris.is_empty() {
-                return None;
-            }
-
-            let mut bitmaps: Vec<RoaringBitmap> = Vec::with_capacity(tris.len());
-            for tri in tris {
-                bitmaps.push(self.posting_for_trigram(tri)?);
-            }
-            bitmaps.sort_by_key(|b| b.len());
-            let mut iter = bitmaps.into_iter();
-            let mut acc = iter.next().unwrap_or_else(RoaringBitmap::new);
-            for b in iter {
-                acc &= &b;
-                if acc.is_empty() {
-                    break;
-                }
-            }
-            Some(acc)
-        });
+        // 能力感知：无哨兵视为旧段（trigram 不覆盖目录组件），禁用预过滤避免假阴性。
+        let candidates = if self.has_trigram_sentinel() {
+            self.trigram_candidates(matcher)
+        } else {
+            None
+        };
 
         let tomb = self.tombstones();
         let arena = self.snap.path_arena_bytes();
@@ -592,7 +619,9 @@ impl IndexLayer for MmapIndex {
 mod tests {
     use super::*;
     use crate::index::PersistentIndex;
+    use crate::query::matcher::create_matcher;
     use crate::storage::snapshot::SnapshotStore;
+    use std::collections::HashMap;
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -636,5 +665,110 @@ mod tests {
             .get_meta_by_key(FileKey { dev: 1, ino: 1 })
             .expect("get_meta_by_key");
         assert!(meta.path.to_string_lossy().contains("alpha_test"));
+    }
+
+    fn build_basename_only_trigram_segments(docs: &[(u32, &PathBuf)]) -> (Vec<u8>, Vec<u8>) {
+        let mut tri_idx: HashMap<[u8; 3], RoaringBitmap> = HashMap::new();
+
+        for (docid, path) in docs {
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+            let lower = name.to_lowercase();
+            let bytes = lower.as_bytes();
+            if bytes.len() < 3 {
+                continue;
+            }
+            for w in bytes.windows(3) {
+                let tri = [w[0], w[1], w[2]];
+                tri_idx
+                    .entry(tri)
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(*docid);
+            }
+        }
+
+        let mut postings_blob_bytes: Vec<u8> = Vec::new();
+        let mut entries: Vec<([u8; 3], u32, u32)> = Vec::with_capacity(tri_idx.len());
+        for (tri, posting) in tri_idx.iter() {
+            let mut buf = Vec::new();
+            posting.serialize_into(&mut buf).expect("write to vec");
+            let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
+            let len: u32 = buf.len().try_into().unwrap_or(u32::MAX);
+            postings_blob_bytes.extend_from_slice(&buf);
+            entries.push((*tri, off, len));
+        }
+        entries.sort_by_key(|(tri, _, _)| *tri);
+
+        let mut trigram_table_bytes = Vec::with_capacity(entries.len() * TRI_REC_SIZE);
+        for (tri, off, len) in entries {
+            trigram_table_bytes.extend_from_slice(&tri);
+            trigram_table_bytes.push(0); // pad
+            trigram_table_bytes.extend_from_slice(&off.to_le_bytes());
+            trigram_table_bytes.extend_from_slice(&len.to_le_bytes());
+        }
+
+        (trigram_table_bytes, postings_blob_bytes)
+    }
+
+    #[tokio::test]
+    async fn sentinel_absent_forces_full_scan_to_avoid_false_negative() {
+        let root = unique_tmp_dir("sentinel-old");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let dir_src = root.join("src");
+        std::fs::create_dir_all(&dir_src).unwrap();
+
+        let p_dir_hit = dir_src.join("a.txt");
+        let p_base_hit = root.join("src_lib.rs");
+        std::fs::write(&p_dir_hit, b"a").unwrap();
+        std::fs::write(&p_base_hit, b"b").unwrap();
+
+        // 构建索引：两个 doc，docid 依插入顺序为 0/1。
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: p_dir_hit.clone(),
+            size: 1,
+            mtime: None,
+        });
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 2 },
+            path: p_base_hit.clone(),
+            size: 1,
+            mtime: None,
+        });
+
+        // 模拟“旧段”：仅 basename 建 trigram，且无哨兵 key。
+        let mut segs = idx.export_segments_v6();
+        let (tri_table, postings_blob) =
+            build_basename_only_trigram_segments(&[(0, &p_dir_hit), (1, &p_base_hit)]);
+        segs.trigram_table_bytes = tri_table;
+        segs.postings_blob_bytes = postings_blob;
+
+        let store = SnapshotStore::new(root.join("index.db"));
+        store.write_atomic_v6(&segs).await.unwrap();
+
+        let snap = store
+            .load_v6_mmap_if_valid(&[root.clone()])
+            .unwrap()
+            .expect("load v6");
+        let mmap_idx = MmapIndex::new(snap);
+
+        // 查询 "src"：若错误走候选集（basename-only），会漏掉 /src/a.txt（目录段命中）。
+        let m = create_matcher("src");
+        let r = mmap_idx.query(m.as_ref());
+        assert_eq!(r.len(), 2);
+        let s0 = r[0].path.to_string_lossy();
+        let s1 = r[1].path.to_string_lossy();
+        assert!(
+            s0.contains("/src/a.txt") || s1.contains("/src/a.txt"),
+            "must include dir-segment hit"
+        );
+        assert!(
+            s0.ends_with("src_lib.rs") || s1.ends_with("src_lib.rs"),
+            "must include basename hit"
+        );
     }
 }

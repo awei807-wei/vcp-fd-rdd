@@ -13,7 +13,9 @@ use tokio::fs;
 
 /// 索引文件 Header
 const MAGIC: u32 = 0xFDDD_0002;
-const VERSION_CURRENT: u32 = 6;
+const VERSION_V6: u32 = 6; // legacy: SimpleChecksum
+const VERSION_V7: u32 = 7; // CRC32C (Castagnoli)
+const VERSION_CURRENT: u32 = VERSION_V7;
 const VERSION_COMPAT_V5: u32 = 5;
 const VERSION_COMPAT_V4: u32 = 4;
 const VERSION_COMPAT_V3: u32 = 3;
@@ -196,12 +198,21 @@ fn read_file_range(file: &mut std::fs::File, offset: u64, len: u64) -> anyhow::R
     Ok(buf)
 }
 
-fn compute_file_checksum(file: &mut std::fs::File, offset: u64, len: u64) -> anyhow::Result<u32> {
+fn compute_file_checksum_with(
+    file: &mut std::fs::File,
+    offset: u64,
+    len: u64,
+    v7_crc32c: bool,
+) -> anyhow::Result<u32> {
     use std::io::Read;
 
     file.seek(SeekFrom::Start(offset))?;
 
-    let mut hasher = SimpleChecksum::new();
+    let mut hasher = if v7_crc32c {
+        Checksum32::Crc32c(Crc32c::new())
+    } else {
+        Checksum32::Simple(SimpleChecksum::new())
+    };
     let mut buffer = [0u8; 64 * 1024]; // 64KB stack buffer
     let mut remaining = len;
     while remaining > 0 {
@@ -211,6 +222,27 @@ fn compute_file_checksum(file: &mut std::fs::File, offset: u64, len: u64) -> any
         remaining -= to_read as u64;
     }
     Ok(hasher.finalize())
+}
+
+enum Checksum32 {
+    Simple(SimpleChecksum),
+    Crc32c(Crc32c),
+}
+
+impl Checksum32 {
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Checksum32::Simple(s) => s.update(data),
+            Checksum32::Crc32c(c) => c.update(data),
+        }
+    }
+
+    fn finalize(self) -> u32 {
+        match self {
+            Checksum32::Simple(s) => s.finalize(),
+            Checksum32::Crc32c(c) => c.finalize(),
+        }
+    }
 }
 
 struct SimpleChecksum {
@@ -269,6 +301,51 @@ impl SimpleChecksum {
         self.hash = self.hash.rotate_left(7);
     }
 }
+
+/// CRC32C (Castagnoli) 校验：u32 输出，支持流式 update。
+///
+/// 说明：
+/// - 初值 0xFFFF_FFFF，finalize 取反（标准 CRC32C 约定）
+/// - 使用 reflected 多项式 0x82F63B78
+struct Crc32c {
+    state: u32,
+}
+
+impl Crc32c {
+    fn new() -> Self {
+        Self { state: 0xFFFF_FFFF }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        for &b in data {
+            let idx = (self.state as u8) ^ b;
+            self.state = (self.state >> 8) ^ CRC32C_TABLE[idx as usize];
+        }
+    }
+
+    fn finalize(self) -> u32 {
+        !self.state
+    }
+}
+
+// CRC32C 查表（reflected poly = 0x82F63B78）
+const CRC32C_TABLE: [u32; 256] = {
+    const POLY: u32 = 0x82F6_3B78;
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (POLY & mask);
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
 
 struct ChecksumWriter<'a, W: Write> {
     inner: &'a mut W,
@@ -433,13 +510,15 @@ impl SnapshotStore {
         let manifest_len = u32::from_le_bytes(header[12..16].try_into()?) as usize;
         let manifest_checksum = u32::from_le_bytes(header[16..20].try_into()?);
 
-        if magic != MAGIC || version != VERSION_CURRENT {
+        if magic != MAGIC || !(version == VERSION_V6 || version == VERSION_V7) {
             return Ok(None);
         }
         if state != STATE_COMMITTED {
             tracing::warn!("Snapshot v6 state INCOMPLETE, ignoring");
             return Ok(None);
         }
+
+        let v7 = version == VERSION_V7;
 
         if file_len < (HEADER_SIZE + manifest_len) as u64 {
             tracing::warn!("Snapshot v6 too small, ignoring");
@@ -450,7 +529,13 @@ impl SnapshotStore {
         file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
         let mut manifest = vec![0u8; manifest_len];
         file.read_exact(&mut manifest)?;
-        let computed = simple_checksum(&manifest);
+        let computed = if v7 {
+            let mut c = Crc32c::new();
+            c.update(&manifest);
+            c.finalize()
+        } else {
+            simple_checksum(&manifest)
+        };
         if computed != manifest_checksum {
             tracing::warn!(
                 "Snapshot v6 manifest checksum mismatch: {} != {}",
@@ -557,11 +642,17 @@ impl SnapshotStore {
             // streaming checksum (avoid touching mmap pages at startup)
             let c = if d.kind == V6SegKind::Roots {
                 let bytes = read_file_range(&mut file, d.offset, d.len)?;
-                let c = simple_checksum(&bytes);
+                let c = if v7 {
+                    let mut c = Crc32c::new();
+                    c.update(&bytes);
+                    c.finalize()
+                } else {
+                    simple_checksum(&bytes)
+                };
                 roots_bytes = Some(bytes);
                 c
             } else {
-                compute_file_checksum(&mut file, d.offset, d.len)?
+                compute_file_checksum_with(&mut file, d.offset, d.len, v7)?
             };
 
             if c != d.checksum {
@@ -639,8 +730,8 @@ impl SnapshotStore {
             tracing::warn!("Snapshot magic mismatch: {:#x} != {:#x}", magic, MAGIC);
             return Ok(None);
         }
-        // v6 走 mmap 段式加载路径，不在本方法中处理
-        if version == VERSION_CURRENT {
+        // v6/v7 走 mmap 段式加载路径，不在本方法中处理
+        if version == VERSION_V6 || version == VERSION_V7 {
             return Ok(None);
         }
 
@@ -808,10 +899,17 @@ impl SnapshotStore {
         let mut cursor = align_up(HEADER_SIZE + manifest_len, 8);
 
         let mut descs: Vec<V6SegDesc> = Vec::with_capacity(seg_count);
+        let v7 = true; // 写入端固定使用 v7 (CRC32C)；读取端兼容 v6/v7。
         for (kind, ver, bytes) in &seg_list {
             let start = cursor;
             let len = bytes.len();
-            let checksum = simple_checksum(bytes);
+            let checksum = if v7 {
+                let mut c = Crc32c::new();
+                c.update(bytes);
+                c.finalize()
+            } else {
+                simple_checksum(bytes)
+            };
             descs.push(V6SegDesc {
                 kind: *kind,
                 version: *ver,
@@ -837,7 +935,13 @@ impl SnapshotStore {
         }
         debug_assert_eq!(manifest.len(), manifest_len);
 
-        let manifest_checksum = simple_checksum(&manifest);
+        let manifest_checksum = if v7 {
+            let mut c = Crc32c::new();
+            c.update(&manifest);
+            c.finalize()
+        } else {
+            simple_checksum(&manifest)
+        };
 
         let tmp_path = path.with_extension("db.tmp");
         let mut file = std::fs::File::create(&tmp_path)?;
@@ -1400,6 +1504,77 @@ mod tests {
 
         let other_root = unique_tmp_dir("other");
         let snap = store.load_v6_mmap_if_valid(&[other_root]).unwrap();
+        assert!(snap.is_none());
+    }
+
+    #[tokio::test]
+    async fn v6_flip_one_byte_rejects_load() {
+        let root = unique_tmp_dir("v6-flip");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        let p1 = root.join("alpha_test.txt");
+        std::fs::write(&p1, b"a").unwrap();
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: p1.clone(),
+            size: 1,
+            mtime: None,
+        });
+
+        let store = SnapshotStore::new(root.join("index.db"));
+        let segs = idx.export_segments_v6();
+        store.write_atomic_v6(&segs).await.unwrap();
+
+        // 人工翻转 metas 段内的 1 个字节，应导致校验失败并拒绝加载。
+        let path = store.legacy_db_path();
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        let mut header = [0u8; HEADER_SIZE];
+        use std::io::Read;
+        f.read_exact(&mut header).unwrap();
+        let manifest_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        assert!(manifest_len >= 16 + 32);
+
+        f.seek(SeekFrom::Start(HEADER_SIZE as u64)).unwrap();
+        let mut manifest = vec![0u8; manifest_len];
+        f.read_exact(&mut manifest).unwrap();
+
+        let seg_count = u32::from_le_bytes(manifest[8..12].try_into().unwrap()) as usize;
+        let desc_base = 16usize;
+        let desc_size = 32usize;
+        assert!(manifest.len() >= desc_base + seg_count * desc_size);
+
+        // metas kind = 3
+        let mut target: Option<(u64, u64)> = None;
+        for i in 0..seg_count {
+            let off = desc_base + i * desc_size;
+            let d = &manifest[off..off + desc_size];
+            let kind_u32 = u32::from_le_bytes(d[0..4].try_into().unwrap());
+            let offset = u64::from_le_bytes(d[8..16].try_into().unwrap());
+            let len = u64::from_le_bytes(d[16..24].try_into().unwrap());
+            if kind_u32 == V6SegKind::Metas as u32 {
+                target = Some((offset, len));
+                break;
+            }
+        }
+        let (off, seg_len) = target.expect("metas segment");
+        assert!(seg_len > 0);
+
+        let flip_off = off + (seg_len / 2);
+        f.seek(SeekFrom::Start(flip_off)).unwrap();
+        let mut b = [0u8; 1];
+        f.read_exact(&mut b).unwrap();
+        b[0] ^= 0xFF;
+        f.seek(SeekFrom::Start(flip_off)).unwrap();
+        f.write_all(&b).unwrap();
+        f.sync_all().unwrap();
+
+        let snap = store.load_v6_mmap_if_valid(&[root.clone()]).unwrap();
         assert!(snap.is_none());
     }
 

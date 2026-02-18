@@ -19,6 +19,14 @@ pub trait Matcher: Send + Sync {
     fn prefix(&self) -> Option<&str> {
         None
     }
+    /// 获取可用于 trigram 候选预过滤的 literal 提示（可选）。
+    ///
+    /// 约束：
+    /// - 必须不包含路径分隔符（`/`、`\\`），否则会破坏“组件索引”的超集性质
+    /// - 允许返回长度 < 3 的 hint；调用方应做长度门槛并回退全扫
+    fn literal_hint(&self) -> Option<&[u8]> {
+        None
+    }
     /// 获取 glob 模式（非 glob 匹配器返回 None）
     fn glob_mode(&self) -> Option<GlobMode> {
         None
@@ -42,6 +50,15 @@ impl Matcher for ExactMatcher {
     fn matches(&self, path: &str) -> bool {
         path.contains(&self.pattern)
     }
+
+    fn literal_hint(&self) -> Option<&[u8]> {
+        // contains 语义可能跨组件（例如 "/a/b"），无法保证组件 trigram 的超集过滤；
+        // 因此当 pattern 含分隔符时显式禁用 hint，回退全扫。
+        if contains_path_separator(&self.pattern) {
+            return None;
+        }
+        Some(self.pattern.as_bytes())
+    }
 }
 
 /// 通配符匹配 (Glob)
@@ -49,6 +66,7 @@ pub struct GlobMatcher {
     wild: WildMatch,
     prefix: Option<String>,
     mode: GlobMode,
+    literal_hint: Option<Vec<u8>>,
 }
 
 impl GlobMatcher {
@@ -60,10 +78,13 @@ impl GlobMatcher {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
+        let literal_hint = extract_longest_literal_hint(pattern);
+
         Self {
             wild: WildMatch::new(pattern),
             prefix,
             mode,
+            literal_hint,
         }
     }
 }
@@ -96,6 +117,10 @@ impl Matcher for GlobMatcher {
         self.prefix.as_deref()
     }
 
+    fn literal_hint(&self) -> Option<&[u8]> {
+        self.literal_hint.as_deref()
+    }
+
     fn glob_mode(&self) -> Option<GlobMode> {
         Some(self.mode)
     }
@@ -104,6 +129,33 @@ impl Matcher for GlobMatcher {
 /// 判断模式是否包含路径分隔符
 fn contains_path_separator(pattern: &str) -> bool {
     pattern.contains('/') || pattern.contains('\\')
+}
+
+fn is_literal_delim(b: u8) -> bool {
+    matches!(b, b'/' | b'\\' | b'*' | b'?')
+}
+
+/// 安全 literal 提取：把 `/`、`\\`、`*`、`?` 统一视为分隔符，提取最长连续片段（长度 >= 3）。
+fn extract_longest_literal_hint(pattern: &str) -> Option<Vec<u8>> {
+    let bytes = pattern.as_bytes();
+    let mut best: Option<(usize, usize)> = None; // (start, len)
+    let mut start = 0usize;
+
+    for i in 0..=bytes.len() {
+        let at_end = i == bytes.len();
+        if at_end || is_literal_delim(bytes[i]) {
+            let len = i.saturating_sub(start);
+            if len >= 3 {
+                match best {
+                    Some((_, best_len)) if best_len >= len => {}
+                    _ => best = Some((start, len)),
+                }
+            }
+            start = i.saturating_add(1);
+        }
+    }
+
+    best.map(|(s, len)| bytes[s..s + len].to_vec())
 }
 
 /// 匹配器工厂与自动识别
@@ -214,5 +266,25 @@ mod tests {
     fn exact_contains_no_match() {
         let m = create_matcher("nonexistent");
         assert!(!m.matches("/tmp/vcptest/test_123"));
+    }
+
+    // ── literal_hint（trigram 候选预过滤提示）──
+
+    #[test]
+    fn exact_literal_hint_disabled_when_contains_separator() {
+        let m = create_matcher("/some/deep/path");
+        assert_eq!(m.literal_hint(), None);
+    }
+
+    #[test]
+    fn glob_literal_hint_extracts_longest_and_never_includes_separator() {
+        let m = create_matcher("/some/deep/path/*回忆录*");
+        assert_eq!(m.literal_hint(), Some("回忆录".as_bytes()));
+    }
+
+    #[test]
+    fn glob_literal_hint_none_when_all_literals_too_short() {
+        let m = create_matcher("*ab*");
+        assert_eq!(m.literal_hint(), None);
     }
 }
