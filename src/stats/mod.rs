@@ -17,6 +17,24 @@ pub struct MemoryReport {
     pub rebuild: RebuildStats,
     /// 进程级 RSS（从 /proc/self/statm 读取）
     pub process_rss_bytes: u64,
+    /// 进程级内存拆分（从 /proc/self/smaps_rollup 读取；Linux-only）
+    pub process_smaps_rollup: Option<SmapsRollupStats>,
+    /// 进程级 page faults（从 /proc/self/stat 读取；Linux-only）
+    pub process_faults: Option<FaultStats>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SmapsRollupStats {
+    pub rss_bytes: u64,
+    pub pss_bytes: u64,
+    pub private_clean_bytes: u64,
+    pub private_dirty_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FaultStats {
+    pub minflt: u64,
+    pub majflt: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -126,6 +144,46 @@ impl MemoryReport {
             .map(|pages| pages * 4096) // x86_64 page size
             .unwrap_or(0)
     }
+
+    /// 从 /proc/self/smaps_rollup 读取关键指标（kB → bytes）。
+    pub fn read_smaps_rollup() -> Option<SmapsRollupStats> {
+        let s = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+        let mut out = SmapsRollupStats::default();
+        for line in s.lines() {
+            let mut it = line.split_whitespace();
+            let key = it.next()?;
+            let val = it.next()?;
+            let unit = it.next().unwrap_or("");
+            if unit != "kB" {
+                continue;
+            }
+            let v_kb: u64 = val.parse().ok()?;
+            let v = v_kb.saturating_mul(1024);
+            match key {
+                "Rss:" => out.rss_bytes = v,
+                "Pss:" => out.pss_bytes = v,
+                "Private_Clean:" => out.private_clean_bytes = v,
+                "Private_Dirty:" => out.private_dirty_bytes = v,
+                _ => {}
+            }
+        }
+        Some(out)
+    }
+
+    /// 从 /proc/self/stat 读取 minflt/majflt（minor/major page faults）。
+    pub fn read_faults() -> Option<FaultStats> {
+        let s = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let rparen = s.rfind(')')?;
+        // 右括号后通常是 ") "，紧跟 state 等字段。
+        let after = s.get(rparen + 2..)?;
+        let parts: Vec<&str> = after.split_whitespace().collect();
+        if parts.len() < 10 {
+            return None;
+        }
+        let minflt: u64 = parts.get(7)?.parse().ok()?;
+        let majflt: u64 = parts.get(9)?.parse().ok()?;
+        Some(FaultStats { minflt, majflt })
+    }
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -153,6 +211,27 @@ impl fmt::Display for MemoryReport {
             "║ Process RSS: {:>35} ║",
             human_bytes(self.process_rss_bytes)
         )?;
+        if let Some(s) = &self.process_smaps_rollup {
+            writeln!(
+                f,
+                "║ Smaps: rss={:<10} pss={:<10} pc={:<10} ║",
+                human_bytes(s.rss_bytes),
+                human_bytes(s.pss_bytes),
+                human_bytes(s.private_clean_bytes)
+            )?;
+            writeln!(
+                f,
+                "║       pd={:<10}                               ║",
+                human_bytes(s.private_dirty_bytes)
+            )?;
+        }
+        if let Some(pf) = &self.process_faults {
+            writeln!(
+                f,
+                "║ Faults: minflt={:<12} majflt={:<12} ║",
+                pf.minflt, pf.majflt
+            )?;
+        }
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ L1 Cache:                                        ║")?;
         writeln!(

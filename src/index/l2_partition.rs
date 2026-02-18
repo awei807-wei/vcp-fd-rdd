@@ -3,7 +3,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[cfg(feature = "rkyv")]
 use crate::core::FileKeyEntry;
@@ -18,19 +18,6 @@ type Trigram = [u8; 3];
 /// DocId：L2 内部紧凑文档编号（posting 的元素类型）
 pub type DocId = u32;
 
-/// 从文件名中提取 trigram 集合
-fn extract_trigrams(name: &str) -> HashSet<Trigram> {
-    let lower = name.to_lowercase();
-    let bytes = lower.as_bytes();
-    let mut set = HashSet::new();
-    if bytes.len() >= 3 {
-        for w in bytes.windows(3) {
-            set.insert([w[0], w[1], w[2]]);
-        }
-    }
-    set
-}
-
 /// 从查询词中提取 trigram 列表
 fn query_trigrams(query: &str) -> Vec<Trigram> {
     let lower = query.to_lowercase();
@@ -44,11 +31,26 @@ fn query_trigrams(query: &str) -> Vec<Trigram> {
     tris
 }
 
-fn basename_bytes(path_bytes: &[u8]) -> &[u8] {
-    match path_bytes.iter().rposition(|b| *b == b'/') {
-        Some(pos) if pos + 1 < path_bytes.len() => &path_bytes[pos + 1..],
-        _ => path_bytes,
+/// 从路径的所有“洁净组件”（`Component::Normal`）中提取 trigram 集合。
+///
+/// - 标准化：lossy UTF-8 + to_lowercase
+/// - 目的：让 trigram 候选集成为 Segment/contains 等精确匹配的严格超集（避免假阴性）
+fn component_trigrams(path: &Path) -> HashSet<Trigram> {
+    let mut set: HashSet<Trigram> = HashSet::new();
+    for c in path.components() {
+        let Component::Normal(os) = c else {
+            continue;
+        };
+        let lower = os.to_string_lossy().to_lowercase();
+        let bytes = lower.as_bytes();
+        if bytes.len() < 3 {
+            continue;
+        }
+        for w in bytes.windows(3) {
+            set.insert([w[0], w[1], w[2]]);
+        }
     }
+    set
 }
 
 /// Path blob arena：所有路径的连续字节存储
@@ -431,16 +433,13 @@ impl PersistentIndex {
                     .and_modify(|v| v.insert(docid))
                     .or_insert(OneOrManyDocId::One(docid));
 
-                let name_bytes = basename_bytes(rel_bytes);
-                let name = std::str::from_utf8(name_bytes)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|_| String::from_utf8_lossy(name_bytes).into_owned());
-
-                for tri in extract_trigrams(&name) {
-                    trigram_index
-                        .entry(tri)
-                        .or_insert_with(RoaringBitmap::new)
-                        .insert(docid);
+                if let Some(abs_path) = self.compose_abs_path_buf(meta.root_id, rel_bytes) {
+                    for tri in component_trigrams(abs_path.as_path()) {
+                        trigram_index
+                            .entry(tri)
+                            .or_insert_with(RoaringBitmap::new)
+                            .insert(docid);
+                    }
                 }
             }
         }
@@ -875,6 +874,15 @@ impl PersistentIndex {
         }
     }
 
+    /// 导出 v6 段（物理 compaction 版）：仅包含 live metas（不携带 tombstones）。
+    ///
+    /// 用途：段合并/replace-base 时做“真·Tombstone GC”，让段文件尺寸随真实文件系统状态收敛。
+    pub fn export_segments_v6_compacted(&self) -> V6Segments {
+        let compact = PersistentIndex::new_with_roots(self.roots.clone());
+        self.for_each_live_meta(|m| compact.upsert_rename(m));
+        compact.export_segments_v6()
+    }
+
     pub fn export_segments_v6(&self) -> V6Segments {
         use std::io::Write;
 
@@ -942,6 +950,21 @@ impl PersistentIndex {
             let len: u32 = buf.len().try_into().unwrap_or(u32::MAX);
             postings_blob_bytes.write_all(&buf).expect("write to vec");
             entries.push((*tri, off, len));
+        }
+
+        // 能力哨兵：用于 mmap layer 区分“新段（全组件 trigram）”与“旧段（仅 basename trigram）”。
+        // - path 组件不允许包含 NUL，因此 [0,0,0] 不会与真实 trigram 冲突。
+        // - posting 置空即可（只用 key 存在性探测）。
+        const TRIGRAM_SENTINEL: [u8; 3] = [0, 0, 0];
+        if !tri_idx.contains_key(&TRIGRAM_SENTINEL) {
+            let mut buf = Vec::new();
+            RoaringBitmap::new()
+                .serialize_into(&mut buf)
+                .expect("write to vec");
+            let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
+            let len: u32 = buf.len().try_into().unwrap_or(u32::MAX);
+            postings_blob_bytes.write_all(&buf).expect("write to vec");
+            entries.push((TRIGRAM_SENTINEL, off, len));
         }
         entries.sort_by_key(|(tri, _, _)| *tri);
 
@@ -1219,16 +1242,8 @@ impl PersistentIndex {
     }
 
     fn remove_trigrams(&self, docid: DocId, path: &Path) {
-        use std::os::unix::ffi::OsStrExt;
-
-        let path_bytes = path.as_os_str().as_bytes();
-        let name_bytes = basename_bytes(path_bytes);
-        let name = std::str::from_utf8(name_bytes)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| String::from_utf8_lossy(name_bytes).into_owned());
-
         let mut tri_idx = self.trigram_index.write();
-        for tri in extract_trigrams(&name) {
+        for tri in component_trigrams(path) {
             if let Some(posting) = tri_idx.get_mut(&tri) {
                 posting.remove(docid);
                 if posting.is_empty() {
@@ -1239,16 +1254,8 @@ impl PersistentIndex {
     }
 
     fn insert_trigrams(&self, docid: DocId, path: &Path) {
-        use std::os::unix::ffi::OsStrExt;
-
-        let path_bytes = path.as_os_str().as_bytes();
-        let name_bytes = basename_bytes(path_bytes);
-        let name = std::str::from_utf8(name_bytes)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| String::from_utf8_lossy(name_bytes).into_owned());
-
         let mut tri_idx = self.trigram_index.write();
-        for tri in extract_trigrams(&name) {
+        for tri in component_trigrams(path) {
             tri_idx
                 .entry(tri)
                 .or_insert_with(RoaringBitmap::new)
@@ -1312,8 +1319,9 @@ impl PersistentIndex {
     }
 
     fn trigram_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringBitmap> {
-        let prefix = matcher.prefix()?;
-        let tris = query_trigrams(prefix);
+        let hint = matcher.literal_hint()?;
+        let s = String::from_utf8_lossy(hint);
+        let tris = query_trigrams(s.as_ref());
         if tris.is_empty() {
             return None;
         }
