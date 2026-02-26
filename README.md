@@ -8,7 +8,7 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前主线实现沿 v0.4.0 路线演进（语义锚定 + MergedView + LSM Hygiene）。
+> 当前主线实现沿 v0.4.3 路线演进（语义锚定 + MergedView + LSM Hygiene）。
 
 ## 核心能力
 
