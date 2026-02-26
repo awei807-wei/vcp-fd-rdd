@@ -24,6 +24,10 @@ const STATE_COMMITTED: u32 = 0x0000_0001;
 const STATE_INCOMPLETE: u32 = 0xFFFF_FFFF;
 const HEADER_SIZE: usize = 4 + 4 + 4 + 4 + 4; // magic + version + state + data_len + checksum
 
+// Safety guards: prevent memory DoS via corrupted headers/segments.
+const MAX_V6_MANIFEST_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+const MAX_V6_ROOTS_SEGMENT_BYTES: u64 = 1024 * 1024; // 1 MiB
+
 /// 原子快照存储（atomic replacement）
 ///
 /// 落盘流程（低峰值，允许 seek）：
@@ -145,9 +149,12 @@ fn align_up(v: usize, a: usize) -> usize {
 }
 
 fn encode_roots_segment(roots: &[PathBuf]) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
     let mut roots = roots.to_vec();
-    roots.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+    roots.sort_by(|a, b| {
+        a.as_os_str()
+            .as_encoded_bytes()
+            .cmp(b.as_os_str().as_encoded_bytes())
+    });
     roots.dedup();
     roots.retain(|p| p != Path::new("/"));
     roots.insert(0, PathBuf::from("/"));
@@ -156,7 +163,7 @@ fn encode_roots_segment(roots: &[PathBuf]) -> Vec<u8> {
     let count: u16 = roots.len().try_into().unwrap_or(u16::MAX);
     out.extend_from_slice(&count.to_le_bytes());
     for r in roots.iter().take(count as usize) {
-        let b = r.as_os_str().as_bytes();
+        let b = r.as_os_str().as_encoded_bytes();
         let len: u16 = b.len().try_into().unwrap_or(u16::MAX);
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&b[..len as usize]);
@@ -510,6 +517,11 @@ impl SnapshotStore {
         let manifest_len = u32::from_le_bytes(header[12..16].try_into()?) as usize;
         let manifest_checksum = u32::from_le_bytes(header[16..20].try_into()?);
 
+        if manifest_len > MAX_V6_MANIFEST_BYTES {
+            tracing::warn!("Snapshot v6 manifest too large ({} bytes), ignoring", manifest_len);
+            return Ok(None);
+        }
+
         if magic != MAGIC || !(version == VERSION_V6 || version == VERSION_V7) {
             return Ok(None);
         }
@@ -559,7 +571,14 @@ impl SnapshotStore {
         }
         let desc_base = 16;
         let desc_size = 32usize;
-        if manifest.len() < desc_base + seg_count * desc_size {
+        let Some(required_len) = seg_count
+            .checked_mul(desc_size)
+            .and_then(|v| v.checked_add(desc_base))
+        else {
+            tracing::warn!("Snapshot v6 manifest invalid seg_count");
+            return Ok(None);
+        };
+        if manifest.len() < required_len {
             tracing::warn!("Snapshot v6 manifest truncated");
             return Ok(None);
         }
@@ -641,6 +660,10 @@ impl SnapshotStore {
 
             // streaming checksum (avoid touching mmap pages at startup)
             let c = if d.kind == V6SegKind::Roots {
+                if d.len > MAX_V6_ROOTS_SEGMENT_BYTES {
+                    tracing::warn!("Snapshot v6 roots segment too large, ignoring snapshot");
+                    return Ok(None);
+                }
                 let bytes = read_file_range(&mut file, d.offset, d.len)?;
                 let c = if v7 {
                     let mut c = Crc32c::new();
@@ -1019,6 +1042,11 @@ const LSM_MANIFEST_MAGIC: u32 = 0x314D_534C; // "LSM1" little-endian
 const LSM_MANIFEST_VERSION: u32 = 3;
 const LSM_MANIFEST_HEADER_SIZE: usize = 4 + 4 + 4 + 4; // magic + ver + body_len + checksum
 
+// Safety guards: these values are read from disk; cap to avoid OOM on corrupted files.
+const MAX_LSM_MANIFEST_BODY_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+const MAX_LSM_DELETED_PATHS: usize = 500_000;
+const MAX_LSM_DELETED_TOTAL_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+
 #[derive(Clone, Debug, Default)]
 struct LsmManifest {
     next_id: u64,
@@ -1066,6 +1094,10 @@ fn lsm_decode_manifest_body(body: &[u8]) -> anyhow::Result<LsmManifest> {
     let next_id = u64::from_le_bytes(body[0..8].try_into()?);
     let base_id = u64::from_le_bytes(body[8..16].try_into()?);
     let n = u32::from_le_bytes(body[16..20].try_into()?) as usize;
+    let max_n = body.len().saturating_sub(20) / 8;
+    if n > max_n {
+        anyhow::bail!("LSM manifest body truncated");
+    }
     let mut delta_ids = Vec::with_capacity(n);
     let mut off = 20;
     for _ in 0..n {
@@ -1110,6 +1142,14 @@ fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
     let checksum = u32::from_le_bytes(hdr[12..16].try_into()?);
     if magic != LSM_MANIFEST_MAGIC || !(ver == 1 || ver == 2 || ver == LSM_MANIFEST_VERSION) {
         anyhow::bail!("LSM manifest magic/version mismatch");
+    }
+    if body_len > MAX_LSM_MANIFEST_BODY_BYTES {
+        anyhow::bail!("LSM manifest body too large: {}", body_len);
+    }
+    let file_len = f.metadata().map(|m| m.len() as usize).unwrap_or(usize::MAX);
+    let remaining = file_len.saturating_sub(LSM_MANIFEST_HEADER_SIZE);
+    if body_len > remaining {
+        anyhow::bail!("LSM manifest body truncated");
     }
     let mut body = vec![0u8; body_len];
     f.read_exact(&mut body)?;
@@ -1205,6 +1245,10 @@ fn lsm_read_deleted_paths(path: &Path) -> anyhow::Result<Vec<Vec<u8>>> {
     if magic != LSM_DEL_MAGIC || ver != LSM_DEL_VERSION {
         anyhow::bail!("LSM del magic/version mismatch");
     }
+    if count > MAX_LSM_DELETED_PATHS {
+        anyhow::bail!("LSM del too many paths: {}", count);
+    }
+    let mut total_bytes = 0usize;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let mut lenb = [0u8; 2];
@@ -1212,6 +1256,10 @@ fn lsm_read_deleted_paths(path: &Path) -> anyhow::Result<Vec<Vec<u8>>> {
             break;
         }
         let len = u16::from_le_bytes(lenb) as usize;
+        total_bytes = total_bytes.saturating_add(len);
+        if total_bytes > MAX_LSM_DELETED_TOTAL_BYTES {
+            anyhow::bail!("LSM del too large (total bytes exceeded)");
+        }
         let mut buf = vec![0u8; len];
         f.read_exact(&mut buf)?;
         out.push(buf);

@@ -75,15 +75,19 @@ impl MmapIndex {
             .unwrap_or(b"/");
         let mut out = Vec::with_capacity(root.len() + 1 + rel_bytes.len());
         out.extend_from_slice(root);
-        if !out.ends_with(b"/") {
-            out.push(b'/');
+        let needs_sep = if cfg!(windows) {
+            !out.ends_with(b"/") && !out.ends_with(b"\\")
+        } else {
+            !out.ends_with(b"/")
+        };
+        if needs_sep {
+            out.push(std::path::MAIN_SEPARATOR as u8);
         }
         out.extend_from_slice(rel_bytes);
         out
     }
 
     fn compose_abs_path(&self, root_id: u16, rel_bytes: &[u8]) -> PathBuf {
-        use std::os::unix::ffi::OsStringExt;
         let root = self
             .snap
             .roots
@@ -92,11 +96,16 @@ impl MmapIndex {
             .unwrap_or(b"/");
         let mut out = Vec::with_capacity(root.len() + 1 + rel_bytes.len());
         out.extend_from_slice(root);
-        if !out.ends_with(b"/") {
-            out.push(b'/');
+        let needs_sep = if cfg!(windows) {
+            !out.ends_with(b"/") && !out.ends_with(b"\\")
+        } else {
+            !out.ends_with(b"/")
+        };
+        if needs_sep {
+            out.push(std::path::MAIN_SEPARATOR as u8);
         }
         out.extend_from_slice(rel_bytes);
-        PathBuf::from(std::ffi::OsString::from_vec(out))
+        PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(out) })
     }
 
     fn meta_at(
@@ -589,16 +598,19 @@ impl MmapIndex {
     }
 
     pub fn roots_match(&self, expected_roots: &[PathBuf]) -> bool {
-        use std::os::unix::ffi::OsStrExt;
         let encoded = {
             let mut roots = expected_roots.to_vec();
-            roots.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+            roots.sort_by(|a, b| {
+                a.as_os_str()
+                    .as_encoded_bytes()
+                    .cmp(b.as_os_str().as_encoded_bytes())
+            });
             roots.dedup();
             roots.retain(|p| p != Path::new("/"));
             roots.insert(0, PathBuf::from("/"));
             roots
                 .into_iter()
-                .map(|p| p.as_os_str().as_bytes().to_vec())
+                .map(|p| p.as_os_str().as_encoded_bytes().to_vec())
                 .collect::<Vec<_>>()
         };
         self.snap.roots == encoded
@@ -762,8 +774,9 @@ mod tests {
         assert_eq!(r.len(), 2);
         let s0 = r[0].path.to_string_lossy();
         let s1 = r[1].path.to_string_lossy();
+        let dir_hit = format!("src{}a.txt", std::path::MAIN_SEPARATOR);
         assert!(
-            s0.contains("/src/a.txt") || s1.contains("/src/a.txt"),
+            s0.contains(&dir_hit) || s1.contains(&dir_hit),
             "must include dir-segment hit"
         );
         assert!(

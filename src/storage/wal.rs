@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -9,6 +8,10 @@ use crate::core::{EventRecord, EventType, FileIdentifier};
 
 const WAL_MAGIC: u32 = 0x314C_4157; // "WAL1"
 const WAL_VERSION: u32 = 2;
+
+// Safety guard: WAL records are expected to be small (path + metadata). Treat any huge length as
+// corruption to avoid memory DoS via `vec![0u8; len]`.
+const MAX_WAL_RECORD_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
 fn now_seal_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,11 +33,11 @@ fn crc32_simple(data: &[u8]) -> u32 {
 }
 
 fn encode_path(path: &Path) -> Vec<u8> {
-    path.as_os_str().as_bytes().to_vec()
+    path.as_os_str().as_encoded_bytes().to_vec()
 }
 
 fn decode_path(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    PathBuf::from(unsafe { OsString::from_encoded_bytes_unchecked(bytes.to_vec()) })
 }
 
 fn encode_file_id(id: &FileIdentifier) -> Vec<u8> {
@@ -453,6 +456,7 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, usize)> {
         return Ok((Vec::new(), 0));
     }
     let mut f = File::open(path)?;
+    let file_len = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
 
     let mut hdr = [0u8; 8];
     if f.read_exact(&mut hdr).is_err() {
@@ -466,18 +470,25 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, usize)> {
 
     let mut out = Vec::new();
     let mut truncated_tail = 0usize;
+    let mut pos: u64 = 8; // header consumed
     loop {
         let mut lb = [0u8; 8];
         if let Err(_) = f.read_exact(&mut lb) {
             break;
         }
+        pos = pos.saturating_add(8);
         let len = u32::from_le_bytes(lb[0..4].try_into()?) as usize;
         let crc = u32::from_le_bytes(lb[4..8].try_into()?);
+        if len > MAX_WAL_RECORD_BYTES || pos.saturating_add(len as u64) > file_len {
+            truncated_tail += 1;
+            break;
+        }
         let mut buf = vec![0u8; len];
         if let Err(_) = f.read_exact(&mut buf) {
             truncated_tail += 1;
             break;
         }
+        pos = pos.saturating_add(len as u64);
         if crc32_simple(&buf) != crc {
             // 校验失败：视为截断/损坏，停止读取（保守）。
             truncated_tail += 1;

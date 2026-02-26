@@ -16,6 +16,43 @@ pub struct FileKey {
     pub ino: u64,
 }
 
+impl FileKey {
+    pub fn from_path_and_metadata(
+        path: &std::path::Path,
+        meta: &std::fs::Metadata,
+    ) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            return Some(Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            });
+        }
+
+        #[cfg(windows)]
+        {
+            use std::hash::{Hash, Hasher};
+
+            // Windows stable std does not expose a true inode/file-id for rename-stable identity.
+            // Fall back to a path-based key to keep the project buildable on Windows. This degrades
+            // rename semantics to delete+create (still correct for query results).
+            let _ = meta;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            path.as_os_str().as_encoded_bytes().hash(&mut hasher);
+            let h = hasher.finish();
+            return Some(Self { dev: 0, ino: h });
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            let _ = meta;
+            None
+        }
+    }
+}
+
 /// FileKeyMap 段的条目：稳定身份 -> docid（仅用于磁盘结晶与 mmap 反查）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "rkyv", derive(Archive, RkyvSerialize, RkyvDeserialize))]
@@ -116,7 +153,6 @@ impl BuildRDD<FileMeta> for FsScanRDD {
 
     fn compute(&self, part: &Partition) -> Box<dyn Iterator<Item = FileMeta> + Send> {
         use ignore::WalkBuilder;
-        use std::os::unix::fs::MetadataExt;
 
         let walker = WalkBuilder::new(&part.root)
             .max_depth(Some(part.max_depth))
@@ -130,11 +166,9 @@ impl BuildRDD<FileMeta> for FsScanRDD {
             .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
             .filter_map(|e| {
                 let meta = e.metadata().ok()?;
+                let file_key = FileKey::from_path_and_metadata(e.path(), &meta)?;
                 Some(FileMeta {
-                    file_key: FileKey {
-                        dev: meta.dev(),
-                        ino: meta.ino(),
-                    },
+                    file_key,
                     path: e.path().to_path_buf(),
                     size: meta.len(),
                     mtime: meta.modified().ok(),
@@ -151,7 +185,6 @@ fn scan_partition_parallel(
     sink: Arc<dyn Fn(FileMeta) + Send + Sync>,
 ) {
     use ignore::{WalkBuilder, WalkState};
-    use std::os::unix::fs::MetadataExt;
 
     let walker = WalkBuilder::new(&part.root)
         .max_depth(Some(part.max_depth))
@@ -173,12 +206,12 @@ fn scan_partition_parallel(
             let Ok(meta) = e.metadata() else {
                 return WalkState::Continue;
             };
+            let Some(file_key) = FileKey::from_path_and_metadata(e.path(), &meta) else {
+                return WalkState::Continue;
+            };
 
             sink(FileMeta {
-                file_key: FileKey {
-                    dev: meta.dev(),
-                    ino: meta.ino(),
-                },
+                file_key,
                 path: e.path().to_path_buf(),
                 size: meta.len(),
                 mtime: meta.modified().ok(),
