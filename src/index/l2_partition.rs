@@ -72,9 +72,7 @@ impl PathArena {
     }
 
     pub fn push_path(&mut self, path: &Path) -> Option<(u32, u16)> {
-        use std::os::unix::ffi::OsStrExt;
-
-        let bytes = path.as_os_str().as_bytes();
+        let bytes = path.as_os_str().as_encoded_bytes();
         self.push_bytes(bytes)
     }
 
@@ -85,10 +83,10 @@ impl PathArena {
     }
 
     pub fn get_path_buf(&self, off: u32, len: u16) -> Option<PathBuf> {
-        use std::os::unix::ffi::OsStringExt;
-
         let bytes = self.get_bytes(off, len)?.to_vec();
-        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+        Some(PathBuf::from(unsafe {
+            std::ffi::OsString::from_encoded_bytes_unchecked(bytes)
+        }))
     }
 }
 
@@ -300,8 +298,7 @@ impl PersistentIndex {
         let roots_bytes = roots
             .iter()
             .map(|p| {
-                use std::os::unix::ffi::OsStrExt;
-                p.as_os_str().as_bytes().to_vec()
+                p.as_os_str().as_encoded_bytes().to_vec()
             })
             .collect::<Vec<_>>();
 
@@ -718,18 +715,16 @@ impl PersistentIndex {
 
     /// 批量应用事件
     pub fn apply_events(&self, events: &[EventRecord]) {
-        use std::os::unix::fs::MetadataExt;
-
         for ev in events {
             match &ev.event_type {
                 EventType::Create | EventType::Modify => {
                     if let Some(p) = ev.best_path() {
                         if let Ok(meta) = std::fs::metadata(p) {
+                            let Some(file_key) = FileKey::from_path_and_metadata(p, &meta) else {
+                                continue;
+                            };
                             self.upsert(FileMeta {
-                                file_key: FileKey {
-                                    dev: meta.dev(),
-                                    ino: meta.ino(),
-                                },
+                                file_key,
                                 path: p.to_path_buf(),
                                 size: meta.len(),
                                 mtime: meta.modified().ok(),
@@ -752,7 +747,7 @@ impl PersistentIndex {
                                 }
                             } {
                                 if let Ok(meta) = std::fs::metadata(&path) {
-                                    if meta.dev() == fk.dev && meta.ino() == fk.ino {
+                                    if FileKey::from_path_and_metadata(&path, &meta) == Some(fk) {
                                         self.upsert(FileMeta {
                                             file_key: fk,
                                             path,
@@ -843,11 +838,11 @@ impl PersistentIndex {
 
                         if let Some(to_path) = to_path {
                             if let Ok(meta) = std::fs::metadata(&to_path) {
+                                let Some(file_key) = FileKey::from_path_and_metadata(&to_path, &meta) else {
+                                    continue;
+                                };
                                 self.upsert(FileMeta {
-                                    file_key: FileKey {
-                                        dev: meta.dev(),
-                                        ino: meta.ino(),
-                                    },
+                                    file_key,
                                     path: to_path,
                                     size: meta.len(),
                                     mtime: meta.modified().ok(),
@@ -1207,8 +1202,7 @@ impl PersistentIndex {
             (0, rel)
         };
 
-        use std::os::unix::ffi::OsStrExt;
-        let rel_bytes = rel_path.as_os_str().as_bytes().to_vec();
+        let rel_bytes = rel_path.as_os_str().as_encoded_bytes().to_vec();
         let root_id: u16 = root_id_usize.try_into().unwrap_or(0);
         (root_id, rel_bytes)
     }
@@ -1222,17 +1216,23 @@ impl PersistentIndex {
 
         let mut out = Vec::with_capacity(root.len() + 1 + rel_bytes.len());
         out.extend_from_slice(root);
-        if !out.ends_with(b"/") {
-            out.push(b'/');
+        let needs_sep = if cfg!(windows) {
+            !out.ends_with(b"/") && !out.ends_with(b"\\")
+        } else {
+            !out.ends_with(b"/")
+        };
+        if needs_sep {
+            out.push(std::path::MAIN_SEPARATOR as u8);
         }
         out.extend_from_slice(rel_bytes);
         out
     }
 
     fn compose_abs_path_buf(&self, root_id: u16, rel_bytes: &[u8]) -> Option<PathBuf> {
-        use std::os::unix::ffi::OsStringExt;
         let abs = self.compose_abs_path_bytes(root_id, rel_bytes);
-        Some(PathBuf::from(std::ffi::OsString::from_vec(abs)))
+        Some(PathBuf::from(unsafe {
+            std::ffi::OsString::from_encoded_bytes_unchecked(abs)
+        }))
     }
 
     fn absolute_path_buf(&self, root_id: u16, off: u32, len: u16) -> Option<PathBuf> {
@@ -1264,9 +1264,7 @@ impl PersistentIndex {
     }
 
     fn insert_path_hash(&self, docid: DocId, path: &Path) {
-        use std::os::unix::ffi::OsStrExt;
-
-        let bytes = path.as_os_str().as_bytes();
+        let bytes = path.as_os_str().as_encoded_bytes();
         let h = path_hash_bytes(bytes);
         let mut map = self.path_hash_to_id.write();
         map.entry(h)
@@ -1275,9 +1273,7 @@ impl PersistentIndex {
     }
 
     fn remove_path_hash(&self, docid: DocId, path: &Path) {
-        use std::os::unix::ffi::OsStrExt;
-
-        let bytes = path.as_os_str().as_bytes();
+        let bytes = path.as_os_str().as_encoded_bytes();
         let h = path_hash_bytes(bytes);
         let mut map = self.path_hash_to_id.write();
         if let Some(v) = map.get_mut(&h) {
@@ -1289,9 +1285,7 @@ impl PersistentIndex {
     }
 
     fn lookup_docid_by_path(&self, path: &Path) -> Option<DocId> {
-        use std::os::unix::ffi::OsStrExt;
-
-        let bytes = path.as_os_str().as_bytes();
+        let bytes = path.as_os_str().as_encoded_bytes();
         let h = path_hash_bytes(bytes);
 
         // 先复制候选 DocId（避免同时持有 path_hash_to_id 与 metas/arena 的锁）
@@ -1430,10 +1424,12 @@ fn path_hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 fn normalize_roots_with_fallback(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-
     // 去重 + 排序，保证 root_id 的解释在“同一组 roots”下稳定。
-    roots.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+    roots.sort_by(|a, b| {
+        a.as_os_str()
+            .as_encoded_bytes()
+            .cmp(b.as_os_str().as_encoded_bytes())
+    });
     roots.dedup();
 
     // root_id=0 固定为 "/"（用于兜底匹配与快照兼容）。

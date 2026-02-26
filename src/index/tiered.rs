@@ -775,8 +775,6 @@ impl TieredIndex {
             return results;
         }
 
-        use std::os::unix::ffi::OsStrExt;
-
         // blocked：path 维度的屏蔽集合（delete + 已输出路径）
         // - delete 语义仍以路径为准（LSM sidecar `.del`），用于屏蔽更老 segment 的同路径记录
         // - 同一路径只返回最新版本：用于处理 inode 复用/旧段残留等场景（即使 FileKey 不同也应屏蔽）
@@ -800,7 +798,7 @@ impl TieredIndex {
                 continue;
             }
             let Some(r) = l2.get_meta(key) else { continue };
-            let pb = r.path.as_os_str().as_bytes();
+            let pb = r.path.as_os_str().as_encoded_bytes();
             if blocked.contains(pb) {
                 continue;
             }
@@ -821,7 +819,7 @@ impl TieredIndex {
                 let Some(r) = layer.idx.get_meta(key) else {
                     continue;
                 };
-                let pb = r.path.as_os_str().as_bytes();
+                let pb = r.path.as_os_str().as_encoded_bytes();
                 if blocked.contains(pb) {
                     continue;
                 }
@@ -890,7 +888,6 @@ impl TieredIndex {
             }
         }
 
-        use std::os::unix::ffi::OsStrExt;
 
         // 若 rebuild 在进行：先缓冲 pending 事件；并在持锁期间捕获当前 l2 指针，
         // 避免切换窗口导致“事件已缓冲但应用到了新索引”而重复回放。
@@ -936,7 +933,7 @@ impl TieredIndex {
                         // FID-only 且无路径：阶段 1 保守跳过 overlay 更新（后续 fanotify 反查完善）。
                         continue;
                     };
-                    let path_bytes = path.as_os_str().as_bytes();
+                    let path_bytes = path.as_os_str().as_encoded_bytes();
                     match &ev.event_type {
                         EventType::Delete => {
                             let _ = ov.upserted_paths.remove(path_bytes);
@@ -952,7 +949,7 @@ impl TieredIndex {
                         } => {
                             let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
                             if let Some(from_path) = from_best {
-                                let from_bytes = from_path.as_os_str().as_bytes();
+                                let from_bytes = from_path.as_os_str().as_encoded_bytes();
                                 let _ = ov.upserted_paths.remove(from_bytes);
                                 let _ = ov.deleted_paths.insert(from_bytes);
                             }
@@ -1120,7 +1117,12 @@ impl TieredIndex {
 
     /// 定期快照循环
     pub async fn snapshot_loop(self: Arc<Self>, store: Arc<SnapshotStore>, interval_secs: u64) {
-        let interval = std::time::Duration::from_secs(interval_secs);
+        // interval_secs==0 is treated as "disabled" to avoid a busy loop.
+        let interval = if interval_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(interval_secs))
+        };
         loop {
             // flush 请求优先：避免 overlay 长期积压。
             if self.flush_requested.load(Ordering::Acquire) {
@@ -1132,9 +1134,16 @@ impl TieredIndex {
                 continue;
             }
 
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {},
-                _ = self.flush_notify.notified() => {},
+            match interval {
+                Some(interval) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval) => {},
+                        _ = self.flush_notify.notified() => {},
+                    }
+                }
+                None => {
+                    self.flush_notify.notified().await;
+                }
             }
 
             if let Err(e) = self.snapshot_now(&store).await {
@@ -1179,14 +1188,13 @@ impl TieredIndex {
 
         let rebuild = {
             use std::mem::size_of;
-            use std::os::unix::ffi::OsStrExt;
 
             let st = self.rebuild_state.lock();
             let mut key_bytes = 0u64;
             let mut from_bytes = 0u64;
             for (k, v) in st.pending_events.iter() {
                 key_bytes += match k {
-                    FileIdentifier::Path(p) => p.as_os_str().as_bytes().len() as u64,
+                    FileIdentifier::Path(p) => p.as_os_str().as_encoded_bytes().len() as u64,
                     FileIdentifier::Fid { .. } => 16,
                 };
                 if let EventType::Rename {
@@ -1195,15 +1203,15 @@ impl TieredIndex {
                 } = &v.event_type
                 {
                     from_bytes += match from {
-                        FileIdentifier::Path(p) => p.as_os_str().as_bytes().len() as u64,
+                        FileIdentifier::Path(p) => p.as_os_str().as_encoded_bytes().len() as u64,
                         FileIdentifier::Fid { .. } => 16,
                     };
                     if let Some(p) = from_path_hint {
-                        from_bytes += p.as_os_str().as_bytes().len() as u64;
+                        from_bytes += p.as_os_str().as_encoded_bytes().len() as u64;
                     }
                 }
                 if let Some(p) = &v.path_hint {
-                    key_bytes += p.as_os_str().as_bytes().len() as u64;
+                    key_bytes += p.as_os_str().as_encoded_bytes().len() as u64;
                 }
             }
             let cap = st.pending_events.capacity();
@@ -1239,14 +1247,20 @@ impl TieredIndex {
         pipeline_stats_fn: Arc<dyn Fn() -> EventPipelineStats + Send + Sync>,
         interval_secs: u64,
     ) {
+        if interval_secs == 0 {
+            tracing::info!("Memory reporting disabled (interval_secs=0)");
+            return;
+        }
         // 首次报告延迟 5 秒
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let interval = std::time::Duration::from_secs(interval_secs);
 
         loop {
             let stats = pipeline_stats_fn();
             let report = self.memory_report(stats);
             tracing::info!("\n{}", report);
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+            tokio::time::sleep(interval).await;
         }
     }
 
@@ -1264,10 +1278,16 @@ impl TieredIndex {
 
         let idx = self.clone();
         tokio::spawn(async move {
+            struct CompactionInProgressGuard(Arc<TieredIndex>);
+            impl Drop for CompactionInProgressGuard {
+                fn drop(&mut self) {
+                    self.0.compaction_in_progress.store(false, Ordering::Release);
+                }
+            }
+            let _guard = CompactionInProgressGuard(idx.clone());
             if let Err(e) = idx.compact_layers(store_path, layers).await {
                 tracing::error!("Compaction failed: {}", e);
             }
-            idx.compaction_in_progress.store(false, Ordering::Release);
         });
     }
 
@@ -1364,8 +1384,7 @@ impl TieredIndex {
 }
 
 fn pathbuf_from_bytes(bytes: &[u8]) -> PathBuf {
-    use std::os::unix::ffi::OsStringExt;
-    PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
+    PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes.to_vec()) })
 }
 
 fn lsm_dir_from_store_path(path: &PathBuf) -> PathBuf {
@@ -1545,7 +1564,6 @@ mod tests {
     async fn lsm_layering_delete_blocks_base() {
         use crate::core::{FileKey, FileMeta};
         use crate::index::PersistentIndex;
-        use std::os::unix::ffi::OsStrExt;
 
         let root = unique_tmp_dir("lsm-del");
         std::fs::create_dir_all(&root).unwrap();
@@ -1577,7 +1595,7 @@ mod tests {
             size: 1,
             mtime: None,
         });
-        let deleted = vec![alpha.as_os_str().as_bytes().to_vec()];
+        let deleted = vec![alpha.as_os_str().as_encoded_bytes().to_vec()];
         store
             .lsm_append_delta_v6(
                 &delta_idx.export_segments_v6(),
@@ -1600,7 +1618,6 @@ mod tests {
     async fn lsm_delete_then_recreate_prefers_newest() {
         use crate::core::{FileKey, FileMeta};
         use crate::index::PersistentIndex;
-        use std::os::unix::ffi::OsStrExt;
 
         let root = unique_tmp_dir("lsm-recreate");
         std::fs::create_dir_all(&root).unwrap();
@@ -1624,7 +1641,7 @@ mod tests {
 
         // delta1: delete(alpha)
         let d1 = PersistentIndex::new_with_roots(vec![root.clone()]);
-        let deleted = vec![alpha.as_os_str().as_bytes().to_vec()];
+        let deleted = vec![alpha.as_os_str().as_encoded_bytes().to_vec()];
         store
             .lsm_append_delta_v6(&d1.export_segments_v6(), &deleted, &[root.clone()], 0)
             .await
@@ -1704,7 +1721,6 @@ mod tests {
     async fn query_rename_from_tombstone_blocks_old_path() {
         use crate::core::{FileKey, FileMeta};
         use crate::index::PersistentIndex;
-        use std::os::unix::ffi::OsStrExt;
 
         let root = unique_tmp_dir("q-rename-tombstone");
         std::fs::create_dir_all(&root).unwrap();
@@ -1737,7 +1753,7 @@ mod tests {
             size: 1,
             mtime: None,
         });
-        let deleted = vec![old.as_os_str().as_bytes().to_vec()];
+        let deleted = vec![old.as_os_str().as_encoded_bytes().to_vec()];
         store
             .lsm_append_delta_v6(&seg2.export_segments_v6(), &deleted, &[root.clone()], 0)
             .await
