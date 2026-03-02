@@ -8,7 +8,7 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前主线实现沿 v0.4.3 路线演进（语义锚定 + MergedView + LSM Hygiene）。
+> 当前主线实现沿 v0.4.4 路线演进（语义锚定 + MergedView + LSM Hygiene）。
 
 ## 核心能力
 
@@ -17,6 +17,13 @@
 - 持久化：mmap 段式容器 + 目录化 LSM（`index.d/`）+ `events.wal` 增量回放
 - 物理结界：段与 manifest 读前流式校验（v7=CRC32C），避免 bit rot 触发未定义行为
 - 观测闭环：定期输出 MemoryReport（RSS + smaps_rollup + page faults）
+
+## v0.4.4 更新
+
+- 安全性：移除路径解码中的不安全转换，避免损坏输入触发未定义行为
+- 一致性：LSM 加载改为“任一段或 `.del` sidecar 异常即整体拒绝”，避免部分加载导致静默漏数
+- 稳定性：`event_channel_size=0` 现在会明确报错，不再在运行时 panic
+- 测试：新增 LSM 部分损坏/sidecar 损坏与 channel 参数防御测试
 
 ## 架构概览
 

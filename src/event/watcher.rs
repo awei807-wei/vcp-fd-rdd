@@ -14,6 +14,9 @@ impl EventWatcher {
         channel_size: usize,
         overflow_drops: Arc<AtomicU64>,
     ) -> anyhow::Result<(mpsc::Receiver<notify::Event>, notify::RecommendedWatcher)> {
+        if channel_size == 0 {
+            anyhow::bail!("event channel_size must be >= 1");
+        }
         let (tx, rx) = mpsc::channel(channel_size);
 
         let watcher = notify::RecommendedWatcher::new(
@@ -36,6 +39,19 @@ impl EventWatcher {
 
         // 注意：watcher 必须由调用方持有，否则会被 drop
         Ok((rx, watcher))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_zero_channel_size() {
+        let drops = Arc::new(AtomicU64::new(0));
+        let roots: Vec<std::path::PathBuf> = Vec::new();
+        let res = EventWatcher::start(&roots, 0, drops);
+        assert!(res.is_err());
     }
 }
 

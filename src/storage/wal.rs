@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -36,8 +35,21 @@ fn encode_path(path: &Path) -> Vec<u8> {
     path.as_os_str().as_encoded_bytes().to_vec()
 }
 
+fn pathbuf_from_encoded_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        return PathBuf::from(OsString::from_vec(bytes.to_vec()));
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
 fn decode_path(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(unsafe { OsString::from_encoded_bytes_unchecked(bytes.to_vec()) })
+    pathbuf_from_encoded_bytes(bytes)
 }
 
 fn encode_file_id(id: &FileIdentifier) -> Vec<u8> {
