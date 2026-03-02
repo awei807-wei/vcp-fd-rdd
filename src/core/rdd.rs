@@ -18,7 +18,7 @@ pub struct FileKey {
 
 impl FileKey {
     pub fn from_path_and_metadata(
-        path: &std::path::Path,
+        _path: &std::path::Path,
         meta: &std::fs::Metadata,
     ) -> Option<Self> {
         #[cfg(unix)]
@@ -39,7 +39,7 @@ impl FileKey {
             // rename semantics to delete+create (still correct for query results).
             let _ = meta;
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            path.as_os_str().as_encoded_bytes().hash(&mut hasher);
+            _path.as_os_str().as_encoded_bytes().hash(&mut hasher);
             let h = hasher.finish();
             return Some(Self { dev: 0, ino: h });
         }

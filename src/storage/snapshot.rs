@@ -518,7 +518,10 @@ impl SnapshotStore {
         let manifest_checksum = u32::from_le_bytes(header[16..20].try_into()?);
 
         if manifest_len > MAX_V6_MANIFEST_BYTES {
-            tracing::warn!("Snapshot v6 manifest too large ({} bytes), ignoring", manifest_len);
+            tracing::warn!(
+                "Snapshot v6 manifest too large ({} bytes), ignoring",
+                manifest_len
+            );
             return Ok(None);
         }
 
@@ -1285,10 +1288,23 @@ impl SnapshotStore {
             let snap =
                 Self::load_v6_mmap_from_path_if_valid(&self.lsm_seg_db_path(id), expected_roots)?;
             let Some(snap) = snap else {
+                tracing::warn!(
+                    "LSM base segment corrupted or invalid, rejecting LSM: id={}",
+                    id
+                );
                 return Ok(None);
             };
-            let deleted_paths =
-                lsm_read_deleted_paths(&self.lsm_seg_del_path(id)).unwrap_or_default();
+            let deleted_paths = match lsm_read_deleted_paths(&self.lsm_seg_del_path(id)) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "LSM base tombstone sidecar invalid, rejecting LSM: id={} err={}",
+                        id,
+                        e
+                    );
+                    return Ok(None);
+                }
+            };
             base = Some(LsmSegmentLoaded {
                 id,
                 snap,
@@ -1302,13 +1318,22 @@ impl SnapshotStore {
                 Self::load_v6_mmap_from_path_if_valid(&self.lsm_seg_db_path(id), expected_roots)?;
             let Some(snap) = snap else {
                 tracing::warn!(
-                    "LSM delta segment corrupted or invalid, skipping: id={}",
+                    "LSM delta segment corrupted or invalid, rejecting LSM: id={}",
                     id
                 );
-                continue;
+                return Ok(None);
             };
-            let deleted_paths =
-                lsm_read_deleted_paths(&self.lsm_seg_del_path(id)).unwrap_or_default();
+            let deleted_paths = match lsm_read_deleted_paths(&self.lsm_seg_del_path(id)) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "LSM delta tombstone sidecar invalid, rejecting LSM: id={} err={}",
+                        id,
+                        e
+                    );
+                    return Ok(None);
+                }
+            };
             deltas.push(LsmSegmentLoaded {
                 id,
                 snap,
@@ -1624,6 +1649,73 @@ mod tests {
 
         let snap = store.load_v6_mmap_if_valid(&[root.clone()]).unwrap();
         assert!(snap.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_lsm_rejects_partial_delta_set() {
+        let root = unique_tmp_dir("lsm-partial");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SnapshotStore::new(root.join("index.db"));
+
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        let p1 = root.join("a.txt");
+        std::fs::write(&p1, b"a").unwrap();
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: p1,
+            size: 1,
+            mtime: None,
+        });
+        let base = idx.export_segments_v6();
+        store
+            .lsm_replace_base_v6(&base, None, &[root.clone()], 0)
+            .await
+            .unwrap();
+
+        let delta_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        let p2 = root.join("b.txt");
+        std::fs::write(&p2, b"b").unwrap();
+        delta_idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 2 },
+            path: p2,
+            size: 1,
+            mtime: None,
+        });
+        let delta = delta_idx.export_segments_v6();
+        let appended = store
+            .lsm_append_delta_v6(&delta, &[], &[root.clone()], 0)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(store.lsm_seg_db_path(appended.id)).unwrap();
+        let loaded = store.load_lsm_if_valid(&[root.clone()]).unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_lsm_rejects_invalid_del_sidecar() {
+        let root = unique_tmp_dir("lsm-del-invalid");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SnapshotStore::new(root.join("index.db"));
+
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        let p1 = root.join("a.txt");
+        std::fs::write(&p1, b"a").unwrap();
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: p1,
+            size: 1,
+            mtime: None,
+        });
+        let segs = idx.export_segments_v6();
+        let appended = store
+            .lsm_append_delta_v6(&segs, &[], &[root.clone()], 0)
+            .await
+            .unwrap();
+
+        std::fs::write(store.lsm_seg_del_path(appended.id), b"bad-sidecar").unwrap();
+        let loaded = store.load_lsm_if_valid(&[root.clone()]).unwrap();
+        assert!(loaded.is_none());
     }
 
     #[test]

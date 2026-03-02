@@ -15,6 +15,19 @@ use crate::stats::L2Stats;
 /// Trigram：3 字节子串，用于倒排索引加速查询
 type Trigram = [u8; 3];
 
+fn pathbuf_from_encoded_vec(bytes: Vec<u8>) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        return PathBuf::from(OsString::from_vec(bytes));
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
 /// DocId：L2 内部紧凑文档编号（posting 的元素类型）
 pub type DocId = u32;
 
@@ -84,9 +97,7 @@ impl PathArena {
 
     pub fn get_path_buf(&self, off: u32, len: u16) -> Option<PathBuf> {
         let bytes = self.get_bytes(off, len)?.to_vec();
-        Some(PathBuf::from(unsafe {
-            std::ffi::OsString::from_encoded_bytes_unchecked(bytes)
-        }))
+        Some(pathbuf_from_encoded_vec(bytes))
     }
 }
 
@@ -297,9 +308,7 @@ impl PersistentIndex {
         let roots = normalize_roots_with_fallback(roots);
         let roots_bytes = roots
             .iter()
-            .map(|p| {
-                p.as_os_str().as_encoded_bytes().to_vec()
-            })
+            .map(|p| p.as_os_str().as_encoded_bytes().to_vec())
             .collect::<Vec<_>>();
 
         Self {
@@ -838,7 +847,9 @@ impl PersistentIndex {
 
                         if let Some(to_path) = to_path {
                             if let Ok(meta) = std::fs::metadata(&to_path) {
-                                let Some(file_key) = FileKey::from_path_and_metadata(&to_path, &meta) else {
+                                let Some(file_key) =
+                                    FileKey::from_path_and_metadata(&to_path, &meta)
+                                else {
                                     continue;
                                 };
                                 self.upsert(FileMeta {
@@ -1230,9 +1241,7 @@ impl PersistentIndex {
 
     fn compose_abs_path_buf(&self, root_id: u16, rel_bytes: &[u8]) -> Option<PathBuf> {
         let abs = self.compose_abs_path_bytes(root_id, rel_bytes);
-        Some(PathBuf::from(unsafe {
-            std::ffi::OsString::from_encoded_bytes_unchecked(abs)
-        }))
+        Some(pathbuf_from_encoded_vec(abs))
     }
 
     fn absolute_path_buf(&self, root_id: u16, off: u32, len: u16) -> Option<PathBuf> {

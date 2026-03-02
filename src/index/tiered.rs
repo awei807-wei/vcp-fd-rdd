@@ -888,7 +888,6 @@ impl TieredIndex {
             }
         }
 
-
         // 若 rebuild 在进行：先缓冲 pending 事件；并在持锁期间捕获当前 l2 指针，
         // 避免切换窗口导致“事件已缓冲但应用到了新索引”而重复回放。
         let l2 = {
@@ -1281,7 +1280,9 @@ impl TieredIndex {
             struct CompactionInProgressGuard(Arc<TieredIndex>);
             impl Drop for CompactionInProgressGuard {
                 fn drop(&mut self) {
-                    self.0.compaction_in_progress.store(false, Ordering::Release);
+                    self.0
+                        .compaction_in_progress
+                        .store(false, Ordering::Release);
                 }
             }
             let _guard = CompactionInProgressGuard(idx.clone());
@@ -1384,7 +1385,16 @@ impl TieredIndex {
 }
 
 fn pathbuf_from_bytes(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes.to_vec()) })
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        return PathBuf::from(OsString::from_vec(bytes.to_vec()));
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 fn lsm_dir_from_store_path(path: &PathBuf) -> PathBuf {
