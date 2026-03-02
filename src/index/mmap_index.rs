@@ -26,6 +26,19 @@ const FKM_HDR_SIZE: usize = 8;
 const FKM_FLAG_LEGACY: u16 = 0;
 const FKM_FLAG_RKYV: u16 = 1;
 
+fn pathbuf_from_encoded_vec(bytes: Vec<u8>) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        return PathBuf::from(OsString::from_vec(bytes));
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
 pub struct MmapIndex {
     snap: Arc<MmapSnapshotV6>,
     tomb_cache: parking_lot::Mutex<Option<RoaringBitmap>>,
@@ -105,7 +118,7 @@ impl MmapIndex {
             out.push(std::path::MAIN_SEPARATOR as u8);
         }
         out.extend_from_slice(rel_bytes);
-        PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(out) })
+        pathbuf_from_encoded_vec(out)
     }
 
     fn meta_at(
