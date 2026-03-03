@@ -86,6 +86,7 @@ impl EventPipeline {
 
         let index = self.index.clone();
         let debounce_ms = self.debounce_ms;
+        let channel_size = self.channel_size;
         let total_events = self.total_events.clone();
         let last_batch_size = self.last_batch_size.clone();
         let overflow_drops_seen = overflow_drops.clone();
@@ -99,6 +100,8 @@ impl EventPipeline {
             let mut last_rebuild_at =
                 tokio::time::Instant::now() - std::time::Duration::from_secs(3600);
             let rebuild_cooldown = std::time::Duration::from_secs(60);
+            let overflow_rebuild_delta_threshold =
+                (channel_size as u64).saturating_mul(2).max(1024);
             let mut raw_events: Vec<notify::Event> = Vec::with_capacity(256);
             let mut merge_scratch = MergeScratch::default();
 
@@ -153,11 +156,17 @@ impl EventPipeline {
                 // 如果发生过 channel overflow，索引增量更新可能已经丢失事件，必须触发兜底重建。
                 // 为避免风暴下频繁重建，这里加一个最小冷却时间。
                 let cur_overflow = overflow_drops_seen.load(Ordering::Relaxed);
-                if cur_overflow > last_overflow_handled
+                let delta = cur_overflow.saturating_sub(last_overflow_handled);
+                if delta >= overflow_rebuild_delta_threshold
                     && last_rebuild_at.elapsed() >= rebuild_cooldown
                 {
                     last_overflow_handled = cur_overflow;
                     last_rebuild_at = tokio::time::Instant::now();
+                    tracing::warn!(
+                        "Event overflow delta reached threshold: delta={} threshold={}, triggering rebuild",
+                        delta,
+                        overflow_rebuild_delta_threshold
+                    );
                     index.spawn_rebuild("event channel overflow");
                 }
             }
