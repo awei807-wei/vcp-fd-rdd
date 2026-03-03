@@ -49,6 +49,14 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     report_interval_secs: u64,
 
+    /// RSS trim 检查间隔（秒，0=禁用）
+    #[arg(long, default_value_t = 300)]
+    trim_interval_secs: u64,
+
+    /// 触发 trim 的 Private_Dirty 阈值（MB，0=禁用）
+    #[arg(long, default_value_t = 128)]
+    trim_pd_threshold_mb: u64,
+
     /// watcher 事件 channel 容量（越大越不容易 overflow，但会占用更多内存）
     #[arg(long, default_value_t = 4096)]
     event_channel_size: usize,
@@ -174,6 +182,18 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             report_index
                 .memory_report_loop(stats_fn, report_interval_secs)
+                .await;
+        });
+    }
+
+    // 8.5) 启动条件性 RSS trim 循环（按 smaps Private_Dirty 阈值触发）
+    {
+        let trim_index = index.clone();
+        let trim_interval_secs = args.trim_interval_secs;
+        let trim_pd_threshold_mb = args.trim_pd_threshold_mb;
+        tokio::spawn(async move {
+            trim_index
+                .rss_trim_loop(trim_interval_secs, trim_pd_threshold_mb)
                 .await;
         });
     }
