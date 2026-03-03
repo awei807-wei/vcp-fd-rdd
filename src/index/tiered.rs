@@ -339,7 +339,7 @@ fn maybe_trim_rss() {}
 struct DiskLayer {
     id: u64,
     idx: Arc<MmapIndex>,
-    deleted_paths: Vec<Vec<u8>>,
+    deleted_paths: Arc<Vec<Vec<u8>>>,
 }
 
 #[derive(Debug)]
@@ -487,14 +487,14 @@ impl TieredIndex {
                 layers.push(DiskLayer {
                     id: b.id,
                     idx: Arc::new(MmapIndex::new(b.snap)),
-                    deleted_paths: b.deleted_paths,
+                    deleted_paths: Arc::new(b.deleted_paths),
                 });
             }
             for d in lsm.deltas {
                 layers.push(DiskLayer {
                     id: d.id,
                     idx: Arc::new(MmapIndex::new(d.snap)),
-                    deleted_paths: d.deleted_paths,
+                    deleted_paths: Arc::new(d.deleted_paths),
                 });
             }
 
@@ -515,7 +515,7 @@ impl TieredIndex {
             let base = DiskLayer {
                 id: 0,
                 idx: Arc::new(MmapIndex::new(snap)),
-                deleted_paths: Vec::new(),
+                deleted_paths: Arc::new(Vec::new()),
             };
             let idx = Self::new(
                 l1,
@@ -781,21 +781,34 @@ impl TieredIndex {
         // blocked：path 维度的屏蔽集合（delete + 已输出路径）
         // - delete 语义仍以路径为准（LSM sidecar `.del`），用于屏蔽更老 segment 的同路径记录
         // - 同一路径只返回最新版本：用于处理 inode 复用/旧段残留等场景（即使 FileKey 不同也应屏蔽）
-        let mut blocked: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        {
+        let l2 = self.l2.load_full();
+        let mut blocked: std::collections::HashSet<Vec<u8>> = {
             let st = self.overlay_state.lock();
+            let mut blocked = std::collections::HashSet::with_capacity(
+                st.deleted_paths.len_paths().saturating_add(64),
+            );
             st.deleted_paths.for_each_bytes(|p| {
                 blocked.insert(p.to_vec());
             });
+            blocked
+        };
+        {
+            let layers = self.disk_layers.read();
+            let extra = layers
+                .iter()
+                .map(|l| l.deleted_paths.len())
+                .sum::<usize>()
+                .saturating_add(l2.file_count());
+            blocked.reserve(extra);
         }
 
         // seen：FileKey 维度的“先到先得”去重（rename/覆盖语义）
-        let mut seen: std::collections::HashSet<FileKey> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<FileKey> =
+            std::collections::HashSet::with_capacity(l2.file_count().saturating_add(256));
 
-        let mut results: Vec<FileMeta> = Vec::new();
+        let mut results: Vec<FileMeta> = Vec::with_capacity(128);
 
         // L2: 内存 Delta（newest）
-        let l2 = self.l2.load_full();
         for key in l2.query_keys(matcher.as_ref()) {
             if !seen.insert(key) {
                 continue;
@@ -810,9 +823,11 @@ impl TieredIndex {
         }
 
         // Disk segments: newest → oldest
+        // 这里保留“克隆层列表”的设计，避免查询全程持有读锁阻塞 flush/compaction。
+        // P2 优化点：DiskLayer 的 deleted_paths 改为 Arc，克隆时不再深拷贝 tombstone bytes。
         let layers = self.disk_layers.read().clone();
         for layer in layers.iter().rev() {
-            for p in &layer.deleted_paths {
+            for p in layer.deleted_paths.iter() {
                 blocked.insert(p.clone());
             }
             for key in layer.idx.query_keys(matcher.as_ref()) {
@@ -1086,7 +1101,7 @@ impl TieredIndex {
             let new_layer = DiskLayer {
                 id: base.id,
                 idx: Arc::new(MmapIndex::new(base.snap)),
-                deleted_paths: base.deleted_paths,
+                deleted_paths: Arc::new(base.deleted_paths),
             };
 
             *self.disk_layers.write() = vec![new_layer];
@@ -1105,7 +1120,7 @@ impl TieredIndex {
         self.disk_layers.write().push(DiskLayer {
             id: seg.id,
             idx: Arc::new(MmapIndex::new(seg.snap)),
-            deleted_paths: seg.deleted_paths,
+            deleted_paths: Arc::new(seg.deleted_paths),
         });
         self.l1.clear();
         if let Some(w) = self.wal.lock().clone() {
@@ -1413,7 +1428,7 @@ impl TieredIndex {
         let merged = PersistentIndex::new_with_roots(roots.clone());
 
         for layer in &layers_snapshot {
-            for p in &layer.deleted_paths {
+            for p in layer.deleted_paths.iter() {
                 let pb = pathbuf_from_bytes(p);
                 merged.mark_deleted_by_path(&pb);
             }
@@ -1448,7 +1463,7 @@ impl TieredIndex {
         let new_layer = DiskLayer {
             id: new_base.id,
             idx: Arc::new(MmapIndex::new(new_base.snap)),
-            deleted_paths: new_base.deleted_paths,
+            deleted_paths: Arc::new(new_base.deleted_paths),
         };
 
         // 仅当段列表未变化时才替换（弱 CAS）
