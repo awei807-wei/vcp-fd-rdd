@@ -99,10 +99,12 @@ impl EventPipeline {
             let mut last_rebuild_at =
                 tokio::time::Instant::now() - std::time::Duration::from_secs(3600);
             let rebuild_cooldown = std::time::Duration::from_secs(60);
+            let mut raw_events: Vec<notify::Event> = Vec::with_capacity(256);
+            let mut merge_scratch = MergeScratch::default();
 
             loop {
                 // 收集一批事件（debounce 窗口）
-                let mut raw_events = Vec::new();
+                raw_events.clear();
 
                 // 等待第一个事件
                 match rx.recv().await {
@@ -133,17 +135,17 @@ impl EventPipeline {
                 }
 
                 // 合并去重
-                let records = merge_events(&mut seq, raw_events);
+                merge_events_in_place(&mut seq, &mut raw_events, &mut merge_scratch);
 
-                if !records.is_empty() {
-                    let merged_count = records.len();
+                if !merge_scratch.records.is_empty() {
+                    let merged_count = merge_scratch.records.len();
                     tracing::debug!(
                         "EventPipeline: raw={} merged={} total={}",
                         raw_count,
                         merged_count,
                         total_events.load(Ordering::Relaxed) + merged_count as u64
                     );
-                    index.apply_events(&records);
+                    index.apply_events(&merge_scratch.records);
                     total_events.fetch_add(merged_count as u64, Ordering::Relaxed);
                     last_batch_size.store(merged_count as u64, Ordering::Relaxed);
                 }
@@ -178,12 +180,19 @@ fn should_ignore_event(ev: &notify::Event, ignore_prefixes: &[PathBuf]) -> bool 
     false
 }
 
+#[derive(Default)]
+struct MergeScratch {
+    merged: HashMap<FileIdentifier, EventRecord>,
+    records: Vec<EventRecord>,
+}
+
 /// 合并事件：同一路径的多个事件合并为最终状态
-fn merge_events(seq: &mut u64, raw: Vec<notify::Event>) -> Vec<EventRecord> {
-    let mut merged: HashMap<FileIdentifier, EventRecord> = HashMap::new();
+fn merge_events_in_place(seq: &mut u64, raw: &mut Vec<notify::Event>, scratch: &mut MergeScratch) {
+    scratch.merged.clear();
+    scratch.records.clear();
     let now = std::time::SystemTime::now();
 
-    for ev in raw {
+    for ev in raw.drain(..) {
         // 处理 Rename（双路径事件）
         if matches!(
             ev.kind,
@@ -194,11 +203,11 @@ fn merge_events(seq: &mut u64, raw: Vec<notify::Event>) -> Vec<EventRecord> {
             let to = ev.paths[1].clone();
 
             // 移除 from 的旧事件
-            merged.remove(&FileIdentifier::Path(from.clone()));
+            scratch.merged.remove(&FileIdentifier::Path(from.clone()));
 
             *seq += 1;
             let key = FileIdentifier::Path(to.clone());
-            merged.insert(
+            scratch.merged.insert(
                 key.clone(),
                 EventRecord {
                     seq: *seq,
@@ -226,7 +235,7 @@ fn merge_events(seq: &mut u64, raw: Vec<notify::Event>) -> Vec<EventRecord> {
         *seq += 1;
         let key = FileIdentifier::Path(path.clone());
         let new_hint = Some(path);
-        merged.insert(
+        scratch.merged.insert(
             key.clone(),
             EventRecord {
                 seq: *seq,
@@ -238,7 +247,8 @@ fn merge_events(seq: &mut u64, raw: Vec<notify::Event>) -> Vec<EventRecord> {
         );
     }
 
-    let mut records: Vec<EventRecord> = merged.into_values().collect();
-    records.sort_by_key(|r| r.seq);
-    records
+    scratch
+        .records
+        .extend(scratch.merged.drain().map(|(_, v)| v));
+    scratch.records.sort_by_key(|r| r.seq);
 }
