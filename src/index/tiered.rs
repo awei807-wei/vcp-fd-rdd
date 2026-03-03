@@ -27,6 +27,8 @@ use crate::storage::wal::WalStore;
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
 // 更激进的合并阈值：用于百万文件后的“瘦身期”，加速 delta 段收敛。
 const COMPACTION_DELTA_THRESHOLD: usize = 2;
+// 防抖：避免 flush 高频阶段反复启动 compaction 造成临时大分配抖动。
+const COMPACTION_COOLDOWN: Duration = Duration::from_secs(180);
 
 fn dir_tree_changed_since(roots: &[PathBuf], ignore_prefixes: &[PathBuf], cutoff_ns: u64) -> bool {
     use std::time::Duration;
@@ -395,6 +397,7 @@ pub struct TieredIndex {
     overlay_state: Mutex<OverlayState>,
     apply_gate: RwLock<()>,
     compaction_in_progress: AtomicBool,
+    compaction_last_started_at: Mutex<Option<Instant>>,
     flush_requested: AtomicBool,
     flush_notify: Notify,
     auto_flush_overlay_paths: AtomicU64,
@@ -422,6 +425,7 @@ impl TieredIndex {
             overlay_state: Mutex::new(OverlayState::default()),
             apply_gate: RwLock::new(()),
             compaction_in_progress: AtomicBool::new(false),
+            compaction_last_started_at: Mutex::new(None),
             flush_requested: AtomicBool::new(false),
             flush_notify: Notify::new(),
             auto_flush_overlay_paths: AtomicU64::new(250_000),
@@ -1377,10 +1381,26 @@ impl TieredIndex {
     }
 
     fn maybe_spawn_compaction(self: &Arc<Self>, store_path: PathBuf) {
+        // flush 请求优先；先把内存/overlay 刷稳再考虑 compaction，避免两者互相打架。
+        if self.flush_requested.load(Ordering::Acquire) {
+            return;
+        }
+
         let layers = self.disk_layers.read().clone();
         let delta_count = layers.len().saturating_sub(1);
         if delta_count < COMPACTION_DELTA_THRESHOLD {
             return;
+        }
+
+        // 防抖：冷却期内不重复启动 compaction（尤其是 manifest changed 场景）。
+        {
+            let mut g = self.compaction_last_started_at.lock();
+            if let Some(last) = *g {
+                if last.elapsed() < COMPACTION_COOLDOWN {
+                    return;
+                }
+            }
+            *g = Some(Instant::now());
         }
 
         // 避免并发 compaction
@@ -1399,9 +1419,20 @@ impl TieredIndex {
                 }
             }
             let _guard = CompactionInProgressGuard(idx.clone());
-            if let Err(e) = idx.compact_layers(store_path, layers).await {
-                tracing::error!("Compaction failed: {}", e);
+            match idx.compact_layers(store_path, layers).await {
+                Ok(()) => tracing::debug!("Compaction attempt finished"),
+                Err(e) => {
+                    // manifest changed 是并发下的预期分支：并不意味着数据损坏。
+                    let msg = e.to_string();
+                    if msg.contains("LSM manifest changed, aborting compaction") {
+                        tracing::info!("Compaction skipped due to concurrent manifest change");
+                    } else {
+                        tracing::error!("Compaction failed: {}", e);
+                    }
+                }
             }
+            // compaction 是临时分配大户；无论成功/跳过/失败都尝试一次回吐。
+            maybe_trim_rss();
         });
     }
 
@@ -1412,6 +1443,19 @@ impl TieredIndex {
     ) -> anyhow::Result<()> {
         if layers_snapshot.is_empty() {
             return Ok(());
+        }
+        // 若进入执行时层列表已变化，直接放弃本轮（避免无意义重活）。
+        {
+            let cur_ids = self
+                .disk_layers
+                .read()
+                .iter()
+                .map(|l| l.id)
+                .collect::<Vec<_>>();
+            let snap_ids = layers_snapshot.iter().map(|l| l.id).collect::<Vec<_>>();
+            if cur_ids != snap_ids {
+                return Ok(());
+            }
         }
         if layers_snapshot[0].id == 0 {
             // legacy base 只能通过 bootstrap 进入 LSM；此处不做跨体系 compaction。
