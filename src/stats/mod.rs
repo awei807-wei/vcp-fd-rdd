@@ -21,6 +21,12 @@ pub struct MemoryReport {
     pub process_smaps_rollup: Option<SmapsRollupStats>,
     /// 进程级 page faults（从 /proc/self/stat 读取；Linux-only）
     pub process_faults: Option<FaultStats>,
+    /// 索引相关结构估算总和（L1 + L2 + overlay + rebuild）
+    pub index_estimated_bytes: u64,
+    /// 非索引 Private_Dirty（smaps.private_dirty - index_estimated；仅在 smaps 可用时有值）
+    pub non_index_private_dirty_bytes: Option<u64>,
+    /// 是否疑似“堆高水位常驻”（非索引脏页明显偏高）
+    pub heap_high_water_suspected: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -186,6 +192,21 @@ impl MemoryReport {
     }
 }
 
+/// 根据当前 Private_Dirty 与索引估算量推断“非索引堆高水位”信号。
+///
+/// 返回：
+/// - `non_index_private_dirty_bytes`: 近似“运行时/分配器/临时分配”占用
+/// - `suspected`: 是否达到高水位嫌疑阈值
+pub(crate) fn infer_heap_high_water(
+    private_dirty_bytes: u64,
+    index_estimated_bytes: u64,
+) -> (u64, bool) {
+    let non_index = private_dirty_bytes.saturating_sub(index_estimated_bytes);
+    let suspected = non_index >= 64 * 1024 * 1024
+        && index_estimated_bytes.saturating_mul(4) <= private_dirty_bytes;
+    (non_index, suspected)
+}
+
 fn human_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -223,6 +244,17 @@ impl fmt::Display for MemoryReport {
                 f,
                 "║       pd={:<10}                               ║",
                 human_bytes(s.private_dirty_bytes)
+            )?;
+            writeln!(
+                f,
+                "║ Heap: idx={:<10} non-idx-pd={:<10}      ║",
+                human_bytes(self.index_estimated_bytes),
+                human_bytes(self.non_index_private_dirty_bytes.unwrap_or(0)),
+            )?;
+            writeln!(
+                f,
+                "║       high-water-suspected={:<5}                 ║",
+                self.heap_high_water_suspected
             )?;
         }
         if let Some(pf) = &self.process_faults {
@@ -395,5 +427,27 @@ impl fmt::Display for MemoryReport {
         )?;
         writeln!(f, "╚══════════════════════════════════════════════════╝")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::infer_heap_high_water;
+
+    #[test]
+    fn heap_high_water_detects_large_non_index_dirty() {
+        let pd = 256 * 1024 * 1024;
+        let idx = 8 * 1024 * 1024;
+        let (non, suspected) = infer_heap_high_water(pd, idx);
+        assert!(non >= 200 * 1024 * 1024);
+        assert!(suspected);
+    }
+
+    #[test]
+    fn heap_high_water_ignores_index_dominated_dirty() {
+        let pd = 96 * 1024 * 1024;
+        let idx = 80 * 1024 * 1024;
+        let (_non, suspected) = infer_heap_high_water(pd, idx);
+        assert!(!suspected);
     }
 }
