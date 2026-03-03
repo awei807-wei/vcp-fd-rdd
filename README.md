@@ -101,6 +101,13 @@ curl "http://127.0.0.1:6060/search?q=*memoir*&limit=20"
 - MemoryReport：区分堆高水位（Private_Dirty）与 file-backed 常驻（Private_Clean）
 - page faults：在真实查询压力下量化“零拷贝是否真的少触页”
 
+长期运行时可启用条件性 RSS trim（v0.4.4+）：
+
+- `--trim-interval-secs`：检查周期（秒，0=禁用，默认 300）
+- `--trim-pd-threshold-mb`：`Private_Dirty` 触发阈值（MB，0=禁用，默认 128）
+
+该策略用于缓解“索引结构已很小，但匿名脏页高水位常驻”的场景。
+
 ## 许可证
 
 MIT License (c) 2026 fd-rdd Contributors

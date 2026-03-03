@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{collections::VecDeque, time::UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
@@ -17,7 +18,9 @@ use crate::index::l3_cold::IndexBuilder;
 use crate::index::mmap_index::MmapIndex;
 use crate::index::IndexLayer;
 use crate::query::matcher::create_matcher;
-use crate::stats::{EventPipelineStats, MemoryReport, OverlayStats, RebuildStats};
+use crate::stats::{
+    infer_heap_high_water, EventPipelineStats, MemoryReport, OverlayStats, RebuildStats,
+};
 use crate::storage::snapshot::{LoadedSnapshot, SnapshotStore};
 use crate::storage::wal::WalStore;
 
@@ -26,7 +29,7 @@ const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
 const COMPACTION_DELTA_THRESHOLD: usize = 2;
 
 fn dir_tree_changed_since(roots: &[PathBuf], ignore_prefixes: &[PathBuf], cutoff_ns: u64) -> bool {
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
 
     let cutoff = UNIX_EPOCH
         + Duration::new(
@@ -1165,6 +1168,8 @@ impl TieredIndex {
 
     /// 生成完整内存报告
     pub fn memory_report(&self, pipeline_stats: EventPipelineStats) -> MemoryReport {
+        let l1 = self.l1.memory_stats();
+        let l2 = self.l2.load_full().memory_stats();
         let overlay = {
             let ov = self.overlay_state.lock();
             OverlayStats {
@@ -1227,16 +1232,33 @@ impl TieredIndex {
             }
         };
 
+        let index_estimated_bytes = l1.estimated_bytes
+            + l2.estimated_bytes
+            + overlay.estimated_bytes
+            + rebuild.estimated_bytes;
+        let process_smaps_rollup = MemoryReport::read_smaps_rollup();
+        let (non_index_private_dirty_bytes, heap_high_water_suspected) = process_smaps_rollup
+            .as_ref()
+            .map(|s| {
+                let (non, suspected) =
+                    infer_heap_high_water(s.private_dirty_bytes, index_estimated_bytes);
+                (Some(non), suspected)
+            })
+            .unwrap_or((None, false));
+
         MemoryReport {
-            l1: self.l1.memory_stats(),
-            l2: self.l2.load_full().memory_stats(),
+            l1,
+            l2,
             disk_segments: self.disk_layers.read().len(),
             event_pipeline: pipeline_stats,
             overlay,
             rebuild,
             process_rss_bytes: MemoryReport::read_process_rss(),
-            process_smaps_rollup: MemoryReport::read_smaps_rollup(),
+            process_smaps_rollup,
             process_faults: MemoryReport::read_faults(),
+            index_estimated_bytes,
+            non_index_private_dirty_bytes,
+            heap_high_water_suspected,
         }
     }
 
@@ -1254,12 +1276,88 @@ impl TieredIndex {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         let interval = std::time::Duration::from_secs(interval_secs);
+        let mut rss_window: VecDeque<u64> = VecDeque::with_capacity(12);
 
         loop {
             let stats = pipeline_stats_fn();
             let report = self.memory_report(stats);
-            tracing::info!("\n{}", report);
+
+            rss_window.push_back(report.process_rss_bytes);
+            while rss_window.len() > 12 {
+                rss_window.pop_front();
+            }
+
+            let trend_mb_per_min = if rss_window.len() >= 2 {
+                let first = *rss_window.front().unwrap_or(&0) as f64;
+                let last = *rss_window.back().unwrap_or(&0) as f64;
+                let minutes = ((rss_window.len() - 1) as f64 * interval_secs as f64) / 60.0;
+                if minutes > 0.0 {
+                    (last - first) / (1024.0 * 1024.0) / minutes
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            tracing::info!(
+                "\n{}\n[heap-signal] index_est_bytes={} non_index_pd_bytes={} suspected={} rss_trend_mb_per_min={:+.2}",
+                report,
+                report.index_estimated_bytes,
+                report.non_index_private_dirty_bytes.unwrap_or(0),
+                report.heap_high_water_suspected,
+                trend_mb_per_min
+            );
             tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// 条件性 RSS trim 循环：
+    /// - 周期检查 smaps 的 Private_Dirty
+    /// - 当“非索引脏页偏高”且超过阈值时触发一次 trim
+    pub async fn rss_trim_loop(self: Arc<Self>, interval_secs: u64, trim_pd_threshold_mb: u64) {
+        if interval_secs == 0 || trim_pd_threshold_mb == 0 {
+            tracing::info!(
+                "RSS trim disabled (interval_secs={}, trim_pd_threshold_mb={})",
+                interval_secs,
+                trim_pd_threshold_mb
+            );
+            return;
+        }
+
+        let interval = Duration::from_secs(interval_secs);
+        let threshold_bytes = trim_pd_threshold_mb.saturating_mul(1024 * 1024);
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let report = self.memory_report(EventPipelineStats::default());
+            let Some(smaps) = report.process_smaps_rollup.as_ref() else {
+                continue;
+            };
+
+            if smaps.private_dirty_bytes < threshold_bytes || !report.heap_high_water_suspected {
+                continue;
+            }
+
+            tracing::warn!(
+                "RSS trim trigger: private_dirty_bytes={} threshold_bytes={} index_est_bytes={} non_index_pd_bytes={}",
+                smaps.private_dirty_bytes,
+                threshold_bytes,
+                report.index_estimated_bytes,
+                report.non_index_private_dirty_bytes.unwrap_or(0),
+            );
+            maybe_trim_rss();
+
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let after = MemoryReport::read_smaps_rollup()
+                .map(|s| s.private_dirty_bytes)
+                .unwrap_or(0);
+            tracing::info!(
+                "RSS trim done: private_dirty_bytes={} -> {}",
+                smaps.private_dirty_bytes,
+                after
+            );
         }
     }
 
