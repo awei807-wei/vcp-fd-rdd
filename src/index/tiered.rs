@@ -147,6 +147,9 @@ struct PathArenaSet {
 }
 
 impl PathArenaSet {
+    const ARENA_KEEP_BYTES: usize = 256 * 1024;
+    const MAP_KEEP_CAP: usize = 1024;
+
     fn len_paths(&self) -> usize {
         self.paths_len
     }
@@ -291,6 +294,16 @@ impl PathArenaSet {
         self.arena.clear();
         self.paths_len = 0;
         self.active_bytes = 0;
+    }
+
+    /// flush/rebuild 后按阈值回收容量，避免历史高水位长期常驻。
+    fn maybe_shrink_after_clear(&mut self) {
+        if self.arena.capacity() > Self::ARENA_KEEP_BYTES * 2 {
+            self.arena.shrink_to(Self::ARENA_KEEP_BYTES);
+        }
+        if self.map.capacity() > Self::MAP_KEEP_CAP * 2 {
+            self.map.shrink_to(Self::MAP_KEEP_CAP);
+        }
     }
 
     /// 估算 overlay 堆占用（粗估、偏保守）：arena + HashMap 桶 + collision Vec 容量。
@@ -672,6 +685,8 @@ impl TieredIndex {
                         let mut ov = self.overlay_state.lock();
                         ov.deleted_paths.clear();
                         ov.upserted_paths.clear();
+                        ov.deleted_paths.maybe_shrink_after_clear();
+                        ov.upserted_paths.maybe_shrink_after_clear();
                     }
                     st.in_progress = false;
                     // 若 rebuild 期间又被请求（例如 overflow 风暴），合并为下一轮 rebuild。
@@ -1066,6 +1081,8 @@ impl TieredIndex {
             });
             ov.deleted_paths.clear();
             ov.upserted_paths.clear();
+            ov.deleted_paths.maybe_shrink_after_clear();
+            ov.upserted_paths.maybe_shrink_after_clear();
             self.flush_requested.store(false, Ordering::Release);
 
             (old, deleted, self.disk_layers.read().clone(), wal_seal_id)
@@ -1346,6 +1363,7 @@ impl TieredIndex {
 
         let interval = Duration::from_secs(interval_secs);
         let threshold_bytes = trim_pd_threshold_mb.saturating_mul(1024 * 1024);
+        let mut non_idx_pd_window: VecDeque<u64> = VecDeque::with_capacity(6);
 
         loop {
             tokio::time::sleep(interval).await;
@@ -1354,17 +1372,43 @@ impl TieredIndex {
             let Some(smaps) = report.process_smaps_rollup.as_ref() else {
                 continue;
             };
+            let non_idx_pd = report
+                .non_index_private_dirty_bytes
+                .unwrap_or(smaps.private_dirty_bytes);
+            non_idx_pd_window.push_back(non_idx_pd);
+            while non_idx_pd_window.len() > 6 {
+                non_idx_pd_window.pop_front();
+            }
 
-            if smaps.private_dirty_bytes < threshold_bytes || !report.heap_high_water_suspected {
+            let trend_mb_per_min = if non_idx_pd_window.len() >= 2 {
+                let first = *non_idx_pd_window.front().unwrap_or(&0) as f64;
+                let last = *non_idx_pd_window.back().unwrap_or(&0) as f64;
+                let minutes = ((non_idx_pd_window.len() - 1) as f64 * interval_secs as f64) / 60.0;
+                if minutes > 0.0 {
+                    (last - first) / (1024.0 * 1024.0) / minutes
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            let growing = trend_mb_per_min >= 0.5;
+            let very_high = smaps.private_dirty_bytes >= threshold_bytes.saturating_mul(2);
+            if smaps.private_dirty_bytes < threshold_bytes
+                || !report.heap_high_water_suspected
+                || (!growing && !very_high)
+            {
                 continue;
             }
 
             tracing::warn!(
-                "RSS trim trigger: private_dirty_bytes={} threshold_bytes={} index_est_bytes={} non_index_pd_bytes={}",
+                "RSS trim trigger: private_dirty_bytes={} threshold_bytes={} index_est_bytes={} non_index_pd_bytes={} trend_mb_per_min={:+.2}",
                 smaps.private_dirty_bytes,
                 threshold_bytes,
                 report.index_estimated_bytes,
                 report.non_index_private_dirty_bytes.unwrap_or(0),
+                trend_mb_per_min
             );
             maybe_trim_rss();
 
