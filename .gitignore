@@ -1,5 +1,9 @@
 /target
 
+# python
+__pycache__/
+*.pyc
+
 # local scratch files
 /posting_list
 .github/workflows/release(1).yml

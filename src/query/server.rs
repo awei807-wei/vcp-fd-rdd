@@ -50,12 +50,11 @@ async fn search_handler(
     Query(params): Query<SearchParams>,
     State(index): State<Arc<TieredIndex>>,
 ) -> Json<Vec<SearchResult>> {
-    let results = index.query(&params.q);
     let limit = params.limit.unwrap_or(100);
+    let results = index.query_limit(&params.q, limit);
 
     let response = results
         .into_iter()
-        .take(limit)
         .map(|m| SearchResult {
             path: m.path.to_string_lossy().into_owned(),
             size: m.size,
