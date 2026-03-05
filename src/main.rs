@@ -2,6 +2,7 @@ use clap::Parser;
 use fd_rdd::event::EventPipeline;
 use fd_rdd::index::TieredIndex;
 use fd_rdd::query::QueryServer;
+use fd_rdd::query::SocketServer;
 use fd_rdd::storage::snapshot::SnapshotStore;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +41,10 @@ struct Args {
     /// HTTP 查询端口
     #[arg(long, default_value_t = 6060)]
     http_port: u16,
+
+    /// Unix domain socket 查询地址（可选）：用于流式输出（避免 HTTP/JSON 聚合带来的峰值）
+    #[arg(long, value_name = "PATH")]
+    uds_socket: Option<PathBuf>,
 
     /// 快照写入间隔（秒）
     #[arg(long, default_value_t = 300)]
@@ -155,6 +160,16 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!("Query server error: {}", e);
         }
     });
+
+    // 6.5) 启动 UDS 查询服务（可选，流式）
+    if let Some(path) = args.uds_socket.clone() {
+        let socket_server = SocketServer::new(index.clone());
+        tokio::spawn(async move {
+            if let Err(e) = socket_server.run(&path).await {
+                tracing::error!("UDS query server error: {}", e);
+            }
+        });
+    }
 
     // 7) 启动定期快照循环（每 300 秒）
     let snap_index = index.clone();

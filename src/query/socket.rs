@@ -4,47 +4,322 @@ use std::sync::Arc;
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::path::{Path, PathBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
     use tokio::net::UnixListener;
+    use tokio::sync::oneshot;
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct SocketConfig {
+        pub default_limit: usize,
+        pub max_limit: usize,
+        pub flush_every: usize,
+        pub max_request_bytes: usize,
+    }
+
+    impl Default for SocketConfig {
+        fn default() -> Self {
+            Self {
+                default_limit: 2000,
+                max_limit: 200_000,
+                flush_every: 1000,
+                max_request_bytes: 8 * 1024,
+            }
+        }
+    }
 
     /// Unix Socket 查询服务（供 fd-query.sh / fzf 使用）
     pub struct SocketServer {
         pub index: Arc<TieredIndex>,
+        pub config: SocketConfig,
     }
 
     impl SocketServer {
         pub fn new(index: Arc<TieredIndex>) -> Self {
-            Self { index }
+            Self {
+                index,
+                config: SocketConfig::default(),
+            }
         }
 
-        pub async fn run(self, path: &str) -> anyhow::Result<()> {
-            let _ = std::fs::remove_file(path);
-            let listener = UnixListener::bind(path)?;
-            tracing::info!("Unix Socket Server listening on {}", path);
+        pub fn with_config(mut self, config: SocketConfig) -> Self {
+            self.config = config;
+            self
+        }
+
+        pub async fn run(self, path: &Path) -> anyhow::Result<()> {
+            let (_tx, rx) = oneshot::channel::<()>();
+            self.run_until_shutdown(path, rx).await
+        }
+
+        pub async fn run_until_shutdown(
+            self,
+            path: &Path,
+            mut shutdown: oneshot::Receiver<()>,
+        ) -> anyhow::Result<()> {
+            let path: PathBuf = path.to_path_buf();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+            tracing::info!("Unix Socket Server listening on {}", path.display());
 
             loop {
-                let (mut socket, _) = listener.accept().await?;
-                let index = self.index.clone();
-
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 1024];
-                    if let Ok(n) = socket.read(&mut buf).await {
-                        let request = String::from_utf8_lossy(&buf[..n]);
-                        let parts: Vec<&str> = request.trim().splitn(2, ':').collect();
-
-                        if parts.len() == 2 {
-                            let keyword = parts[1];
-                            let results = index.query(keyword);
-                            let mut response = String::new();
-                            for meta in results.iter().take(200) {
-                                response.push_str(&meta.path.to_string_lossy());
-                                response.push('\n');
+                tokio::select! {
+                    _ = &mut shutdown => break,
+                    accept = listener.accept() => {
+                        let (socket, _) = accept?;
+                        let index = self.index.clone();
+                        let cfg = self.config;
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(index, cfg, socket).await {
+                                tracing::debug!("Unix Socket handler error: {}", e);
                             }
-                            let _ = socket.write_all(response.as_bytes()).await;
-                        }
+                        });
                     }
-                });
+                }
             }
+
+            let _ = std::fs::remove_file(&path);
+            Ok(())
+        }
+    }
+
+    async fn handle_connection(
+        index: Arc<TieredIndex>,
+        cfg: SocketConfig,
+        mut socket: impl AsyncRead + AsyncWrite + Unpin,
+    ) -> anyhow::Result<()> {
+        let mut req: Vec<u8> = Vec::with_capacity(256);
+        let n = socket.read_to_end(&mut req).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        if req.len() > cfg.max_request_bytes {
+            anyhow::bail!("request too large: {} bytes", req.len());
+        }
+
+        let request = String::from_utf8_lossy(&req);
+        let mut keyword: Option<&str> = None;
+        let mut limit: Option<usize> = None;
+
+        for line in request.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("q:").or_else(|| line.strip_prefix("q=")) {
+                keyword = Some(rest.trim());
+                continue;
+            }
+            if let Some(rest) = line
+                .strip_prefix("limit:")
+                .or_else(|| line.strip_prefix("limit="))
+            {
+                if let Ok(v) = rest.trim().parse::<usize>() {
+                    limit = Some(v);
+                }
+                continue;
+            }
+
+            // 兼容旧协议："x:keyword"（例如 "q:hello"）
+            if keyword.is_none() {
+                if let Some((_, rhs)) = line.split_once(':') {
+                    keyword = Some(rhs.trim());
+                    continue;
+                }
+                keyword = Some(line);
+            }
+        }
+
+        let keyword = match keyword.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+
+        let mut limit = limit.unwrap_or(cfg.default_limit);
+        if limit == 0 {
+            limit = cfg.default_limit;
+        }
+        limit = limit.min(cfg.max_limit).max(1);
+
+        let results = index.query_limit(keyword, limit);
+
+        // 流式写回：不要在内存里拼接巨大 String/JSON。
+        let mut w = BufWriter::new(&mut socket);
+        for (i, meta) in results.iter().enumerate() {
+            w.write_all(meta.path.as_os_str().as_encoded_bytes())
+                .await?;
+            w.write_all(b"\n").await?;
+            if cfg.flush_every > 0 && (i + 1) % cfg.flush_every == 0 {
+                w.flush().await?;
+            }
+        }
+        w.flush().await?;
+        let _ = socket.shutdown().await;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::core::{EventRecord, EventType, FileIdentifier};
+        use crate::event::recovery::DirtyScope;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::io::duplex;
+
+        fn unique_tmp_dir(prefix: &str) -> PathBuf {
+            let ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "fd-rdd-test-{}-{}-{}",
+                prefix,
+                std::process::id(),
+                ns
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        }
+
+        fn ev(seq: u64, ty: EventType, path: PathBuf) -> EventRecord {
+            EventRecord {
+                seq,
+                timestamp: SystemTime::now(),
+                event_type: ty,
+                id: FileIdentifier::Path(path),
+                path_hint: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn socket_handler_respects_limit() -> anyhow::Result<()> {
+            let root = unique_tmp_dir("socket-limit");
+
+            let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+            let mut events: Vec<EventRecord> = Vec::new();
+            for i in 0..10u64 {
+                let p = root.join(format!("match_{}.txt", i));
+                std::fs::write(&p, b"hello")?;
+                events.push(ev(i + 1, EventType::Create, p));
+            }
+            index.apply_events(&events);
+
+            let (mut client, server) = duplex(64 * 1024);
+            let cfg = SocketConfig {
+                default_limit: 2000,
+                max_limit: 200_000,
+                flush_every: 2,
+                max_request_bytes: 8 * 1024,
+            };
+            let server_task = tokio::spawn(handle_connection(index.clone(), cfg, server));
+
+            client.write_all(b"q:match\nlimit:2\n").await?;
+            client.shutdown().await?;
+
+            let mut out: Vec<u8> = Vec::new();
+            client.read_to_end(&mut out).await?;
+            let s = String::from_utf8_lossy(&out);
+            let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+            assert_eq!(lines.len(), 2);
+
+            server_task.await??;
+
+            let _ = std::fs::remove_dir_all(&root);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn allocator_and_socket_handler_work_together() -> anyhow::Result<()> {
+            let expected = if cfg!(feature = "mimalloc") {
+                "mimalloc"
+            } else {
+                "system"
+            };
+            assert_eq!(crate::ALLOCATOR_KIND, expected);
+
+            let root = unique_tmp_dir("socket-p0p1");
+            let p = root.join("match_one.txt");
+            std::fs::write(&p, b"hello")?;
+
+            let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+            index.apply_events(&[ev(1, EventType::Create, p.clone())]);
+
+            let (mut client, server) = duplex(64 * 1024);
+            let cfg = SocketConfig::default();
+            let server_task = tokio::spawn(handle_connection(index.clone(), cfg, server));
+
+            client.write_all(b"q:match\nlimit:10\n").await?;
+            client.shutdown().await?;
+
+            let mut out: Vec<u8> = Vec::new();
+            client.read_to_end(&mut out).await?;
+            let s = String::from_utf8_lossy(&out);
+            assert!(s.contains("match_one.txt"));
+
+            server_task.await??;
+
+            let _ = std::fs::remove_dir_all(&root);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn p0_p1_p2_integration_fast_sync_affects_streaming_query() -> anyhow::Result<()> {
+            // P0：分配器选择可观测
+            let expected = if cfg!(feature = "mimalloc") {
+                "mimalloc"
+            } else {
+                "system"
+            };
+            assert_eq!(crate::ALLOCATOR_KIND, expected);
+
+            let root = unique_tmp_dir("socket-p0p1p2");
+            let old = root.join("old_match.txt");
+            std::fs::write(&old, b"old")?;
+
+            let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+            index.apply_events(&[ev(1, EventType::Create, old.clone())]);
+
+            // 离线变更：删旧加新，不经事件管道
+            std::fs::remove_file(&old)?;
+            let new = root.join("new_match.txt");
+            std::fs::write(&new, b"new")?;
+
+            let _r = index.fast_sync(
+                DirtyScope::Dirs {
+                    cutoff_ns: 0,
+                    dirs: vec![root.clone()],
+                },
+                &[],
+            );
+
+            // P1：socket handler 通过 query_limit 流式输出，且结果应反映 fast-sync 后的状态
+            let (mut client, server) = duplex(64 * 1024);
+            let cfg = SocketConfig::default();
+            let server_task = tokio::spawn(handle_connection(index.clone(), cfg, server));
+
+            client.write_all(b"q:match\nlimit:100\n").await?;
+            client.shutdown().await?;
+
+            let mut out: Vec<u8> = Vec::new();
+            client.read_to_end(&mut out).await?;
+            let s = String::from_utf8_lossy(&out);
+            assert!(s.contains("new_match.txt"));
+            assert!(!s.contains("old_match.txt"));
+
+            server_task.await??;
+
+            let _ = std::fs::remove_dir_all(&root);
+            Ok(())
         }
     }
 }
@@ -63,7 +338,7 @@ mod imp {
             Self { index }
         }
 
-        pub async fn run(self, _path: &str) -> anyhow::Result<()> {
+        pub async fn run(self, _path: &std::path::Path) -> anyhow::Result<()> {
             anyhow::bail!("Unix domain socket server is not supported on this platform")
         }
     }

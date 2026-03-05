@@ -1,7 +1,7 @@
 # Maintainer: shiyi
 pkgname=fd-rdd-git
 _pkgname=vcp-fd-rdd
-pkgver=0.4.4
+pkgver=0.4.5
 pkgrel=3
 pkgdesc="Event-driven elastic file indexer with RDD lineage and glob support"
 arch=('x86_64')
@@ -41,6 +41,7 @@ package() {
     # 安装二进制文件 (注意：cargo 编译出的二进制名字由 Cargo.toml 定义，通常是 fd-rdd)
     # 如果 Cargo.toml 里的 name 是 fd-rdd，这里就用 fd-rdd
     install -Dm755 "target/release/fd-rdd" "$pkgdir/usr/bin/fd-rdd"
+    install -Dm755 "target/release/fd-rdd-query" "$pkgdir/usr/bin/fd-rdd-query"
     
     # 安装并修正 Service 文件
     mkdir -p "$pkgdir/usr/lib/systemd/user/"
