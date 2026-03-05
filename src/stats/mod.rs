@@ -9,6 +9,14 @@ pub struct MemoryReport {
     pub l2: L2Stats,
     /// 磁盘只读 segments（mmap 基座 + delta 段数量）
     pub disk_segments: usize,
+    /// Disk segments 的 tombstones（delete/rename-from sidecar）路径条目总数
+    pub disk_deleted_paths: usize,
+    /// Disk segments 的 tombstones 路径字节总量（下界估算：len 之和，不含 Vec/allocator 开销）
+    pub disk_deleted_bytes: u64,
+    /// Disk segments 的 tombstones 常驻堆占用估算（Vec 元数据 + bytes；粗估、偏保守）
+    pub disk_deleted_estimated_bytes: u64,
+    /// 单个 disk layer 的 tombstones 估算上界（用于识别异常段）
+    pub disk_deleted_estimated_bytes_max: u64,
     /// 事件管道
     pub event_pipeline: EventPipelineStats,
     /// overlay（跨段 delete/upsert 屏蔽集合）
@@ -21,7 +29,7 @@ pub struct MemoryReport {
     pub process_smaps_rollup: Option<SmapsRollupStats>,
     /// 进程级 page faults（从 /proc/self/stat 读取；Linux-only）
     pub process_faults: Option<FaultStats>,
-    /// 索引相关结构估算总和（L1 + L2 + overlay + rebuild）
+    /// 索引相关结构估算总和（L1 + L2 + Disk tombstones + overlay + rebuild）
     pub index_estimated_bytes: u64,
     /// 非索引 Private_Dirty（smaps.private_dirty - index_estimated；仅在 smaps 可用时有值）
     pub non_index_private_dirty_bytes: Option<u64>,
@@ -104,6 +112,14 @@ pub struct EventPipelineStats {
     pub total_events_processed: u64,
     /// channel 溢出丢弃次数
     pub overflow_drops: u64,
+    /// notify/inotify rescan 信号次数（表示可能漏事件，需要补扫）
+    pub rescan_signals: u64,
+    /// raw_events(Vec<notify::Event>) capacity
+    pub raw_events_capacity: usize,
+    /// merged(HashMap<FileIdentifier, EventRecord>) capacity
+    pub merged_map_capacity: usize,
+    /// records(Vec<EventRecord>) capacity
+    pub records_capacity: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -202,8 +218,10 @@ pub(crate) fn infer_heap_high_water(
     index_estimated_bytes: u64,
 ) -> (u64, bool) {
     let non_index = private_dirty_bytes.saturating_sub(index_estimated_bytes);
-    let suspected = non_index >= 64 * 1024 * 1024
-        && index_estimated_bytes.saturating_mul(4) <= private_dirty_bytes;
+    // 经验阈值：non-index PD 达到 32MB 以上且显著高于“索引估算占用”时，倾向认为 allocator/临时分配高水位需要关注。
+    // 注意：这是启发式信号（用于触发条件性 trim），不是泄漏判定。
+    let suspected = non_index >= 32 * 1024 * 1024
+        && index_estimated_bytes.saturating_mul(2) <= private_dirty_bytes;
     (non_index, suspected)
 }
 
@@ -355,6 +373,18 @@ impl fmt::Display for MemoryReport {
         )?;
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ Disk Segments (mmap): {:>24} ║", self.disk_segments)?;
+        writeln!(
+            f,
+            "║   tomb paths:  {:>10}  (logic={:>10})     ║",
+            self.disk_deleted_paths,
+            human_bytes(self.disk_deleted_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   tomb est:    {:>10}  (max={:>10})       ║",
+            human_bytes(self.disk_deleted_estimated_bytes),
+            human_bytes(self.disk_deleted_estimated_bytes_max)
+        )?;
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ Event Pipeline:                  ║")?;
         writeln!(
@@ -371,6 +401,26 @@ impl fmt::Display for MemoryReport {
             f,
             "║   overflow:     {:>10}                       ║",
             self.event_pipeline.overflow_drops
+        )?;
+        writeln!(
+            f,
+            "║   rescan:       {:>10}                       ║",
+            self.event_pipeline.rescan_signals
+        )?;
+        writeln!(
+            f,
+            "║   raw cap:      {:>10}                       ║",
+            self.event_pipeline.raw_events_capacity
+        )?;
+        writeln!(
+            f,
+            "║   merged cap:   {:>10}                       ║",
+            self.event_pipeline.merged_map_capacity
+        )?;
+        writeln!(
+            f,
+            "║   records cap:  {:>10}                       ║",
+            self.event_pipeline.records_capacity
         )?;
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ Shadow Memory (Overlay/Rebuild):                 ║")?;

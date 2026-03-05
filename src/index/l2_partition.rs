@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 
 #[cfg(feature = "rkyv")]
 use crate::core::FileKeyEntry;
-use crate::core::{EventRecord, EventType, FileKey, FileMeta};
+use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta};
 use crate::index::IndexLayer;
 use crate::query::matcher::Matcher;
 use crate::stats::L2Stats;
@@ -44,12 +44,11 @@ fn query_trigrams(query: &str) -> Vec<Trigram> {
     tris
 }
 
-/// 从路径的所有“洁净组件”（`Component::Normal`）中提取 trigram 集合。
+/// 从路径的所有“洁净组件”（`Component::Normal`）中枚举 trigram（可能重复）。
 ///
 /// - 标准化：lossy UTF-8 + to_lowercase
 /// - 目的：让 trigram 候选集成为 Segment/contains 等精确匹配的严格超集（避免假阴性）
-fn component_trigrams(path: &Path) -> HashSet<Trigram> {
-    let mut set: HashSet<Trigram> = HashSet::new();
+fn for_each_component_trigram(path: &Path, mut f: impl FnMut(Trigram)) {
     for c in path.components() {
         let Component::Normal(os) = c else {
             continue;
@@ -60,10 +59,9 @@ fn component_trigrams(path: &Path) -> HashSet<Trigram> {
             continue;
         }
         for w in bytes.windows(3) {
-            set.insert([w[0], w[1], w[2]]);
+            f([w[0], w[1], w[2]]);
         }
     }
-    set
 }
 
 /// Path blob arena：所有路径的连续字节存储
@@ -440,12 +438,12 @@ impl PersistentIndex {
                     .or_insert(OneOrManyDocId::One(docid));
 
                 if let Some(abs_path) = self.compose_abs_path_buf(meta.root_id, rel_bytes) {
-                    for tri in component_trigrams(abs_path.as_path()) {
+                    for_each_component_trigram(abs_path.as_path(), |tri| {
                         trigram_index
                             .entry(tri)
                             .or_insert_with(RoaringBitmap::new)
                             .insert(docid);
-                    }
+                    });
                 }
             }
         }
@@ -782,6 +780,177 @@ impl PersistentIndex {
                 } => {
                     let from_best_path = from_path_hint.as_deref().or_else(|| from.as_path());
                     let to_path = ev.best_path().map(|p| p.to_path_buf());
+
+                    let docid_opt = if let Some(fk) = from.as_file_key() {
+                        self.filekey_to_docid.read().get(&fk).copied()
+                    } else {
+                        from_best_path.and_then(|p| self.lookup_docid_by_path(p))
+                    };
+
+                    if let Some(docid) = docid_opt {
+                        let old = {
+                            let metas = self.metas.read();
+                            metas.get(docid as usize).cloned()
+                        };
+                        if let Some(mut m) = old {
+                            // 移除旧路径 posting/hash：优先 meta 中存储的旧路径。
+                            if let Some(old_path) =
+                                self.absolute_path_buf(m.root_id, m.path_off, m.path_len)
+                            {
+                                self.remove_trigrams(docid, &old_path);
+                                self.remove_path_hash(docid, &old_path);
+                            } else if let Some(p) = from_best_path {
+                                self.remove_trigrams(docid, p);
+                                self.remove_path_hash(docid, p);
+                            }
+
+                            if let Some(to_path) = to_path {
+                                let (root_id, rel_bytes) =
+                                    self.split_root_relative_bytes(to_path.as_path());
+                                if let Some((off, len)) = self.arena.write().push_bytes(&rel_bytes)
+                                {
+                                    m.root_id = root_id;
+                                    m.path_off = off;
+                                    m.path_len = len;
+                                }
+
+                                if let Ok(fs_meta) = std::fs::metadata(&to_path) {
+                                    m.size = fs_meta.len();
+                                    m.mtime = fs_meta.modified().ok();
+                                }
+
+                                self.insert_trigrams(docid, to_path.as_path());
+                                self.insert_path_hash(docid, to_path.as_path());
+                            } else if let Some(p) = from_best_path {
+                                // 无 to path：保守更新元数据
+                                if let Ok(fs_meta) = std::fs::metadata(p) {
+                                    m.size = fs_meta.len();
+                                    m.mtime = fs_meta.modified().ok();
+                                }
+                            }
+
+                            if let Some(slot) = self.metas.write().get_mut(docid as usize) {
+                                *slot = m;
+                            }
+                            self.tombstones.write().remove(docid);
+                            *self.dirty.write() = true;
+                        }
+                    } else {
+                        // 未命中：降级为 delete + create（若有路径）
+                        if let Some(fk) = from.as_file_key() {
+                            self.mark_deleted(fk);
+                        } else if let Some(p) = from_best_path {
+                            self.mark_deleted_by_path(p);
+                        }
+
+                        if let Some(to_path) = to_path {
+                            if let Ok(meta) = std::fs::metadata(&to_path) {
+                                let Some(file_key) =
+                                    FileKey::from_path_and_metadata(&to_path, &meta)
+                                else {
+                                    continue;
+                                };
+                                self.upsert(FileMeta {
+                                    file_key,
+                                    path: to_path,
+                                    size: meta.len(),
+                                    mtime: meta.modified().ok(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 批量应用事件（drain 版本）：
+    /// - 消费 `Vec<EventRecord>`，避免 `Create/Modify/Rename` 在这里再次 `to_path_buf()` 造成的额外分配。
+    /// - 用于 EventPipeline / fast-sync 这类“事件量很大、且不需要保留 EventRecord”的路径。
+    pub fn apply_events_drain(&self, events: &mut Vec<EventRecord>) {
+        for ev in events.drain(..) {
+            match ev.event_type {
+                EventType::Create | EventType::Modify => match (ev.path_hint, ev.id) {
+                    (Some(path), _) => {
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            let Some(file_key) = FileKey::from_path_and_metadata(&path, &meta)
+                            else {
+                                continue;
+                            };
+                            self.upsert(FileMeta {
+                                file_key,
+                                path,
+                                size: meta.len(),
+                                mtime: meta.modified().ok(),
+                            });
+                        }
+                    }
+                    (None, FileIdentifier::Path(path)) => {
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            let Some(file_key) = FileKey::from_path_and_metadata(&path, &meta)
+                            else {
+                                continue;
+                            };
+                            self.upsert(FileMeta {
+                                file_key,
+                                path,
+                                size: meta.len(),
+                                mtime: meta.modified().ok(),
+                            });
+                        }
+                    }
+                    (None, FileIdentifier::Fid { dev, ino }) => {
+                        let fk = FileKey { dev, ino };
+                        // FID-only 且无 path_hint：若索引里已有路径，则用现有路径做保守更新。
+                        let docid = { self.filekey_to_docid.read().get(&fk).copied() };
+                        let Some(docid) = docid else {
+                            continue;
+                        };
+                        let path = {
+                            let metas = self.metas.read();
+                            match metas.get(docid as usize) {
+                                Some(m) => {
+                                    self.absolute_path_buf(m.root_id, m.path_off, m.path_len)
+                                }
+                                None => None,
+                            }
+                        };
+                        let Some(path) = path else {
+                            continue;
+                        };
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            if FileKey::from_path_and_metadata(&path, &meta) == Some(fk) {
+                                self.upsert(FileMeta {
+                                    file_key: fk,
+                                    path,
+                                    size: meta.len(),
+                                    mtime: meta.modified().ok(),
+                                });
+                            }
+                        }
+                    }
+                },
+                EventType::Delete => match (ev.path_hint, ev.id) {
+                    (_, FileIdentifier::Fid { dev, ino }) => {
+                        self.mark_deleted(FileKey { dev, ino });
+                    }
+                    (Some(path), _) => {
+                        self.mark_deleted_by_path(&path);
+                    }
+                    (None, FileIdentifier::Path(path)) => {
+                        self.mark_deleted_by_path(&path);
+                    }
+                },
+                EventType::Rename {
+                    from,
+                    from_path_hint,
+                } => {
+                    let from_best_path = from_path_hint.as_deref().or_else(|| from.as_path());
+                    let to_path: Option<PathBuf> = match (ev.path_hint, ev.id) {
+                        (Some(p), _) => Some(p),
+                        (None, FileIdentifier::Path(p)) => Some(p),
+                        (None, _) => None,
+                    };
 
                     let docid_opt = if let Some(fk) = from.as_file_key() {
                         self.filekey_to_docid.read().get(&fk).copied()
@@ -1252,24 +1421,24 @@ impl PersistentIndex {
 
     fn remove_trigrams(&self, docid: DocId, path: &Path) {
         let mut tri_idx = self.trigram_index.write();
-        for tri in component_trigrams(path) {
+        for_each_component_trigram(path, |tri| {
             if let Some(posting) = tri_idx.get_mut(&tri) {
                 posting.remove(docid);
                 if posting.is_empty() {
                     tri_idx.remove(&tri);
                 }
             }
-        }
+        });
     }
 
     fn insert_trigrams(&self, docid: DocId, path: &Path) {
         let mut tri_idx = self.trigram_index.write();
-        for tri in component_trigrams(path) {
+        for_each_component_trigram(path, |tri| {
             tri_idx
                 .entry(tri)
                 .or_insert_with(RoaringBitmap::new)
                 .insert(docid);
-        }
+        });
     }
 
     fn insert_path_hash(&self, docid: DocId, path: &Path) {

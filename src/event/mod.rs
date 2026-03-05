@@ -1,3 +1,4 @@
+pub mod recovery;
 pub mod stream;
 pub mod verify;
 pub mod watcher;

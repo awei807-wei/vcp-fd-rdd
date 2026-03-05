@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use crate::core::{
     AdaptiveScheduler, EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Task,
 };
+use crate::event::recovery::{DirtyScope, DirtyTracker};
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
@@ -27,8 +28,10 @@ use crate::storage::wal::WalStore;
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
 // 更激进的合并阈值：用于百万文件后的“瘦身期”，加速 delta 段收敛。
 const COMPACTION_DELTA_THRESHOLD: usize = 2;
+// 每次 compaction 最多合并多少个 delta（避免“delta 很多时一次合并过重”导致常驻/临时分配抖动）。
+const COMPACTION_MAX_DELTAS_PER_RUN: usize = 2;
 // 防抖：避免 flush 高频阶段反复启动 compaction 造成临时大分配抖动。
-const COMPACTION_COOLDOWN: Duration = Duration::from_secs(180);
+const COMPACTION_COOLDOWN: Duration = Duration::from_secs(30);
 
 fn dir_tree_changed_since(roots: &[PathBuf], ignore_prefixes: &[PathBuf], cutoff_ns: u64) -> bool {
     use std::time::Duration;
@@ -88,6 +91,84 @@ fn dir_tree_changed_since(roots: &[PathBuf], ignore_prefixes: &[PathBuf], cutoff
         }
     }
     false
+}
+
+fn collect_dirs_changed_since(
+    roots: &[PathBuf],
+    ignore_prefixes: &[PathBuf],
+    cutoff_ns: u64,
+) -> Vec<PathBuf> {
+    use std::time::Duration;
+
+    let cutoff = UNIX_EPOCH
+        + Duration::new(
+            cutoff_ns / 1_000_000_000,
+            (cutoff_ns % 1_000_000_000) as u32,
+        );
+
+    let should_skip = |p: &std::path::Path| -> bool {
+        ignore_prefixes
+            .iter()
+            .any(|ig| !ig.as_os_str().is_empty() && p.starts_with(ig))
+    };
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut stack: Vec<PathBuf> = roots.to_vec();
+    while let Some(dir) = stack.pop() {
+        if should_skip(&dir) {
+            continue;
+        }
+
+        let md = match std::fs::symlink_metadata(&dir) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !md.is_dir() {
+            continue;
+        }
+
+        if let Ok(modified) = md.modified() {
+            if cutoff_ns == 0 || modified > cutoff {
+                out.push(dir.clone());
+            }
+        }
+
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                tracing::debug!(
+                    "fast-sync mtime crawl: skip unreadable dir {:?}: {}",
+                    dir,
+                    e
+                );
+                continue;
+            }
+        };
+        for ent in rd {
+            let ent = match ent {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let ft = match ent.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                stack.push(ent.path());
+            }
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FastSyncReport {
+    dirs_scanned: usize,
+    upsert_events: usize,
+    delete_events: usize,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -355,6 +436,21 @@ struct DiskLayer {
     id: u64,
     idx: Arc<MmapIndex>,
     deleted_paths: Arc<Vec<Vec<u8>>>,
+    deleted_paths_count: usize,
+    deleted_paths_bytes: u64,
+    deleted_paths_estimated_bytes: u64,
+}
+
+fn deleted_paths_stats(paths: &Vec<Vec<u8>>) -> (usize, u64, u64) {
+    use std::mem::size_of;
+
+    let count = paths.len();
+    let bytes: u64 = paths.iter().map(|p| p.len() as u64).sum();
+    // Vec<Vec<u8>>：外层 buffer（Vec<u8> 元数据数组）+ 内层 bytes buffer（len≈cap，to_vec() 生成）
+    let outer_buf_bytes = paths.capacity() as u64 * size_of::<Vec<u8>>() as u64;
+    let outer_hdr_bytes = size_of::<Vec<Vec<u8>>>() as u64;
+    let estimated = outer_hdr_bytes + outer_buf_bytes + bytes;
+    (count, bytes, estimated)
 }
 
 #[derive(Debug)]
@@ -501,17 +597,25 @@ impl TieredIndex {
         if let Ok(Some(lsm)) = store.load_lsm_if_valid(&roots) {
             let mut layers: Vec<DiskLayer> = Vec::new();
             if let Some(b) = lsm.base {
+                let (cnt, bytes, est) = deleted_paths_stats(&b.deleted_paths);
                 layers.push(DiskLayer {
                     id: b.id,
                     idx: Arc::new(MmapIndex::new(b.snap)),
                     deleted_paths: Arc::new(b.deleted_paths),
+                    deleted_paths_count: cnt,
+                    deleted_paths_bytes: bytes,
+                    deleted_paths_estimated_bytes: est,
                 });
             }
             for d in lsm.deltas {
+                let (cnt, bytes, est) = deleted_paths_stats(&d.deleted_paths);
                 layers.push(DiskLayer {
                     id: d.id,
                     idx: Arc::new(MmapIndex::new(d.snap)),
                     deleted_paths: Arc::new(d.deleted_paths),
+                    deleted_paths_count: cnt,
+                    deleted_paths_bytes: bytes,
+                    deleted_paths_estimated_bytes: est,
                 });
             }
 
@@ -533,6 +637,9 @@ impl TieredIndex {
                 id: 0,
                 idx: Arc::new(MmapIndex::new(snap)),
                 deleted_paths: Arc::new(Vec::new()),
+                deleted_paths_count: 0,
+                deleted_paths_bytes: 0,
+                deleted_paths_estimated_bytes: 0,
             };
             let idx = Self::new(
                 l1,
@@ -787,14 +894,174 @@ impl TieredIndex {
         });
     }
 
+    /// overflow 兜底：dirty region + cooldown/max-staleness 触发后执行一次 fast-sync（best-effort）。
+    ///
+    /// 设计目标：
+    /// - 避免 “overflow → 立刻全盘 rebuild” 在风暴中触发大分配/高水位；
+    /// - 允许查询短暂陈旧，但不阻塞查询、不 OOM；
+    /// - fast-sync 以“目录为单位”做对齐：只需要 read_dir + 必要的 metadata，不假设 mtime 冒泡。
+    pub fn spawn_fast_sync(
+        self: &Arc<Self>,
+        scope: DirtyScope,
+        ignore_prefixes: Vec<PathBuf>,
+        tracker: Arc<DirtyTracker>,
+    ) {
+        let idx = self.clone();
+        std::thread::spawn(move || {
+            let report = idx.fast_sync(scope, &ignore_prefixes);
+            tracing::warn!(
+                "Fast-sync complete: dirs={} upserts={} deletes={}",
+                report.dirs_scanned,
+                report.upsert_events,
+                report.delete_events
+            );
+            tracing::warn!("Fast-sync complete, triggering manual RSS trim...");
+            maybe_trim_rss();
+            tracker.finish_sync();
+        });
+    }
+
+    pub(crate) fn fast_sync(
+        &self,
+        scope: DirtyScope,
+        ignore_prefixes: &[PathBuf],
+    ) -> FastSyncReport {
+        use std::collections::HashSet;
+
+        let mut report = FastSyncReport::default();
+
+        // 1) 计算需要对齐的目录集合
+        let mut dirs: Vec<PathBuf> = match scope {
+            DirtyScope::All { cutoff_ns } => {
+                collect_dirs_changed_since(&self.roots, ignore_prefixes, cutoff_ns)
+            }
+            DirtyScope::Dirs { dirs, .. } => {
+                let mut v = dirs;
+                v.sort();
+                v.dedup();
+                v
+            }
+        };
+
+        // 过滤：忽略 self-write 目录/不存在目录
+        dirs.retain(|d| {
+            if ignore_prefixes
+                .iter()
+                .any(|ig| !ig.as_os_str().is_empty() && d.starts_with(ig))
+            {
+                return false;
+            }
+            std::fs::symlink_metadata(d)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+        });
+        dirs.sort();
+        dirs.dedup();
+
+        if dirs.is_empty() {
+            return report;
+        }
+
+        // 2) 扫描目录：生成 upsert events。
+        //
+        // 说明：这里不再构建“文件名集合（HashSet<OsString>）”用于删除对齐，
+        // 因为它会在大目录下产生大量短命分配，容易把非索引 PD 顶到高水位。
+        let mut upsert_events: Vec<EventRecord> = Vec::with_capacity(2048);
+        let mut seq: u64 = 0;
+
+        for dir in dirs.iter() {
+            report.dirs_scanned += 1;
+            let rd = match std::fs::read_dir(dir) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+
+            for ent in rd {
+                let ent = match ent {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let ft = match ent.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if ft.is_dir() {
+                    continue;
+                }
+
+                let path = ent.path();
+                seq = seq.wrapping_add(1);
+                upsert_events.push(EventRecord {
+                    seq,
+                    timestamp: std::time::SystemTime::now(),
+                    event_type: EventType::Modify,
+                    id: FileIdentifier::Path(path),
+                    path_hint: None,
+                });
+                report.upsert_events += 1;
+            }
+
+            if upsert_events.len() >= 2048 {
+                self.apply_events_drain(&mut upsert_events);
+            }
+        }
+        if !upsert_events.is_empty() {
+            self.apply_events_drain(&mut upsert_events);
+        }
+
+        let dirty_dirs: HashSet<PathBuf> = dirs.into_iter().collect();
+
+        // 3) 删除对齐：只对齐“被标记 dirty 的目录”下的条目（但对文件做轻量存在性检查，避免构建巨大的 names set）。
+        // 注意：for_each_live_meta 内部持有读锁，期间不能调用 apply_events（会死锁）。
+        let l2 = self.l2.load_full();
+        let mut delete_events: Vec<EventRecord> = Vec::new();
+        l2.for_each_live_meta(|m| {
+            let Some(parent) = m.path.parent() else {
+                return;
+            };
+            if !dirty_dirs.contains(parent) {
+                return;
+            };
+
+            match std::fs::symlink_metadata(&m.path) {
+                Ok(_) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return,
+            };
+            seq = seq.wrapping_add(1);
+            delete_events.push(EventRecord {
+                seq,
+                timestamp: std::time::SystemTime::now(),
+                event_type: EventType::Delete,
+                id: FileIdentifier::Path(m.path),
+                path_hint: None,
+            });
+        });
+
+        report.delete_events = delete_events.len();
+        for chunk in delete_events.chunks(2048) {
+            self.apply_events(chunk);
+        }
+
+        report
+    }
+
     /// 查询入口：L1 → L2 → DiskSegments（mmap），不扫真实文件系统
     pub fn query(&self, keyword: &str) -> Vec<FileMeta> {
+        self.query_limit(keyword, usize::MAX)
+    }
+
+    /// 查询入口（带 limit）：用于 IPC/HTTP 等“结果集可能很大”的场景，避免一次性聚合造成内存峰值。
+    pub fn query_limit(&self, keyword: &str, limit: usize) -> Vec<FileMeta> {
+        if limit == 0 {
+            return Vec::new();
+        }
         let matcher = create_matcher(keyword);
 
         // L1: 热缓存
         if let Some(results) = self.l1.query(matcher.as_ref()) {
             tracing::debug!("L1 hit: {} results", results.len());
-            return results;
+            return results.into_iter().take(limit).collect();
         }
 
         // blocked：path 维度的屏蔽集合（delete + 已输出路径）
@@ -825,7 +1092,7 @@ impl TieredIndex {
         let mut seen: std::collections::HashSet<FileKey> =
             std::collections::HashSet::with_capacity(l2.file_count().saturating_add(256));
 
-        let mut results: Vec<FileMeta> = Vec::with_capacity(128);
+        let mut results: Vec<FileMeta> = Vec::with_capacity(limit.min(128));
 
         // L2: 内存 Delta（newest）
         for key in l2.query_keys(matcher.as_ref()) {
@@ -839,29 +1106,40 @@ impl TieredIndex {
             }
             blocked.insert(pb.to_vec());
             results.push(r);
+            if results.len() >= limit {
+                break;
+            }
         }
 
-        // Disk segments: newest → oldest
-        // 这里保留“克隆层列表”的设计，避免查询全程持有读锁阻塞 flush/compaction。
-        // P2 优化点：DiskLayer 的 deleted_paths 改为 Arc，克隆时不再深拷贝 tombstone bytes。
-        let layers = self.disk_layers.read().clone();
-        for layer in layers.iter().rev() {
-            for p in layer.deleted_paths.iter() {
-                blocked.insert(p.clone());
-            }
-            for key in layer.idx.query_keys(matcher.as_ref()) {
-                if !seen.insert(key) {
-                    continue;
+        if results.len() < limit {
+            // Disk segments: newest → oldest
+            // 这里保留“克隆层列表”的设计，避免查询全程持有读锁阻塞 flush/compaction。
+            // P2 优化点：DiskLayer 的 deleted_paths 改为 Arc，克隆时不再深拷贝 tombstone bytes。
+            let layers = self.disk_layers.read().clone();
+            for layer in layers.iter().rev() {
+                for p in layer.deleted_paths.iter() {
+                    blocked.insert(p.clone());
                 }
-                let Some(r) = layer.idx.get_meta(key) else {
-                    continue;
-                };
-                let pb = r.path.as_os_str().as_encoded_bytes();
-                if blocked.contains(pb) {
-                    continue;
+                for key in layer.idx.query_keys(matcher.as_ref()) {
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let Some(r) = layer.idx.get_meta(key) else {
+                        continue;
+                    };
+                    let pb = r.path.as_os_str().as_encoded_bytes();
+                    if blocked.contains(pb) {
+                        continue;
+                    }
+                    blocked.insert(pb.to_vec());
+                    results.push(r);
+                    if results.len() >= limit {
+                        break;
+                    }
                 }
-                blocked.insert(pb.to_vec());
-                results.push(r);
+                if results.len() >= limit {
+                    break;
+                }
             }
         }
 
@@ -883,6 +1161,15 @@ impl TieredIndex {
     /// 批量应用事件到索引
     pub fn apply_events(&self, events: &[EventRecord]) {
         self.apply_events_inner(events, true);
+    }
+
+    /// 批量应用事件到索引（drain 版本）：消费 `Vec<EventRecord>`，用于减少 PathBuf 克隆带来的非索引 PD 高水位。
+    ///
+    /// 说明：
+    /// - 仅用于“事件生产者本就不需要保留 EventRecord”的路径（EventPipeline / fast-sync）。
+    /// - 内部会清空 `events`，但保留 capacity 以便复用。
+    pub fn apply_events_drain(&self, events: &mut Vec<EventRecord>) {
+        self.apply_events_inner_drain(events, true);
     }
 
     /// 设置 overlay 强制 flush 阈值（0 表示禁用对应阈值）。
@@ -1038,6 +1325,107 @@ impl TieredIndex {
             .fetch_add(events.len() as u64, Ordering::Relaxed);
     }
 
+    fn apply_events_inner_drain(&self, events: &mut Vec<EventRecord>, log_to_wal: bool) {
+        if events.is_empty() {
+            return;
+        }
+
+        let event_count = events.len();
+
+        // flush/compaction 期间需要短暂阻塞写入，避免“指针 swap 后仍写旧 delta”的竞态。
+        let _g = self.apply_gate.read();
+
+        // WAL：先写后用（best-effort）。replay 场景下禁用写回，避免重复追加。
+        if log_to_wal {
+            if let Some(wal) = self.wal.lock().clone() {
+                if let Err(e) = wal.append(events.as_slice()) {
+                    tracing::warn!("WAL append failed (continuing without durability): {}", e);
+                }
+            }
+        }
+
+        // 若 rebuild 在进行：当前 drain 优化意义不大（会进 pending_events），直接复用 slice 逻辑。
+        if self.rebuild_state.lock().in_progress {
+            self.apply_events_inner(events.as_slice(), false);
+            events.clear();
+            return;
+        }
+
+        // overlay：记录跨段 delete/upsert（用于屏蔽更老 segment 结果 + flush sidecar）
+        {
+            let mut ov = self.overlay_state.lock();
+            for ev in events.iter() {
+                let Some(path) = ev.best_path() else {
+                    // FID-only 且无路径：阶段 1 保守跳过 overlay 更新（后续 fanotify 反查完善）。
+                    continue;
+                };
+                let path_bytes = path.as_os_str().as_encoded_bytes();
+                match &ev.event_type {
+                    EventType::Delete => {
+                        let _ = ov.upserted_paths.remove(path_bytes);
+                        let _ = ov.deleted_paths.insert(path_bytes);
+                    }
+                    EventType::Create | EventType::Modify => {
+                        let _ = ov.deleted_paths.remove(path_bytes);
+                        let _ = ov.upserted_paths.insert(path_bytes);
+                    }
+                    EventType::Rename {
+                        from,
+                        from_path_hint,
+                    } => {
+                        let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
+                        if let Some(from_path) = from_best {
+                            let from_bytes = from_path.as_os_str().as_encoded_bytes();
+                            let _ = ov.upserted_paths.remove(from_bytes);
+                            let _ = ov.deleted_paths.insert(from_bytes);
+                        }
+
+                        let _ = ov.deleted_paths.remove(path_bytes);
+                        let _ = ov.upserted_paths.insert(path_bytes);
+                    }
+                }
+            }
+
+            // overlay 达阈值时请求强制 flush（合并触发，避免无界膨胀）。
+            let overlay_paths = ov.deleted_paths.len_paths() + ov.upserted_paths.len_paths();
+            let overlay_arena_bytes =
+                (ov.deleted_paths.arena_len() + ov.upserted_paths.arena_len()) as u64;
+            drop(ov);
+            self.maybe_request_flush(overlay_paths, overlay_arena_bytes);
+        }
+
+        // L1 失效：先做失效再 drain，以避免为失效另存一份路径。
+        for ev in events.iter() {
+            match &ev.event_type {
+                EventType::Delete => {
+                    if let Some(p) = ev.best_path() {
+                        self.l1.remove_by_path(p);
+                    } else if let Some(fid) = ev.id.as_file_key() {
+                        self.l1.remove(&fid);
+                    }
+                }
+                EventType::Rename {
+                    from,
+                    from_path_hint,
+                } => {
+                    let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
+                    if let Some(p) = from_best {
+                        self.l1.remove_by_path(p);
+                    } else if let Some(fid) = from.as_file_key() {
+                        self.l1.remove(&fid);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let l2 = self.l2.load_full();
+        l2.apply_events_drain(events);
+
+        self.event_seq
+            .fetch_add(event_count as u64, Ordering::Relaxed);
+    }
+
     /// 原子快照
     pub async fn snapshot_now(self: &Arc<Self>, store: &SnapshotStore) -> anyhow::Result<()> {
         // Flush：把当前内存 Delta 刷盘为新 Segment；必要时触发后台 compaction。
@@ -1101,28 +1489,41 @@ impl TieredIndex {
             for layer in &layers_snapshot {
                 layer.idx.for_each_live_meta(|m| merged.upsert_rename(m));
             }
+            drop(layers_snapshot);
 
             // 再应用跨段 delete（delete/rename-from）。
             for p in &deleted_paths {
                 let pb = pathbuf_from_bytes(p);
                 merged.mark_deleted_by_path(&pb);
             }
+            drop(deleted_paths);
 
             // 最后灌入本次 delta（newest）。
             old_delta.for_each_live_meta(|m| merged.upsert_rename(m));
+            drop(old_delta);
 
             let segs = merged.export_segments_v6_compacted();
+            drop(merged);
             let base = store
                 .lsm_replace_base_v6(&segs, None, &roots, wal_seal_id)
                 .await?;
+            drop(segs);
             if let Err(e) = store.gc_stale_segments() {
                 tracing::warn!("LSM gc stale segments failed after replace-base: {}", e);
             }
 
+            // deleted_paths 在 append/replace-base 后通常会经历增长与扩容；这里 shrink 一次，避免把 capacity 高水位长期带到常驻层。
+            let mut base_deleted_paths = base.deleted_paths;
+            base_deleted_paths.shrink_to_fit();
+            let (cnt, bytes, est) = deleted_paths_stats(&base_deleted_paths);
+            let deleted_paths = Arc::new(base_deleted_paths);
             let new_layer = DiskLayer {
                 id: base.id,
                 idx: Arc::new(MmapIndex::new(base.snap)),
-                deleted_paths: Arc::new(base.deleted_paths),
+                deleted_paths,
+                deleted_paths_count: cnt,
+                deleted_paths_bytes: bytes,
+                deleted_paths_estimated_bytes: est,
             };
 
             *self.disk_layers.write() = vec![new_layer];
@@ -1130,18 +1531,32 @@ impl TieredIndex {
             if let Some(w) = self.wal.lock().clone() {
                 let _ = w.cleanup_sealed_up_to(wal_seal_id);
             }
+            // snapshot/flush 是临时分配大户；完成后尝试回吐。
+            maybe_trim_rss();
             return Ok(());
         }
 
+        drop(layers_snapshot);
         let segs = old_delta.export_segments_v6();
+        drop(old_delta);
         let seg = store
             .lsm_append_delta_v6(&segs, &deleted_paths, &roots, wal_seal_id)
             .await?;
+        drop(segs);
+        drop(deleted_paths);
 
+        // deleted_paths 在 append 后通常会经历增长与扩容；这里 shrink 一次，避免把 capacity 高水位长期带到常驻层。
+        let mut seg_deleted_paths = seg.deleted_paths;
+        seg_deleted_paths.shrink_to_fit();
+        let (cnt, bytes, est) = deleted_paths_stats(&seg_deleted_paths);
+        let deleted_paths = Arc::new(seg_deleted_paths);
         self.disk_layers.write().push(DiskLayer {
             id: seg.id,
             idx: Arc::new(MmapIndex::new(seg.snap)),
-            deleted_paths: Arc::new(seg.deleted_paths),
+            deleted_paths,
+            deleted_paths_count: cnt,
+            deleted_paths_bytes: bytes,
+            deleted_paths_estimated_bytes: est,
         });
         self.l1.clear();
         if let Some(w) = self.wal.lock().clone() {
@@ -1150,6 +1565,8 @@ impl TieredIndex {
 
         // compaction：段数达到阈值后后台合并
         self.maybe_spawn_compaction(store.path().to_path_buf());
+        // snapshot/flush 是临时分配大户；完成后尝试回吐。
+        maybe_trim_rss();
         Ok(())
     }
 
@@ -1268,8 +1685,30 @@ impl TieredIndex {
             }
         };
 
+        let (
+            disk_segments,
+            disk_deleted_paths,
+            disk_deleted_bytes,
+            disk_deleted_estimated_bytes,
+            disk_deleted_estimated_bytes_max,
+        ) = {
+            let layers = self.disk_layers.read();
+            let mut total_paths: usize = 0;
+            let mut total_bytes: u64 = 0;
+            let mut total_est: u64 = 0;
+            let mut max_est: u64 = 0;
+            for l in layers.iter() {
+                total_paths = total_paths.saturating_add(l.deleted_paths_count);
+                total_bytes = total_bytes.saturating_add(l.deleted_paths_bytes);
+                total_est = total_est.saturating_add(l.deleted_paths_estimated_bytes);
+                max_est = max_est.max(l.deleted_paths_estimated_bytes);
+            }
+            (layers.len(), total_paths, total_bytes, total_est, max_est)
+        };
+
         let index_estimated_bytes = l1.estimated_bytes
             + l2.estimated_bytes
+            + disk_deleted_estimated_bytes
             + overlay.estimated_bytes
             + rebuild.estimated_bytes;
         let process_smaps_rollup = MemoryReport::read_smaps_rollup();
@@ -1285,7 +1724,11 @@ impl TieredIndex {
         MemoryReport {
             l1,
             l2,
-            disk_segments: self.disk_layers.read().len(),
+            disk_segments,
+            disk_deleted_paths,
+            disk_deleted_bytes,
+            disk_deleted_estimated_bytes,
+            disk_deleted_estimated_bytes_max,
             event_pipeline: pipeline_stats,
             overlay,
             rebuild,
@@ -1425,15 +1868,15 @@ impl TieredIndex {
     }
 
     fn maybe_spawn_compaction(self: &Arc<Self>, store_path: PathBuf) {
-        // flush 请求优先；先把内存/overlay 刷稳再考虑 compaction，避免两者互相打架。
-        if self.flush_requested.load(Ordering::Acquire) {
-            return;
-        }
-
-        let layers = self.disk_layers.read().clone();
+        let mut layers = self.disk_layers.read().clone();
         let delta_count = layers.len().saturating_sub(1);
         if delta_count < COMPACTION_DELTA_THRESHOLD {
             return;
+        }
+        // 为了避免一次 compaction 过重：只合并 base + 最老的一小段 delta，剩余新 delta 保留在 suffix。
+        let max_layers = 1 + COMPACTION_MAX_DELTAS_PER_RUN;
+        if layers.len() > max_layers {
+            layers.truncate(max_layers);
         }
 
         // 防抖：冷却期内不重复启动 compaction（尤其是 manifest changed 场景）。
@@ -1488,7 +1931,8 @@ impl TieredIndex {
         if layers_snapshot.is_empty() {
             return Ok(());
         }
-        // 若进入执行时层列表已变化，直接放弃本轮（避免无意义重活）。
+        // 若进入执行时层列表“前缀”已变化，直接放弃本轮（避免无意义重活）。
+        // 允许并发 append 新 delta：只要当前层列表仍以本次 snapshot 作为前缀，本轮 compaction 仍然有意义。
         {
             let cur_ids = self
                 .disk_layers
@@ -1497,7 +1941,8 @@ impl TieredIndex {
                 .map(|l| l.id)
                 .collect::<Vec<_>>();
             let snap_ids = layers_snapshot.iter().map(|l| l.id).collect::<Vec<_>>();
-            if cur_ids != snap_ids {
+            let snap_len = snap_ids.len();
+            if cur_ids.len() < snap_len || cur_ids[..snap_len] != snap_ids[..] {
                 return Ok(());
             }
         }
@@ -1548,19 +1993,33 @@ impl TieredIndex {
             );
         }
 
+        let (cnt, bytes, est) = deleted_paths_stats(&new_base.deleted_paths);
+        let deleted_paths = Arc::new(new_base.deleted_paths);
         let new_layer = DiskLayer {
             id: new_base.id,
             idx: Arc::new(MmapIndex::new(new_base.snap)),
-            deleted_paths: Arc::new(new_base.deleted_paths),
+            deleted_paths,
+            deleted_paths_count: cnt,
+            deleted_paths_bytes: bytes,
+            deleted_paths_estimated_bytes: est,
         };
 
         // 仅当段列表未变化时才替换（弱 CAS）
         {
             let mut cur = self.disk_layers.write();
-            let cur_ids = cur.iter().map(|l| l.id).collect::<Vec<_>>();
-            let snap_ids = layers_snapshot.iter().map(|l| l.id).collect::<Vec<_>>();
-            if cur_ids == snap_ids {
-                *cur = vec![new_layer];
+            let snap_len = layers_snapshot.len();
+            let prefix_matches = cur.len() >= snap_len
+                && cur
+                    .iter()
+                    .take(snap_len)
+                    .map(|l| l.id)
+                    .eq(layers_snapshot.iter().map(|l| l.id));
+            if prefix_matches {
+                // 保留并发 append 的新 delta（suffix）；用 new_base 替换掉本次 compaction 的 prefix。
+                let suffix: Vec<DiskLayer> = cur.drain(snap_len..).collect();
+                cur.clear();
+                cur.push(new_layer);
+                cur.extend(suffix);
                 self.l1.clear();
             }
         }
@@ -1739,6 +2198,45 @@ mod tests {
         idx.finish_rebuild(new_l2);
         assert!(idx.query("old_aaa").is_empty());
         assert!(!idx.query("new_bbb").is_empty());
+    }
+
+    #[test]
+    fn fast_sync_reconciles_add_and_delete() {
+        let root = unique_tmp_dir("fast-sync");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let a = root.join("a_match.txt");
+        let b = root.join("b_match.txt");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        let idx = TieredIndex::empty(vec![root.clone()]);
+        idx.apply_events(&[
+            mk_event(1, EventType::Create, a.clone()),
+            mk_event(2, EventType::Create, b.clone()),
+        ]);
+        assert!(!idx.query("a_match").is_empty());
+        assert!(!idx.query("b_match").is_empty());
+
+        // 离线变更：不经过事件管道直接修改文件系统
+        std::fs::remove_file(&b).unwrap();
+        let c = root.join("c_match.txt");
+        std::fs::write(&c, b"c").unwrap();
+
+        let r = idx.fast_sync(
+            DirtyScope::Dirs {
+                cutoff_ns: 0,
+                dirs: vec![root.clone()],
+            },
+            &[],
+        );
+        assert!(r.dirs_scanned >= 1);
+        assert!(r.upsert_events >= 1);
+        assert!(r.delete_events >= 1);
+
+        assert!(!idx.query("a_match").is_empty());
+        assert!(idx.query("b_match").is_empty());
+        assert!(!idx.query("c_match").is_empty());
     }
 
     #[tokio::test]
