@@ -8,7 +8,14 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前主线实现沿 v0.4.5 路线演进（语义锚定 + MergedView + LSM Hygiene）。
+> 当前主线实现沿 v0.4.6 路线演进（语义锚定 + MergedView + LSM Hygiene + 最近一轮内存治理修正）。
+
+## v0.4.6 更新
+
+- 版本：主线版本提升到 `v0.4.6`，便于区分包含最近内存治理修正的测试构建
+- LSM：修复 compaction 仅替换“base + 被 compact 的 delta 前缀”时的 manifest 判定，避免 suffix delta 被误伤后长期不收敛
+- Flush：新增 `--batch-flush-min-events` / `--batch-flush-min-bytes`，让低频小变更先留在 WAL/L2，攒够一批再落段
+- 稳定性：保留 overlay 强制 flush 与退出前最终 snapshot 语义，不让批量门槛拖慢止血路径
 
 ## 核心能力
 
@@ -121,6 +128,17 @@ UDS 流式查询（推荐用于大结果集；边收边输出，不聚合）：
 
 - `--trim-interval-secs`：检查周期（秒，0=禁用，默认 300）
 - `--trim-pd-threshold-mb`：`Private_Dirty` 触发阈值（MB，0=禁用，默认 128）
+
+如需减少“低频小变更也每轮都落成一个新 delta 段”的情况，可额外启用定时 flush 批量门槛：
+
+- `--batch-flush-min-events`：周期性 flush 的最小事件数（0=禁用，默认 0）
+- `--batch-flush-min-bytes`：周期性 flush 的最小事件字节数（0=禁用，默认 0）
+
+说明：
+
+- 这两个参数只影响 **周期性** flush（`--snapshot-interval-secs`）。
+- overlay 达阈值触发的强制 flush、以及进程退出前的最终 snapshot **不受影响**。
+- 它们的用途是“把小批次变更继续留在 WAL/L2，等攒够一批再落段”，用于减缓新段增长；不能替代 compaction 收敛。
 
 该策略用于缓解“索引结构已很小，但匿名脏页高水位常驻”的场景。
 

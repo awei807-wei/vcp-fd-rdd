@@ -83,6 +83,14 @@ struct Args {
     /// overlay 强制 flush 阈值（arena 字节数，近似“物理路径字节池”体量）（0=禁用）
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     auto_flush_overlay_bytes: u64,
+
+    /// 定时 flush 的最小事件数门槛；未达到时继续保留在 WAL/L2，等待后续批量落盘（0=禁用）
+    #[arg(long, default_value_t = 0)]
+    batch_flush_min_events: u64,
+
+    /// 定时 flush 的最小事件字节数门槛；未达到时继续保留在 WAL/L2，等待后续批量落盘（0=禁用）
+    #[arg(long, default_value_t = 0)]
+    batch_flush_min_bytes: u64,
 }
 
 #[tokio::main]
@@ -124,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         TieredIndex::load(store.as_ref(), roots).await?
     };
     index.set_auto_flush_limits(args.auto_flush_overlay_paths, args.auto_flush_overlay_bytes);
+    index.set_periodic_flush_batch_limits(args.batch_flush_min_events, args.batch_flush_min_bytes);
     // WAL：即使 --no_snapshot，也允许记录后续事件（仅不回放历史）。
     let _ = index.attach_wal(&store);
 

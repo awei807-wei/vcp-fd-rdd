@@ -1396,7 +1396,12 @@ impl SnapshotStore {
         })
     }
 
-    /// LSM：用新的 base segment 替换当前 base+delta（并清空 delta 列表）。
+    /// LSM：用新的 base segment 替换当前“base + 一段 delta 前缀”。
+    ///
+    /// `expected_prev` 表示本轮将被 compact 掉的层前缀：
+    /// - `(base_id, delta_ids_prefix)`
+    /// - 当前 manifest 必须仍以该前缀开头
+    /// - 未参与本轮 compaction 的 suffix delta 会被原样保留
     pub async fn lsm_replace_base_v6(
         &self,
         segs: &V6Segments,
@@ -1420,17 +1425,23 @@ impl SnapshotStore {
             }
         };
 
-        if let Some((base_id, delta_ids)) = expected_prev {
-            if manifest.base_id != base_id || manifest.delta_ids != delta_ids {
+        let preserved_suffix = if let Some((base_id, delta_ids_prefix)) = expected_prev {
+            let prefix_matches = manifest.base_id == base_id
+                && manifest.delta_ids.len() >= delta_ids_prefix.len()
+                && manifest.delta_ids[..delta_ids_prefix.len()] == delta_ids_prefix[..];
+            if !prefix_matches {
                 anyhow::bail!("LSM manifest changed, aborting compaction");
             }
-        }
+            manifest.delta_ids[delta_ids_prefix.len()..].to_vec()
+        } else {
+            Vec::new()
+        };
 
         let id = manifest.next_id.max(1);
         manifest.next_id = id.saturating_add(1);
         manifest.base_id = id;
-        manifest.delta_ids.clear();
-        manifest.wal_seal_id = wal_seal_id;
+        manifest.delta_ids = preserved_suffix;
+        manifest.wal_seal_id = manifest.wal_seal_id.max(wal_seal_id);
         manifest.last_build_ns = now_unix_nanos();
 
         let seg_path = self.lsm_seg_db_path(id);
