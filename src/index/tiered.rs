@@ -453,6 +453,31 @@ fn deleted_paths_stats(paths: &Vec<Vec<u8>>) -> (usize, u64, u64) {
     (count, bytes, estimated)
 }
 
+fn file_identifier_estimated_bytes(id: &FileIdentifier) -> u64 {
+    match id {
+        FileIdentifier::Path(p) => p.as_os_str().as_encoded_bytes().len() as u64,
+        FileIdentifier::Fid { .. } => 16,
+    }
+}
+
+fn event_record_estimated_bytes(ev: &EventRecord) -> u64 {
+    let mut bytes = file_identifier_estimated_bytes(&ev.id);
+    if let Some(p) = &ev.path_hint {
+        bytes = bytes.saturating_add(p.as_os_str().as_encoded_bytes().len() as u64);
+    }
+    if let EventType::Rename {
+        from,
+        from_path_hint,
+    } = &ev.event_type
+    {
+        bytes = bytes.saturating_add(file_identifier_estimated_bytes(from));
+        if let Some(p) = from_path_hint {
+            bytes = bytes.saturating_add(p.as_os_str().as_encoded_bytes().len() as u64);
+        }
+    }
+    bytes
+}
+
 #[derive(Debug)]
 struct RebuildState {
     in_progress: bool,
@@ -511,6 +536,10 @@ pub struct TieredIndex {
     flush_notify: Notify,
     auto_flush_overlay_paths: AtomicU64,
     auto_flush_overlay_bytes: AtomicU64,
+    periodic_flush_min_events: AtomicU64,
+    periodic_flush_min_bytes: AtomicU64,
+    pending_flush_events: AtomicU64,
+    pending_flush_bytes: AtomicU64,
     pub roots: Vec<PathBuf>,
 }
 
@@ -539,6 +568,10 @@ impl TieredIndex {
             flush_notify: Notify::new(),
             auto_flush_overlay_paths: AtomicU64::new(250_000),
             auto_flush_overlay_bytes: AtomicU64::new(64 * 1024 * 1024),
+            periodic_flush_min_events: AtomicU64::new(0),
+            periodic_flush_min_bytes: AtomicU64::new(0),
+            pending_flush_events: AtomicU64::new(0),
+            pending_flush_bytes: AtomicU64::new(0),
             roots,
         }
     }
@@ -795,6 +828,7 @@ impl TieredIndex {
                         ov.deleted_paths.maybe_shrink_after_clear();
                         ov.upserted_paths.maybe_shrink_after_clear();
                     }
+                    self.note_pending_flush_rebuild(new_l2.as_ref());
                     st.in_progress = false;
                     // 若 rebuild 期间又被请求（例如 overflow 风暴），合并为下一轮 rebuild。
                     let again = st.requested;
@@ -1180,6 +1214,54 @@ impl TieredIndex {
             .store(overlay_bytes, Ordering::Relaxed);
     }
 
+    /// 设置“定时 flush”的最小批量门槛。
+    ///
+    /// - 仅影响 snapshot_loop 的周期性 flush
+    /// - overlay 强制 flush / 退出前最终 snapshot 不受影响
+    pub fn set_periodic_flush_batch_limits(&self, min_events: u64, min_bytes: u64) {
+        self.periodic_flush_min_events
+            .store(min_events, Ordering::Relaxed);
+        self.periodic_flush_min_bytes
+            .store(min_bytes, Ordering::Relaxed);
+    }
+
+    fn note_pending_flush_batch(&self, events: &[EventRecord]) {
+        if events.is_empty() {
+            return;
+        }
+        let bytes = events
+            .iter()
+            .map(event_record_estimated_bytes)
+            .fold(0u64, u64::saturating_add);
+        self.pending_flush_events
+            .fetch_add(events.len() as u64, Ordering::Relaxed);
+        self.pending_flush_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn note_pending_flush_rebuild(&self, idx: &PersistentIndex) {
+        self.pending_flush_events
+            .store(idx.file_count() as u64, Ordering::Relaxed);
+        self.pending_flush_bytes
+            .store(idx.memory_stats().estimated_bytes, Ordering::Relaxed);
+    }
+
+    fn reset_pending_flush_batch(&self) {
+        self.pending_flush_events.store(0, Ordering::Relaxed);
+        self.pending_flush_bytes.store(0, Ordering::Relaxed);
+    }
+
+    fn periodic_flush_batch_ready(&self) -> bool {
+        let min_events = self.periodic_flush_min_events.load(Ordering::Relaxed);
+        let min_bytes = self.periodic_flush_min_bytes.load(Ordering::Relaxed);
+        if min_events == 0 && min_bytes == 0 {
+            return true;
+        }
+        let pending_events = self.pending_flush_events.load(Ordering::Relaxed);
+        let pending_bytes = self.pending_flush_bytes.load(Ordering::Relaxed);
+        (min_events > 0 && pending_events >= min_events)
+            || (min_bytes > 0 && pending_bytes >= min_bytes)
+    }
+
     fn maybe_request_flush(&self, overlay_paths: usize, overlay_arena_bytes: u64) {
         let limit_paths = self.auto_flush_overlay_paths.load(Ordering::Relaxed);
         let limit_bytes = self.auto_flush_overlay_bytes.load(Ordering::Relaxed);
@@ -1294,6 +1376,7 @@ impl TieredIndex {
             self.l2.load_full()
         };
 
+        self.note_pending_flush_batch(events);
         l2.apply_events(events);
 
         // 同步更新 L1
@@ -1394,6 +1477,7 @@ impl TieredIndex {
             self.maybe_request_flush(overlay_paths, overlay_arena_bytes);
         }
 
+        self.note_pending_flush_batch(events.as_slice());
         // L1 失效：先做失效再 drain，以避免为失效另存一份路径。
         for ev in events.iter() {
             match &ev.event_type {
@@ -1441,6 +1525,7 @@ impl TieredIndex {
             if !delta_dirty && !overlay_dirty {
                 tracing::debug!("No delta/overlay changes, skipping flush");
                 self.flush_requested.store(false, Ordering::Release);
+                self.reset_pending_flush_batch();
                 return Ok(());
             }
 
@@ -1531,6 +1616,7 @@ impl TieredIndex {
             if let Some(w) = self.wal.lock().clone() {
                 let _ = w.cleanup_sealed_up_to(wal_seal_id);
             }
+            self.reset_pending_flush_batch();
             // snapshot/flush 是临时分配大户；完成后尝试回吐。
             maybe_trim_rss();
             return Ok(());
@@ -1562,6 +1648,7 @@ impl TieredIndex {
         if let Some(w) = self.wal.lock().clone() {
             let _ = w.cleanup_sealed_up_to(wal_seal_id);
         }
+        self.reset_pending_flush_batch();
 
         // compaction：段数达到阈值后后台合并
         self.maybe_spawn_compaction(store.path().to_path_buf());
@@ -1589,16 +1676,28 @@ impl TieredIndex {
                 continue;
             }
 
-            match interval {
+            let periodic_tick = match interval {
                 Some(interval) => {
                     tokio::select! {
-                        _ = tokio::time::sleep(interval) => {},
-                        _ = self.flush_notify.notified() => {},
+                        _ = tokio::time::sleep(interval) => true,
+                        _ = self.flush_notify.notified() => false,
                     }
                 }
                 None => {
                     self.flush_notify.notified().await;
+                    false
                 }
+            };
+
+            if periodic_tick && !self.periodic_flush_batch_ready() {
+                tracing::debug!(
+                    "Periodic flush skipped: pending_events={} pending_bytes={} min_events={} min_bytes={}",
+                    self.pending_flush_events.load(Ordering::Relaxed),
+                    self.pending_flush_bytes.load(Ordering::Relaxed),
+                    self.periodic_flush_min_events.load(Ordering::Relaxed),
+                    self.periodic_flush_min_bytes.load(Ordering::Relaxed),
+                );
+                continue;
             }
 
             if let Err(e) = self.snapshot_now(&store).await {
@@ -2270,6 +2369,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn periodic_flush_batch_threshold_skips_then_flushes() {
+        let root = unique_tmp_dir("periodic-batch-events");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store = Arc::new(SnapshotStore::new(root.join("index.db")));
+        let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+        idx.set_auto_flush_limits(0, 0);
+        idx.set_periodic_flush_batch_limits(2, 0);
+
+        let h = tokio::spawn(idx.clone().snapshot_loop(store.clone(), 1));
+
+        let p1 = root.join("a.txt");
+        std::fs::write(&p1, b"a").unwrap();
+        idx.apply_events(&[mk_event(1, EventType::Create, p1.clone())]);
+
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        assert!(idx.disk_layers.read().is_empty());
+
+        let p2 = root.join("b.txt");
+        std::fs::write(&p2, b"b").unwrap();
+        idx.apply_events(&[mk_event(2, EventType::Create, p2.clone())]);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !idx.disk_layers.read().is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("periodic flush did not flush after event threshold was met");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn periodic_flush_batch_byte_threshold_skips_then_flushes() {
+        let root = unique_tmp_dir("periodic-batch-bytes");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store = Arc::new(SnapshotStore::new(root.join("index.db")));
+        let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+        idx.set_auto_flush_limits(0, 0);
+
+        let p1 = root.join("alpha-long-name.txt");
+        let ev1 = mk_event(1, EventType::Create, p1.clone());
+        let threshold = event_record_estimated_bytes(&ev1).saturating_add(1);
+        idx.set_periodic_flush_batch_limits(0, threshold);
+
+        let h = tokio::spawn(idx.clone().snapshot_loop(store.clone(), 1));
+
+        std::fs::write(&p1, b"a").unwrap();
+        idx.apply_events(&[ev1]);
+
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        assert!(idx.disk_layers.read().is_empty());
+
+        let p2 = root.join("beta-long-name.txt");
+        std::fs::write(&p2, b"b").unwrap();
+        idx.apply_events(&[mk_event(2, EventType::Create, p2.clone())]);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !idx.disk_layers.read().is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("periodic flush did not flush after byte threshold was met");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        h.abort();
+    }
+
+    #[tokio::test]
     async fn lsm_layering_delete_blocks_base() {
         use crate::core::{FileKey, FileMeta};
         use crate::index::PersistentIndex;
@@ -2598,5 +2774,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idx.disk_layers.read().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
+        use crate::core::{FileKey, FileMeta};
+        use crate::index::PersistentIndex;
+
+        let root = unique_tmp_dir("lsm-compact-prefix");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SnapshotStore::new(root.join("index.db"));
+
+        let mk_seg = |ino: u64, name: &str| {
+            let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+            idx.upsert(FileMeta {
+                file_key: FileKey { dev: 1, ino },
+                path: root.join(name),
+                size: ino,
+                mtime: None,
+            });
+            idx
+        };
+
+        store
+            .lsm_replace_base_v6(
+                &mk_seg(1, "base.txt").export_segments_v6(),
+                None,
+                &[root.clone()],
+                10,
+            )
+            .await
+            .unwrap();
+        store
+            .lsm_append_delta_v6(
+                &mk_seg(2, "delta-1.txt").export_segments_v6(),
+                &[],
+                &[root.clone()],
+                11,
+            )
+            .await
+            .unwrap();
+        store
+            .lsm_append_delta_v6(
+                &mk_seg(3, "delta-2.txt").export_segments_v6(),
+                &[],
+                &[root.clone()],
+                12,
+            )
+            .await
+            .unwrap();
+        store
+            .lsm_append_delta_v6(
+                &mk_seg(4, "delta-3.txt").export_segments_v6(),
+                &[],
+                &[root.clone()],
+                13,
+            )
+            .await
+            .unwrap();
+        store
+            .lsm_append_delta_v6(
+                &mk_seg(5, "delta-4.txt").export_segments_v6(),
+                &[],
+                &[root.clone()],
+                14,
+            )
+            .await
+            .unwrap();
+
+        let idx = Arc::new(
+            TieredIndex::load_or_empty(&store, vec![root.clone()])
+                .await
+                .unwrap(),
+        );
+        assert_eq!(idx.disk_layers.read().len(), 5);
+
+        let prefix = idx
+            .disk_layers
+            .read()
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prefix.iter().map(|l| l.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        idx.compact_layers(store.path().to_path_buf(), prefix)
+            .await
+            .unwrap();
+
+        let layer_ids = idx
+            .disk_layers
+            .read()
+            .iter()
+            .map(|l| l.id)
+            .collect::<Vec<_>>();
+        assert_eq!(layer_ids.len(), 3);
+        assert_eq!(layer_ids[1..], [4, 5]);
+        assert!(layer_ids[0] > 5);
+
+        let loaded = store.load_lsm_if_valid(&[root.clone()]).unwrap().unwrap();
+        assert_eq!(loaded.base.as_ref().map(|b| b.id), Some(layer_ids[0]));
+        assert_eq!(
+            loaded.deltas.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert_eq!(loaded.wal_seal_id, 14);
     }
 }
