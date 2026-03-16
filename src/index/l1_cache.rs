@@ -35,6 +35,7 @@ impl L1Cache {
     pub fn query(&self, matcher: &dyn Matcher) -> Option<Vec<FileMeta>> {
         let is_segment = matcher.glob_mode() == Some(GlobMode::Segment);
         let prefix = matcher.prefix();
+        let case_sensitive = matcher.case_sensitive();
 
         let results: Vec<FileMeta> = self
             .inner
@@ -43,19 +44,23 @@ impl L1Cache {
                 let meta = e.value();
                 // 前缀启发式过滤
                 if let Some(p) = prefix {
-                    if is_segment {
-                        let basename = meta
-                            .path
-                            .file_name()
-                            .map(|n| n.to_string_lossy())
-                            .unwrap_or_default();
-                        if !basename.contains(p) {
-                            return false;
-                        }
-                    } else {
-                        let path_str = meta.path.to_string_lossy();
-                        if !path_str.contains(p) {
-                            return false;
+                    // Smart-Case：当 matcher 不敏感时，prefix 的大小写过滤若做错会产生假阴性。
+                    // L1 容量有限，直接跳过该启发式更安全。
+                    if case_sensitive {
+                        if is_segment {
+                            let basename = meta
+                                .path
+                                .file_name()
+                                .map(|n| n.to_string_lossy())
+                                .unwrap_or_default();
+                            if !basename.contains(p) {
+                                return false;
+                            }
+                        } else {
+                            let path_str = meta.path.to_string_lossy();
+                            if !path_str.contains(p) {
+                                return false;
+                            }
                         }
                     }
                 }

@@ -9,4 +9,4 @@ if [ -z "$QUERY" ]; then
     exit 1
 fi
 
-curl -s "http://localhost:6060/search?q=$QUERY" | jq -r '.[].path'
+curl -sG "http://localhost:6060/search" --data-urlencode "q=$QUERY" | jq -r '.[].path'
