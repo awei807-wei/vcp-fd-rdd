@@ -17,7 +17,7 @@ struct Args {
     #[arg(long)]
     spawn: bool,
 
-    /// 查询关键字（Exact contains 或 glob）
+    /// 查询表达式（支持 AND/OR/NOT/过滤器；详见 README）
     query: String,
 }
 

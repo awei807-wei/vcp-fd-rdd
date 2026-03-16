@@ -782,7 +782,7 @@ mod tests {
         let mmap_idx = MmapIndex::new(snap);
 
         // 查询 "src"：若错误走候选集（basename-only），会漏掉 /src/a.txt（目录段命中）。
-        let m = create_matcher("src");
+        let m = create_matcher("src", true);
         let r = mmap_idx.query(m.as_ref());
         assert_eq!(r.len(), 2);
         let s0 = r[0].path.to_string_lossy();

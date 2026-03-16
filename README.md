@@ -8,7 +8,12 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前主线实现沿 v0.4.6 路线演进（语义锚定 + MergedView + LSM Hygiene + 最近一轮内存治理修正）。
+> 当前主线实现沿 v0.4.7 路线演进（语义锚定 + MergedView + LSM Hygiene + 最近一轮内存治理修正）。
+
+## v0.4.7 更新
+
+- 版本：主线版本提升到 `v0.4.7`，便于区分包含最新查询语法联调验收的测试构建
+- 查询：新增搜索语法冒烟脚本 `scripts/smoke-search-syntax.sh`，可自动创建样例文件并调用 HTTP `/search` 验证 Smart-Case、AND/OR/NOT、短语、glob、`ext/pic/dm/size`、`wfn/regex` 等关键语义
 
 ## v0.4.6 更新
 
@@ -68,12 +73,41 @@
 
 启动时优先加载 `index.d/`，随后按 `MANIFEST.bin` 的 `wal_seal_id` 回放 WAL，使查询包含“最后一次 snapshot 之后”的增量变更。
 
-## 查询匹配说明
+## 查询语法（`q=...`）
 
-- 不带通配符：contains 匹配（大小写敏感）
+### Smart-Case（默认不敏感）
+
+- 默认：大小写不敏感
+- 若查询中包含大写字母，或显式使用 `case:`：切换为大小写敏感
+
+### 逻辑运算符
+
+- 空格（AND）：`VCP server`
+- 竖线 `|`（OR）：`server.js|Plugin.js`
+- 感叹号 `!`（NOT，全局排除）：`server.js !node_modules`
+
+### 短语
+
+- 双引号：`"New Folder"`（作为一个完整词组参与匹配）
+
+### 基础匹配（路径字符串）
+
+- 不带通配符：contains 子串匹配
 - 带 `*`/`?`：glob 匹配
   - pattern 含 `/` 或 `\\`：对完整路径做 glob（FullPath）
   - 否则：按“文件名/任意路径段”匹配（Segment）
+
+### 快捷过滤器
+
+- `doc:` / `pic:` / `video:`：按扩展名集合过滤（支持 `pic:十一` 等价于 `pic:` AND `十一`）
+- `ext:js;py`：按后缀过滤（`;`/`,` 分隔）
+- `dm:today` / `dm:YYYY-MM-DD`：按修改日期过滤（以 Daemon 本地时间为准）
+- `size:>10mb`：按大小过滤（单位支持 `b/kb/mb/gb/tb`，1024 进制）
+
+### 高级
+
+- `wfn:`：完整文件名匹配（默认 basename；若 pattern 含 `/` 或 `\\` 则对 fullpath 生效）
+- `regex:`：正则匹配（默认 basename；pattern 含 `/` 或 Windows 分隔符 `\\` 时对 fullpath 生效；regex 内含 `|`/空格时请使用引号：`regex:"^VCP.*\\.(js|ts)$"`，Windows 示例：`regex:"^C:\\\\tmp\\\\VCP.*\\.js$"`）
 
 ## 快速开始
 
@@ -104,8 +138,9 @@ cargo build --release --no-default-features
 查询：
 
 ```bash
-curl "http://127.0.0.1:6060/search?q=main.rs&limit=20"
-curl "http://127.0.0.1:6060/search?q=*memoir*&limit=20"
+curl -G "http://127.0.0.1:6060/search" --data-urlencode "q=main.rs" --data-urlencode "limit=20"
+curl -G "http://127.0.0.1:6060/search" --data-urlencode "q=*memoir*" --data-urlencode "limit=20"
+curl -G "http://127.0.0.1:6060/search" --data-urlencode "q=server.js !node_modules" --data-urlencode "limit=20"
 ```
 
 UDS 流式查询（推荐用于大结果集；边收边输出，不聚合）：
