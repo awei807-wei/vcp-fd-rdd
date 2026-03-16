@@ -1520,7 +1520,7 @@ mod tests {
         assert!(snap.file_key_map.is_some());
 
         let mmap_idx = MmapIndex::new(snap);
-        let m = create_matcher("alpha");
+        let m = create_matcher("alpha", true);
         let r = mmap_idx.query(m.as_ref());
         assert_eq!(r.len(), 1);
         assert!(r[0].path.to_string_lossy().contains("alpha_test"));

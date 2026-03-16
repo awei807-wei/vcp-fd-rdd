@@ -1640,7 +1640,7 @@ mod tests {
             mtime: None,
         });
 
-        let m = create_matcher("alpha");
+        let m = create_matcher("alpha", true);
         let r = idx.query(m.as_ref());
         assert_eq!(r.len(), 1);
         assert!(r[0].path.to_string_lossy().contains("alpha_test"));

@@ -18,6 +18,7 @@ use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::index::mmap_index::MmapIndex;
 use crate::index::IndexLayer;
+use crate::query::dsl::compile_query;
 use crate::query::matcher::create_matcher;
 use crate::stats::{
     infer_heap_high_water, EventPipelineStats, MemoryReport, OverlayStats, RebuildStats,
@@ -1090,13 +1091,113 @@ impl TieredIndex {
         if limit == 0 {
             return Vec::new();
         }
-        let matcher = create_matcher(keyword);
 
-        // L1: 热缓存
-        if let Some(results) = self.l1.query(matcher.as_ref()) {
-            tracing::debug!("L1 hit: {} results", results.len());
-            return results.into_iter().take(limit).collect();
-        }
+        let compiled = match compile_query(keyword) {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::warn!(
+                    "query dsl compile failed, fallback to legacy matcher: {}",
+                    e
+                );
+                let case_sensitive =
+                    keyword.contains("case:") || keyword.chars().any(|c| c.is_uppercase());
+                let matcher = create_matcher(keyword, case_sensitive);
+
+                // L1: 热缓存（legacy 路径维持原行为）
+                if let Some(results) = self.l1.query(matcher.as_ref()) {
+                    tracing::debug!("L1 hit: {} results", results.len());
+                    return results.into_iter().take(limit).collect();
+                }
+
+                // blocked：path 维度的屏蔽集合（delete + 已输出路径）
+                // - delete 语义仍以路径为准（LSM sidecar `.del`），用于屏蔽更老 segment 的同路径记录
+                // - 同一路径只返回最新版本：用于处理 inode 复用/旧段残留等场景（即使 FileKey 不同也应屏蔽）
+                let l2 = self.l2.load_full();
+                let mut blocked: std::collections::HashSet<Vec<u8>> = {
+                    let st = self.overlay_state.lock();
+                    let mut blocked = std::collections::HashSet::with_capacity(
+                        st.deleted_paths.len_paths().saturating_add(64),
+                    );
+                    st.deleted_paths.for_each_bytes(|p| {
+                        blocked.insert(p.to_vec());
+                    });
+                    blocked
+                };
+                {
+                    let layers = self.disk_layers.read();
+                    let extra = layers
+                        .iter()
+                        .map(|l| l.deleted_paths.len())
+                        .sum::<usize>()
+                        .saturating_add(l2.file_count());
+                    blocked.reserve(extra);
+                }
+
+                // seen：FileKey 维度的“先到先得”去重（rename/覆盖语义）
+                let mut seen: std::collections::HashSet<FileKey> =
+                    std::collections::HashSet::with_capacity(l2.file_count().saturating_add(256));
+
+                let mut results: Vec<FileMeta> = Vec::with_capacity(limit.min(128));
+
+                // L2: 内存 Delta（newest）
+                for key in l2.query_keys(matcher.as_ref()) {
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let Some(r) = l2.get_meta(key) else { continue };
+                    let pb = r.path.as_os_str().as_encoded_bytes();
+                    if blocked.contains(pb) {
+                        continue;
+                    }
+                    blocked.insert(pb.to_vec());
+                    results.push(r);
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+
+                if results.len() < limit {
+                    // Disk segments: newest → oldest
+                    let layers = self.disk_layers.read().clone();
+                    for layer in layers.iter().rev() {
+                        for p in layer.deleted_paths.iter() {
+                            blocked.insert(p.clone());
+                        }
+                        for key in layer.idx.query_keys(matcher.as_ref()) {
+                            if !seen.insert(key) {
+                                continue;
+                            }
+                            let Some(r) = layer.idx.get_meta(key) else {
+                                continue;
+                            };
+                            let pb = r.path.as_os_str().as_encoded_bytes();
+                            if blocked.contains(pb) {
+                                continue;
+                            }
+                            blocked.insert(pb.to_vec());
+                            results.push(r);
+                            if results.len() >= limit {
+                                break;
+                            }
+                        }
+                        if results.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+
+                if !results.is_empty() {
+                    tracing::debug!("Query hit: {} results", results.len());
+                    for meta in results.iter().take(10) {
+                        self.l1.insert(meta.clone());
+                    }
+                    return results;
+                }
+
+                l2.maybe_schedule_repair();
+                return Vec::new();
+            }
+        };
 
         // blocked：path 维度的屏蔽集合（delete + 已输出路径）
         // - delete 语义仍以路径为准（LSM sidecar `.del`），用于屏蔽更老 segment 的同路径记录
@@ -1128,20 +1229,28 @@ impl TieredIndex {
 
         let mut results: Vec<FileMeta> = Vec::with_capacity(limit.min(128));
 
+        // DSL 语义：
+        // - include/exclude/过滤器 都在这里统一评估
+        // - **重要**：即使不匹配，也要把该 path 标记为 blocked（避免旧段的同路径旧元数据“误命中”）
+
         // L2: 内存 Delta（newest）
-        for key in l2.query_keys(matcher.as_ref()) {
-            if !seen.insert(key) {
-                continue;
-            }
-            let Some(r) = l2.get_meta(key) else { continue };
-            let pb = r.path.as_os_str().as_encoded_bytes();
-            if blocked.contains(pb) {
-                continue;
-            }
-            blocked.insert(pb.to_vec());
-            results.push(r);
-            if results.len() >= limit {
-                break;
+        'l2: for anchor in compiled.anchors() {
+            for key in l2.query_keys(anchor.as_ref()) {
+                if !seen.insert(key) {
+                    continue;
+                }
+                let Some(r) = l2.get_meta(key) else { continue };
+                let pb = r.path.as_os_str().as_encoded_bytes();
+                if blocked.contains(pb) {
+                    continue;
+                }
+                blocked.insert(pb.to_vec());
+                if compiled.matches(&r) {
+                    results.push(r);
+                    if results.len() >= limit {
+                        break 'l2;
+                    }
+                }
             }
         }
 
@@ -1150,25 +1259,29 @@ impl TieredIndex {
             // 这里保留“克隆层列表”的设计，避免查询全程持有读锁阻塞 flush/compaction。
             // P2 优化点：DiskLayer 的 deleted_paths 改为 Arc，克隆时不再深拷贝 tombstone bytes。
             let layers = self.disk_layers.read().clone();
-            for layer in layers.iter().rev() {
+            'disk: for layer in layers.iter().rev() {
                 for p in layer.deleted_paths.iter() {
                     blocked.insert(p.clone());
                 }
-                for key in layer.idx.query_keys(matcher.as_ref()) {
-                    if !seen.insert(key) {
-                        continue;
-                    }
-                    let Some(r) = layer.idx.get_meta(key) else {
-                        continue;
-                    };
-                    let pb = r.path.as_os_str().as_encoded_bytes();
-                    if blocked.contains(pb) {
-                        continue;
-                    }
-                    blocked.insert(pb.to_vec());
-                    results.push(r);
-                    if results.len() >= limit {
-                        break;
+                for anchor in compiled.anchors() {
+                    for key in layer.idx.query_keys(anchor.as_ref()) {
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        let Some(r) = layer.idx.get_meta(key) else {
+                            continue;
+                        };
+                        let pb = r.path.as_os_str().as_encoded_bytes();
+                        if blocked.contains(pb) {
+                            continue;
+                        }
+                        blocked.insert(pb.to_vec());
+                        if compiled.matches(&r) {
+                            results.push(r);
+                            if results.len() >= limit {
+                                break 'disk;
+                            }
+                        }
                     }
                 }
                 if results.len() >= limit {
@@ -2366,6 +2479,34 @@ mod tests {
         }
 
         h.abort();
+    }
+
+    #[tokio::test]
+    async fn query_filters_do_not_leak_old_segment_meta() -> anyhow::Result<()> {
+        let root = unique_tmp_dir("query-dsl-no-leak");
+        std::fs::create_dir_all(&root)?;
+
+        let store = SnapshotStore::new(root.join("index.db"));
+        let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+
+        let p = root.join("x.txt");
+        std::fs::write(&p, b"x")?;
+        idx.apply_events(&[mk_event(1, EventType::Create, p.clone())]);
+
+        // flush: 让旧元数据进入 disk layer
+        idx.snapshot_now(&store).await?;
+        assert!(!idx.disk_layers.read().is_empty());
+
+        // 修改文件：新元数据进入 L2（size 变大）
+        std::fs::write(&p, vec![b'a'; 128])?;
+        idx.apply_events(&[mk_event(2, EventType::Modify, p.clone())]);
+
+        // 若未在 miss 时也 block path，旧段的 size 可能会“误命中”并被返回
+        let r = idx.query_limit("size:<10b", 100);
+        assert!(r.is_empty(), "should not return stale disk meta");
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[tokio::test]
