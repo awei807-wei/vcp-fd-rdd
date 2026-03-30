@@ -99,6 +99,7 @@ pub trait BuildRDD<T: Send + Sync + 'static>: Send + Sync {
 pub struct FsScanRDD {
     pub parts: Vec<Partition>,
     parallelism: usize,
+    include_hidden: bool,
 }
 
 impl FsScanRDD {
@@ -115,12 +116,19 @@ impl FsScanRDD {
         Self {
             parts,
             parallelism: 1,
+            include_hidden: false,
         }
     }
 
     /// 设置扫描并行度（仅影响 `for_each_meta` 的并行 walker）。
     pub fn with_parallelism(mut self, parallelism: usize) -> Self {
         self.parallelism = parallelism.max(1);
+        self
+    }
+
+    /// 控制是否将 `.` 开头的文件/目录纳入扫描。
+    pub fn with_hidden(mut self, include_hidden: bool) -> Self {
+        self.include_hidden = include_hidden;
         self
     }
 
@@ -141,7 +149,7 @@ impl FsScanRDD {
         }
 
         for p in self.partitions() {
-            scan_partition_parallel(p, self.parallelism, sink.clone());
+            scan_partition_parallel(p, self.parallelism, self.include_hidden, sink.clone());
         }
     }
 }
@@ -156,7 +164,7 @@ impl BuildRDD<FileMeta> for FsScanRDD {
 
         let walker = WalkBuilder::new(&part.root)
             .max_depth(Some(part.max_depth))
-            .hidden(true)
+            .hidden(!self.include_hidden)
             .ignore(true)
             .git_ignore(true)
             .build();
@@ -182,13 +190,14 @@ impl BuildRDD<FileMeta> for FsScanRDD {
 fn scan_partition_parallel(
     part: &Partition,
     parallelism: usize,
+    include_hidden: bool,
     sink: Arc<dyn Fn(FileMeta) + Send + Sync>,
 ) {
     use ignore::{WalkBuilder, WalkState};
 
     let walker = WalkBuilder::new(&part.root)
         .max_depth(Some(part.max_depth))
-        .hidden(true)
+        .hidden(!include_hidden)
         .ignore(true)
         .git_ignore(true)
         .threads(parallelism)
@@ -242,5 +251,55 @@ impl BuildLineage {
             self.records.pop_front();
         }
         self.records.push_back(record);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("fd-rdd-rdd-{}-{}", tag, nanos))
+    }
+
+    #[test]
+    fn scan_skips_hidden_files_by_default() {
+        let root = unique_tmp_dir("hidden-off");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("visible.txt"), b"visible").expect("write visible");
+        fs::write(root.join(".hidden.txt"), b"hidden").expect("write hidden");
+
+        let rdd = FsScanRDD::from_roots(vec![root.clone()]);
+        let mut seen = Vec::new();
+        rdd.for_each(|meta| seen.push(meta.path));
+
+        assert!(seen.iter().any(|p| p.ends_with("visible.txt")));
+        assert!(!seen.iter().any(|p| p.ends_with(".hidden.txt")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_includes_hidden_files_when_enabled() {
+        let root = unique_tmp_dir("hidden-on");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("visible.txt"), b"visible").expect("write visible");
+        fs::write(root.join(".hidden.txt"), b"hidden").expect("write hidden");
+
+        let rdd = FsScanRDD::from_roots(vec![root.clone()]).with_hidden(true);
+        let mut seen = Vec::new();
+        rdd.for_each(|meta| seen.push(meta.path));
+
+        assert!(seen.iter().any(|p| p.ends_with("visible.txt")));
+        assert!(seen.iter().any(|p| p.ends_with(".hidden.txt")));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

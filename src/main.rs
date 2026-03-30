@@ -38,6 +38,10 @@ struct Args {
     #[arg(long)]
     no_build: bool,
 
+    /// 将 `.` 开头的文件/目录纳入冷启动全扫、后台重建与增量补扫
+    #[arg(long)]
+    include_hidden: bool,
+
     /// HTTP 查询端口
     #[arg(long, default_value_t = 6060)]
     http_port: u16,
@@ -127,9 +131,9 @@ async fn main() -> anyhow::Result<()> {
 
     // 3) 从快照加载或空索引启动
     let index = if args.no_snapshot {
-        Arc::new(TieredIndex::empty(roots))
+        Arc::new(TieredIndex::empty_with_hidden(roots, args.include_hidden))
     } else {
-        TieredIndex::load(store.as_ref(), roots).await?
+        TieredIndex::load_with_hidden(store.as_ref(), roots, args.include_hidden).await?
     };
     index.set_auto_flush_limits(args.auto_flush_overlay_paths, args.auto_flush_overlay_bytes);
     index.set_periodic_flush_batch_limits(args.batch_flush_min_events, args.batch_flush_min_bytes);

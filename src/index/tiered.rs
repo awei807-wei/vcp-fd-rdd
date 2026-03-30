@@ -542,6 +542,7 @@ pub struct TieredIndex {
     pending_flush_events: AtomicU64,
     pending_flush_bytes: AtomicU64,
     pub roots: Vec<PathBuf>,
+    pub include_hidden: bool,
 }
 
 impl TieredIndex {
@@ -550,6 +551,7 @@ impl TieredIndex {
         l2: Arc<PersistentIndex>,
         l3: IndexBuilder,
         roots: Vec<PathBuf>,
+        include_hidden: bool,
         disk_layers: Vec<DiskLayer>,
     ) -> Self {
         Self {
@@ -574,22 +576,36 @@ impl TieredIndex {
             pending_flush_events: AtomicU64::new(0),
             pending_flush_bytes: AtomicU64::new(0),
             roots,
+            include_hidden,
         }
     }
 
     /// 直接以空索引启动（显式忽略快照加载）
     pub fn empty(roots: Vec<PathBuf>) -> Self {
+        Self::empty_with_hidden(roots, false)
+    }
+
+    /// 直接以空索引启动，并指定是否包含隐藏项。
+    pub fn empty_with_hidden(roots: Vec<PathBuf>, include_hidden: bool) -> Self {
         let l1 = L1Cache::with_capacity(1000);
         let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
-        let l3 = IndexBuilder::new(roots.clone());
-        Self::new(l1, l2, l3, roots, Vec::new())
+        let l3 = IndexBuilder::new_with_hidden(roots.clone(), include_hidden);
+        Self::new(l1, l2, l3, roots, include_hidden, Vec::new())
     }
 
     /// 从快照加载（或回退为空），并在返回前执行启动清扫：
     /// 1) 物理清理 manifest 未引用的孤儿段文件（best-effort）
     /// 2) 若现有 delta 段达到阈值则触发后台 compaction（best-effort）
     pub async fn load(store: &SnapshotStore, roots: Vec<PathBuf>) -> anyhow::Result<Arc<Self>> {
-        let index = Arc::new(Self::load_or_empty(store, roots).await?);
+        Self::load_with_hidden(store, roots, false).await
+    }
+
+    pub async fn load_with_hidden(
+        store: &SnapshotStore,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+    ) -> anyhow::Result<Arc<Self>> {
+        let index = Arc::new(Self::load_or_empty_with_hidden(store, roots, include_hidden).await?);
 
         // 1) 物理清理不在 MANIFEST 里的孤儿文件（best-effort）
         let _ = store.gc_stale_segments();
@@ -602,8 +618,17 @@ impl TieredIndex {
 
     /// 从快照加载或空索引启动
     pub async fn load_or_empty(store: &SnapshotStore, roots: Vec<PathBuf>) -> anyhow::Result<Self> {
+        Self::load_or_empty_with_hidden(store, roots, false).await
+    }
+
+    /// 从快照加载或空索引启动，并指定是否包含隐藏项。
+    pub async fn load_or_empty_with_hidden(
+        store: &SnapshotStore,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+    ) -> anyhow::Result<Self> {
         let l1 = L1Cache::with_capacity(1000);
-        let l3 = IndexBuilder::new(roots.clone());
+        let l3 = IndexBuilder::new_with_hidden(roots.clone(), include_hidden);
 
         // 冷启动离线变更检测（仅 LSM 目录布局）：
         // - LSM 段可能包含停机期间的“幽灵记录”（已删除文件但索引仍在）。
@@ -622,6 +647,7 @@ impl TieredIndex {
                     Arc::new(PersistentIndex::new_with_roots(roots.clone())),
                     l3,
                     roots,
+                    include_hidden,
                     Vec::new(),
                 ));
             }
@@ -658,6 +684,7 @@ impl TieredIndex {
                 Arc::new(PersistentIndex::new_with_roots(roots.clone())),
                 l3,
                 roots,
+                include_hidden,
                 layers,
             );
             idx.attach_wal(store)?;
@@ -680,6 +707,7 @@ impl TieredIndex {
                 Arc::new(PersistentIndex::new_with_roots(roots.clone())),
                 l3,
                 roots,
+                include_hidden,
                 vec![base],
             );
             idx.attach_wal(store)?;
@@ -715,7 +743,7 @@ impl TieredIndex {
             }
         };
 
-        let idx = Self::new(l1, Arc::new(l2), l3, roots, Vec::new());
+        let idx = Self::new(l1, Arc::new(l2), l3, roots, include_hidden, Vec::new());
         idx.attach_wal(store)?;
         idx.replay_wal_if_any(0);
         Ok(idx)
