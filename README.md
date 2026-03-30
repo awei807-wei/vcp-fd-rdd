@@ -8,7 +8,13 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前主线实现沿 v0.4.7 路线演进（语义锚定 + MergedView + LSM Hygiene + 最近一轮内存治理修正）。
+> 当前主线实现沿 v0.4.8 路线演进（语义锚定 + MergedView + LSM Hygiene + 最近一轮索引源/隐藏项可控性修正）。
+
+## v0.4.8 更新
+
+- 版本：主线版本提升到 `v0.4.8`，便于区分包含多索引源用法澄清与隐藏文件扫描开关的测试构建
+- 索引源：README 明确 `--root` 可重复传入，以覆盖多个索引源
+- 扫描：新增 `--include-hidden`，允许在冷启动全扫、后台重建与增量补扫时纳入 dotfiles / dotdirs
 
 ## v0.4.7 更新
 
@@ -129,11 +135,18 @@ cargo build --release --no-default-features
 ```bash
 ./target/release/fd-rdd \
   --root /path/to/scan \
+  --root /another/path/to/scan \
+  --include-hidden \
   --snapshot-path /tmp/fd-rdd/index.db \
   --ignore-path /tmp/fd-rdd \
   --http-port 6060 \
   --uds-socket /tmp/fd-rdd.sock
 ```
+
+说明：
+
+- `--root` 可重复传入，用于覆盖多个索引源。
+- 默认会跳过 `.` 开头的文件/目录；如需将 dotfiles / dotdirs 纳入冷启动全扫、后台重建与增量补扫，请显式加 `--include-hidden`。
 
 查询：
 
