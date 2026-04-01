@@ -9,8 +9,8 @@ pub struct AdaptiveScheduler {
 
 impl AdaptiveScheduler {
     pub fn new() -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let mut sys = System::new();
+        sys.refresh_memory();
 
         Self {
             target_parallelism: AtomicUsize::new(num_cpus::get()),
@@ -20,12 +20,12 @@ impl AdaptiveScheduler {
 
     /// 动态调整并行度
     pub fn adjust_parallelism(&mut self) -> usize {
-        self.system.refresh_all();
+        self.system.refresh_memory();
 
         let load = System::load_average().one;
         let cpu_count = num_cpus::get() as f64;
         let mem_free = self.system.available_memory();
-        let total_mem = self.system.total_memory();
+        let total_mem = self.system.total_memory().max(1);
         let mem_pressure = 1.0 - (mem_free as f64 / total_mem as f64);
 
         // 计算目标并行度

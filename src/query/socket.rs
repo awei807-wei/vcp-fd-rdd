@@ -4,10 +4,67 @@ use std::sync::Arc;
 #[cfg(unix)]
 mod imp {
     use super::*;
+    use crate::query::{execute_query, QueryMode};
     use std::path::{Path, PathBuf};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
-    use tokio::net::UnixListener;
+    use tokio::net::{unix::UCred, UnixListener, UnixStream};
     use tokio::sync::oneshot;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct PeerIdentity {
+        pid: Option<libc::pid_t>,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    }
+
+    impl From<UCred> for PeerIdentity {
+        fn from(value: UCred) -> Self {
+            Self {
+                pid: value.pid(),
+                uid: value.uid(),
+                gid: value.gid(),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct PeerAuthPolicy {
+        pub owner_uid: libc::uid_t,
+        pub owner_gid: libc::gid_t,
+        pub allow_root: bool,
+        pub allow_same_gid: bool,
+    }
+
+    impl PeerAuthPolicy {
+        fn current_process() -> Self {
+            Self {
+                owner_uid: unsafe { libc::geteuid() },
+                owner_gid: unsafe { libc::getegid() },
+                allow_root: true,
+                allow_same_gid: false,
+            }
+        }
+
+        fn authorize(self, peer: PeerIdentity) -> anyhow::Result<()> {
+            let allowed = peer.uid == self.owner_uid
+                || (self.allow_root && peer.uid == 0)
+                || (self.allow_same_gid && peer.gid == self.owner_gid);
+            if allowed {
+                return Ok(());
+            }
+
+            anyhow::bail!(
+                "unauthorized uds peer: pid={:?} uid={} gid={} (owner_uid={} owner_gid={} allow_root={} allow_same_gid={})",
+                peer.pid,
+                peer.uid,
+                peer.gid,
+                self.owner_uid,
+                self.owner_gid,
+                self.allow_root,
+                self.allow_same_gid
+            );
+        }
+    }
 
     #[derive(Clone, Copy, Debug)]
     pub struct SocketConfig {
@@ -15,6 +72,7 @@ mod imp {
         pub max_limit: usize,
         pub flush_every: usize,
         pub max_request_bytes: usize,
+        pub peer_auth: PeerAuthPolicy,
     }
 
     impl Default for SocketConfig {
@@ -24,6 +82,7 @@ mod imp {
                 max_limit: 200_000,
                 flush_every: 1000,
                 max_request_bytes: 8 * 1024,
+                peer_auth: PeerAuthPolicy::current_process(),
             }
         }
     }
@@ -94,6 +153,16 @@ mod imp {
     async fn handle_connection(
         index: Arc<TieredIndex>,
         cfg: SocketConfig,
+        socket: UnixStream,
+    ) -> anyhow::Result<()> {
+        let peer = PeerIdentity::from(socket.peer_cred()?);
+        cfg.peer_auth.authorize(peer)?;
+        handle_connection_io(index, cfg, socket).await
+    }
+
+    async fn handle_connection_io(
+        index: Arc<TieredIndex>,
+        cfg: SocketConfig,
         mut socket: impl AsyncRead + AsyncWrite + Unpin,
     ) -> anyhow::Result<()> {
         let mut req: Vec<u8> = Vec::with_capacity(256);
@@ -108,6 +177,7 @@ mod imp {
         let request = String::from_utf8_lossy(&req);
         let mut keyword: Option<&str> = None;
         let mut limit: Option<usize> = None;
+        let mut mode = QueryMode::Exact;
 
         for line in request.lines() {
             let line = line.trim();
@@ -126,6 +196,13 @@ mod imp {
                 if let Ok(v) = rest.trim().parse::<usize>() {
                     limit = Some(v);
                 }
+                continue;
+            }
+            if let Some(rest) = line
+                .strip_prefix("mode:")
+                .or_else(|| line.strip_prefix("mode="))
+            {
+                mode = QueryMode::parse_label(Some(rest.trim())).map_err(anyhow::Error::msg)?;
                 continue;
             }
 
@@ -150,7 +227,7 @@ mod imp {
         }
         limit = limit.min(cfg.max_limit).max(1);
 
-        let results = index.query_limit(keyword, limit);
+        let results = execute_query(index.as_ref(), keyword, limit, mode);
 
         // 流式写回：不要在内存里拼接巨大 String/JSON。
         let mut w = BufWriter::new(&mut socket);
@@ -220,8 +297,9 @@ mod imp {
                 max_limit: 200_000,
                 flush_every: 2,
                 max_request_bytes: 8 * 1024,
+                ..SocketConfig::default()
             };
-            let server_task = tokio::spawn(handle_connection(index.clone(), cfg, server));
+            let server_task = tokio::spawn(handle_connection_io(index.clone(), cfg, server));
 
             client.write_all(b"q:match\nlimit:2\n").await?;
             client.shutdown().await?;
@@ -256,7 +334,7 @@ mod imp {
 
             let (mut client, server) = duplex(64 * 1024);
             let cfg = SocketConfig::default();
-            let server_task = tokio::spawn(handle_connection(index.clone(), cfg, server));
+            let server_task = tokio::spawn(handle_connection_io(index.clone(), cfg, server));
 
             client.write_all(b"q:match\nlimit:10\n").await?;
             client.shutdown().await?;
@@ -265,6 +343,38 @@ mod imp {
             client.read_to_end(&mut out).await?;
             let s = String::from_utf8_lossy(&out);
             assert!(s.contains("match_one.txt"));
+
+            server_task.await??;
+
+            let _ = std::fs::remove_dir_all(&root);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn socket_handler_supports_fuzzy_mode() -> anyhow::Result<()> {
+            let root = unique_tmp_dir("socket-fuzzy");
+            let target = root.join("main_document.txt");
+            let other = root.join("beta.rs");
+            std::fs::write(&target, b"hello")?;
+            std::fs::write(&other, b"world")?;
+
+            let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+            index.apply_events(&[
+                ev(1, EventType::Create, target.clone()),
+                ev(2, EventType::Create, other),
+            ]);
+
+            let (mut client, server) = duplex(64 * 1024);
+            let cfg = SocketConfig::default();
+            let server_task = tokio::spawn(handle_connection_io(index.clone(), cfg, server));
+
+            client.write_all(b"q:mdt\nmode:fuzzy\nlimit:10\n").await?;
+            client.shutdown().await?;
+
+            let mut out: Vec<u8> = Vec::new();
+            client.read_to_end(&mut out).await?;
+            let s = String::from_utf8_lossy(&out);
+            assert!(s.contains("main_document.txt"));
 
             server_task.await??;
 
@@ -305,7 +415,7 @@ mod imp {
             // P1：socket handler 通过 query_limit 流式输出，且结果应反映 fast-sync 后的状态
             let (mut client, server) = duplex(64 * 1024);
             let cfg = SocketConfig::default();
-            let server_task = tokio::spawn(handle_connection(index.clone(), cfg, server));
+            let server_task = tokio::spawn(handle_connection_io(index.clone(), cfg, server));
 
             client.write_all(b"q:match\nlimit:100\n").await?;
             client.shutdown().await?;
@@ -320,6 +430,38 @@ mod imp {
 
             let _ = std::fs::remove_dir_all(&root);
             Ok(())
+        }
+
+        #[test]
+        fn peer_auth_policy_defaults_to_same_uid_or_root() {
+            let policy = PeerAuthPolicy {
+                owner_uid: 1000,
+                owner_gid: 100,
+                allow_root: true,
+                allow_same_gid: false,
+            };
+
+            assert!(policy
+                .authorize(PeerIdentity {
+                    pid: Some(1),
+                    uid: 1000,
+                    gid: 999,
+                })
+                .is_ok());
+            assert!(policy
+                .authorize(PeerIdentity {
+                    pid: Some(1),
+                    uid: 0,
+                    gid: 0,
+                })
+                .is_ok());
+            assert!(policy
+                .authorize(PeerIdentity {
+                    pid: Some(1),
+                    uid: 2000,
+                    gid: 100,
+                })
+                .is_err());
         }
     }
 }

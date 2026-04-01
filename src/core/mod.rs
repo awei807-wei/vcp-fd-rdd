@@ -1,5 +1,4 @@
 pub mod adaptive;
-pub mod dag;
 pub mod lineage;
 pub mod partition;
 pub mod rdd;

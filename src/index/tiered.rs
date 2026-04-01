@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use std::{collections::VecDeque, time::UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use tokio::sync::Notify;
 
 use crate::core::{
@@ -18,13 +18,14 @@ use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::index::mmap_index::MmapIndex;
 use crate::index::IndexLayer;
-use crate::query::dsl::compile_query;
-use crate::query::matcher::create_matcher;
+use crate::query::dsl::{compile_query, CompiledQuery};
+use crate::query::matcher::{create_matcher, Matcher};
 use crate::stats::{
     infer_heap_high_water, EventPipelineStats, MemoryReport, OverlayStats, RebuildStats,
 };
 use crate::storage::snapshot::{LoadedSnapshot, SnapshotStore};
 use crate::storage::wal::WalStore;
+use crate::util::maybe_trim_rss;
 
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
 // 更激进的合并阈值：用于百万文件后的“瘦身期”，加速 delta 段收敛。
@@ -34,7 +35,13 @@ const COMPACTION_MAX_DELTAS_PER_RUN: usize = 2;
 // 防抖：避免 flush 高频阶段反复启动 compaction 造成临时大分配抖动。
 const COMPACTION_COOLDOWN: Duration = Duration::from_secs(30);
 
-fn dir_tree_changed_since(roots: &[PathBuf], ignore_prefixes: &[PathBuf], cutoff_ns: u64) -> bool {
+fn visit_dirs_since(
+    roots: &[PathBuf],
+    ignore_prefixes: &[PathBuf],
+    cutoff_ns: u64,
+    log_prefix: &str,
+    mut on_dir: impl FnMut(&std::path::Path, bool) -> bool,
+) -> bool {
     use std::time::Duration;
 
     let cutoff = UNIX_EPOCH
@@ -64,7 +71,8 @@ fn dir_tree_changed_since(roots: &[PathBuf], ignore_prefixes: &[PathBuf], cutoff
         }
 
         if let Ok(modified) = md.modified() {
-            if modified > cutoff {
+            let changed = cutoff_ns == 0 || modified > cutoff;
+            if on_dir(&dir, changed) {
                 return true;
             }
         }
@@ -73,72 +81,9 @@ fn dir_tree_changed_since(roots: &[PathBuf], ignore_prefixes: &[PathBuf], cutoff
             Ok(rd) => rd,
             Err(e) => {
                 // 权限/竞态等错误不应导致“永远判 stale”；保守地跳过不可读子树。
-                tracing::debug!("offline mtime crawl: skip unreadable dir {:?}: {}", dir, e);
-                continue;
-            }
-        };
-        for ent in rd {
-            let ent = match ent {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let ft = match ent.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                stack.push(ent.path());
-            }
-        }
-    }
-    false
-}
-
-fn collect_dirs_changed_since(
-    roots: &[PathBuf],
-    ignore_prefixes: &[PathBuf],
-    cutoff_ns: u64,
-) -> Vec<PathBuf> {
-    use std::time::Duration;
-
-    let cutoff = UNIX_EPOCH
-        + Duration::new(
-            cutoff_ns / 1_000_000_000,
-            (cutoff_ns % 1_000_000_000) as u32,
-        );
-
-    let should_skip = |p: &std::path::Path| -> bool {
-        ignore_prefixes
-            .iter()
-            .any(|ig| !ig.as_os_str().is_empty() && p.starts_with(ig))
-    };
-
-    let mut out: Vec<PathBuf> = Vec::new();
-    let mut stack: Vec<PathBuf> = roots.to_vec();
-    while let Some(dir) = stack.pop() {
-        if should_skip(&dir) {
-            continue;
-        }
-
-        let md = match std::fs::symlink_metadata(&dir) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if !md.is_dir() {
-            continue;
-        }
-
-        if let Ok(modified) = md.modified() {
-            if cutoff_ns == 0 || modified > cutoff {
-                out.push(dir.clone());
-            }
-        }
-
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(e) => {
                 tracing::debug!(
-                    "fast-sync mtime crawl: skip unreadable dir {:?}: {}",
+                    "{} mtime crawl: skip unreadable dir {:?}: {}",
+                    log_prefix,
                     dir,
                     e
                 );
@@ -159,10 +104,45 @@ fn collect_dirs_changed_since(
             }
         }
     }
+    false
+}
+
+fn dir_tree_changed_since(roots: &[PathBuf], ignore_prefixes: &[PathBuf], cutoff_ns: u64) -> bool {
+    visit_dirs_since(
+        roots,
+        ignore_prefixes,
+        cutoff_ns,
+        "offline",
+        |_dir, changed| changed,
+    )
+}
+
+fn collect_dirs_changed_since(
+    roots: &[PathBuf],
+    ignore_prefixes: &[PathBuf],
+    cutoff_ns: u64,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    visit_dirs_since(
+        roots,
+        ignore_prefixes,
+        cutoff_ns,
+        "fast-sync",
+        |dir, changed| {
+            if changed {
+                out.push(dir.to_path_buf());
+            }
+            false
+        },
+    );
 
     out.sort();
     out.dedup();
     out
+}
+
+fn path_deleted_by_any(path_bytes: &[u8], deleted_sets: &[Arc<PathArenaSet>]) -> bool {
+    deleted_sets.iter().any(|paths| paths.contains(path_bytes))
 }
 
 #[derive(Debug, Default)]
@@ -409,49 +389,31 @@ impl PathArenaSet {
     }
 }
 
-#[cfg(feature = "mimalloc")]
-fn maybe_trim_rss() {
-    // mimalloc 作为全局分配器时，glibc 的 malloc_trim 无效，需要调用 mimalloc 自己的回收。
-    extern "C" {
-        fn mi_collect(force: bool);
-    }
-    unsafe { mi_collect(true) };
-}
-
-#[cfg(all(not(feature = "mimalloc"), target_os = "linux", target_env = "gnu"))]
-fn maybe_trim_rss() {
-    // glibc malloc 的主动回吐：释放尽可能多的空闲块回 OS。
-    unsafe {
-        libc::malloc_trim(0);
-    }
-}
-
-#[cfg(all(
-    not(feature = "mimalloc"),
-    not(all(target_os = "linux", target_env = "gnu"))
-))]
-fn maybe_trim_rss() {}
-
 #[derive(Clone)]
 struct DiskLayer {
     id: u64,
     idx: Arc<MmapIndex>,
-    deleted_paths: Arc<Vec<Vec<u8>>>,
+    deleted_paths: Arc<PathArenaSet>,
     deleted_paths_count: usize,
     deleted_paths_bytes: u64,
     deleted_paths_estimated_bytes: u64,
 }
 
-fn deleted_paths_stats(paths: &Vec<Vec<u8>>) -> (usize, u64, u64) {
-    use std::mem::size_of;
+fn path_arena_set_from_paths(paths: Vec<Vec<u8>>) -> PathArenaSet {
+    let mut set = PathArenaSet::default();
 
-    let count = paths.len();
-    let bytes: u64 = paths.iter().map(|p| p.len() as u64).sum();
-    // Vec<Vec<u8>>：外层 buffer（Vec<u8> 元数据数组）+ 内层 bytes buffer（len≈cap，to_vec() 生成）
-    let outer_buf_bytes = paths.capacity() as u64 * size_of::<Vec<u8>>() as u64;
-    let outer_hdr_bytes = size_of::<Vec<Vec<u8>>>() as u64;
-    let estimated = outer_hdr_bytes + outer_buf_bytes + bytes;
-    (count, bytes, estimated)
+    for path in paths {
+        let _ = set.insert(&path);
+    }
+    set
+}
+
+fn deleted_paths_stats(paths: &PathArenaSet) -> (usize, u64, u64) {
+    (
+        paths.len_paths(),
+        paths.active_bytes(),
+        paths.estimated_bytes(),
+    )
 }
 
 fn file_identifier_estimated_bytes(id: &FileIdentifier) -> u64 {
@@ -477,6 +439,43 @@ fn event_record_estimated_bytes(ev: &EventRecord) -> u64 {
         }
     }
     bytes
+}
+
+enum QueryEvaluator {
+    Legacy(Arc<dyn Matcher>),
+    Compiled(CompiledQuery),
+}
+
+struct QueryPlan {
+    anchors: Vec<Arc<dyn Matcher>>,
+    evaluator: QueryEvaluator,
+}
+
+impl QueryPlan {
+    fn compiled(compiled: CompiledQuery) -> Self {
+        Self {
+            anchors: compiled.anchors().to_vec(),
+            evaluator: QueryEvaluator::Compiled(compiled),
+        }
+    }
+
+    fn legacy(matcher: Arc<dyn Matcher>) -> Self {
+        Self {
+            anchors: vec![matcher.clone()],
+            evaluator: QueryEvaluator::Legacy(matcher),
+        }
+    }
+
+    fn anchors(&self) -> &[Arc<dyn Matcher>] {
+        &self.anchors
+    }
+
+    fn matches(&self, meta: &FileMeta) -> bool {
+        match &self.evaluator {
+            QueryEvaluator::Legacy(matcher) => matcher.matches(&meta.path.to_string_lossy()),
+            QueryEvaluator::Compiled(compiled) => compiled.matches(meta),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -511,12 +510,19 @@ struct PendingEvent {
     path_hint: Option<PathBuf>,
 }
 
+struct ApplyBatchState<'a> {
+    _gate: RwLockReadGuard<'a, ()>,
+    l2: Arc<PersistentIndex>,
+    rebuild_in_progress: bool,
+    event_count: usize,
+}
+
 #[derive(Debug, Default)]
 struct OverlayState {
     /// delete / rename-from：需要跨段屏蔽更老 segment 结果，并在 flush 时写入 seg-*.del
-    deleted_paths: PathArenaSet,
+    deleted_paths: Arc<PathArenaSet>,
     /// create/modify/rename-to：用于抵消同一路径的 deleted（delete→recreate）
-    upserted_paths: PathArenaSet,
+    upserted_paths: Arc<PathArenaSet>,
 }
 
 /// 三级索引：L1 热缓存 → L2 持久索引（内存常驻）→ L3 构建器（不在查询链路）
@@ -657,22 +663,24 @@ impl TieredIndex {
         if let Ok(Some(lsm)) = store.load_lsm_if_valid(&roots) {
             let mut layers: Vec<DiskLayer> = Vec::new();
             if let Some(b) = lsm.base {
-                let (cnt, bytes, est) = deleted_paths_stats(&b.deleted_paths);
+                let deleted_paths = Arc::new(path_arena_set_from_paths(b.deleted_paths));
+                let (cnt, bytes, est) = deleted_paths_stats(deleted_paths.as_ref());
                 layers.push(DiskLayer {
                     id: b.id,
                     idx: Arc::new(MmapIndex::new(b.snap)),
-                    deleted_paths: Arc::new(b.deleted_paths),
+                    deleted_paths,
                     deleted_paths_count: cnt,
                     deleted_paths_bytes: bytes,
                     deleted_paths_estimated_bytes: est,
                 });
             }
             for d in lsm.deltas {
-                let (cnt, bytes, est) = deleted_paths_stats(&d.deleted_paths);
+                let deleted_paths = Arc::new(path_arena_set_from_paths(d.deleted_paths));
+                let (cnt, bytes, est) = deleted_paths_stats(deleted_paths.as_ref());
                 layers.push(DiskLayer {
                     id: d.id,
                     idx: Arc::new(MmapIndex::new(d.snap)),
-                    deleted_paths: Arc::new(d.deleted_paths),
+                    deleted_paths,
                     deleted_paths_count: cnt,
                     deleted_paths_bytes: bytes,
                     deleted_paths_estimated_bytes: est,
@@ -697,7 +705,7 @@ impl TieredIndex {
             let base = DiskLayer {
                 id: 0,
                 idx: Arc::new(MmapIndex::new(snap)),
-                deleted_paths: Arc::new(Vec::new()),
+                deleted_paths: Arc::new(PathArenaSet::default()),
                 deleted_paths_count: 0,
                 deleted_paths_bytes: 0,
                 deleted_paths_estimated_bytes: 0,
@@ -852,10 +860,10 @@ impl TieredIndex {
                     self.disk_layers.write().clear();
                     {
                         let mut ov = self.overlay_state.lock();
-                        ov.deleted_paths.clear();
-                        ov.upserted_paths.clear();
-                        ov.deleted_paths.maybe_shrink_after_clear();
-                        ov.upserted_paths.maybe_shrink_after_clear();
+                        Arc::make_mut(&mut ov.deleted_paths).clear();
+                        Arc::make_mut(&mut ov.upserted_paths).clear();
+                        Arc::make_mut(&mut ov.deleted_paths).maybe_shrink_after_clear();
+                        Arc::make_mut(&mut ov.upserted_paths).maybe_shrink_after_clear();
                     }
                     self.note_pending_flush_rebuild(new_l2.as_ref());
                     st.in_progress = false;
@@ -1030,6 +1038,7 @@ impl TieredIndex {
         // 说明：这里不再构建“文件名集合（HashSet<OsString>）”用于删除对齐，
         // 因为它会在大目录下产生大量短命分配，容易把非索引 PD 顶到高水位。
         let mut upsert_events: Vec<EventRecord> = Vec::with_capacity(2048);
+        let mut upsert_metas: Vec<FileMeta> = Vec::with_capacity(2048);
         let mut seq: u64 = 0;
 
         for dir in dirs.iter() {
@@ -1053,7 +1062,20 @@ impl TieredIndex {
                 }
 
                 let path = ent.path();
+                let meta = match ent.metadata() {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+                let Some(file_key) = FileKey::from_path_and_metadata(&path, &meta) else {
+                    continue;
+                };
                 seq = seq.wrapping_add(1);
+                upsert_metas.push(FileMeta {
+                    file_key,
+                    path: path.clone(),
+                    size: meta.len(),
+                    mtime: meta.modified().ok(),
+                });
                 upsert_events.push(EventRecord {
                     seq,
                     timestamp: std::time::SystemTime::now(),
@@ -1065,11 +1087,13 @@ impl TieredIndex {
             }
 
             if upsert_events.len() >= 2048 {
-                self.apply_events_drain(&mut upsert_events);
+                self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
+                upsert_events.clear();
             }
         }
         if !upsert_events.is_empty() {
-            self.apply_events_drain(&mut upsert_events);
+            self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
+            upsert_events.clear();
         }
 
         let dirty_dirs: HashSet<PathBuf> = dirs.into_iter().collect();
@@ -1120,8 +1144,8 @@ impl TieredIndex {
             return Vec::new();
         }
 
-        let compiled = match compile_query(keyword) {
-            Ok(q) => q,
+        let plan = match compile_query(keyword) {
+            Ok(compiled) => QueryPlan::compiled(compiled),
             Err(e) => {
                 tracing::warn!(
                     "query dsl compile failed, fallback to legacy matcher: {}",
@@ -1131,206 +1155,109 @@ impl TieredIndex {
                     keyword.contains("case:") || keyword.chars().any(|c| c.is_uppercase());
                 let matcher = create_matcher(keyword, case_sensitive);
 
-                // L1: 热缓存（legacy 路径维持原行为）
                 if let Some(results) = self.l1.query(matcher.as_ref()) {
                     tracing::debug!("L1 hit: {} results", results.len());
                     return results.into_iter().take(limit).collect();
                 }
 
-                // blocked：path 维度的屏蔽集合（delete + 已输出路径）
-                // - delete 语义仍以路径为准（LSM sidecar `.del`），用于屏蔽更老 segment 的同路径记录
-                // - 同一路径只返回最新版本：用于处理 inode 复用/旧段残留等场景（即使 FileKey 不同也应屏蔽）
-                let l2 = self.l2.load_full();
-                let mut blocked: std::collections::HashSet<Vec<u8>> = {
-                    let st = self.overlay_state.lock();
-                    let mut blocked = std::collections::HashSet::with_capacity(
-                        st.deleted_paths.len_paths().saturating_add(64),
-                    );
-                    st.deleted_paths.for_each_bytes(|p| {
-                        blocked.insert(p.to_vec());
-                    });
-                    blocked
-                };
-                {
-                    let layers = self.disk_layers.read();
-                    let extra = layers
-                        .iter()
-                        .map(|l| l.deleted_paths.len())
-                        .sum::<usize>()
-                        .saturating_add(l2.file_count());
-                    blocked.reserve(extra);
-                }
-
-                // seen：FileKey 维度的“先到先得”去重（rename/覆盖语义）
-                let mut seen: std::collections::HashSet<FileKey> =
-                    std::collections::HashSet::with_capacity(l2.file_count().saturating_add(256));
-
-                let mut results: Vec<FileMeta> = Vec::with_capacity(limit.min(128));
-
-                // L2: 内存 Delta（newest）
-                for key in l2.query_keys(matcher.as_ref()) {
-                    if !seen.insert(key) {
-                        continue;
-                    }
-                    let Some(r) = l2.get_meta(key) else { continue };
-                    let pb = r.path.as_os_str().as_encoded_bytes();
-                    if blocked.contains(pb) {
-                        continue;
-                    }
-                    blocked.insert(pb.to_vec());
-                    results.push(r);
-                    if results.len() >= limit {
-                        break;
-                    }
-                }
-
-                if results.len() < limit {
-                    // Disk segments: newest → oldest
-                    let layers = self.disk_layers.read().clone();
-                    for layer in layers.iter().rev() {
-                        for p in layer.deleted_paths.iter() {
-                            blocked.insert(p.clone());
-                        }
-                        for key in layer.idx.query_keys(matcher.as_ref()) {
-                            if !seen.insert(key) {
-                                continue;
-                            }
-                            let Some(r) = layer.idx.get_meta(key) else {
-                                continue;
-                            };
-                            let pb = r.path.as_os_str().as_encoded_bytes();
-                            if blocked.contains(pb) {
-                                continue;
-                            }
-                            blocked.insert(pb.to_vec());
-                            results.push(r);
-                            if results.len() >= limit {
-                                break;
-                            }
-                        }
-                        if results.len() >= limit {
-                            break;
-                        }
-                    }
-                }
-
-                if !results.is_empty() {
-                    tracing::debug!("Query hit: {} results", results.len());
-                    for meta in results.iter().take(10) {
-                        self.l1.insert(meta.clone());
-                    }
-                    return results;
-                }
-
-                l2.maybe_schedule_repair();
-                return Vec::new();
+                QueryPlan::legacy(matcher)
             }
         };
 
-        // blocked：path 维度的屏蔽集合（delete + 已输出路径）
-        // - delete 语义仍以路径为准（LSM sidecar `.del`），用于屏蔽更老 segment 的同路径记录
-        // - 同一路径只返回最新版本：用于处理 inode 复用/旧段残留等场景（即使 FileKey 不同也应屏蔽）
-        let l2 = self.l2.load_full();
-        let mut blocked: std::collections::HashSet<Vec<u8>> = {
-            let st = self.overlay_state.lock();
-            let mut blocked = std::collections::HashSet::with_capacity(
-                st.deleted_paths.len_paths().saturating_add(64),
-            );
-            st.deleted_paths.for_each_bytes(|p| {
-                blocked.insert(p.to_vec());
-            });
-            blocked
-        };
-        {
-            let layers = self.disk_layers.read();
-            let extra = layers
-                .iter()
-                .map(|l| l.deleted_paths.len())
-                .sum::<usize>()
-                .saturating_add(l2.file_count());
-            blocked.reserve(extra);
-        }
-
-        // seen：FileKey 维度的“先到先得”去重（rename/覆盖语义）
-        let mut seen: std::collections::HashSet<FileKey> =
-            std::collections::HashSet::with_capacity(l2.file_count().saturating_add(256));
-
-        let mut results: Vec<FileMeta> = Vec::with_capacity(limit.min(128));
-
-        // DSL 语义：
-        // - include/exclude/过滤器 都在这里统一评估
-        // - **重要**：即使不匹配，也要把该 path 标记为 blocked（避免旧段的同路径旧元数据“误命中”）
-
-        // L2: 内存 Delta（newest）
-        'l2: for anchor in compiled.anchors() {
-            for key in l2.query_keys(anchor.as_ref()) {
-                if !seen.insert(key) {
-                    continue;
-                }
-                let Some(r) = l2.get_meta(key) else { continue };
-                let pb = r.path.as_os_str().as_encoded_bytes();
-                if blocked.contains(pb) {
-                    continue;
-                }
-                blocked.insert(pb.to_vec());
-                if compiled.matches(&r) {
-                    results.push(r);
-                    if results.len() >= limit {
-                        break 'l2;
-                    }
-                }
-            }
-        }
-
-        if results.len() < limit {
-            // Disk segments: newest → oldest
-            // 这里保留“克隆层列表”的设计，避免查询全程持有读锁阻塞 flush/compaction。
-            // P2 优化点：DiskLayer 的 deleted_paths 改为 Arc，克隆时不再深拷贝 tombstone bytes。
-            let layers = self.disk_layers.read().clone();
-            'disk: for layer in layers.iter().rev() {
-                for p in layer.deleted_paths.iter() {
-                    blocked.insert(p.clone());
-                }
-                for anchor in compiled.anchors() {
-                    for key in layer.idx.query_keys(anchor.as_ref()) {
-                        if !seen.insert(key) {
-                            continue;
-                        }
-                        let Some(r) = layer.idx.get_meta(key) else {
-                            continue;
-                        };
-                        let pb = r.path.as_os_str().as_encoded_bytes();
-                        if blocked.contains(pb) {
-                            continue;
-                        }
-                        blocked.insert(pb.to_vec());
-                        if compiled.matches(&r) {
-                            results.push(r);
-                            if results.len() >= limit {
-                                break 'disk;
-                            }
-                        }
-                    }
-                }
-                if results.len() >= limit {
-                    break;
-                }
-            }
-        }
-
+        let results = self.execute_query_plan(&plan, limit);
         if !results.is_empty() {
             tracing::debug!("Query hit: {} results", results.len());
-            // 回填 L1（有界）
             for meta in results.iter().take(10) {
                 self.l1.insert(meta.clone());
             }
             return results;
         }
 
-        // miss：不在查询链路扫盘，返回空
-        // 可选：触发后台补扫
-        l2.maybe_schedule_repair();
+        self.l2.load_full().maybe_schedule_repair();
         Vec::new()
+    }
+
+    fn execute_query_plan(&self, plan: &QueryPlan, limit: usize) -> Vec<FileMeta> {
+        let l2 = self.l2.load_full();
+        let layers = self.disk_layers.read().clone();
+        let overlay_deleted = { self.overlay_state.lock().deleted_paths.clone() };
+        let mut blocked_paths = PathArenaSet::default();
+        let mut deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
+        let mut seen: std::collections::HashSet<FileKey> =
+            std::collections::HashSet::with_capacity(l2.file_count().saturating_add(256));
+        let mut results: Vec<FileMeta> = Vec::with_capacity(limit.min(128));
+
+        if self.query_layer(
+            plan,
+            l2.as_ref(),
+            None,
+            deleted_sources.as_slice(),
+            &mut seen,
+            &mut blocked_paths,
+            &mut results,
+            limit,
+        ) {
+            return results;
+        }
+
+        for layer in layers.iter().rev() {
+            if self.query_layer(
+                plan,
+                layer.idx.as_ref(),
+                Some(layer.deleted_paths.as_ref()),
+                deleted_sources.as_slice(),
+                &mut seen,
+                &mut blocked_paths,
+                &mut results,
+                limit,
+            ) {
+                return results;
+            }
+            deleted_sources.push(layer.deleted_paths.clone());
+        }
+
+        results
+    }
+
+    fn query_layer(
+        &self,
+        plan: &QueryPlan,
+        layer: &dyn IndexLayer,
+        layer_deleted: Option<&PathArenaSet>,
+        deleted_sources: &[Arc<PathArenaSet>],
+        seen: &mut std::collections::HashSet<FileKey>,
+        blocked_paths: &mut PathArenaSet,
+        results: &mut Vec<FileMeta>,
+        limit: usize,
+    ) -> bool {
+        for anchor in plan.anchors() {
+            for key in layer.query_keys(anchor.as_ref()) {
+                if !seen.insert(key) {
+                    continue;
+                }
+
+                let Some(meta) = layer.get_meta(key) else {
+                    continue;
+                };
+                let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+                if blocked_paths.contains(path_bytes)
+                    || layer_deleted.is_some_and(|paths| paths.contains(path_bytes))
+                    || path_deleted_by_any(path_bytes, deleted_sources)
+                {
+                    continue;
+                }
+
+                let _ = blocked_paths.insert(path_bytes);
+                if plan.matches(&meta) {
+                    results.push(meta);
+                    if results.len() >= limit {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     /// 批量应用事件到索引
@@ -1422,105 +1349,101 @@ impl TieredIndex {
         }
     }
 
-    fn apply_events_inner(&self, events: &[EventRecord], log_to_wal: bool) {
-        // flush/compaction 期间需要短暂阻塞写入，避免“指针 swap 后仍写旧 delta”的竞态。
-        let _g = self.apply_gate.read();
+    fn append_events_to_wal(&self, events: &[EventRecord], log_to_wal: bool) {
+        if !log_to_wal {
+            return;
+        }
 
-        // WAL：先写后用（best-effort）。replay 场景下禁用写回，避免重复追加。
-        if log_to_wal {
-            if let Some(wal) = self.wal.lock().clone() {
-                if let Err(e) = wal.append(events) {
-                    tracing::warn!("WAL append failed (continuing without durability): {}", e);
+        if let Some(wal) = self.wal.lock().clone() {
+            if let Err(e) = wal.append(events) {
+                tracing::warn!("WAL append failed (continuing without durability): {}", e);
+            }
+        }
+    }
+
+    fn capture_l2_for_apply(&self, events: &[EventRecord]) -> (Arc<PersistentIndex>, bool) {
+        let mut st = self.rebuild_state.lock();
+        if !st.in_progress {
+            drop(st);
+            return (self.l2.load_full(), false);
+        }
+
+        // 有界化：按身份去重，只保留每条身份的最新事件（避免 rebuild 期间无限堆积）。
+        for ev in events {
+            let key = ev.id.clone();
+            match st.pending_events.get_mut(&key) {
+                Some(old) if old.seq >= ev.seq => {
+                    // 旧记录更新：忽略（避免乱序覆盖）。
+                }
+                Some(old) => {
+                    // 新事件覆盖旧事件；path_hint 仅在新事件提供时覆盖（“最后一次非空覆盖”）。
+                    old.seq = ev.seq;
+                    old.timestamp = ev.timestamp;
+                    old.event_type = ev.event_type.clone();
+                    if ev.path_hint.is_some() {
+                        old.path_hint = ev.path_hint.clone();
+                    }
+                }
+                None => {
+                    st.pending_events.insert(
+                        key,
+                        PendingEvent {
+                            seq: ev.seq,
+                            timestamp: ev.timestamp,
+                            event_type: ev.event_type.clone(),
+                            path_hint: ev.path_hint.clone(),
+                        },
+                    );
                 }
             }
         }
 
-        // 若 rebuild 在进行：先缓冲 pending 事件；并在持锁期间捕获当前 l2 指针，
-        // 避免切换窗口导致“事件已缓冲但应用到了新索引”而重复回放。
-        let l2 = {
-            let mut st = self.rebuild_state.lock();
-            if st.in_progress {
-                // 有界化：按身份去重，只保留每条身份的最新事件（避免 rebuild 期间无限堆积）。
-                for ev in events {
-                    let key = ev.id.clone();
-                    match st.pending_events.get_mut(&key) {
-                        Some(old) if old.seq >= ev.seq => {
-                            // 旧记录更新：忽略（避免乱序覆盖）。
-                        }
-                        Some(old) => {
-                            // 新事件覆盖旧事件；path_hint 仅在新事件提供时覆盖（“最后一次非空覆盖”）。
-                            old.seq = ev.seq;
-                            old.timestamp = ev.timestamp;
-                            old.event_type = ev.event_type.clone();
-                            if ev.path_hint.is_some() {
-                                old.path_hint = ev.path_hint.clone();
-                            }
-                        }
-                        None => {
-                            st.pending_events.insert(
-                                key,
-                                PendingEvent {
-                                    seq: ev.seq,
-                                    timestamp: ev.timestamp,
-                                    event_type: ev.event_type.clone(),
-                                    path_hint: ev.path_hint.clone(),
-                                },
-                            );
-                        }
+        (self.l2.load_full(), true)
+    }
+
+    fn update_overlay_for_events(&self, events: &[EventRecord]) {
+        let mut ov = self.overlay_state.lock();
+        for ev in events {
+            let Some(path) = ev.best_path() else {
+                // FID-only 且无路径：阶段 1 保守跳过 overlay 更新（后续 fanotify 反查完善）。
+                continue;
+            };
+            let path_bytes = path.as_os_str().as_encoded_bytes();
+            match &ev.event_type {
+                EventType::Delete => {
+                    let _ = Arc::make_mut(&mut ov.upserted_paths).remove(path_bytes);
+                    let _ = Arc::make_mut(&mut ov.deleted_paths).insert(path_bytes);
+                }
+                EventType::Create | EventType::Modify => {
+                    let _ = Arc::make_mut(&mut ov.deleted_paths).remove(path_bytes);
+                    let _ = Arc::make_mut(&mut ov.upserted_paths).insert(path_bytes);
+                }
+                EventType::Rename {
+                    from,
+                    from_path_hint,
+                } => {
+                    let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
+                    if let Some(from_path) = from_best {
+                        let from_bytes = from_path.as_os_str().as_encoded_bytes();
+                        let _ = Arc::make_mut(&mut ov.upserted_paths).remove(from_bytes);
+                        let _ = Arc::make_mut(&mut ov.deleted_paths).insert(from_bytes);
                     }
+
+                    let _ = Arc::make_mut(&mut ov.deleted_paths).remove(path_bytes);
+                    let _ = Arc::make_mut(&mut ov.upserted_paths).insert(path_bytes);
                 }
             }
+        }
 
-            // overlay：记录跨段 delete/upsert（用于屏蔽更老 segment 结果 + flush sidecar）
-            {
-                let mut ov = self.overlay_state.lock();
-                for ev in events {
-                    let Some(path) = ev.best_path() else {
-                        // FID-only 且无路径：阶段 1 保守跳过 overlay 更新（后续 fanotify 反查完善）。
-                        continue;
-                    };
-                    let path_bytes = path.as_os_str().as_encoded_bytes();
-                    match &ev.event_type {
-                        EventType::Delete => {
-                            let _ = ov.upserted_paths.remove(path_bytes);
-                            let _ = ov.deleted_paths.insert(path_bytes);
-                        }
-                        EventType::Create | EventType::Modify => {
-                            let _ = ov.deleted_paths.remove(path_bytes);
-                            let _ = ov.upserted_paths.insert(path_bytes);
-                        }
-                        EventType::Rename {
-                            from,
-                            from_path_hint,
-                        } => {
-                            let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
-                            if let Some(from_path) = from_best {
-                                let from_bytes = from_path.as_os_str().as_encoded_bytes();
-                                let _ = ov.upserted_paths.remove(from_bytes);
-                                let _ = ov.deleted_paths.insert(from_bytes);
-                            }
+        // overlay 达阈值时请求强制 flush（合并触发，避免无界膨胀）。
+        let overlay_paths = ov.deleted_paths.len_paths() + ov.upserted_paths.len_paths();
+        let overlay_arena_bytes =
+            (ov.deleted_paths.arena_len() + ov.upserted_paths.arena_len()) as u64;
+        drop(ov);
+        self.maybe_request_flush(overlay_paths, overlay_arena_bytes);
+    }
 
-                            let _ = ov.deleted_paths.remove(path_bytes);
-                            let _ = ov.upserted_paths.insert(path_bytes);
-                        }
-                    }
-                }
-
-                // overlay 达阈值时请求强制 flush（合并触发，避免无界膨胀）。
-                let overlay_paths = ov.deleted_paths.len_paths() + ov.upserted_paths.len_paths();
-                let overlay_arena_bytes =
-                    (ov.deleted_paths.arena_len() + ov.upserted_paths.arena_len()) as u64;
-                drop(ov);
-                self.maybe_request_flush(overlay_paths, overlay_arena_bytes);
-            }
-
-            self.l2.load_full()
-        };
-
-        self.note_pending_flush_batch(events);
-        l2.apply_events(events);
-
-        // 同步更新 L1
+    fn invalidate_l1_for_events(&self, events: &[EventRecord]) {
         for ev in events {
             match &ev.event_type {
                 EventType::Delete => {
@@ -1544,111 +1467,79 @@ impl TieredIndex {
                 _ => {}
             }
         }
+    }
 
+    fn begin_apply_batch(
+        &self,
+        events: &[EventRecord],
+        log_to_wal: bool,
+    ) -> Option<ApplyBatchState<'_>> {
+        if events.is_empty() {
+            return None;
+        }
+
+        // flush/compaction 期间需要短暂阻塞写入，避免“指针 swap 后仍写旧 delta”的竞态。
+        let gate = self.apply_gate.read();
+
+        // WAL：先写后用（best-effort）。replay 场景下禁用写回，避免重复追加。
+        self.append_events_to_wal(events, log_to_wal);
+
+        // 若 rebuild 在进行：先缓冲 pending 事件；并在持锁期间捕获当前 l2 指针，
+        // 避免切换窗口导致“事件已缓冲但应用到了新索引”而重复回放。
+        let (l2, rebuild_in_progress) = self.capture_l2_for_apply(events);
+        self.update_overlay_for_events(events);
+        self.note_pending_flush_batch(events);
+        self.invalidate_l1_for_events(events);
+
+        Some(ApplyBatchState {
+            _gate: gate,
+            l2,
+            rebuild_in_progress,
+            event_count: events.len(),
+        })
+    }
+
+    fn apply_events_inner(&self, events: &[EventRecord], log_to_wal: bool) {
+        let Some(batch) = self.begin_apply_batch(events, log_to_wal) else {
+            return;
+        };
+        batch.l2.apply_events(events);
         self.event_seq
-            .fetch_add(events.len() as u64, Ordering::Relaxed);
+            .fetch_add(batch.event_count as u64, Ordering::Relaxed);
     }
 
     fn apply_events_inner_drain(&self, events: &mut Vec<EventRecord>, log_to_wal: bool) {
-        if events.is_empty() {
+        let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal) else {
             return;
-        }
-
-        let event_count = events.len();
-
-        // flush/compaction 期间需要短暂阻塞写入，避免“指针 swap 后仍写旧 delta”的竞态。
-        let _g = self.apply_gate.read();
-
-        // WAL：先写后用（best-effort）。replay 场景下禁用写回，避免重复追加。
-        if log_to_wal {
-            if let Some(wal) = self.wal.lock().clone() {
-                if let Err(e) = wal.append(events.as_slice()) {
-                    tracing::warn!("WAL append failed (continuing without durability): {}", e);
-                }
-            }
-        }
-
-        // 若 rebuild 在进行：当前 drain 优化意义不大（会进 pending_events），直接复用 slice 逻辑。
-        if self.rebuild_state.lock().in_progress {
-            self.apply_events_inner(events.as_slice(), false);
+        };
+        if batch.rebuild_in_progress {
+            batch.l2.apply_events(events.as_slice());
             events.clear();
-            return;
+        } else {
+            batch.l2.apply_events_drain(events);
         }
-
-        // overlay：记录跨段 delete/upsert（用于屏蔽更老 segment 结果 + flush sidecar）
-        {
-            let mut ov = self.overlay_state.lock();
-            for ev in events.iter() {
-                let Some(path) = ev.best_path() else {
-                    // FID-only 且无路径：阶段 1 保守跳过 overlay 更新（后续 fanotify 反查完善）。
-                    continue;
-                };
-                let path_bytes = path.as_os_str().as_encoded_bytes();
-                match &ev.event_type {
-                    EventType::Delete => {
-                        let _ = ov.upserted_paths.remove(path_bytes);
-                        let _ = ov.deleted_paths.insert(path_bytes);
-                    }
-                    EventType::Create | EventType::Modify => {
-                        let _ = ov.deleted_paths.remove(path_bytes);
-                        let _ = ov.upserted_paths.insert(path_bytes);
-                    }
-                    EventType::Rename {
-                        from,
-                        from_path_hint,
-                    } => {
-                        let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
-                        if let Some(from_path) = from_best {
-                            let from_bytes = from_path.as_os_str().as_encoded_bytes();
-                            let _ = ov.upserted_paths.remove(from_bytes);
-                            let _ = ov.deleted_paths.insert(from_bytes);
-                        }
-
-                        let _ = ov.deleted_paths.remove(path_bytes);
-                        let _ = ov.upserted_paths.insert(path_bytes);
-                    }
-                }
-            }
-
-            // overlay 达阈值时请求强制 flush（合并触发，避免无界膨胀）。
-            let overlay_paths = ov.deleted_paths.len_paths() + ov.upserted_paths.len_paths();
-            let overlay_arena_bytes =
-                (ov.deleted_paths.arena_len() + ov.upserted_paths.arena_len()) as u64;
-            drop(ov);
-            self.maybe_request_flush(overlay_paths, overlay_arena_bytes);
-        }
-
-        self.note_pending_flush_batch(events.as_slice());
-        // L1 失效：先做失效再 drain，以避免为失效另存一份路径。
-        for ev in events.iter() {
-            match &ev.event_type {
-                EventType::Delete => {
-                    if let Some(p) = ev.best_path() {
-                        self.l1.remove_by_path(p);
-                    } else if let Some(fid) = ev.id.as_file_key() {
-                        self.l1.remove(&fid);
-                    }
-                }
-                EventType::Rename {
-                    from,
-                    from_path_hint,
-                } => {
-                    let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
-                    if let Some(p) = from_best {
-                        self.l1.remove_by_path(p);
-                    } else if let Some(fid) = from.as_file_key() {
-                        self.l1.remove(&fid);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let l2 = self.l2.load_full();
-        l2.apply_events_drain(events);
-
         self.event_seq
-            .fetch_add(event_count as u64, Ordering::Relaxed);
+            .fetch_add(batch.event_count as u64, Ordering::Relaxed);
+    }
+
+    fn apply_upserted_metas_inner(
+        &self,
+        events: &[EventRecord],
+        metas: &mut Vec<FileMeta>,
+        log_to_wal: bool,
+    ) {
+        let Some(batch) = self.begin_apply_batch(events, log_to_wal) else {
+            metas.clear();
+            return;
+        };
+        if batch.rebuild_in_progress {
+            batch.l2.apply_file_metas(metas.as_slice());
+            metas.clear();
+        } else {
+            batch.l2.apply_file_metas_drain(metas);
+        }
+        self.event_seq
+            .fetch_add(batch.event_count as u64, Ordering::Relaxed);
     }
 
     /// 原子快照
@@ -1693,10 +1584,10 @@ impl TieredIndex {
                     deleted.push(p.to_vec());
                 }
             });
-            ov.deleted_paths.clear();
-            ov.upserted_paths.clear();
-            ov.deleted_paths.maybe_shrink_after_clear();
-            ov.upserted_paths.maybe_shrink_after_clear();
+            Arc::make_mut(&mut ov.deleted_paths).clear();
+            Arc::make_mut(&mut ov.upserted_paths).clear();
+            Arc::make_mut(&mut ov.deleted_paths).maybe_shrink_after_clear();
+            Arc::make_mut(&mut ov.upserted_paths).maybe_shrink_after_clear();
             self.flush_requested.store(false, Ordering::Release);
 
             (old, deleted, self.disk_layers.read().clone(), wal_seal_id)
@@ -1741,8 +1632,8 @@ impl TieredIndex {
             // deleted_paths 在 append/replace-base 后通常会经历增长与扩容；这里 shrink 一次，避免把 capacity 高水位长期带到常驻层。
             let mut base_deleted_paths = base.deleted_paths;
             base_deleted_paths.shrink_to_fit();
-            let (cnt, bytes, est) = deleted_paths_stats(&base_deleted_paths);
-            let deleted_paths = Arc::new(base_deleted_paths);
+            let deleted_paths = Arc::new(path_arena_set_from_paths(base_deleted_paths));
+            let (cnt, bytes, est) = deleted_paths_stats(deleted_paths.as_ref());
             let new_layer = DiskLayer {
                 id: base.id,
                 idx: Arc::new(MmapIndex::new(base.snap)),
@@ -1775,8 +1666,8 @@ impl TieredIndex {
         // deleted_paths 在 append 后通常会经历增长与扩容；这里 shrink 一次，避免把 capacity 高水位长期带到常驻层。
         let mut seg_deleted_paths = seg.deleted_paths;
         seg_deleted_paths.shrink_to_fit();
-        let (cnt, bytes, est) = deleted_paths_stats(&seg_deleted_paths);
-        let deleted_paths = Arc::new(seg_deleted_paths);
+        let deleted_paths = Arc::new(path_arena_set_from_paths(seg_deleted_paths));
+        let (cnt, bytes, est) = deleted_paths_stats(deleted_paths.as_ref());
         self.disk_layers.write().push(DiskLayer {
             id: seg.id,
             idx: Arc::new(MmapIndex::new(seg.snap)),
@@ -2201,10 +2092,10 @@ impl TieredIndex {
         let merged = PersistentIndex::new_with_roots(roots.clone());
 
         for layer in &layers_snapshot {
-            for p in layer.deleted_paths.iter() {
+            layer.deleted_paths.for_each_bytes(|p| {
                 let pb = pathbuf_from_bytes(p);
                 merged.mark_deleted_by_path(&pb);
-            }
+            });
             layer.idx.for_each_live_meta(|m| merged.upsert_rename(m));
         }
 
@@ -2233,8 +2124,8 @@ impl TieredIndex {
             );
         }
 
-        let (cnt, bytes, est) = deleted_paths_stats(&new_base.deleted_paths);
-        let deleted_paths = Arc::new(new_base.deleted_paths);
+        let deleted_paths = Arc::new(path_arena_set_from_paths(new_base.deleted_paths));
+        let (cnt, bytes, est) = deleted_paths_stats(deleted_paths.as_ref());
         let new_layer = DiskLayer {
             id: new_base.id,
             idx: Arc::new(MmapIndex::new(new_base.snap)),
@@ -2284,7 +2175,8 @@ impl TieredIndex {
     }
 }
 
-fn pathbuf_from_bytes(bytes: &[u8]) -> PathBuf {
+fn pathbuf_from_bytes(bytes: impl AsRef<[u8]>) -> PathBuf {
+    let bytes = bytes.as_ref();
     #[cfg(unix)]
     {
         use std::ffi::OsString;
