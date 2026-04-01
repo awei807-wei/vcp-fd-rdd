@@ -1,5 +1,20 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum QueryModeArg {
+    Exact,
+    Fuzzy,
+}
+
+impl QueryModeArg {
+    fn as_protocol(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Fuzzy => "fuzzy",
+        }
+    }
+}
 
 /// fd-rdd-query：通过 Unix Domain Socket 向 fd-rdd Daemon 发起查询（流式输出）
 #[derive(Parser, Debug)]
@@ -12,6 +27,10 @@ struct Args {
     /// 最大返回条数（0 表示使用服务端默认值）
     #[arg(long, default_value_t = 2000)]
     limit: usize,
+
+    /// 查询模式：`exact` 保持现有 DSL/过滤器语义，`fuzzy` 走 fzf 风格模糊匹配
+    #[arg(long, value_enum, default_value_t = QueryModeArg::Exact)]
+    mode: QueryModeArg,
 
     /// 若连不上 socket，尝试自动拉起 fd-rdd Daemon（`fd-rdd --uds-socket <PATH>`）
     #[arg(long)]
@@ -29,7 +48,12 @@ async fn main() -> anyhow::Result<()> {
     use tokio::net::UnixStream;
 
     let args = Args::parse();
-    let req = format!("q:{}\nlimit:{}\n", args.query, args.limit);
+    let req = format!(
+        "q:{}\nlimit:{}\nmode:{}\n",
+        args.query,
+        args.limit,
+        args.mode.as_protocol()
+    );
 
     let mut stream = match UnixStream::connect(&args.socket).await {
         Ok(s) => s,

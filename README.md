@@ -8,7 +8,14 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前主线实现沿 v0.4.8 路线演进（语义锚定 + MergedView + LSM Hygiene + 最近一轮索引源/隐藏项可控性修正）。
+> 当前主线实现沿 v0.4.9 路线演进（Query DSL/Fuzzy 并存、DAG/Verifier 补强、UDS 认证与 fast-sync 热路径收敛）。
+
+## v0.4.9 更新
+
+- 版本：主线版本提升到 `v0.4.9`，便于区分包含 DAG/Verifier 补强、Fuzzy 查询接入以及后续 review 收敛修复的测试构建
+- 查询：`FzfIntegration` 已接入 HTTP `/search`、UDS 文本协议与 `fd-rdd-query` 客户端；新增显式 `mode=fuzzy`
+- 安全性：UDS 服务新增 peer credential 校验，默认仅接受 same-euid 或 `root` 发起的连接
+- 稳定性：fast-sync 复用 `DirEntry::metadata()` 直接写入 `FileMeta`；`PathArena` 对超长 root-relative 路径改为跳过并告警，避免污染索引
 
 ## v0.4.8 更新
 
@@ -154,6 +161,7 @@ cargo build --release --no-default-features
 curl -G "http://127.0.0.1:6060/search" --data-urlencode "q=main.rs" --data-urlencode "limit=20"
 curl -G "http://127.0.0.1:6060/search" --data-urlencode "q=*memoir*" --data-urlencode "limit=20"
 curl -G "http://127.0.0.1:6060/search" --data-urlencode "q=server.js !node_modules" --data-urlencode "limit=20"
+curl -G "http://127.0.0.1:6060/search" --data-urlencode "q=mdt" --data-urlencode "mode=fuzzy" --data-urlencode "limit=20"
 ```
 
 UDS 流式查询（推荐用于大结果集；边收边输出，不聚合）：
@@ -161,7 +169,14 @@ UDS 流式查询（推荐用于大结果集；边收边输出，不聚合）：
 ```bash
 ./target/release/fd-rdd-query --socket /tmp/fd-rdd.sock --limit 2000 "main.rs"
 ./target/release/fd-rdd-query --socket /tmp/fd-rdd.sock --spawn --limit 2000 "*.rs"
+./target/release/fd-rdd-query --socket /tmp/fd-rdd.sock --mode fuzzy --limit 200 "mdt"
 ```
+
+说明：
+
+- UDS 服务除 socket 文件 `0600` 外，还会校验 peer credential；默认仅接受“同一有效 UID”或 `root` 发起的连接，单独的同 GID 不构成放行条件。
+- `mode=exact` 下的 1-2 字符短查询会先走“短组件候选索引”再做精确过滤，减少退化全扫的概率。
+- `PathArena` 当前仍以 `path_len: u16` 编码路径；root-relative 路径超过 `65535` bytes 时会跳过该条索引并输出告警，而不是写入损坏占位记录。
 
 ## 内存与长期运行（如何判断“好用”）
 

@@ -1,34 +1,143 @@
 use crate::core::{FileKey, FileMeta};
 use crate::query::matcher::{GlobMode, Matcher};
 use crate::stats::L1Stats;
-use dashmap::DashMap;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::path::Path;
 
-/// L1: 查询结果热缓存（有界 DashMap，LRU 淘汰）
+#[derive(Clone, Copy, Debug, Default)]
+struct LruLinks {
+    prev: Option<FileKey>,
+    next: Option<FileKey>,
+}
+
+#[derive(Debug, Default)]
+struct LruState {
+    head: Option<FileKey>,
+    tail: Option<FileKey>,
+    links: HashMap<FileKey, LruLinks>,
+}
+
+impl LruState {
+    fn len(&self) -> usize {
+        self.links.len()
+    }
+
+    fn touch(&mut self, key: FileKey) {
+        if self.tail == Some(key) || !self.links.contains_key(&key) {
+            return;
+        }
+
+        self.detach(key);
+        self.attach_tail(key);
+    }
+
+    fn insert(&mut self, key: FileKey, capacity: usize) -> Option<FileKey> {
+        if self.links.contains_key(&key) {
+            self.touch(key);
+            return None;
+        }
+
+        self.links.insert(key, LruLinks::default());
+        self.attach_tail(key);
+
+        if capacity > 0 && self.links.len() > capacity {
+            return self.pop_lru();
+        }
+
+        None
+    }
+
+    fn remove(&mut self, key: FileKey) -> bool {
+        let existed = self.links.contains_key(&key);
+        if existed {
+            self.detach(key);
+            self.links.remove(&key);
+        }
+        existed
+    }
+
+    fn clear(&mut self) {
+        self.head = None;
+        self.tail = None;
+        self.links.clear();
+    }
+
+    fn pop_lru(&mut self) -> Option<FileKey> {
+        let key = self.head?;
+        self.remove(key);
+        Some(key)
+    }
+
+    fn detach(&mut self, key: FileKey) {
+        let Some(links) = self.links.get(&key).copied() else {
+            return;
+        };
+
+        match links.prev {
+            Some(prev) => {
+                if let Some(prev_links) = self.links.get_mut(&prev) {
+                    prev_links.next = links.next;
+                }
+            }
+            None => self.head = links.next,
+        }
+
+        match links.next {
+            Some(next) => {
+                if let Some(next_links) = self.links.get_mut(&next) {
+                    next_links.prev = links.prev;
+                }
+            }
+            None => self.tail = links.prev,
+        }
+
+        if let Some(slot) = self.links.get_mut(&key) {
+            slot.prev = None;
+            slot.next = None;
+        }
+    }
+
+    fn attach_tail(&mut self, key: FileKey) {
+        let old_tail = self.tail;
+
+        if let Some(slot) = self.links.get_mut(&key) {
+            slot.prev = old_tail;
+            slot.next = None;
+        }
+
+        match old_tail {
+            Some(tail) => {
+                if let Some(tail_links) = self.links.get_mut(&tail) {
+                    tail_links.next = Some(key);
+                }
+            }
+            None => self.head = Some(key),
+        }
+
+        self.tail = Some(key);
+    }
+}
+
+/// L1 查询结果缓存。
 ///
-/// ## 语义说明
-/// L1 是**查询结果缓存**，不是 L2 主索引的子集。
-/// 它缓存最近被查询命中的 `FileMeta` 条目，以加速重复查询。
-/// 主键为 `FileKey(dev,ino)`（与扫描/事件输入一致），辅以 `path_index` 反查。
-///
-/// L1 不参与索引构建流程，仅在 `TieredIndex::query()` 命中时回填。
-/// 容量有限，超出时按 LRU 策略淘汰。
+/// 数据使用 `RwLock<HashMap>` 保存，淘汰顺序由一个单独的 O(1) LRU 链表维护。
 pub struct L1Cache {
-    /// 主存储：FileKey -> FileMeta（查询缓存，非主索引）
-    pub inner: DashMap<FileKey, FileMeta>,
-    /// 路径反查：path -> FileKey（用于按路径失效）
-    pub path_index: DashMap<std::path::PathBuf, FileKey>,
+    /// 主存储：FileKey -> FileMeta
+    pub inner: RwLock<HashMap<FileKey, FileMeta>>,
+    /// 路径反查：path -> FileKey
+    pub path_index: RwLock<HashMap<std::path::PathBuf, FileKey>>,
     pub capacity: usize,
-    access_count: DashMap<FileKey, u64>,
+    lru: Mutex<LruState>,
 }
 
 impl L1Cache {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            inner: DashMap::with_capacity(cap),
-            path_index: DashMap::new(),
+            inner: RwLock::new(HashMap::with_capacity(cap)),
+            path_index: RwLock::new(HashMap::with_capacity(cap)),
             capacity: cap,
-            access_count: DashMap::new(),
+            lru: Mutex::new(LruState::default()),
         }
     }
 
@@ -36,16 +145,13 @@ impl L1Cache {
         let is_segment = matcher.glob_mode() == Some(GlobMode::Segment);
         let prefix = matcher.prefix();
         let case_sensitive = matcher.case_sensitive();
+        let mut touched: Vec<FileKey> = Vec::new();
+        let inner = self.inner.read();
 
-        let results: Vec<FileMeta> = self
-            .inner
+        let results: Vec<FileMeta> = inner
             .iter()
-            .filter(|e| {
-                let meta = e.value();
-                // 前缀启发式过滤
+            .filter(|(_, meta)| {
                 if let Some(p) = prefix {
-                    // Smart-Case：当 matcher 不敏感时，prefix 的大小写过滤若做错会产生假阴性。
-                    // L1 容量有限，直接跳过该启发式更安全。
                     if case_sensitive {
                         if is_segment {
                             let basename = meta
@@ -66,15 +172,19 @@ impl L1Cache {
                 }
                 matcher.matches(&meta.path.to_string_lossy())
             })
-            .map(|e| {
-                let fid = *e.key();
-                self.access_count
-                    .entry(fid)
-                    .and_modify(|v| *v += 1)
-                    .or_insert(1);
-                e.value().clone()
+            .map(|(fid, meta)| {
+                touched.push(*fid);
+                meta.clone()
             })
             .collect();
+        drop(inner);
+
+        if !touched.is_empty() {
+            let mut lru = self.lru.lock();
+            for fid in touched {
+                lru.touch(fid);
+            }
+        }
 
         if results.is_empty() {
             None
@@ -84,74 +194,112 @@ impl L1Cache {
     }
 
     pub fn insert(&self, meta: FileMeta) {
-        if self.inner.len() >= self.capacity {
-            // LRU 淘汰
-            let lru_key = self
-                .access_count
-                .iter()
-                .min_by_key(|e| *e.value())
-                .map(|e| *e.key());
-
-            if let Some(key) = lru_key {
-                if let Some((_, old)) = self.inner.remove(&key) {
-                    self.path_index.remove(&old.path);
-                }
-                self.access_count.remove(&key);
-            }
+        if self.capacity == 0 {
+            return;
         }
 
         let fid = meta.file_key;
-        self.path_index.insert(meta.path.clone(), fid);
-        self.inner.insert(fid, meta);
+        if let Some(old_path) = self.inner.read().get(&fid).map(|e| e.path.clone()) {
+            if old_path != meta.path {
+                self.path_index.write().remove(&old_path);
+            }
+        }
+
+        if let Some(evicted) = self.lru.lock().insert(fid, self.capacity) {
+            if let Some(old) = self.inner.write().remove(&evicted) {
+                self.path_index.write().remove(&old.path);
+            }
+        }
+
+        self.path_index.write().insert(meta.path.clone(), fid);
+        self.inner.write().insert(fid, meta);
     }
 
     pub fn remove_by_path(&self, path: &Path) {
-        if let Some((_, fid)) = self.path_index.remove(path) {
-            self.inner.remove(&fid);
-            self.access_count.remove(&fid);
+        if let Some(fid) = self.path_index.write().remove(path) {
+            self.inner.write().remove(&fid);
+            self.lru.lock().remove(fid);
         }
     }
 
     pub fn remove(&self, fid: &FileKey) {
-        if let Some((_, meta)) = self.inner.remove(fid) {
-            self.path_index.remove(&meta.path);
+        if let Some(meta) = self.inner.write().remove(fid) {
+            self.path_index.write().remove(&meta.path);
         }
-        self.access_count.remove(fid);
+        self.lru.lock().remove(*fid);
     }
 
     pub fn clear(&self) {
-        self.inner.clear();
-        self.path_index.clear();
-        self.access_count.clear();
+        self.inner.write().clear();
+        self.path_index.write().clear();
+        self.lru.lock().clear();
     }
 
-    /// 内存占用统计
     pub fn memory_stats(&self) -> L1Stats {
-        let entry_count = self.inner.len();
-        let path_index_count = self.path_index.len();
-        let access_count_entries = self.access_count.len();
+        use std::mem::size_of;
 
-        // DashMap 每条 entry 开销 ≈ 数据 + ~64 bytes 控制结构
+        let inner = self.inner.read();
+        let path_index = self.path_index.read();
+        let entry_count = inner.len();
+        let path_index_count = path_index.len();
+        let lru_entries = self.lru.lock().len();
+
         let avg_path_len: u64 = if entry_count > 0 {
-            let total: u64 = self
-                .inner
-                .iter()
-                .map(|e| e.value().path.as_os_str().len() as u64)
+            let total: u64 = inner
+                .values()
+                .map(|meta| meta.path.as_os_str().len() as u64)
                 .sum();
             total / entry_count as u64
         } else {
             0
         };
+        drop(path_index);
+        drop(inner);
 
         let inner_bytes = entry_count as u64 * (16 + 64 + avg_path_len + 64);
         let path_index_bytes = path_index_count as u64 * (24 + avg_path_len + 16 + 64);
-        let access_bytes = access_count_entries as u64 * (16 + 8 + 64);
+        let lru_bytes = lru_entries as u64 * (size_of::<(FileKey, LruLinks)>() as u64 + 32);
 
         L1Stats {
             entry_count,
             path_index_count,
-            access_count_entries,
-            estimated_bytes: inner_bytes + path_index_bytes + access_bytes,
+            lru_entries,
+            estimated_bytes: inner_bytes + path_index_bytes + lru_bytes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::matcher::create_matcher;
+    use std::path::PathBuf;
+
+    fn meta(ino: u64, name: &str) -> FileMeta {
+        FileMeta {
+            file_key: FileKey { dev: 1, ino },
+            path: PathBuf::from(format!("/tmp/{name}")),
+            size: ino,
+            mtime: None,
+        }
+    }
+
+    #[test]
+    fn evicts_true_lru_entry() {
+        let cache = L1Cache::with_capacity(2);
+        cache.insert(meta(1, "alpha.txt"));
+        cache.insert(meta(2, "beta.txt"));
+
+        let matcher = create_matcher("alpha", true);
+        let hit = cache.query(matcher.as_ref()).unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].file_key.ino, 1);
+
+        cache.insert(meta(3, "gamma.txt"));
+
+        let inner = cache.inner.read();
+        assert!(inner.contains_key(&FileKey { dev: 1, ino: 1 }));
+        assert!(!inner.contains_key(&FileKey { dev: 1, ino: 2 }));
+        assert!(inner.contains_key(&FileKey { dev: 1, ino: 3 }));
     }
 }
