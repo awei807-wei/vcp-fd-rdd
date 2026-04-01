@@ -28,28 +28,7 @@ where
     false
 }
 
-#[cfg(feature = "mimalloc")]
-fn maybe_trim_rss() {
-    // mimalloc 作为全局分配器时，glibc 的 malloc_trim 无效，需要调用 mimalloc 自己的回收。
-    extern "C" {
-        fn mi_collect(force: bool);
-    }
-    unsafe { mi_collect(true) };
-}
-
-#[cfg(all(not(feature = "mimalloc"), target_os = "linux", target_env = "gnu"))]
-fn maybe_trim_rss() {
-    // glibc malloc 的主动回吐：释放尽可能多的空闲块回 OS。
-    unsafe {
-        libc::malloc_trim(0);
-    }
-}
-
-#[cfg(all(
-    not(feature = "mimalloc"),
-    not(all(target_os = "linux", target_env = "gnu"))
-))]
-fn maybe_trim_rss() {}
+use crate::util::maybe_trim_rss;
 
 /// 事件管道：bounded channel + debounce/合并 + 批量应用
 pub struct EventPipeline {
