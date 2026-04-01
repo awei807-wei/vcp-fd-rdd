@@ -53,12 +53,12 @@ pub struct FaultStats {
 
 #[derive(Clone, Debug, Default)]
 pub struct L1Stats {
-    /// DashMap<FileKey, FileMeta> 条目数
+    /// L1 主存储条目数
     pub entry_count: usize,
     /// path_index 条目数
     pub path_index_count: usize,
-    /// access_count 条目数
-    pub access_count_entries: usize,
+    /// LRU 条目数
+    pub lru_entries: usize,
     /// 估算内存（字节）
     pub estimated_bytes: u64,
 }
@@ -296,8 +296,8 @@ impl fmt::Display for MemoryReport {
         )?;
         writeln!(
             f,
-            "║   access_count: {:>10}                       ║",
-            self.l1.access_count_entries
+            "║   lru_entries:  {:>10}                       ║",
+            self.l1.lru_entries
         )?;
         writeln!(
             f,
