@@ -1,6 +1,7 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{collections::HashMap, path::Component};
 
 use roaring::RoaringBitmap;
 
@@ -10,6 +11,7 @@ use crate::core::{FileKey, FileMeta};
 use crate::index::IndexLayer;
 use crate::query::matcher::Matcher;
 use crate::storage::snapshot::MmapSnapshotV6;
+use crate::util::{compose_abs_path_buf, compose_abs_path_bytes, root_bytes_for_id};
 
 #[cfg(feature = "rkyv")]
 use std::sync::OnceLock;
@@ -26,16 +28,40 @@ const FKM_HDR_SIZE: usize = 8;
 const FKM_FLAG_LEGACY: u16 = 0;
 const FKM_FLAG_RKYV: u16 = 1;
 
-fn pathbuf_from_encoded_vec(bytes: Vec<u8>) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-        return PathBuf::from(OsString::from_vec(bytes));
+fn normalize_short_hint(hint: &[u8]) -> Option<Vec<u8>> {
+    let normalized = String::from_utf8_lossy(hint).to_lowercase().into_bytes();
+    if (1..=2).contains(&normalized.len()) {
+        Some(normalized)
+    } else {
+        None
     }
-    #[cfg(not(unix))]
-    {
-        PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn trigram_matches_short_hint(tri: [u8; 3], hint: &[u8]) -> bool {
+    match hint.len() {
+        1 => tri.contains(&hint[0]),
+        2 => tri[0..2] == hint[..] || tri[1..3] == hint[..],
+        _ => false,
+    }
+}
+
+fn short_component_matches(component: &[u8], hint: &[u8]) -> bool {
+    if hint.is_empty() || component.len() < hint.len() {
+        return false;
+    }
+    component.windows(hint.len()).any(|window| window == hint)
+}
+
+fn for_each_short_component(path: &Path, mut f: impl FnMut(&[u8])) {
+    for component in path.components() {
+        let Component::Normal(os) = component else {
+            continue;
+        };
+        let lower = os.to_string_lossy().to_lowercase();
+        let bytes = lower.as_bytes();
+        if (1..=2).contains(&bytes.len()) {
+            f(bytes);
+        }
     }
 }
 
@@ -44,6 +70,7 @@ pub struct MmapIndex {
     tomb_cache: parking_lot::Mutex<Option<RoaringBitmap>>,
     // 兼容旧段：若缺少 mmap 内的 file_key_map 段，则按需构建一次排序 map（以 bytes 形式存储，便于二分查找）。
     filekey_map_cache: parking_lot::Mutex<Option<Arc<Vec<u8>>>>,
+    short_component_cache: parking_lot::Mutex<Option<Arc<HashMap<Box<[u8]>, RoaringBitmap>>>>,
     #[cfg(feature = "rkyv")]
     validated_rkyv: OnceLock<anyhow::Result<()>>,
 }
@@ -54,6 +81,7 @@ impl MmapIndex {
             snap: Arc::new(snap),
             tomb_cache: parking_lot::Mutex::new(None),
             filekey_map_cache: parking_lot::Mutex::new(None),
+            short_component_cache: parking_lot::Mutex::new(None),
             #[cfg(feature = "rkyv")]
             validated_rkyv: OnceLock::new(),
         }
@@ -77,48 +105,6 @@ impl MmapIndex {
         let b = RoaringBitmap::deserialize_from(&mut cur).unwrap_or_else(|_| RoaringBitmap::new());
         *g = Some(b.clone());
         b
-    }
-
-    fn compose_abs_path_bytes(&self, root_id: u16, rel_bytes: &[u8]) -> Vec<u8> {
-        let root = self
-            .snap
-            .roots
-            .get(root_id as usize)
-            .map(|v| v.as_slice())
-            .unwrap_or(b"/");
-        let mut out = Vec::with_capacity(root.len() + 1 + rel_bytes.len());
-        out.extend_from_slice(root);
-        let needs_sep = if cfg!(windows) {
-            !out.ends_with(b"/") && !out.ends_with(b"\\")
-        } else {
-            !out.ends_with(b"/")
-        };
-        if needs_sep {
-            out.push(std::path::MAIN_SEPARATOR as u8);
-        }
-        out.extend_from_slice(rel_bytes);
-        out
-    }
-
-    fn compose_abs_path(&self, root_id: u16, rel_bytes: &[u8]) -> PathBuf {
-        let root = self
-            .snap
-            .roots
-            .get(root_id as usize)
-            .map(|v| v.as_slice())
-            .unwrap_or(b"/");
-        let mut out = Vec::with_capacity(root.len() + 1 + rel_bytes.len());
-        out.extend_from_slice(root);
-        let needs_sep = if cfg!(windows) {
-            !out.ends_with(b"/") && !out.ends_with(b"\\")
-        } else {
-            !out.ends_with(b"/")
-        };
-        if needs_sep {
-            out.push(std::path::MAIN_SEPARATOR as u8);
-        }
-        out.extend_from_slice(rel_bytes);
-        pathbuf_from_encoded_vec(out)
     }
 
     fn meta_at(
@@ -419,10 +405,79 @@ impl MmapIndex {
         Some(acc)
     }
 
+    fn short_component_cache(&self) -> Arc<HashMap<Box<[u8]>, RoaringBitmap>> {
+        if let Some(cache) = self.short_component_cache.lock().clone() {
+            return cache;
+        }
+
+        let tomb = self.tombstones();
+        let arena = self.snap.path_arena_bytes();
+        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u32;
+        let mut cache: HashMap<Box<[u8]>, RoaringBitmap> = HashMap::new();
+
+        for docid in 0..n {
+            if tomb.contains(docid) {
+                continue;
+            }
+            let Some((_, root_id, path_off, path_len, ..)) = self.meta_at(docid) else {
+                continue;
+            };
+            let start = path_off as usize;
+            let end = start.saturating_add(path_len as usize);
+            let Some(rel) = arena.get(start..end) else {
+                continue;
+            };
+            let path = compose_abs_path_buf(root_bytes_for_id(&self.snap.roots, root_id), rel);
+            for_each_short_component(path.as_path(), |component| {
+                cache
+                    .entry(Box::<[u8]>::from(component))
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(docid);
+            });
+        }
+
+        let cache = Arc::new(cache);
+        *self.short_component_cache.lock() = Some(cache.clone());
+        cache
+    }
+
+    fn short_hint_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringBitmap> {
+        if !self.has_trigram_sentinel() {
+            return None;
+        }
+
+        let hint = normalize_short_hint(matcher.literal_hint()?)?;
+        let cache = self.short_component_cache();
+        let table = self.snap.trigram_table_bytes();
+        let n = table.len() / TRI_REC_SIZE;
+        let mut acc = RoaringBitmap::new();
+
+        for i in 0..n {
+            let off = i * TRI_REC_SIZE;
+            let rec = &table[off..off + TRI_REC_SIZE];
+            let tri = [rec[0], rec[1], rec[2]];
+            if !trigram_matches_short_hint(tri, &hint) {
+                continue;
+            }
+            if let Some(posting) = self.posting_for_trigram(tri) {
+                acc |= posting;
+            }
+        }
+
+        for (component, posting) in cache.iter() {
+            if short_component_matches(component.as_ref(), &hint) {
+                acc |= posting.clone();
+            }
+        }
+
+        Some(acc)
+    }
+
     pub fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
         // 能力感知：无哨兵视为旧段（trigram 不覆盖目录组件），禁用预过滤避免假阴性。
         let candidates = if self.has_trigram_sentinel() {
             self.trigram_candidates(matcher)
+                .or_else(|| self.short_hint_candidates(matcher))
         } else {
             None
         };
@@ -445,7 +500,7 @@ impl MmapIndex {
                 let Some(rel) = arena.get(start..end) else {
                     continue;
                 };
-                let abs = self.compose_abs_path_bytes(root_id, rel);
+                let abs = compose_abs_path_bytes(root_bytes_for_id(&self.snap.roots, root_id), rel);
                 let s = std::str::from_utf8(&abs)
                     .map(std::borrow::Cow::Borrowed)
                     .unwrap_or_else(|_| String::from_utf8_lossy(&abs));
@@ -469,7 +524,7 @@ impl MmapIndex {
             let Some(rel) = arena.get(start..end) else {
                 continue;
             };
-            let abs = self.compose_abs_path_bytes(root_id, rel);
+            let abs = compose_abs_path_bytes(root_bytes_for_id(&self.snap.roots, root_id), rel);
             let s = std::str::from_utf8(&abs)
                 .map(std::borrow::Cow::Borrowed)
                 .unwrap_or_else(|_| String::from_utf8_lossy(&abs));
@@ -495,7 +550,7 @@ impl MmapIndex {
         let start = path_off as usize;
         let end = start.saturating_add(path_len as usize);
         let rel = arena.get(start..end)?;
-        let path = self.compose_abs_path(root_id, rel);
+        let path = compose_abs_path_buf(root_bytes_for_id(&self.snap.roots, root_id), rel);
         Some(FileMeta {
             file_key,
             path,
@@ -508,6 +563,7 @@ impl MmapIndex {
         // 能力感知：无哨兵视为旧段（trigram 不覆盖目录组件），禁用预过滤避免假阴性。
         let candidates = if self.has_trigram_sentinel() {
             self.trigram_candidates(matcher)
+                .or_else(|| self.short_hint_candidates(matcher))
         } else {
             None
         };
@@ -534,7 +590,7 @@ impl MmapIndex {
                     continue;
                 };
 
-                let path = self.compose_abs_path(root_id, rel);
+                let path = compose_abs_path_buf(root_bytes_for_id(&self.snap.roots, root_id), rel);
                 let s = path.to_string_lossy();
                 if !matcher.matches(&s) {
                     continue;
@@ -566,7 +622,7 @@ impl MmapIndex {
                 continue;
             };
 
-            let path = self.compose_abs_path(root_id, rel);
+            let path = compose_abs_path_buf(root_bytes_for_id(&self.snap.roots, root_id), rel);
             let s = path.to_string_lossy();
             if !matcher.matches(&s) {
                 continue;
@@ -600,7 +656,7 @@ impl MmapIndex {
             let Some(rel) = arena.get(start..end) else {
                 continue;
             };
-            let path = self.compose_abs_path(root_id, rel);
+            let path = compose_abs_path_buf(root_bytes_for_id(&self.snap.roots, root_id), rel);
             f(FileMeta {
                 file_key,
                 path,
@@ -796,5 +852,41 @@ mod tests {
             s0.ends_with("src_lib.rs") || s1.ends_with("src_lib.rs"),
             "must include basename hit"
         );
+    }
+
+    #[tokio::test]
+    async fn short_literal_query_hits_short_component_candidates() {
+        let root = unique_tmp_dir("short-hint");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        for (ino, name) in [(1, "ab"), (2, "cabd.txt")] {
+            let path = root.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            idx.upsert(FileMeta {
+                file_key: FileKey { dev: 1, ino },
+                path,
+                size: 1,
+                mtime: None,
+            });
+        }
+
+        let store = SnapshotStore::new(root.join("index.db"));
+        let segs = idx.export_segments_v6();
+        store.write_atomic_v6(&segs).await.unwrap();
+
+        let snap = store
+            .load_v6_mmap_if_valid(&[root.clone()])
+            .unwrap()
+            .expect("load v6");
+        let mmap_idx = MmapIndex::new(snap);
+
+        let matcher = create_matcher("ab", true);
+        let results = mmap_idx.query(matcher.as_ref());
+        assert_eq!(results.len(), 2);
+
+        let matcher = create_matcher("a", true);
+        let results = mmap_idx.query(matcher.as_ref());
+        assert_eq!(results.len(), 2);
     }
 }
