@@ -436,6 +436,88 @@ impl Matcher for ExtMatcher {
     }
 }
 
+/// 路径段首字母匹配：`c\use\shi\pro` 匹配 `C:\Users\shiyi\project`
+///
+/// 规则：
+/// - 输入按 `\` 或 `/` 分割为段 ["c", "use", "shi", "pro"]
+/// - 路径按分隔符分割为段 ["C:", "Users", "shiyi", "project"]
+/// - 每个输入段必须是对应路径段的前缀（大小写不敏感）
+/// - 可以跳过路径中间段（允许省略层级）
+/// - 最后一段做子串匹配（更宽容的文件名搜索）
+pub struct PathInitialsMatcher {
+    segments: Vec<String>, // 小写化后的输入段
+}
+
+impl PathInitialsMatcher {
+    pub fn new(input: &str) -> Self {
+        let segments = input
+            .split(|c: char| c == '/' || c == '\\')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .collect();
+        Self { segments }
+    }
+}
+
+impl Matcher for PathInitialsMatcher {
+    fn matches(&self, path: &str) -> bool {
+        if self.segments.is_empty() {
+            return true;
+        }
+
+        // Split path into segments
+        let path_segs: Vec<&str> = path
+            .split(|c: char| c == '/' || c == '\\')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut qi = 0; // query segment index
+        let mut pi = 0; // path segment index
+
+        while qi < self.segments.len() && pi < path_segs.len() {
+            let qs = &self.segments[qi];
+            let is_last = qi == self.segments.len() - 1;
+
+            // Scan forward in path segments to find a match
+            let mut found = false;
+            while pi < path_segs.len() {
+                let ps_lower = path_segs[pi].to_lowercase();
+
+                let matched = if is_last {
+                    // Last query segment: prefix or substring match
+                    ps_lower.starts_with(qs.as_str()) || ps_lower.contains(qs.as_str())
+                } else {
+                    // Non-last segments: prefix match only
+                    ps_lower.starts_with(qs.as_str())
+                };
+
+                pi += 1;
+                if matched {
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                return false;
+            }
+            qi += 1;
+        }
+
+        // All query segments must be matched
+        qi == self.segments.len()
+    }
+
+    fn case_sensitive(&self) -> bool {
+        false
+    }
+
+    fn literal_hint(&self) -> Option<&[u8]> {
+        // Path initials mode queries contain separators; cannot use single-segment literal hints.
+        None
+    }
+}
+
 /// Match-all：用于无正向 anchor 的退化扫描。
 pub struct MatchAllMatcher;
 
@@ -569,5 +651,49 @@ mod tests {
     fn smart_case_insensitive_contains() {
         let m = create_matcher("vcp", false);
         assert!(m.matches("/tmp/VCPTest/main.rs"));
+    }
+
+    // ── PathInitialsMatcher ──
+
+    #[test]
+    fn path_initials_basic_prefix_match() {
+        let m = PathInitialsMatcher::new("tmp/tes/new");
+        assert!(m.matches("/tmp/test_data/newfile.txt"));
+    }
+
+    #[test]
+    fn path_initials_case_insensitive() {
+        let m = PathInitialsMatcher::new("c/use/shi/pro");
+        assert!(m.matches("C:/Users/shiyi/project"));
+    }
+
+    #[test]
+    fn path_initials_backslash_separator() {
+        let m = PathInitialsMatcher::new(r"c\use\shi\pro");
+        assert!(m.matches(r"C:\Users\shiyi\project"));
+    }
+
+    #[test]
+    fn path_initials_skips_intermediate_segments() {
+        let m = PathInitialsMatcher::new("home/pro");
+        assert!(m.matches("/home/user/documents/project/main.rs"));
+    }
+
+    #[test]
+    fn path_initials_last_segment_substring() {
+        let m = PathInitialsMatcher::new("tmp/file");
+        assert!(m.matches("/tmp/data/myfile.txt"));
+    }
+
+    #[test]
+    fn path_initials_no_match() {
+        let m = PathInitialsMatcher::new("xyz/abc");
+        assert!(!m.matches("/tmp/test_data/newfile.txt"));
+    }
+
+    #[test]
+    fn path_initials_empty_segments() {
+        let m = PathInitialsMatcher::new("");
+        assert!(m.matches("/any/path"));
     }
 }

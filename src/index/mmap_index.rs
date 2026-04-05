@@ -556,6 +556,8 @@ impl MmapIndex {
             path,
             size,
             mtime,
+            ctime: None,
+            atime: None,
         })
     }
 
@@ -601,6 +603,8 @@ impl MmapIndex {
                     path,
                     size,
                     mtime,
+                    ctime: None,
+                    atime: None,
                 });
             }
             return out;
@@ -615,24 +619,23 @@ impl MmapIndex {
             else {
                 continue;
             };
-
             let start = path_off as usize;
             let end = start.saturating_add(path_len as usize);
             let Some(rel) = arena.get(start..end) else {
                 continue;
             };
-
             let path = compose_abs_path_buf(root_bytes_for_id(&self.snap.roots, root_id), rel);
             let s = path.to_string_lossy();
             if !matcher.matches(&s) {
                 continue;
             }
-
             out.push(FileMeta {
                 file_key,
                 path,
                 size,
                 mtime,
+                ctime: None,
+                atime: None,
             });
         }
 
@@ -662,6 +665,8 @@ impl MmapIndex {
                 path,
                 size,
                 mtime,
+                ctime: None,
+                atime: None,
             });
         }
     }
@@ -725,6 +730,8 @@ mod tests {
             path: p.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
 
         let store = SnapshotStore::new(root.join("index.db"));
@@ -813,12 +820,16 @@ mod tests {
             path: p_dir_hit.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         idx.upsert(FileMeta {
             file_key: FileKey { dev: 1, ino: 2 },
             path: p_base_hit.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
 
         // 模拟“旧段”：仅 basename 建 trigram，且无哨兵 key。
@@ -868,6 +879,8 @@ mod tests {
                 path,
                 size: 1,
                 mtime: None,
+                ctime: None,
+                atime: None,
             });
         }
 

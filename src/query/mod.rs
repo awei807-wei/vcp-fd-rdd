@@ -1,6 +1,7 @@
 pub mod dsl;
 pub mod fzf;
 pub mod matcher;
+pub mod scoring;
 pub mod server;
 pub mod socket;
 

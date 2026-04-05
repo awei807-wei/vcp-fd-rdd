@@ -1,5 +1,6 @@
 use crate::core::FileMeta;
 use crate::index::TieredIndex;
+use crate::query::scoring::{score_result, ScoreConfig};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 
@@ -31,15 +32,117 @@ impl QueryMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SortColumn {
+    /// Relevance score (default)
+    #[default]
+    Score,
+    Name,
+    Path,
+    Size,
+    Ext,
+    DateModified,
+    DateCreated,
+    DateAccessed,
+}
+
+impl SortColumn {
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(str::trim).filter(|v| !v.is_empty()) {
+            Some("name") => Self::Name,
+            Some("path") => Self::Path,
+            Some("size") => Self::Size,
+            Some("ext" | "extension") => Self::Ext,
+            Some("date_modified" | "dm" | "modified") => Self::DateModified,
+            Some("date_created" | "dc" | "created") => Self::DateCreated,
+            Some("date_accessed" | "da" | "accessed") => Self::DateAccessed,
+            _ => Self::Score,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SortOrder {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl SortOrder {
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(str::trim) {
+            Some("desc") => Self::Desc,
+            _ => Self::Asc,
+        }
+    }
+}
+
 pub fn execute_query(
     index: &TieredIndex,
     keyword: &str,
     limit: usize,
     mode: QueryMode,
+    sort: SortColumn,
+    order: SortOrder,
 ) -> Vec<FileMeta> {
-    match mode {
+    let mut results = match mode {
         QueryMode::Exact => index.query_limit(keyword, limit),
         QueryMode::Fuzzy => FzfIntegration::new().query_index(index, keyword, limit),
+    };
+
+    sort_results(&mut results, keyword, sort, order);
+    results
+}
+
+fn sort_results(results: &mut Vec<FileMeta>, keyword: &str, sort: SortColumn, order: SortOrder) {
+    use std::cmp::Ordering;
+
+    results.sort_by(|a, b| {
+        let cmp = match sort {
+            SortColumn::Score => {
+                let config = ScoreConfig::from_query(keyword);
+                let sa = score_result(a, &config);
+                let sb = score_result(b, &config);
+                // Score: higher is better, so default desc
+                sb.cmp(&sa).then_with(|| a.path.cmp(&b.path))
+            }
+            SortColumn::Name => {
+                let na = a.path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let nb = b.path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
+                na.cmp(&nb).then_with(|| a.path.cmp(&b.path))
+            }
+            SortColumn::Path => a.path.cmp(&b.path),
+            SortColumn::Size => a.size.cmp(&b.size).then_with(|| a.path.cmp(&b.path)),
+            SortColumn::Ext => {
+                let ea = a.path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let eb = b.path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+                ea.cmp(&eb).then_with(|| a.path.cmp(&b.path))
+            }
+            SortColumn::DateModified => cmp_time(a.mtime, b.mtime).then_with(|| a.path.cmp(&b.path)),
+            SortColumn::DateCreated => cmp_time(a.ctime, b.ctime).then_with(|| a.path.cmp(&b.path)),
+            SortColumn::DateAccessed => cmp_time(a.atime, b.atime).then_with(|| a.path.cmp(&b.path)),
+        };
+
+        // Score column is already desc by default; all others respect order param
+        if sort == SortColumn::Score {
+            cmp
+        } else if order == SortOrder::Desc {
+            cmp.reverse()
+        } else {
+            cmp
+        }
+    });
+}
+
+fn cmp_time(
+    a: Option<std::time::SystemTime>,
+    b: Option<std::time::SystemTime>,
+) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(ta), Some(tb)) => ta.cmp(&tb),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
     }
 }
 
@@ -157,10 +260,10 @@ mod tests {
         let index = TieredIndex::empty(vec![root.clone()]);
         index.apply_events(&[ev(1, wanted.clone()), ev(2, other)]);
 
-        let exact = execute_query(&index, "mdt", 10, QueryMode::Exact);
+        let exact = execute_query(&index, "mdt", 10, QueryMode::Exact, SortColumn::default(), SortOrder::default());
         assert!(exact.is_empty());
 
-        let fuzzy = execute_query(&index, "mdt", 1, QueryMode::Fuzzy);
+        let fuzzy = execute_query(&index, "mdt", 1, QueryMode::Fuzzy, SortColumn::default(), SortOrder::default());
         assert_eq!(fuzzy.len(), 1);
         assert_eq!(fuzzy[0].path, wanted);
         Ok(())

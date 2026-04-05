@@ -1,12 +1,14 @@
 use crate::index::TieredIndex;
-use crate::query::{execute_query, QueryMode};
+use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
+use crate::query::{execute_query, QueryMode, SortColumn, SortOrder};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,12 +21,27 @@ pub struct SearchParams {
     pub q: String,
     pub limit: Option<usize>,
     pub mode: Option<String>,
+    pub sort: Option<String>,
+    pub order: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct SearchResult {
     pub path: String,
     pub size: u64,
+    pub score: i64,
+    pub highlights: Vec<[usize; 2]>,
+}
+
+#[derive(Deserialize)]
+pub struct ScanParams {
+    pub paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ScanResponse {
+    pub scanned: usize,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -76,6 +93,7 @@ impl QueryServer {
         let app = Router::new()
             .route("/search", get(search_handler))
             .route("/status", get(status_handler))
+            .route("/scan", post(scan_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
@@ -106,8 +124,11 @@ async fn search_handler(
     let keyword = params.q;
     let index = state.index.clone();
 
+    let kw_clone = keyword.clone();
+    let sort = SortColumn::parse(params.sort.as_deref());
+    let order = SortOrder::parse(params.order.as_deref());
     let search_task =
-        tokio::task::spawn_blocking(move || execute_query(index.as_ref(), &keyword, limit, mode));
+        tokio::task::spawn_blocking(move || execute_query(index.as_ref(), &kw_clone, limit, mode, sort, order));
     let results = match tokio::time::timeout(state.config.query_timeout, search_task).await {
         Ok(Ok(results)) => results,
         Ok(Err(e)) => {
@@ -134,11 +155,19 @@ async fn search_handler(
         }
     };
 
+    let config = ScoreConfig::from_query(&keyword);
     let response = results
         .into_iter()
-        .map(|m| SearchResult {
-            path: m.path.to_string_lossy().into_owned(),
-            size: m.size,
+        .map(|m| {
+            let path_str = m.path.to_string_lossy().into_owned();
+            let score = score_result(&m, &config);
+            let highlights = compute_highlights(&path_str, &keyword);
+            SearchResult {
+                path: path_str,
+                size: m.size,
+                score,
+                highlights,
+            }
         })
         .collect();
 
@@ -149,6 +178,31 @@ async fn status_handler(State(state): State<QueryServerState>) -> Json<StatusRes
     Json(StatusResponse {
         indexed_count: state.index.file_count(),
     })
+}
+
+async fn scan_handler(
+    State(state): State<QueryServerState>,
+    Json(params): Json<ScanParams>,
+) -> Result<Json<ScanResponse>, (StatusCode, String)> {
+    if params.paths.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "paths must not be empty".to_string()));
+    }
+
+    let dirs: Vec<PathBuf> = params
+        .paths
+        .iter()
+        .take(10)
+        .map(PathBuf::from)
+        .collect();
+
+    let index = state.index.clone();
+    let (scanned, elapsed_ms) = tokio::task::spawn_blocking(move || {
+        index.scan_dirs_immediate(&dirs)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ScanResponse { scanned, elapsed_ms }))
 }
 
 #[cfg(test)]

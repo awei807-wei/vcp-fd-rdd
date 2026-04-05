@@ -1075,6 +1075,8 @@ impl TieredIndex {
                     path: path.clone(),
                     size: meta.len(),
                     mtime: meta.modified().ok(),
+                    ctime: meta.created().ok(),
+                    atime: meta.accessed().ok(),
                 });
                 upsert_events.push(EventRecord {
                     seq,
@@ -1131,6 +1133,78 @@ impl TieredIndex {
         }
 
         report
+    }
+
+    /// 即时扫描指定目录并更新索引（同步执行，不走 debounce/channel）。
+    ///
+    /// 限制：最多 10 个目录，每目录最多 10000 条目。
+    /// 返回 (scanned_files, elapsed_ms)。
+    pub fn scan_dirs_immediate(&self, dirs: &[PathBuf]) -> (usize, u64) {
+        let start = Instant::now();
+        let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
+
+        let mut upsert_events: Vec<EventRecord> = Vec::new();
+        let mut upsert_metas: Vec<FileMeta> = Vec::new();
+        let mut scanned: usize = 0;
+        let mut seq: u64 = 0;
+
+        for dir in dirs {
+            let rd = match std::fs::read_dir(dir) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            let mut dir_count = 0;
+            for ent in rd {
+                let ent = match ent {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let ft = match ent.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if ft.is_dir() {
+                    continue;
+                }
+                if dir_count >= 10_000 {
+                    break;
+                }
+                dir_count += 1;
+
+                let path = ent.path();
+                let meta = match ent.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let Some(file_key) = FileKey::from_path_and_metadata(&path, &meta) else {
+                    continue;
+                };
+                seq = seq.wrapping_add(1);
+                upsert_metas.push(FileMeta {
+                    file_key,
+                    path: path.clone(),
+                    size: meta.len(),
+                    mtime: meta.modified().ok(),
+                    ctime: meta.created().ok(),
+                    atime: meta.accessed().ok(),
+                });
+                upsert_events.push(EventRecord {
+                    seq,
+                    timestamp: std::time::SystemTime::now(),
+                    event_type: EventType::Modify,
+                    id: FileIdentifier::Path(path),
+                    path_hint: None,
+                });
+                scanned += 1;
+            }
+        }
+
+        if !upsert_events.is_empty() {
+            self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
+        }
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        (scanned, elapsed_ms)
     }
 
     /// 查询入口：L1 → L2 → DiskSegments（mmap），不扫真实文件系统
@@ -2526,6 +2600,8 @@ mod tests {
             path: alpha.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         store
             .lsm_replace_base_v6(&base_idx.export_segments_v6(), None, &[root.clone()], 0)
@@ -2540,6 +2616,8 @@ mod tests {
             path: gamma.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         let deleted = vec![alpha.as_os_str().as_encoded_bytes().to_vec()];
         store
@@ -2578,6 +2656,8 @@ mod tests {
             path: alpha.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         store
             .lsm_replace_base_v6(&base_idx.export_segments_v6(), None, &[root.clone()], 0)
@@ -2600,6 +2680,8 @@ mod tests {
             path: alpha.clone(),
             size: 2,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         store
             .lsm_append_delta_v6(&d2.export_segments_v6(), &[], &[root.clone()], 0)
@@ -2635,6 +2717,8 @@ mod tests {
             path: a.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         store
             .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
@@ -2648,6 +2732,8 @@ mod tests {
             path: a.clone(),
             size: 2,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         store
             .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], &[root.clone()], 0)
@@ -2685,6 +2771,8 @@ mod tests {
             path: old.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         store
             .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
@@ -2698,6 +2786,8 @@ mod tests {
             path: newp.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         let deleted = vec![old.as_os_str().as_encoded_bytes().to_vec()];
         store
@@ -2744,6 +2834,8 @@ mod tests {
             path: p1.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         store
             .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
@@ -2757,6 +2849,8 @@ mod tests {
             path: p2.clone(),
             size: 2,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         store
             .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], &[root.clone()], 0)
@@ -2770,6 +2864,8 @@ mod tests {
             path: p3.clone(),
             size: 3,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         store
             .lsm_append_delta_v6(&seg3.export_segments_v6(), &[], &[root.clone()], 0)
@@ -2814,6 +2910,8 @@ mod tests {
             path: alpha.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         store
             .lsm_replace_base_v6(
@@ -2853,6 +2951,8 @@ mod tests {
                 path: root.join(name),
                 size: ino,
                 mtime: None,
+                ctime: None,
+                atime: None,
             });
             idx
         };
