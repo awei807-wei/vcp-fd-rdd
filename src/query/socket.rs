@@ -4,7 +4,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use crate::query::{execute_query, QueryMode};
+    use crate::query::{execute_query, QueryMode, SortColumn, SortOrder};
     use std::path::{Path, PathBuf};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
     use tokio::net::{unix::UCred, UnixListener, UnixStream};
@@ -227,7 +227,7 @@ mod imp {
         }
         limit = limit.min(cfg.max_limit).max(1);
 
-        let results = execute_query(index.as_ref(), keyword, limit, mode);
+        let results = execute_query(index.as_ref(), keyword, limit, mode, SortColumn::default(), SortOrder::default());
 
         // 流式写回：不要在内存里拼接巨大 String/JSON。
         let mut w = BufWriter::new(&mut socket);

@@ -8,7 +8,57 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前主线实现沿 v0.4.9 路线演进（Query DSL/Fuzzy 并存、DAG/Verifier 补强、UDS 认证与 fast-sync 热路径收敛）。
+> 当前主线实现沿 v0.5.1 路线演进（性能与安全加固：事件通道扩容、AtomicBool dirty flag、全量扫描上限、Trigram 交集优化、DocId 溢出安全化）。
+
+## v0.5.0 更新
+
+- **即时扫描**：新增 `POST /scan` 端点，前端可主动触发目录扫描并立即更新索引；`--debounce-ms` 默认值从 100ms 降至 10ms
+- **路径段首匹配**：`c/use/shi` 自动匹配 `/home/shiyi/...`，DSL 自动检测并追加 OR 分支（`PathInitialsMatcher`）
+- **智能排序**：搜索结果按相关性评分排序（深度惩罚/basename 奖励/长度惩罚/近期修改奖励）；HTTP 新增 `sort`/`order` 参数
+- **匹配高亮**：`SearchResult` 新增 `score` 和 `highlights` 字段（`[byte_start, byte_end)` 数组）
+- **新增过滤器**：`parent:`/`infolder:`、`depth:`、`len:`、`dc:`（创建时间）、`da:`（访问时间）、`type:`
+- **FileMeta 扩展**：新增 `ctime`/`atime` 字段（运行时填充，不持久化到快照）
+
+### 排序参数
+
+```bash
+# 按修改时间降序
+curl "http://127.0.0.1:6060/search?q=test&sort=date_modified&order=desc"
+
+# 按文件名升序
+curl "http://127.0.0.1:6060/search?q=test&sort=name"
+```
+
+可用 `sort` 值：`score`（默认）、`name`、`path`、`size`、`ext`、`date_modified`、`date_created`、`date_accessed`
+
+### 即时扫描
+
+```bash
+curl -X POST http://127.0.0.1:6060/scan \
+  -H 'Content-Type: application/json' \
+  -d '{"paths":["/home/shiyi/Downloads"]}'
+# → {"scanned":42,"elapsed_ms":3}
+```
+
+### 新过滤器示例
+
+```
+parent:/home/shiyi/Downloads    # 父目录精确匹配
+depth:<=3                       # 路径深度不超过 3
+len:>50                         # 文件名超过 50 字节
+dc:today                        # 今天创建的文件
+da:2024-01-01                   # 指定日期访问的文件
+type:file                       # 仅文件（当前默认）
+```
+
+
+## v0.5.1 更新
+
+- **事件通道扩容**：`--event-channel-size` 默认值 4096→65536，git clone 等批量操作不再丢事件
+- **Dirty flag 无锁化**：`dirty` 标记从 `RwLock<bool>` 改为 `AtomicBool`，消除 snapshot 与写入路径的竞态
+- **全量扫描上限**：`PersistentIndex::query()` 新增 `limit` 参数，短查询不再触发无界全量遍历
+- **Trigram 交集优化**：持锁期间按基数排序后原地 `&=`，仅 clone 最小 bitmap，减少内存分配
+- **DocId 溢出安全化**：超过 4B 文件时 `alloc_docid` 返回 `None` 而非静默写入 `u32::MAX`
 
 ## v0.4.9 更新
 

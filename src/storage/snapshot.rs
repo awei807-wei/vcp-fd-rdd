@@ -1500,12 +1500,16 @@ mod tests {
             path: p1.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         idx.upsert(FileMeta {
             file_key: FileKey { dev: 1, ino: 2 },
             path: p2.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
 
         let store = SnapshotStore::new(root.join("index.db"));
@@ -1545,6 +1549,8 @@ mod tests {
             path: p1.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
 
         let store = SnapshotStore::new(root.join("index.db"));
@@ -1580,6 +1586,8 @@ mod tests {
             path: root.join("alpha_test.txt"),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
 
         let store = SnapshotStore::new(root.join("index.db"));
@@ -1604,6 +1612,8 @@ mod tests {
             path: p1.clone(),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
 
         let store = SnapshotStore::new(root.join("index.db"));
@@ -1676,6 +1686,8 @@ mod tests {
             path: p1,
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         let base = idx.export_segments_v6();
         store
@@ -1691,6 +1703,8 @@ mod tests {
             path: p2,
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         let delta = delta_idx.export_segments_v6();
         let appended = store
@@ -1717,6 +1731,8 @@ mod tests {
             path: p1,
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         let segs = idx.export_segments_v6();
         let appended = store

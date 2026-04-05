@@ -341,7 +341,7 @@ pub struct PersistentIndex {
     tombstones: RwLock<RoaringBitmap>,
 
     /// 脏标记（自上次快照后是否有变更）
-    dirty: RwLock<bool>,
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 impl PersistentIndex {
@@ -366,7 +366,7 @@ impl PersistentIndex {
             trigram_index: RwLock::new(HashMap::new()),
             short_component_index: RwLock::new(HashMap::new()),
             tombstones: RwLock::new(RoaringBitmap::new()),
-            dirty: RwLock::new(false),
+            dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -386,7 +386,7 @@ impl PersistentIndex {
             *idx.metas.write() = snap.metas;
             *idx.arena.write() = snap.arena;
             *idx.tombstones.write() = snap.tombstones.into_iter().collect();
-            *idx.dirty.write() = false;
+            idx.dirty.store(false, std::sync::atomic::Ordering::Release);
         }
 
         // rebuild derived indexes
@@ -430,7 +430,7 @@ impl PersistentIndex {
             *idx.metas.write() = new_metas;
             *idx.arena.write() = new_arena;
             *idx.tombstones.write() = tombstones.into_iter().collect();
-            *idx.dirty.write() = false;
+            idx.dirty.store(false, std::sync::atomic::Ordering::Release);
         }
 
         idx.rebuild_derived_indexes();
@@ -560,7 +560,7 @@ impl PersistentIndex {
                     existing.size = meta.size;
                     existing.mtime = meta.mtime;
                 }
-                *self.dirty.write() = true;
+                self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
             }
 
@@ -572,7 +572,7 @@ impl PersistentIndex {
                     existing.size = meta.size;
                     existing.mtime = meta.mtime;
                 }
-                *self.dirty.write() = true;
+                self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
             }
 
@@ -586,7 +586,7 @@ impl PersistentIndex {
 
             let Some((new_off, new_len)) = self.arena.write().push_bytes(&new_rel_bytes) else {
                 self.tombstones.write().insert(docid);
-                *self.dirty.write() = true;
+                self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
             };
 
@@ -613,7 +613,7 @@ impl PersistentIndex {
 
             // rename 视为“存在且活跃”
             self.tombstones.write().remove(docid);
-            *self.dirty.write() = true;
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
 
@@ -625,7 +625,7 @@ impl PersistentIndex {
         };
         self.insert_trigrams(docid, meta.path.as_path());
         self.insert_path_hash(docid, meta.path.as_path());
-        *self.dirty.write() = true;
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn alloc_docid(
@@ -639,7 +639,7 @@ impl PersistentIndex {
         let (off, len) = self.arena.write().push_bytes(rel_bytes)?;
 
         let mut metas = self.metas.write();
-        let docid: DocId = metas.len().try_into().unwrap_or(u32::MAX);
+        let docid: DocId = metas.len().try_into().ok()?;
         metas.push(CompactMeta {
             file_key,
             root_id,
@@ -676,7 +676,7 @@ impl PersistentIndex {
         // 保留 doc 槽位，但移除 filekey 映射，避免 inode 复用/重新扫描复用 docid
         self.filekey_to_docid.write().remove(&file_key);
         self.tombstones.write().insert(docid);
-        *self.dirty.write() = true;
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// 按路径删除
@@ -693,7 +693,7 @@ impl PersistentIndex {
     }
 
     /// 查询：trigram 候选集（Roaring 交集）→ 精确过滤
-    pub fn query(&self, matcher: &dyn Matcher) -> Vec<FileMeta> {
+    pub fn query(&self, matcher: &dyn Matcher, limit: usize) -> Vec<FileMeta> {
         // 重要：先读取 trigram_index 计算候选集，再读取 metas/tombstones/arena。
         // 写入路径通常是先更新 trigram_index 再更新 metas，如果这里反过来拿锁，
         // 在“边写边查”场景下可能形成死锁。
@@ -730,6 +730,8 @@ impl PersistentIndex {
                         path,
                         size: m.size,
                         mtime: m.mtime,
+                        ctime: None,
+                        atime: None,
                     })
                 })
                 .collect(),
@@ -761,17 +763,20 @@ impl PersistentIndex {
                                 path,
                                 size: m.size,
                                 mtime: m.mtime,
+                                ctime: None,
+                                atime: None,
                             })
                         } else {
                             None
                         }
                     })
+                    .take(limit)
                     .collect()
             }
         }
     }
 
-    /// 遍历所有“活跃”文档（跳过 tombstone），用于 Flush/Compaction/重建等离线流程。
+    /// 遍历所有”活跃”文档（跳过 tombstone），用于 Flush/Compaction/重建等离线流程。
     pub fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
         let metas = self.metas.read();
         let arena = self.arena.read();
@@ -794,6 +799,8 @@ impl PersistentIndex {
                 path,
                 size: m.size,
                 mtime: m.mtime,
+                ctime: None,
+                atime: None,
             });
         }
     }
@@ -926,8 +933,9 @@ impl PersistentIndex {
                 path: path.into_owned(),
                 size: meta.size,
                 mtime: meta.mtime,
+                ctime: None,
+                atime: None,
             });
-            return;
         }
 
         let Some(fk) = fid else {
@@ -945,6 +953,8 @@ impl PersistentIndex {
                 path,
                 size: meta.size,
                 mtime: meta.mtime,
+                ctime: None,
+                atime: None,
             });
         }
     }
@@ -1014,7 +1024,7 @@ impl PersistentIndex {
                     *slot = m;
                 }
                 self.tombstones.write().remove(docid);
-                *self.dirty.write() = true;
+                self.dirty.store(true, std::sync::atomic::Ordering::Release);
             }
             return;
         }
@@ -1026,6 +1036,8 @@ impl PersistentIndex {
                 path: to_path.into_owned(),
                 size: meta.size,
                 mtime: meta.mtime,
+                ctime: None,
+                atime: None,
             });
         }
     }
@@ -1035,7 +1047,7 @@ impl PersistentIndex {
         let arena = self.arena.read().clone();
         let metas = self.metas.read().clone();
         let tombstones = self.tombstones.read().iter().collect::<Vec<DocId>>();
-        *self.dirty.write() = false;
+        self.dirty.store(false, std::sync::atomic::Ordering::Release);
         IndexSnapshotV5 {
             roots_hash: self.roots_hash(),
             arena,
@@ -1211,7 +1223,7 @@ impl PersistentIndex {
     }
 
     pub fn is_dirty(&self) -> bool {
-        *self.dirty.read()
+        self.dirty.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn file_count(&self) -> usize {
@@ -1328,7 +1340,7 @@ impl PersistentIndex {
     /// Compaction：清理墓碑（阶段 A：只清 tombstone 位图，不重排 DocId）
     pub fn compact(&self) {
         self.tombstones.write().clear();
-        *self.dirty.write() = true;
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
         tracing::info!("Compaction complete, tombstones cleared");
     }
 
@@ -1346,7 +1358,7 @@ impl PersistentIndex {
         self.metas.write().clear();
         self.arena.write().data.clear();
         self.tombstones.write().clear();
-        *self.dirty.write() = true;
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 
     // ── 内部方法 ──
@@ -1504,26 +1516,25 @@ impl PersistentIndex {
         }
 
         let tri_idx = self.trigram_index.read();
-        let mut bitmaps: Vec<RoaringBitmap> = Vec::with_capacity(tris.len());
-        for tri in &tris {
+        let mut sorted_tris = tris.clone();
+        sorted_tris.sort_by_key(|t| tri_idx.get(t).map(|b| b.len()).unwrap_or(0));
+
+        let mut acc: Option<RoaringBitmap> = None;
+        for tri in &sorted_tris {
             let Some(posting) = tri_idx.get(tri) else {
                 return Some(RoaringBitmap::new());
             };
-            bitmaps.push(posting.clone());
-        }
-        drop(tri_idx);
-
-        // 交集：先按基数排序，减少中间结果大小
-        bitmaps.sort_by_key(|b| b.len());
-        let mut iter = bitmaps.into_iter();
-        let mut acc = iter.next().unwrap_or_else(RoaringBitmap::new);
-        for b in iter {
-            acc &= &b;
-            if acc.is_empty() {
-                break;
+            match acc {
+                None => acc = Some(posting.clone()),
+                Some(ref mut a) => {
+                    *a &= posting;
+                    if a.is_empty() {
+                        return Some(RoaringBitmap::new());
+                    }
+                }
             }
         }
-        Some(acc)
+        Some(acc.unwrap_or_default())
     }
 
     fn short_hint_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringBitmap> {
@@ -1625,6 +1636,8 @@ impl IndexLayer for PersistentIndex {
             path,
             size: m.size,
             mtime: m.mtime,
+            ctime: None,
+            atime: None,
         })
     }
 }
@@ -1666,12 +1679,16 @@ mod tests {
             path: PathBuf::from("/tmp/alpha_test.txt"),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         idx.upsert(FileMeta {
             file_key: FileKey { dev: 1, ino: 2 },
             path: PathBuf::from("/tmp/beta_test.txt"),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
 
         let m = create_matcher("alpha", true);
@@ -1688,12 +1705,16 @@ mod tests {
             path: PathBuf::from("/tmp/ab"),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
         idx.upsert(FileMeta {
             file_key: FileKey { dev: 1, ino: 2 },
             path: PathBuf::from("/tmp/cabd.txt"),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
 
         let m = create_matcher("ab", true);
@@ -1714,6 +1735,8 @@ mod tests {
             path,
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
 
         assert_eq!(idx.file_count(), 0);
@@ -1729,6 +1752,8 @@ mod tests {
             path: PathBuf::from("/tmp/short-name.txt"),
             size: 1,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
 
         let long_path = PathBuf::from(format!("/tmp/{}", "b".repeat(u16::MAX as usize + 1)));
@@ -1737,6 +1762,8 @@ mod tests {
             path: long_path,
             size: 2,
             mtime: None,
+            ctime: None,
+            atime: None,
         });
 
         assert_eq!(idx.file_count(), 0);

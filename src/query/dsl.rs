@@ -1,7 +1,7 @@
 use crate::core::FileMeta;
 use crate::query::matcher::{
-    contains_path_separator, create_matcher, ExtMatcher, MatchAllMatcher, Matcher, PathScope,
-    RegexMatcher, WfnMatcher,
+    contains_path_separator, create_matcher, ExtMatcher, MatchAllMatcher, Matcher, PathInitialsMatcher,
+    PathScope, RegexMatcher, WfnMatcher,
 };
 use regex::{Regex, RegexBuilder};
 use std::sync::Arc;
@@ -40,8 +40,26 @@ pub enum Atom {
     Type(MediaKind),
     /// dm:today / dm:YYYY-MM-DD
     DateModified(DateRange),
+    /// dc:today / dc:YYYY-MM-DD (date created / ctime)
+    DateCreated(DateRange),
+    /// da:today / da:YYYY-MM-DD (date accessed / atime)
+    DateAccessed(DateRange),
     /// size:>10mb
     Size(SizeFilter),
+    /// parent:/home/user  (parent directory equals path)
+    Parent(String),
+    /// depth:3 / depth:>2 (path separator count)
+    Depth(CmpOp, usize),
+    /// len:>30 (filename byte length)
+    NameLen(CmpOp, usize),
+    /// type:file / type:folder
+    EntryType(EntryKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Folder,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +145,12 @@ enum Filter {
     ExtAny(Vec<Vec<u8>>),
     Size(SizeFilter),
     DateModified(DateRange),
+    DateCreated(DateRange),
+    DateAccessed(DateRange),
+    Parent(String),
+    Depth(CmpOp, usize),
+    NameLen(CmpOp, usize),
+    EntryType(EntryKind),
 }
 
 impl Filter {
@@ -140,19 +164,38 @@ impl Filter {
                 let ext_lc = ascii_lower_bytes(ext.as_bytes());
                 exts.iter().any(|e| *e == ext_lc)
             }
-            Filter::Size(sf) => match sf.op {
-                CmpOp::Lt => meta.size < sf.bytes,
-                CmpOp::Le => meta.size <= sf.bytes,
-                CmpOp::Eq => meta.size == sf.bytes,
-                CmpOp::Ge => meta.size >= sf.bytes,
-                CmpOp::Gt => meta.size > sf.bytes,
-            },
+            Filter::Size(sf) => apply_cmp(sf.op, meta.size, sf.bytes),
             Filter::DateModified(dr) => {
-                let Some(t) = meta.mtime else {
-                    return false;
-                };
+                let Some(t) = meta.mtime else { return false; };
                 t >= dr.start && t < dr.end
             }
+            Filter::DateCreated(dr) => {
+                let Some(t) = meta.ctime else { return false; };
+                t >= dr.start && t < dr.end
+            }
+            Filter::DateAccessed(dr) => {
+                let Some(t) = meta.atime else { return false; };
+                t >= dr.start && t < dr.end
+            }
+            Filter::Parent(parent) => {
+                meta.path.parent()
+                    .map(|p| p.to_string_lossy().eq_ignore_ascii_case(parent))
+                    .unwrap_or(false)
+            }
+            Filter::Depth(op, n) => {
+                let s = meta.path.to_string_lossy();
+                let depth = s.matches('/').count() + s.matches('\\').count();
+                apply_cmp(*op, depth as u64, *n as u64)
+            }
+            Filter::NameLen(op, n) => {
+                let len = meta.path.file_name().map(|f| f.len()).unwrap_or(0);
+                apply_cmp(*op, len as u64, *n as u64)
+            }
+            Filter::EntryType(kind) => match kind {
+                // We only index files currently; folder matches always false
+                EntryKind::File => true,
+                EntryKind::Folder => false,
+            },
         }
     }
 }
@@ -163,6 +206,27 @@ pub enum QueryCompileError {
     Syntax(String),
     #[error("invalid filter: {0}")]
     Filter(String),
+}
+
+fn is_path_initials_query(input: &str) -> bool {
+    let has_separator = input.contains('\\') || input.contains('/');
+    let has_glob = input.contains('*') || input.contains('?');
+    let has_special_prefix = input.starts_with("ext:")
+        || input.starts_with("regex:")
+        || input.starts_with("wfn:")
+        || input.starts_with("pic:")
+        || input.starts_with("doc:")
+        || input.starts_with("dm:")
+        || input.starts_with("dc:")
+        || input.starts_with("da:")
+        || input.starts_with("size:")
+        || input.starts_with("parent:")
+        || input.starts_with("infolder:")
+        || input.starts_with("depth:")
+        || input.starts_with("len:")
+        || input.starts_with("type:")
+        || input.starts_with("case:");
+    has_separator && !has_glob && !has_special_prefix
 }
 
 pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
@@ -183,14 +247,27 @@ pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
     }
 
     // 编译表达式
-    let include = compile_expr(&include_expr, case_sensitive)?;
+    let mut include = compile_expr(&include_expr, case_sensitive)?;
     let excludes = exclude_exprs
         .iter()
         .map(|e| compile_expr(e, case_sensitive))
         .collect::<Result<Vec<_>, _>>()?;
 
     // 选 anchor：每个 OR 分支选 1 个；若任一分支无法选出 anchor，则退化为 MatchAll
-    let anchors = select_anchors(&include_expr, case_sensitive)?;
+    let mut anchors = select_anchors(&include_expr, case_sensitive)?;
+
+    // 路径段首匹配：自动检测并追加 PathInitialsMatcher 作为 OR 分支
+    if is_path_initials_query(input) {
+        let pim: Arc<dyn Matcher> = Arc::new(PathInitialsMatcher::new(input));
+        // Wrap include as OR with PathInitialsMatcher
+        include = CompiledExpr::Or(vec![
+            include,
+            CompiledExpr::Path(Arc::clone(&pim)),
+        ]);
+        // Add as additional anchor so index scan covers path-initials matches
+        anchors.push(pim);
+    }
+
     Ok(CompiledQuery {
         case_sensitive,
         anchors,
@@ -265,7 +342,13 @@ fn compile_atom(atom: &Atom, case_sensitive: bool) -> Result<CompiledExpr, Query
             Ok(CompiledExpr::Filter(Filter::ExtAny(exts)))
         }
         Atom::DateModified(dr) => Ok(CompiledExpr::Filter(Filter::DateModified(*dr))),
+        Atom::DateCreated(dr) => Ok(CompiledExpr::Filter(Filter::DateCreated(*dr))),
+        Atom::DateAccessed(dr) => Ok(CompiledExpr::Filter(Filter::DateAccessed(*dr))),
         Atom::Size(sf) => Ok(CompiledExpr::Filter(Filter::Size(*sf))),
+        Atom::Parent(p) => Ok(CompiledExpr::Filter(Filter::Parent(p.clone()))),
+        Atom::Depth(op, n) => Ok(CompiledExpr::Filter(Filter::Depth(*op, *n))),
+        Atom::NameLen(op, n) => Ok(CompiledExpr::Filter(Filter::NameLen(*op, *n))),
+        Atom::EntryType(k) => Ok(CompiledExpr::Filter(Filter::EntryType(*k))),
     }
 }
 
@@ -385,7 +468,9 @@ fn best_anchor_for_atom(
             };
             Ok(Some(Arc::new(ExtMatcher::new(exts, case_sensitive))))
         }
-        Atom::DateModified(_) | Atom::Size(_) => Ok(None),
+        Atom::DateModified(_) | Atom::DateCreated(_) | Atom::DateAccessed(_)
+        | Atom::Size(_) | Atom::Parent(_) | Atom::Depth(_, _)
+        | Atom::NameLen(_, _) | Atom::EntryType(_) => Ok(None),
     }
 }
 
@@ -544,10 +629,42 @@ fn parse_atom_expr(word: &str, case_sensitive: &mut bool) -> Result<Expr, QueryC
             let dr = parse_dm(&v)?;
             Ok(Expr::Atom(Atom::DateModified(dr)))
         }
+        Some("dc") | Some("datecreated") => {
+            let v = unquote(tail)?;
+            let dr = parse_dm(&v)?;
+            Ok(Expr::Atom(Atom::DateCreated(dr)))
+        }
+        Some("da") | Some("dateaccessed") => {
+            let v = unquote(tail)?;
+            let dr = parse_dm(&v)?;
+            Ok(Expr::Atom(Atom::DateAccessed(dr)))
+        }
         Some("size") => {
             let v = unquote(tail)?;
             let sf = parse_size(&v)?;
             Ok(Expr::Atom(Atom::Size(sf)))
+        }
+        Some("parent") | Some("infolder") => {
+            let v = unquote(tail)?;
+            Ok(Expr::Atom(Atom::Parent(v)))
+        }
+        Some("depth") | Some("parents") => {
+            let v = unquote(tail)?;
+            let (op, n) = parse_cmp_usize(&v)?;
+            Ok(Expr::Atom(Atom::Depth(op, n)))
+        }
+        Some("len") | Some("namelength") => {
+            let v = unquote(tail)?;
+            let (op, n) = parse_cmp_usize(&v)?;
+            Ok(Expr::Atom(Atom::NameLen(op, n)))
+        }
+        Some("type") => {
+            let v = unquote(tail)?.to_lowercase();
+            let kind = match v.as_str() {
+                "folder" | "dir" | "directory" => EntryKind::Folder,
+                _ => EntryKind::File,
+            };
+            Ok(Expr::Atom(Atom::EntryType(kind)))
         }
         Some("case") => {
             // 兼容 case: 出现在 split_prefix 分支；不进入 Expr
@@ -723,6 +840,16 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryCompileError> {
     Ok(out)
 }
 
+fn apply_cmp(op: CmpOp, lhs: u64, rhs: u64) -> bool {
+    match op {
+        CmpOp::Lt => lhs < rhs,
+        CmpOp::Le => lhs <= rhs,
+        CmpOp::Eq => lhs == rhs,
+        CmpOp::Ge => lhs >= rhs,
+        CmpOp::Gt => lhs > rhs,
+    }
+}
+
 fn ascii_lower_bytes(bytes: &[u8]) -> Vec<u8> {
     bytes.iter().map(|b| b.to_ascii_lowercase()).collect()
 }
@@ -788,6 +915,26 @@ fn video_exts() -> Vec<Vec<u8>> {
         "3gp".into(),
         "ts".into(),
     ])
+}
+
+fn parse_cmp_usize(s: &str) -> Result<(CmpOp, usize), QueryCompileError> {
+    let raw = s.trim();
+    let (op, rest) = if let Some(r) = raw.strip_prefix(">=") {
+        (CmpOp::Ge, r)
+    } else if let Some(r) = raw.strip_prefix("<=") {
+        (CmpOp::Le, r)
+    } else if let Some(r) = raw.strip_prefix('>') {
+        (CmpOp::Gt, r)
+    } else if let Some(r) = raw.strip_prefix('<') {
+        (CmpOp::Lt, r)
+    } else if let Some(r) = raw.strip_prefix('=') {
+        (CmpOp::Eq, r)
+    } else {
+        (CmpOp::Eq, raw)
+    };
+    let n = rest.trim().parse::<usize>()
+        .map_err(|_| QueryCompileError::Filter(format!("expected integer, got {:?}", rest)))?;
+    Ok((op, n))
 }
 
 fn parse_size(s: &str) -> Result<SizeFilter, QueryCompileError> {
@@ -989,6 +1136,8 @@ mod tests {
             path: PathBuf::from(path),
             size,
             mtime,
+            ctime: None,
+            atime: None,
         }
     }
 

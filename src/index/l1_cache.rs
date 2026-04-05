@@ -281,6 +281,8 @@ mod tests {
             path: PathBuf::from(format!("/tmp/{name}")),
             size: ino,
             mtime: None,
+            ctime: None,
+            atime: None,
         }
     }
 

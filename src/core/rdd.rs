@@ -69,6 +69,12 @@ pub struct FileMeta {
     pub path: PathBuf,
     pub size: u64,
     pub mtime: Option<std::time::SystemTime>,
+    /// 文件创建时间（Linux 上为 ctime/inode-change-time；不持久化到快照）
+    #[serde(default, skip_serializing)]
+    pub ctime: Option<std::time::SystemTime>,
+    /// 最近访问时间（不持久化到快照）
+    #[serde(default, skip_serializing)]
+    pub atime: Option<std::time::SystemTime>,
 }
 
 /// 分区定义（用于构建流水线）
@@ -180,6 +186,8 @@ impl BuildRDD<FileMeta> for FsScanRDD {
                     path: e.path().to_path_buf(),
                     size: meta.len(),
                     mtime: meta.modified().ok(),
+                    ctime: meta.created().ok(),
+                    atime: meta.accessed().ok(),
                 })
             });
 
@@ -224,6 +232,8 @@ fn scan_partition_parallel(
                 path: e.path().to_path_buf(),
                 size: meta.len(),
                 mtime: meta.modified().ok(),
+                ctime: meta.created().ok(),
+                atime: meta.accessed().ok(),
             });
 
             WalkState::Continue

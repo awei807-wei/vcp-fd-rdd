@@ -67,11 +67,12 @@ struct Args {
     trim_pd_threshold_mb: u64,
 
     /// watcher 事件 channel 容量（越大越不容易 overflow，但会占用更多内存）
-    #[arg(long, default_value_t = 4096)]
+    /// 默认 65536，足以应对 git clone 等批量操作；降低此值可减少内存占用但可能丢失事件。
+    #[arg(long, default_value_t = 65536)]
     event_channel_size: usize,
 
     /// watcher 事件 debounce 窗口（毫秒）
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 10)]
     debounce_ms: u64,
 
     /// watcher 忽略路径前缀（可重复）；用于排除 snapshot/log 等“自触发”路径
