@@ -10,6 +10,15 @@
 
 > 当前主线实现沿 v0.5.1 路线演进（性能与安全加固：事件通道扩容、AtomicBool dirty flag、全量扫描上限、Trigram 交集优化、DocId 溢出安全化）。
 
+## v0.5.1 更新
+
+- **事件通道扩容**：`--event-channel-size` 默认值 4096→65536，git clone 等批量操作不再丢事件
+- **Dirty flag 无锁化**：`dirty` 标记从 `RwLock<bool>` 改为 `AtomicBool`，消除 snapshot 与写入路径的竞态
+- **全量扫描上限**：`PersistentIndex::query()` 新增 `limit` 参数，短查询不再触发无界全量遍历
+- **Trigram 交集优化**：持锁期间按基数排序后原地 `&=`，仅 clone 最小 bitmap，减少内存分配
+- **DocId 溢出安全化**：超过 4B 文件时 `alloc_docid` 返回 `None` 而非静默写入 `u32::MAX`
+
+
 ## v0.5.0 更新
 
 - **即时扫描**：新增 `POST /scan` 端点，前端可主动触发目录扫描并立即更新索引；`--debounce-ms` 默认值从 100ms 降至 10ms
@@ -50,15 +59,6 @@ dc:today                        # 今天创建的文件
 da:2024-01-01                   # 指定日期访问的文件
 type:file                       # 仅文件（当前默认）
 ```
-
-
-## v0.5.1 更新
-
-- **事件通道扩容**：`--event-channel-size` 默认值 4096→65536，git clone 等批量操作不再丢事件
-- **Dirty flag 无锁化**：`dirty` 标记从 `RwLock<bool>` 改为 `AtomicBool`，消除 snapshot 与写入路径的竞态
-- **全量扫描上限**：`PersistentIndex::query()` 新增 `limit` 参数，短查询不再触发无界全量遍历
-- **Trigram 交集优化**：持锁期间按基数排序后原地 `&=`，仅 clone 最小 bitmap，减少内存分配
-- **DocId 溢出安全化**：超过 4B 文件时 `alloc_docid` 返回 `None` 而非静默写入 `u32::MAX`
 
 ## v0.4.9 更新
 
