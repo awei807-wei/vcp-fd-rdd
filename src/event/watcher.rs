@@ -109,11 +109,41 @@ mod tests {
     }
 }
 
-/// 注册监听路径（分离出来方便错误处理）
-pub fn watch_roots(watcher: &mut notify::RecommendedWatcher, roots: &[std::path::PathBuf]) {
-    for root in roots {
-        if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
-            tracing::warn!("Failed to watch {:?}: {}", root, e);
+/// 检查 Linux inotify watch 上限，不够时发出警告。
+/// 非 Linux 平台直接返回 None。
+pub fn check_inotify_limit(root_count: usize) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches") {
+            if let Ok(limit) = content.trim().parse::<u64>() {
+                // 粗略估算：每个根目录平均 ~1000 个子目录需要 watch
+                let estimated_need = (root_count as u64).saturating_mul(1000);
+                if limit < estimated_need {
+                    tracing::warn!(
+                        "inotify max_user_watches={} may be insufficient for {} roots (estimated need: {}). \
+                         Consider: sudo sysctl fs.inotify.max_user_watches=524288",
+                        limit, root_count, estimated_need
+                    );
+                }
+                return Some(limit);
+            }
         }
     }
+    let _ = root_count;
+    None
+}
+
+/// 注册监听路径，返回加 watch 失败的目录列表（供降级轮询使用）。
+pub fn watch_roots(
+    watcher: &mut notify::RecommendedWatcher,
+    roots: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut failed = Vec::new();
+    for root in roots {
+        if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
+            tracing::warn!("Failed to watch {:?}: {} — will fallback to polling", root, e);
+            failed.push(root.clone());
+        }
+    }
+    failed
 }
