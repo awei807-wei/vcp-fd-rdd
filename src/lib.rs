@@ -16,3 +16,4 @@ pub mod query;
 pub mod stats;
 pub mod storage;
 pub mod util;
+pub mod config;
