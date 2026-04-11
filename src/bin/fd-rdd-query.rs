@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use fd_rdd::config::default_socket_path;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -21,8 +22,8 @@ impl QueryModeArg {
 #[command(name = "fd-rdd-query", version, about)]
 struct Args {
     /// UDS socket 路径（需与 fd-rdd 的 --uds-socket 一致）
-    #[arg(long, value_name = "PATH", default_value = "/tmp/fd-rdd.sock")]
-    socket: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
 
     /// 最大返回条数（0 表示使用服务端默认值）
     #[arg(long, default_value_t = 2000)]
@@ -48,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
     use tokio::net::UnixStream;
 
     let args = Args::parse();
+    let socket = args.socket.unwrap_or_else(default_socket_path);
     let req = format!(
         "q:{}\nlimit:{}\nmode:{}\n",
         args.query,
@@ -55,25 +57,25 @@ async fn main() -> anyhow::Result<()> {
         args.mode.as_protocol()
     );
 
-    let mut stream = match UnixStream::connect(&args.socket).await {
+    let mut stream = match UnixStream::connect(&socket).await {
         Ok(s) => s,
         Err(e) if args.spawn => {
             // best-effort：按需拉起 daemon；失败则继续返回原错误。
             let _ = std::process::Command::new("fd-rdd")
                 .arg("--uds-socket")
-                .arg(args.socket.to_string_lossy().to_string())
+                .arg(socket.to_string_lossy().to_string())
                 .spawn();
 
             // 等待 socket 可用（最多 5s）
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
-                match UnixStream::connect(&args.socket).await {
+                match UnixStream::connect(&socket).await {
                     Ok(s) => break s,
                     Err(e) => {
                         if tokio::time::Instant::now() >= deadline {
                             return Err(anyhow::anyhow!(
                                 "failed to connect to {} after spawn: {}",
-                                args.socket.display(),
+                                socket.display(),
                                 e
                             ));
                         }

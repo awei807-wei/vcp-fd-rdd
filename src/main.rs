@@ -1,4 +1,5 @@
 use clap::Parser;
+use fd_rdd::config::{Config, default_socket_path};
 use fd_rdd::event::EventPipeline;
 use fd_rdd::index::TieredIndex;
 use fd_rdd::query::QueryServer;
@@ -104,13 +105,22 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // Load config file (~/.config/fd-rdd/config.toml); fall back to defaults on missing file.
+    let cfg = Config::load().unwrap_or_else(|e| {
+        tracing::warn!("Failed to load config file, using defaults: {}", e);
+        Config::default()
+    });
+
     info!(
         "Starting fd-rdd v{}: atomic-snapshot file indexer",
         env!("CARGO_PKG_VERSION")
     );
 
-    // 1) 确定索引根目录
+    // 1) 确定索引根目录 (CLI > config > default)
     let mut roots = args.roots;
+    if roots.is_empty() {
+        roots = cfg.roots.clone();
+    }
     if roots.is_empty() {
         let home_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
         roots.push(home_dir);
@@ -175,9 +185,13 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 6.5) 启动 UDS 查询服务（可选，流式）
-    if let Some(path) = args.uds_socket.clone() {
+    // 6.5) 启动 UDS 查询服务（CLI > config > default_socket_path()）
+    let uds_path = args.uds_socket
+        .or(cfg.socket_path)
+        .unwrap_or_else(default_socket_path);
+    {
         let socket_server = SocketServer::new(index.clone());
+        let path = uds_path.clone();
         tokio::spawn(async move {
             if let Err(e) = socket_server.run(&path).await {
                 tracing::error!("UDS query server error: {}", e);

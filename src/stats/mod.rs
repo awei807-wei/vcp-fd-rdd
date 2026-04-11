@@ -37,6 +37,19 @@ pub struct MemoryReport {
     pub heap_high_water_suspected: bool,
 }
 
+/// Service-level observability stats (uptime, snapshot, watcher health).
+#[derive(Clone, Debug, Default)]
+pub struct ServiceStats {
+    /// Seconds since the daemon started.
+    pub uptime_secs: u64,
+    /// Unix timestamp of the last successful snapshot write (0 = never).
+    pub last_snapshot_time: u64,
+    /// Cumulative watcher failure count (e.g. inotify overflow, re-watch errors).
+    pub watch_failures: u64,
+    /// Whether the watcher is currently in degraded/polling mode.
+    pub watcher_degraded: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SmapsRollupStats {
     pub rss_bytes: u64,
