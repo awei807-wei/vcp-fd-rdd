@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::event::recovery::{DirtyTracker, DirtyScope};
 use crate::event::watcher::{check_inotify_limit, watch_roots, EventWatcher};
+use crate::event::ignore_filter::IgnoreFilter;
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
 
@@ -39,6 +40,8 @@ pub struct EventPipeline {
     channel_size: usize,
     /// watcher 事件过滤：忽略这些路径前缀下的事件（用于避免索引写入反哺 watcher）
     ignore_paths: Vec<PathBuf>,
+    /// .gitignore-based filter for incremental events (None = disabled / --no-ignore)
+    ignore_filter: Option<IgnoreFilter>,
     /// 共享计数器：累计处理事件数
     pub total_events: Arc<AtomicU64>,
     /// 共享计数器：最近批次大小
@@ -62,6 +65,7 @@ impl EventPipeline {
             debounce_ms: 100,
             channel_size: 4096,
             ignore_paths: Vec::new(),
+            ignore_filter: None,
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -78,6 +82,7 @@ impl EventPipeline {
             debounce_ms,
             channel_size,
             ignore_paths: Vec::new(),
+            ignore_filter: None,
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -99,6 +104,7 @@ impl EventPipeline {
             debounce_ms,
             channel_size,
             ignore_paths,
+            ignore_filter: None,
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -107,6 +113,12 @@ impl EventPipeline {
             merged_map_capacity: Arc::new(AtomicU64::new(0)),
             records_capacity: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Set the .gitignore filter. Pass `None` to disable (e.g. --no-ignore).
+    pub fn with_ignore_filter(mut self, filter: Option<IgnoreFilter>) -> Self {
+        self.ignore_filter = filter;
+        self
     }
 
     /// 获取事件管道统计
@@ -145,6 +157,7 @@ impl EventPipeline {
         let total_events = self.total_events.clone();
         let last_batch_size = self.last_batch_size.clone();
         let ignore_paths = self.ignore_paths.clone();
+        let ignore_filter = self.ignore_filter.clone();
         let raw_events_capacity = self.raw_events_capacity.clone();
         let merged_map_capacity = self.merged_map_capacity.clone();
         let records_capacity = self.records_capacity.clone();
@@ -162,7 +175,7 @@ impl EventPipeline {
                 // 收集一批事件（debounce 窗口）
                 raw_events.clear();
 
-                // 等待第一个事件；若长期空闲，则回收事件缓冲的高水位 capacity（避免 plateau 被高水位“粘住”）。
+                // 等待第一个事件；若长期空闲，则回收事件缓冲的高水位 capacity（避免 plateau 被高水位"粘住"）。
                 let first = tokio::select! {
                     ev = rx.recv() => ev,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
@@ -209,9 +222,16 @@ impl EventPipeline {
 
                 let raw_count = raw_events.len();
 
-                // 过滤：忽略索引自身写入（snapshot/segments/log 等）导致的“自触发事件风暴”
+                // 过滤：忽略索引自身写入（snapshot/segments/log 等）导致的"自触发事件风暴"
                 if !ignore_paths.is_empty() {
                     raw_events.retain(|ev| !should_ignore_event(ev, &ignore_paths));
+                }
+
+                // .gitignore filtering
+                if let Some(ref gi) = ignore_filter {
+                    raw_events.retain(|ev| {
+                        !ev.paths.iter().any(|p| gi.is_ignored(p))
+                    });
                 }
 
                 // 合并去重
