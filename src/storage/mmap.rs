@@ -16,3 +16,9 @@ impl MmapStorage {
         Ok(mmap)
     }
 }
+
+impl crate::storage::traits::MmapOpen for MmapStorage {
+    fn open_mut(&self, path: &std::path::Path, size: u64) -> anyhow::Result<memmap2::MmapMut> {
+        MmapStorage::open_mut(path, size)
+    }
+}
