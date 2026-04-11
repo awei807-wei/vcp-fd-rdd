@@ -54,6 +54,8 @@ pub enum Atom {
     NameLen(CmpOp, usize),
     /// type:file / type:folder
     EntryType(EntryKind),
+    /// content:keyword (全文搜索，占位)
+    Content(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +153,7 @@ enum Filter {
     Depth(CmpOp, usize),
     NameLen(CmpOp, usize),
     EntryType(EntryKind),
+    Content(String),
 }
 
 impl Filter {
@@ -196,6 +199,10 @@ impl Filter {
                 EntryKind::File => true,
                 EntryKind::Folder => false,
             },
+            Filter::Content(_) => {
+                // TODO: 接入全文索引后实现真正的内容匹配
+                false
+            }
         }
     }
 }
@@ -225,7 +232,8 @@ fn is_path_initials_query(input: &str) -> bool {
         || input.starts_with("depth:")
         || input.starts_with("len:")
         || input.starts_with("type:")
-        || input.starts_with("case:");
+        || input.starts_with("case:")
+        || input.starts_with("content:");
     has_separator && !has_glob && !has_special_prefix
 }
 
@@ -349,6 +357,7 @@ fn compile_atom(atom: &Atom, case_sensitive: bool) -> Result<CompiledExpr, Query
         Atom::Depth(op, n) => Ok(CompiledExpr::Filter(Filter::Depth(*op, *n))),
         Atom::NameLen(op, n) => Ok(CompiledExpr::Filter(Filter::NameLen(*op, *n))),
         Atom::EntryType(k) => Ok(CompiledExpr::Filter(Filter::EntryType(*k))),
+        Atom::Content(s) => Ok(CompiledExpr::Filter(Filter::Content(s.clone()))),
     }
 }
 
@@ -470,7 +479,7 @@ fn best_anchor_for_atom(
         }
         Atom::DateModified(_) | Atom::DateCreated(_) | Atom::DateAccessed(_)
         | Atom::Size(_) | Atom::Parent(_) | Atom::Depth(_, _)
-        | Atom::NameLen(_, _) | Atom::EntryType(_) => Ok(None),
+        | Atom::NameLen(_, _) | Atom::EntryType(_) | Atom::Content(_) => Ok(None),
     }
 }
 
@@ -665,6 +674,13 @@ fn parse_atom_expr(word: &str, case_sensitive: &mut bool) -> Result<Expr, QueryC
                 _ => EntryKind::File,
             };
             Ok(Expr::Atom(Atom::EntryType(kind)))
+        }
+        Some("content") => {
+            let v = unquote(tail)?;
+            if v.is_empty() {
+                return Err(QueryCompileError::Filter("content: empty keyword".into()));
+            }
+            Ok(Expr::Atom(Atom::Content(v)))
         }
         Some("case") => {
             // 兼容 case: 出现在 split_prefix 分支；不进入 Expr
