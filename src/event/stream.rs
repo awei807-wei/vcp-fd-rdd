@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
-use crate::event::recovery::DirtyTracker;
-use crate::event::watcher::{watch_roots, EventWatcher};
+use crate::event::recovery::{DirtyTracker, DirtyScope};
+use crate::event::watcher::{check_inotify_limit, watch_roots, EventWatcher};
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
 
@@ -136,7 +136,9 @@ impl EventPipeline {
             rescan_signals.clone(),
             Some(dirty.clone()),
         )?;
-        watch_roots(&mut watcher, &roots);
+        // inotify watch 数兜底检查
+        check_inotify_limit(roots.len());
+        let failed_roots = watch_roots(&mut watcher, &roots);
 
         let index = self.index.clone();
         let debounce_ms = self.debounce_ms;
@@ -263,6 +265,30 @@ impl EventPipeline {
                         scope
                     );
                     idx.spawn_fast_sync(scope, ignores.clone(), dirty.clone());
+                }
+            });
+        }
+
+        // 降级轮询：对加不上 watch 的目录，定时触发 fast-sync 补扫
+        if !failed_roots.is_empty() {
+            let poll_idx = self.index.clone();
+            let poll_ignores = self.ignore_paths.clone();
+            let poll_dirty = dirty.clone();
+            let poll_dirs = failed_roots;
+            tracing::warn!(
+                "Fallback polling enabled for {} unwatched directories",
+                poll_dirs.len()
+            );
+            tokio::spawn(async move {
+                let poll_interval = std::time::Duration::from_secs(60);
+                loop {
+                    tokio::time::sleep(poll_interval).await;
+                    tracing::debug!("Fallback poll: scanning {} unwatched dirs", poll_dirs.len());
+                    let scope = DirtyScope::Dirs {
+                        cutoff_ns: 0,
+                        dirs: poll_dirs.clone(),
+                    };
+                    poll_idx.spawn_fast_sync(scope, poll_ignores.clone(), poll_dirty.clone());
                 }
             });
         }
