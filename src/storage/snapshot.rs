@@ -1461,6 +1461,46 @@ impl SnapshotStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SegmentStore trait impl
+// ---------------------------------------------------------------------------
+
+impl crate::storage::traits::SegmentStore for SnapshotStore {
+    fn path(&self) -> &Path {
+        self.path()
+    }
+
+    fn derived_lsm_dir_path(&self) -> PathBuf {
+        self.derived_lsm_dir_path()
+    }
+
+    fn load_v6_mmap_if_valid(
+        &self,
+        expected_roots: &[PathBuf],
+    ) -> anyhow::Result<Option<MmapSnapshotV6>> {
+        self.load_v6_mmap_if_valid(expected_roots)
+    }
+
+    fn load_lsm_if_valid(
+        &self,
+        expected_roots: &[PathBuf],
+    ) -> anyhow::Result<Option<LsmLoadedLayers>> {
+        self.load_lsm_if_valid(expected_roots)
+    }
+
+    fn lsm_last_build_ns(&self) -> anyhow::Result<Option<u64>> {
+        self.lsm_last_build_ns()
+    }
+
+    fn lsm_manifest_wal_seal_id(&self) -> anyhow::Result<u64> {
+        self.lsm_manifest_wal_seal_id()
+    }
+
+    fn gc_stale_segments(&self) -> anyhow::Result<usize> {
+        self.gc_stale_segments()
+    }
+}
+
 /// 简单校验和（非加密，仅用于完整性检测）
 fn simple_checksum(data: &[u8]) -> u32 {
     let mut c = SimpleChecksum::new();

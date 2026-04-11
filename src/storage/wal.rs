@@ -254,6 +254,35 @@ impl WalStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WriteAheadLog trait impl
+// ---------------------------------------------------------------------------
+
+impl crate::storage::traits::WriteAheadLog for WalStore {
+    fn dir(&self) -> &Path {
+        self.dir()
+    }
+
+    fn append(&self, events: &[EventRecord]) -> anyhow::Result<()> {
+        self.append(events)
+    }
+
+    fn seal(&self) -> anyhow::Result<u64> {
+        self.seal()
+    }
+
+    fn cleanup_sealed_up_to(&self, seal_id: u64) -> anyhow::Result<()> {
+        self.cleanup_sealed_up_to(seal_id)
+    }
+
+    fn replay_since_seal(
+        &self,
+        checkpoint_seal_id: u64,
+    ) -> anyhow::Result<WalReplayResult> {
+        self.replay_since_seal(checkpoint_seal_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
