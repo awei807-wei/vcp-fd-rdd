@@ -95,8 +95,6 @@ pub fn execute_query(
 }
 
 fn sort_results(results: &mut Vec<FileMeta>, keyword: &str, sort: SortColumn, order: SortOrder) {
-    use std::cmp::Ordering;
-
     results.sort_by(|a, b| {
         let cmp = match sort {
             SortColumn::Score => {
@@ -107,20 +105,40 @@ fn sort_results(results: &mut Vec<FileMeta>, keyword: &str, sort: SortColumn, or
                 sb.cmp(&sa).then_with(|| a.path.cmp(&b.path))
             }
             SortColumn::Name => {
-                let na = a.path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
-                let nb = b.path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let na = a
+                    .path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let nb = b
+                    .path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
                 na.cmp(&nb).then_with(|| a.path.cmp(&b.path))
             }
             SortColumn::Path => a.path.cmp(&b.path),
             SortColumn::Size => a.size.cmp(&b.size).then_with(|| a.path.cmp(&b.path)),
             SortColumn::Ext => {
-                let ea = a.path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-                let eb = b.path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let ea = a
+                    .path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let eb = b
+                    .path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
                 ea.cmp(&eb).then_with(|| a.path.cmp(&b.path))
             }
-            SortColumn::DateModified => cmp_time(a.mtime, b.mtime).then_with(|| a.path.cmp(&b.path)),
+            SortColumn::DateModified => {
+                cmp_time(a.mtime, b.mtime).then_with(|| a.path.cmp(&b.path))
+            }
             SortColumn::DateCreated => cmp_time(a.ctime, b.ctime).then_with(|| a.path.cmp(&b.path)),
-            SortColumn::DateAccessed => cmp_time(a.atime, b.atime).then_with(|| a.path.cmp(&b.path)),
+            SortColumn::DateAccessed => {
+                cmp_time(a.atime, b.atime).then_with(|| a.path.cmp(&b.path))
+            }
         };
 
         // Score column is already desc by default; all others respect order param
@@ -260,10 +278,24 @@ mod tests {
         let index = TieredIndex::empty(vec![root.clone()]);
         index.apply_events(&[ev(1, wanted.clone()), ev(2, other)]);
 
-        let exact = execute_query(&index, "mdt", 10, QueryMode::Exact, SortColumn::default(), SortOrder::default());
+        let exact = execute_query(
+            &index,
+            "mdt",
+            10,
+            QueryMode::Exact,
+            SortColumn::default(),
+            SortOrder::default(),
+        );
         assert!(exact.is_empty());
 
-        let fuzzy = execute_query(&index, "mdt", 1, QueryMode::Fuzzy, SortColumn::default(), SortOrder::default());
+        let fuzzy = execute_query(
+            &index,
+            "mdt",
+            1,
+            QueryMode::Fuzzy,
+            SortColumn::default(),
+            SortOrder::default(),
+        );
         assert_eq!(fuzzy.len(), 1);
         assert_eq!(fuzzy[0].path, wanted);
         Ok(())

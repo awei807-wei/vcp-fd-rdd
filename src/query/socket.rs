@@ -227,7 +227,14 @@ mod imp {
         }
         limit = limit.min(cfg.max_limit).max(1);
 
-        let results = execute_query(index.as_ref(), keyword, limit, mode, SortColumn::default(), SortOrder::default());
+        let results = execute_query(
+            index.as_ref(),
+            keyword,
+            limit,
+            mode,
+            SortColumn::default(),
+            SortOrder::default(),
+        );
 
         // 流式写回：不要在内存里拼接巨大 String/JSON。
         let mut w = BufWriter::new(&mut socket);

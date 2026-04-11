@@ -17,6 +17,16 @@ const DEFAULT_SEARCH_LIMIT: usize = 100;
 const MAX_SEARCH_LIMIT: usize = 10_000;
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Debug, Default)]
+pub struct HealthTelemetry {
+    pub last_snapshot_time: u64,
+    pub watch_failures: u64,
+    pub watcher_degraded: bool,
+    pub degraded_roots: usize,
+    pub overflow_drops: u64,
+    pub rescan_signals: u64,
+}
+
 #[derive(Deserialize)]
 pub struct SearchParams {
     pub q: String,
@@ -53,9 +63,17 @@ pub struct StatusResponse {
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
+    pub index_health: &'static str,
     pub uptime_secs: u64,
     pub index_entries: usize,
     pub version: &'static str,
+    pub last_snapshot_time: u64,
+    pub watch_failures: u64,
+    pub watcher_degraded: bool,
+    pub degraded_roots: usize,
+    pub overflow_drops: u64,
+    pub rescan_signals: u64,
+    pub issues: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,11 +98,13 @@ struct QueryServerState {
     index: Arc<TieredIndex>,
     config: QueryServerConfig,
     start_time: Instant,
+    health_provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync>,
 }
 
 pub struct QueryServer {
     pub index: Arc<TieredIndex>,
     config: QueryServerConfig,
+    health_provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync>,
 }
 
 impl QueryServer {
@@ -92,7 +112,16 @@ impl QueryServer {
         Self {
             index,
             config: QueryServerConfig::default(),
+            health_provider: Arc::new(|| HealthTelemetry::default()),
         }
+    }
+
+    pub fn with_health_provider(
+        mut self,
+        provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync>,
+    ) -> Self {
+        self.health_provider = provider;
+        self
     }
 
     pub async fn run(self, port: u16) -> anyhow::Result<()> {
@@ -100,6 +129,7 @@ impl QueryServer {
             index: self.index,
             config: self.config,
             start_time: Instant::now(),
+            health_provider: self.health_provider,
         };
         let app = Router::new()
             .route("/search", get(search_handler))
@@ -139,8 +169,9 @@ async fn search_handler(
     let kw_clone = keyword.clone();
     let sort = SortColumn::parse(params.sort.as_deref());
     let order = SortOrder::parse(params.order.as_deref());
-    let search_task =
-        tokio::task::spawn_blocking(move || execute_query(index.as_ref(), &kw_clone, limit, mode, sort, order));
+    let search_task = tokio::task::spawn_blocking(move || {
+        execute_query(index.as_ref(), &kw_clone, limit, mode, sort, order)
+    });
     let results = match tokio::time::timeout(state.config.query_timeout, search_task).await {
         Ok(Ok(results)) => results,
         Ok(Err(e)) => {
@@ -194,11 +225,46 @@ async fn status_handler(State(state): State<QueryServerState>) -> Json<StatusRes
 
 async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthResponse> {
     let uptime = state.start_time.elapsed().as_secs();
+    let health = (state.health_provider)();
+    let mut issues = Vec::new();
+    if health.watcher_degraded {
+        issues.push(format!(
+            "watcher_degraded: {} unwatched directories are using fallback polling",
+            health.degraded_roots
+        ));
+    }
+    if health.watch_failures > 0 {
+        issues.push(format!("watch_failures: {}", health.watch_failures));
+    }
+    if health.overflow_drops > 0 || health.rescan_signals > 0 {
+        issues.push(format!(
+            "event_recovery: overflow_drops={} rescan_signals={}",
+            health.overflow_drops, health.rescan_signals
+        ));
+    }
+    if health.last_snapshot_time == 0 {
+        issues.push("snapshot_not_written_yet".to_string());
+    }
+    let index_health = if health.watcher_degraded {
+        "degraded"
+    } else if issues.is_empty() {
+        "ok"
+    } else {
+        "warning"
+    };
     Json(HealthResponse {
         status: "ok",
+        index_health,
         uptime_secs: uptime,
         index_entries: state.index.file_count(),
         version: env!("CARGO_PKG_VERSION"),
+        last_snapshot_time: health.last_snapshot_time,
+        watch_failures: health.watch_failures,
+        watcher_degraded: health.watcher_degraded,
+        degraded_roots: health.degraded_roots,
+        overflow_drops: health.overflow_drops,
+        rescan_signals: health.rescan_signals,
+        issues,
     })
 }
 
@@ -207,24 +273,24 @@ async fn scan_handler(
     Json(params): Json<ScanParams>,
 ) -> Result<Json<ScanResponse>, (StatusCode, String)> {
     if params.paths.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "paths must not be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "paths must not be empty".to_string(),
+        ));
     }
 
-    let dirs: Vec<PathBuf> = params
-        .paths
-        .iter()
-        .take(10)
-        .map(PathBuf::from)
-        .collect();
+    let dirs: Vec<PathBuf> = params.paths.iter().take(10).map(PathBuf::from).collect();
 
     let index = state.index.clone();
-    let (scanned, elapsed_ms) = tokio::task::spawn_blocking(move || {
-        index.scan_dirs_immediate(&dirs)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let (scanned, elapsed_ms) =
+        tokio::task::spawn_blocking(move || index.scan_dirs_immediate(&dirs))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(ScanResponse { scanned, elapsed_ms }))
+    Ok(Json(ScanResponse {
+        scanned,
+        elapsed_ms,
+    }))
 }
 
 #[cfg(test)]

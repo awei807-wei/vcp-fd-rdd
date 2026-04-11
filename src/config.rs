@@ -8,41 +8,102 @@ use std::path::PathBuf;
 
 /// Returns the platform-appropriate default socket path (user-isolated).
 ///
-/// - Linux: `$XDG_RUNTIME_DIR/fd-rdd/fd-rdd.sock` (fallback: `/tmp/fd-rdd-$UID.sock`)
-/// - macOS: `$TMPDIR/fd-rdd.sock` (TMPDIR is already per-user)
+/// - Linux: `$XDG_RUNTIME_DIR/fd-rdd/fd-rdd.sock`
+///   fallback: `/run/user/$UID/fd-rdd/fd-rdd.sock`
+///   fallback: `/tmp/fd-rdd-$UID.sock`
+/// - macOS: `$TMPDIR/fd-rdd/fd-rdd.sock` (TMPDIR is already per-user)
 /// - Windows: `\\.\pipe\fd-rdd-{username}`
 pub fn default_socket_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        // macOS: $TMPDIR is already user-isolated (e.g. /var/folders/xx/.../T/)
-        let tmpdir = std::env::var("TMPDIR")
-            .unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(tmpdir).join("fd-rdd.sock")
+        let dir = PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()))
+            .join("fd-rdd");
+        let _ = std::fs::create_dir_all(&dir);
+        return dir.join("fd-rdd.sock");
     }
 
     #[cfg(target_os = "linux")]
     {
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
             let dir = PathBuf::from(runtime_dir).join("fd-rdd");
-            // Best-effort create; caller will get a clear error on connect/bind if it fails.
             let _ = std::fs::create_dir_all(&dir);
-            dir.join("fd-rdd.sock")
-        } else {
-            // Fallback: embed UID to avoid multi-user collisions.
-            let uid = unsafe { libc::getuid() };
-            PathBuf::from(format!("/tmp/fd-rdd-{}.sock", uid))
+            return dir.join("fd-rdd.sock");
         }
+
+        let uid = unsafe { libc::getuid() };
+        let run_user_dir = PathBuf::from(format!("/run/user/{}", uid));
+        if run_user_dir.is_dir() {
+            let dir = run_user_dir.join("fd-rdd");
+            let _ = std::fs::create_dir_all(&dir);
+            return dir.join("fd-rdd.sock");
+        }
+
+        return PathBuf::from(format!("/tmp/fd-rdd-{}.sock", uid));
     }
 
     #[cfg(target_os = "windows")]
     {
         let username = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
-        PathBuf::from(format!(r"\\.\pipe\fd-rdd-{}", username))
+        return PathBuf::from(format!(r"\\.\pipe\fd-rdd-{}", username));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         PathBuf::from("/tmp/fd-rdd.sock")
+    }
+}
+
+/// Returns the platform-appropriate default snapshot path (user-isolated).
+///
+/// - Linux: `$XDG_RUNTIME_DIR/fd-rdd/index.db`
+///   fallback: `/run/user/$UID/fd-rdd/index.db`
+///   fallback: `/tmp/fd-rdd-$UID/index.db`
+/// - macOS: `$TMPDIR/fd-rdd/index.db`
+/// - Windows: `%LOCALAPPDATA%/fd-rdd/index.db`
+pub fn default_snapshot_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let dir = PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()))
+            .join("fd-rdd");
+        let _ = std::fs::create_dir_all(&dir);
+        return dir.join("index.db");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            let dir = PathBuf::from(runtime_dir).join("fd-rdd");
+            let _ = std::fs::create_dir_all(&dir);
+            return dir.join("index.db");
+        }
+
+        let uid = unsafe { libc::getuid() };
+        let run_user_dir = PathBuf::from(format!("/run/user/{}", uid));
+        if run_user_dir.is_dir() {
+            let dir = run_user_dir.join("fd-rdd");
+            let _ = std::fs::create_dir_all(&dir);
+            return dir.join("index.db");
+        }
+
+        let dir = PathBuf::from(format!("/tmp/fd-rdd-{}", uid));
+        let _ = std::fs::create_dir_all(&dir);
+        return dir.join("index.db");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let dir = dirs::data_local_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("fd-rdd");
+        let _ = std::fs::create_dir_all(&dir);
+        return dir.join("index.db");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let dir = std::env::temp_dir().join("fd-rdd");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("index.db")
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::core::FileMeta;
 use crate::query::matcher::{
-    contains_path_separator, create_matcher, ExtMatcher, MatchAllMatcher, Matcher, PathInitialsMatcher,
-    PathScope, RegexMatcher, WfnMatcher,
+    contains_path_separator, create_matcher, ExtMatcher, MatchAllMatcher, Matcher,
+    PathInitialsMatcher, PathScope, RegexMatcher, WfnMatcher,
 };
 use regex::{Regex, RegexBuilder};
 use std::sync::Arc;
@@ -142,6 +142,7 @@ impl CompiledExpr {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum Filter {
     ExtAny(Vec<Vec<u8>>),
@@ -169,22 +170,28 @@ impl Filter {
             }
             Filter::Size(sf) => apply_cmp(sf.op, meta.size, sf.bytes),
             Filter::DateModified(dr) => {
-                let Some(t) = meta.mtime else { return false; };
+                let Some(t) = meta.mtime else {
+                    return false;
+                };
                 t >= dr.start && t < dr.end
             }
             Filter::DateCreated(dr) => {
-                let Some(t) = meta.ctime else { return false; };
+                let Some(t) = meta.ctime else {
+                    return false;
+                };
                 t >= dr.start && t < dr.end
             }
             Filter::DateAccessed(dr) => {
-                let Some(t) = meta.atime else { return false; };
+                let Some(t) = meta.atime else {
+                    return false;
+                };
                 t >= dr.start && t < dr.end
             }
-            Filter::Parent(parent) => {
-                meta.path.parent()
-                    .map(|p| p.to_string_lossy().eq_ignore_ascii_case(parent))
-                    .unwrap_or(false)
-            }
+            Filter::Parent(parent) => meta
+                .path
+                .parent()
+                .map(|p| p.to_string_lossy().eq_ignore_ascii_case(parent))
+                .unwrap_or(false),
             Filter::Depth(op, n) => {
                 let s = meta.path.to_string_lossy();
                 let depth = s.matches('/').count() + s.matches('\\').count();
@@ -268,10 +275,7 @@ pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
     if is_path_initials_query(input) {
         let pim: Arc<dyn Matcher> = Arc::new(PathInitialsMatcher::new(input));
         // Wrap include as OR with PathInitialsMatcher
-        include = CompiledExpr::Or(vec![
-            include,
-            CompiledExpr::Path(Arc::clone(&pim)),
-        ]);
+        include = CompiledExpr::Or(vec![include, CompiledExpr::Path(Arc::clone(&pim))]);
         // Add as additional anchor so index scan covers path-initials matches
         anchors.push(pim);
     }
@@ -477,9 +481,15 @@ fn best_anchor_for_atom(
             };
             Ok(Some(Arc::new(ExtMatcher::new(exts, case_sensitive))))
         }
-        Atom::DateModified(_) | Atom::DateCreated(_) | Atom::DateAccessed(_)
-        | Atom::Size(_) | Atom::Parent(_) | Atom::Depth(_, _)
-        | Atom::NameLen(_, _) | Atom::EntryType(_) | Atom::Content(_) => Ok(None),
+        Atom::DateModified(_)
+        | Atom::DateCreated(_)
+        | Atom::DateAccessed(_)
+        | Atom::Size(_)
+        | Atom::Parent(_)
+        | Atom::Depth(_, _)
+        | Atom::NameLen(_, _)
+        | Atom::EntryType(_)
+        | Atom::Content(_) => Ok(None),
     }
 }
 
@@ -948,7 +958,9 @@ fn parse_cmp_usize(s: &str) -> Result<(CmpOp, usize), QueryCompileError> {
     } else {
         (CmpOp::Eq, raw)
     };
-    let n = rest.trim().parse::<usize>()
+    let n = rest
+        .trim()
+        .parse::<usize>()
         .map_err(|_| QueryCompileError::Filter(format!("expected integer, got {:?}", rest)))?;
     Ok((op, n))
 }

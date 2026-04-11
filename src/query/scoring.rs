@@ -118,7 +118,8 @@ fn compute_path_initials_highlights(path: &str, query: &str) -> Vec<[usize; 2]> 
     let mut highlights = Vec::new();
 
     // Split query by separators
-    let query_segments: Vec<&str> = query.split(|c: char| c == '/' || c == '\\')
+    let query_segments: Vec<&str> = query
+        .split(|c: char| c == '/' || c == '\\')
         .filter(|s| !s.is_empty())
         .collect();
 
@@ -245,7 +246,11 @@ mod tests {
     fn score_long_filename_penalty() {
         let config = ScoreConfig::from_query("test");
         let short = meta("/a/test.txt", 100, None);
-        let long = meta("/a/test_with_a_very_long_filename_that_goes_on_forever.txt", 100, None);
+        let long = meta(
+            "/a/test_with_a_very_long_filename_that_goes_on_forever.txt",
+            100,
+            None,
+        );
         assert!(score_result(&short, &config) > score_result(&long, &config));
     }
 
@@ -279,8 +284,8 @@ mod tests {
     fn highlight_path_initials() {
         let h = compute_highlights("/tmp/test_data/newfile.txt", "tmp/tes/new");
         assert_eq!(h.len(), 3);
-        assert_eq!(h[0], [1, 4]);   // "tmp"
-        assert_eq!(h[1], [5, 8]);   // "tes"
+        assert_eq!(h[0], [1, 4]); // "tmp"
+        assert_eq!(h[1], [5, 8]); // "tes"
         assert_eq!(h[2], [15, 18]); // "new"
     }
 

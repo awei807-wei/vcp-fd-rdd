@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
-use crate::event::recovery::{DirtyTracker, DirtyScope};
-use crate::event::watcher::{check_inotify_limit, watch_roots, EventWatcher};
 use crate::event::ignore_filter::IgnoreFilter;
+use crate::event::recovery::{DirtyScope, DirtyTracker};
+use crate::event::watcher::{check_inotify_limit, watch_roots, EventWatcher};
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
 
@@ -50,6 +50,12 @@ pub struct EventPipeline {
     pub overflow_drops: Arc<AtomicU64>,
     /// 共享计数器：notify/inotify Rescan 信号次数（可能漏事件，需要补扫）
     pub rescan_signals: Arc<AtomicU64>,
+    /// 共享计数器：watch 注册/重试失败次数
+    pub watch_failures: Arc<AtomicU64>,
+    /// 共享标记：watcher 当前是否处于降级轮询模式
+    pub watcher_degraded: Arc<AtomicBool>,
+    /// 共享计数器：当前降级轮询的目录数量
+    pub degraded_roots: Arc<AtomicU64>,
     /// 共享计数器：raw_events(Vec<notify::Event>) capacity
     pub raw_events_capacity: Arc<AtomicU64>,
     /// 共享计数器：merged(HashMap<FileIdentifier, EventRecord>) capacity
@@ -70,6 +76,9 @@ impl EventPipeline {
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
             rescan_signals: Arc::new(AtomicU64::new(0)),
+            watch_failures: Arc::new(AtomicU64::new(0)),
+            watcher_degraded: Arc::new(AtomicBool::new(false)),
+            degraded_roots: Arc::new(AtomicU64::new(0)),
             raw_events_capacity: Arc::new(AtomicU64::new(0)),
             merged_map_capacity: Arc::new(AtomicU64::new(0)),
             records_capacity: Arc::new(AtomicU64::new(0)),
@@ -87,6 +96,9 @@ impl EventPipeline {
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
             rescan_signals: Arc::new(AtomicU64::new(0)),
+            watch_failures: Arc::new(AtomicU64::new(0)),
+            watcher_degraded: Arc::new(AtomicBool::new(false)),
+            degraded_roots: Arc::new(AtomicU64::new(0)),
             raw_events_capacity: Arc::new(AtomicU64::new(0)),
             merged_map_capacity: Arc::new(AtomicU64::new(0)),
             records_capacity: Arc::new(AtomicU64::new(0)),
@@ -109,6 +121,9 @@ impl EventPipeline {
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
             rescan_signals: Arc::new(AtomicU64::new(0)),
+            watch_failures: Arc::new(AtomicU64::new(0)),
+            watcher_degraded: Arc::new(AtomicBool::new(false)),
+            degraded_roots: Arc::new(AtomicU64::new(0)),
             raw_events_capacity: Arc::new(AtomicU64::new(0)),
             merged_map_capacity: Arc::new(AtomicU64::new(0)),
             records_capacity: Arc::new(AtomicU64::new(0)),
@@ -128,6 +143,9 @@ impl EventPipeline {
             total_events_processed: self.total_events.load(Ordering::Relaxed),
             overflow_drops: self.overflow_drops.load(Ordering::Relaxed),
             rescan_signals: self.rescan_signals.load(Ordering::Relaxed),
+            watch_failures: self.watch_failures.load(Ordering::Relaxed),
+            watcher_degraded: self.watcher_degraded.load(Ordering::Relaxed),
+            degraded_roots: self.degraded_roots.load(Ordering::Relaxed) as usize,
             raw_events_capacity: self.raw_events_capacity.load(Ordering::Relaxed) as usize,
             merged_map_capacity: self.merged_map_capacity.load(Ordering::Relaxed) as usize,
             records_capacity: self.records_capacity.load(Ordering::Relaxed) as usize,
@@ -151,6 +169,12 @@ impl EventPipeline {
         // inotify watch 数兜底检查
         check_inotify_limit(roots.len());
         let failed_roots = watch_roots(&mut watcher, &roots);
+        self.watch_failures
+            .fetch_add(failed_roots.len() as u64, Ordering::Relaxed);
+        self.degraded_roots
+            .store(failed_roots.len() as u64, Ordering::Relaxed);
+        self.watcher_degraded
+            .store(!failed_roots.is_empty(), Ordering::Relaxed);
 
         let index = self.index.clone();
         let debounce_ms = self.debounce_ms;
@@ -229,9 +253,7 @@ impl EventPipeline {
 
                 // .gitignore filtering
                 if let Some(ref gi) = ignore_filter {
-                    raw_events.retain(|ev| {
-                        !ev.paths.iter().any(|p| gi.is_ignored(p))
-                    });
+                    raw_events.retain(|ev| !ev.paths.iter().any(|p| gi.is_ignored(p)));
                 }
 
                 // 合并去重

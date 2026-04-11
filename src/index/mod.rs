@@ -1,9 +1,9 @@
+pub mod content_filter;
 pub mod l1_cache;
 pub mod l2_partition;
 pub mod l3_cold;
 pub mod mmap_index;
 pub mod tiered;
-pub mod content_filter;
 
 use crate::core::{FileKey, FileMeta};
 use crate::query::Matcher;

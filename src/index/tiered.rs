@@ -23,8 +23,8 @@ use crate::query::matcher::{create_matcher, Matcher};
 use crate::stats::{
     infer_heap_high_water, EventPipelineStats, MemoryReport, OverlayStats, RebuildStats,
 };
-use crate::storage::snapshot::{LoadedSnapshot, SnapshotStore};
-use crate::storage::wal::WalStore;
+use crate::storage::snapshot::LoadedSnapshot;
+use crate::storage::traits::{StorageBackend, WriteAheadLog};
 use crate::util::maybe_trim_rss;
 
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
@@ -532,7 +532,7 @@ pub struct TieredIndex {
     disk_layers: RwLock<Vec<DiskLayer>>,
     pub l3: IndexBuilder,
     scheduler: Mutex<AdaptiveScheduler>,
-    wal: Mutex<Option<Arc<WalStore>>>,
+    wal: Mutex<Option<Arc<dyn WriteAheadLog + Send + Sync>>>,
     pub event_seq: AtomicU64,
     rebuild_state: Mutex<RebuildState>,
     overlay_state: Mutex<OverlayState>,
@@ -547,8 +547,10 @@ pub struct TieredIndex {
     periodic_flush_min_bytes: AtomicU64,
     pending_flush_events: AtomicU64,
     pending_flush_bytes: AtomicU64,
+    last_snapshot_time: AtomicU64,
     pub roots: Vec<PathBuf>,
     pub include_hidden: bool,
+    pub ignore_enabled: bool,
 }
 
 impl TieredIndex {
@@ -558,6 +560,7 @@ impl TieredIndex {
         l3: IndexBuilder,
         roots: Vec<PathBuf>,
         include_hidden: bool,
+        ignore_enabled: bool,
         disk_layers: Vec<DiskLayer>,
     ) -> Self {
         Self {
@@ -581,8 +584,10 @@ impl TieredIndex {
             periodic_flush_min_bytes: AtomicU64::new(0),
             pending_flush_events: AtomicU64::new(0),
             pending_flush_bytes: AtomicU64::new(0),
+            last_snapshot_time: AtomicU64::new(0),
             roots,
             include_hidden,
+            ignore_enabled,
         }
     }
 
@@ -593,48 +598,90 @@ impl TieredIndex {
 
     /// 直接以空索引启动，并指定是否包含隐藏项。
     pub fn empty_with_hidden(roots: Vec<PathBuf>, include_hidden: bool) -> Self {
+        Self::empty_with_options(roots, include_hidden, true)
+    }
+
+    pub fn empty_with_options(
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+    ) -> Self {
         let l1 = L1Cache::with_capacity(1000);
         let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
-        let l3 = IndexBuilder::new_with_hidden(roots.clone(), include_hidden);
-        Self::new(l1, l2, l3, roots, include_hidden, Vec::new())
+        let l3 = IndexBuilder::new_with_options(roots.clone(), include_hidden, ignore_enabled);
+        Self::new(
+            l1,
+            l2,
+            l3,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            Vec::new(),
+        )
     }
 
     /// 从快照加载（或回退为空），并在返回前执行启动清扫：
     /// 1) 物理清理 manifest 未引用的孤儿段文件（best-effort）
     /// 2) 若现有 delta 段达到阈值则触发后台 compaction（best-effort）
-    pub async fn load(store: &SnapshotStore, roots: Vec<PathBuf>) -> anyhow::Result<Arc<Self>> {
-        Self::load_with_hidden(store, roots, false).await
+    pub async fn load<S: StorageBackend + ?Sized>(
+        store: &S,
+        roots: Vec<PathBuf>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::load_with_options(store, roots, false, true).await
     }
 
-    pub async fn load_with_hidden(
-        store: &SnapshotStore,
+    pub async fn load_with_hidden<S: StorageBackend + ?Sized>(
+        store: &S,
         roots: Vec<PathBuf>,
         include_hidden: bool,
     ) -> anyhow::Result<Arc<Self>> {
-        let index = Arc::new(Self::load_or_empty_with_hidden(store, roots, include_hidden).await?);
+        Self::load_with_options(store, roots, include_hidden, true).await
+    }
+
+    pub async fn load_with_options<S: StorageBackend + ?Sized>(
+        store: &S,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+    ) -> anyhow::Result<Arc<Self>> {
+        let index = Arc::new(
+            Self::load_or_empty_with_options(store, roots, include_hidden, ignore_enabled).await?,
+        );
 
         // 1) 物理清理不在 MANIFEST 里的孤儿文件（best-effort）
         let _ = store.gc_stale_segments();
 
-        // 2) 检查是否需要合并现有的碎片段（best-effort）
-        index.maybe_spawn_compaction(store.path().to_path_buf());
+        // 2) 启动阶段不持有可克隆的存储后端句柄时，跳过预热 compaction。
+        // 后续 flush/snapshot 仍会按阈值触发后台 compaction。
 
         Ok(index)
     }
 
     /// 从快照加载或空索引启动
-    pub async fn load_or_empty(store: &SnapshotStore, roots: Vec<PathBuf>) -> anyhow::Result<Self> {
-        Self::load_or_empty_with_hidden(store, roots, false).await
+    pub async fn load_or_empty<S: StorageBackend + ?Sized>(
+        store: &S,
+        roots: Vec<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        Self::load_or_empty_with_options(store, roots, false, true).await
     }
 
     /// 从快照加载或空索引启动，并指定是否包含隐藏项。
-    pub async fn load_or_empty_with_hidden(
-        store: &SnapshotStore,
+    pub async fn load_or_empty_with_hidden<S: StorageBackend + ?Sized>(
+        store: &S,
         roots: Vec<PathBuf>,
         include_hidden: bool,
     ) -> anyhow::Result<Self> {
+        Self::load_or_empty_with_options(store, roots, include_hidden, true).await
+    }
+
+    pub async fn load_or_empty_with_options<S: StorageBackend + ?Sized>(
+        store: &S,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+    ) -> anyhow::Result<Self> {
         let l1 = L1Cache::with_capacity(1000);
-        let l3 = IndexBuilder::new_with_hidden(roots.clone(), include_hidden);
+        let l3 = IndexBuilder::new_with_options(roots.clone(), include_hidden, ignore_enabled);
 
         // 冷启动离线变更检测（仅 LSM 目录布局）：
         // - LSM 段可能包含停机期间的“幽灵记录”（已删除文件但索引仍在）。
@@ -654,6 +701,7 @@ impl TieredIndex {
                     l3,
                     roots,
                     include_hidden,
+                    ignore_enabled,
                     Vec::new(),
                 ));
             }
@@ -693,6 +741,7 @@ impl TieredIndex {
                 l3,
                 roots,
                 include_hidden,
+                ignore_enabled,
                 layers,
             );
             idx.attach_wal(store)?;
@@ -716,6 +765,7 @@ impl TieredIndex {
                 l3,
                 roots,
                 include_hidden,
+                ignore_enabled,
                 vec![base],
             );
             idx.attach_wal(store)?;
@@ -751,19 +801,26 @@ impl TieredIndex {
             }
         };
 
-        let idx = Self::new(l1, Arc::new(l2), l3, roots, include_hidden, Vec::new());
+        let idx = Self::new(
+            l1,
+            Arc::new(l2),
+            l3,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            Vec::new(),
+        );
         idx.attach_wal(store)?;
         idx.replay_wal_if_any(0);
         Ok(idx)
     }
 
-    pub fn attach_wal(&self, store: &SnapshotStore) -> anyhow::Result<()> {
+    pub fn attach_wal<S: StorageBackend + ?Sized>(&self, store: &S) -> anyhow::Result<()> {
         let mut g = self.wal.lock();
         if g.is_some() {
             return Ok(());
         }
-        let wal = WalStore::open_in_dir(store.derived_lsm_dir_path())?;
-        *g = Some(Arc::new(wal));
+        *g = Some(store.open_wal()?);
         Ok(())
     }
 
@@ -1043,28 +1100,42 @@ impl TieredIndex {
 
         for dir in dirs.iter() {
             report.dirs_scanned += 1;
-            let rd = match std::fs::read_dir(dir) {
-                Ok(rd) => rd,
-                Err(_) => continue,
-            };
+            let mut builder = ignore::WalkBuilder::new(dir);
+            builder
+                .max_depth(Some(1))
+                .hidden(!self.include_hidden)
+                .follow_links(false)
+                .ignore(self.ignore_enabled)
+                .git_ignore(self.ignore_enabled)
+                .git_global(self.ignore_enabled)
+                .git_exclude(self.ignore_enabled);
 
-            for ent in rd {
+            for ent in builder.build() {
                 let ent = match ent {
                     Ok(e) => e,
-                    Err(_) => continue,
+                    Err(err) => {
+                        tracing::warn!(
+                            "fast-sync walker skipped entry under {}: {}",
+                            dir.display(),
+                            err
+                        );
+                        continue;
+                    }
                 };
-                let ft = match ent.file_type() {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
+                let Some(ft) = ent.file_type() else {
+                    continue;
                 };
                 if ft.is_dir() {
                     continue;
                 }
 
-                let path = ent.path();
+                let path = ent.path().to_path_buf();
                 let meta = match ent.metadata() {
                     Ok(meta) => meta,
-                    Err(_) => continue,
+                    Err(err) => {
+                        tracing::warn!("fast-sync metadata failed for {}: {}", path.display(), err);
+                        continue;
+                    }
                 };
                 let Some(file_key) = FileKey::from_path_and_metadata(&path, &meta) else {
                     continue;
@@ -1149,19 +1220,30 @@ impl TieredIndex {
         let mut seq: u64 = 0;
 
         for dir in dirs {
-            let rd = match std::fs::read_dir(dir) {
-                Ok(rd) => rd,
-                Err(_) => continue,
-            };
             let mut dir_count = 0;
-            for ent in rd {
+            let mut builder = ignore::WalkBuilder::new(dir);
+            builder
+                .max_depth(Some(1))
+                .hidden(!self.include_hidden)
+                .follow_links(false)
+                .ignore(self.ignore_enabled)
+                .git_ignore(self.ignore_enabled)
+                .git_global(self.ignore_enabled)
+                .git_exclude(self.ignore_enabled);
+            for ent in builder.build() {
                 let ent = match ent {
                     Ok(e) => e,
-                    Err(_) => continue,
+                    Err(err) => {
+                        tracing::warn!(
+                            "scan_dirs_immediate walker skipped entry under {}: {}",
+                            dir.display(),
+                            err
+                        );
+                        continue;
+                    }
                 };
-                let ft = match ent.file_type() {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
+                let Some(ft) = ent.file_type() else {
+                    continue;
                 };
                 if ft.is_dir() {
                     continue;
@@ -1171,10 +1253,17 @@ impl TieredIndex {
                 }
                 dir_count += 1;
 
-                let path = ent.path();
+                let path = ent.path().to_path_buf();
                 let meta = match ent.metadata() {
                     Ok(m) => m,
-                    Err(_) => continue,
+                    Err(err) => {
+                        tracing::warn!(
+                            "scan_dirs_immediate metadata failed for {}: {}",
+                            path.display(),
+                            err
+                        );
+                        continue;
+                    }
                 };
                 let Some(file_key) = FileKey::from_path_and_metadata(&path, &meta) else {
                     continue;
@@ -1617,7 +1706,10 @@ impl TieredIndex {
     }
 
     /// 原子快照
-    pub async fn snapshot_now(self: &Arc<Self>, store: &SnapshotStore) -> anyhow::Result<()> {
+    pub async fn snapshot_now<S>(self: &Arc<Self>, store: Arc<S>) -> anyhow::Result<()>
+    where
+        S: StorageBackend + 'static,
+    {
         // Flush：把当前内存 Delta 刷盘为新 Segment；必要时触发后台 compaction。
         let (old_delta, deleted_paths, layers_snapshot, wal_seal_id) = {
             let _wg = self.apply_gate.write();
@@ -1696,7 +1788,7 @@ impl TieredIndex {
             let segs = merged.export_segments_v6_compacted();
             drop(merged);
             let base = store
-                .lsm_replace_base_v6(&segs, None, &roots, wal_seal_id)
+                .replace_base_v6(&segs, None, &roots, wal_seal_id)
                 .await?;
             drop(segs);
             if let Err(e) = store.gc_stale_segments() {
@@ -1722,6 +1814,7 @@ impl TieredIndex {
             if let Some(w) = self.wal.lock().clone() {
                 let _ = w.cleanup_sealed_up_to(wal_seal_id);
             }
+            self.record_snapshot_success();
             self.reset_pending_flush_batch();
             // snapshot/flush 是临时分配大户；完成后尝试回吐。
             maybe_trim_rss();
@@ -1732,7 +1825,7 @@ impl TieredIndex {
         let segs = old_delta.export_segments_v6();
         drop(old_delta);
         let seg = store
-            .lsm_append_delta_v6(&segs, &deleted_paths, &roots, wal_seal_id)
+            .append_delta_v6(&segs, &deleted_paths, &roots, wal_seal_id)
             .await?;
         drop(segs);
         drop(deleted_paths);
@@ -1754,17 +1847,21 @@ impl TieredIndex {
         if let Some(w) = self.wal.lock().clone() {
             let _ = w.cleanup_sealed_up_to(wal_seal_id);
         }
+        self.record_snapshot_success();
         self.reset_pending_flush_batch();
 
         // compaction：段数达到阈值后后台合并
-        self.maybe_spawn_compaction(store.path().to_path_buf());
+        self.maybe_spawn_compaction(store);
         // snapshot/flush 是临时分配大户；完成后尝试回吐。
         maybe_trim_rss();
         Ok(())
     }
 
     /// 定期快照循环
-    pub async fn snapshot_loop(self: Arc<Self>, store: Arc<SnapshotStore>, interval_secs: u64) {
+    pub async fn snapshot_loop<S>(self: Arc<Self>, store: Arc<S>, interval_secs: u64)
+    where
+        S: StorageBackend + 'static,
+    {
         // interval_secs==0 is treated as "disabled" to avoid a busy loop.
         let interval = if interval_secs == 0 {
             None
@@ -1774,7 +1871,7 @@ impl TieredIndex {
         loop {
             // flush 请求优先：避免 overlay 长期积压。
             if self.flush_requested.load(Ordering::Acquire) {
-                if let Err(e) = self.snapshot_now(&store).await {
+                if let Err(e) = self.snapshot_now(store.clone()).await {
                     tracing::error!("Snapshot failed (flush requested): {}", e);
                     // 避免失败后自旋
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1806,10 +1903,22 @@ impl TieredIndex {
                 continue;
             }
 
-            if let Err(e) = self.snapshot_now(&store).await {
+            if let Err(e) = self.snapshot_now(store.clone()).await {
                 tracing::error!("Snapshot failed: {}", e);
             }
         }
+    }
+
+    pub fn last_snapshot_time(&self) -> u64 {
+        self.last_snapshot_time.load(Ordering::Relaxed)
+    }
+
+    fn record_snapshot_success(&self) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.last_snapshot_time.store(ts, Ordering::Relaxed);
     }
 
     pub fn file_count(&self) -> usize {
@@ -2072,7 +2181,10 @@ impl TieredIndex {
         }
     }
 
-    fn maybe_spawn_compaction(self: &Arc<Self>, store_path: PathBuf) {
+    fn maybe_spawn_compaction<S>(self: &Arc<Self>, store: Arc<S>)
+    where
+        S: StorageBackend + 'static,
+    {
         let mut layers = self.disk_layers.read().clone();
         let delta_count = layers.len().saturating_sub(1);
         if delta_count < COMPACTION_DELTA_THRESHOLD {
@@ -2111,7 +2223,7 @@ impl TieredIndex {
                 }
             }
             let _guard = CompactionInProgressGuard(idx.clone());
-            match idx.compact_layers(store_path, layers).await {
+            match idx.compact_layers(store, layers).await {
                 Ok(()) => tracing::debug!("Compaction attempt finished"),
                 Err(e) => {
                     // manifest changed 是并发下的预期分支：并不意味着数据损坏。
@@ -2128,11 +2240,14 @@ impl TieredIndex {
         });
     }
 
-    async fn compact_layers(
+    async fn compact_layers<S>(
         self: &Arc<Self>,
-        store_path: PathBuf,
+        store: Arc<S>,
         layers_snapshot: Vec<DiskLayer>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        S: StorageBackend + 'static,
+    {
         if layers_snapshot.is_empty() {
             return Ok(());
         }
@@ -2174,7 +2289,6 @@ impl TieredIndex {
         }
 
         let segs = merged.export_segments_v6_compacted();
-        let store = SnapshotStore::new(store_path.clone());
         let wal_seal_id = store.lsm_manifest_wal_seal_id().unwrap_or(0);
 
         let base_id = layers_snapshot[0].id;
@@ -2184,7 +2298,7 @@ impl TieredIndex {
             .map(|l| l.id)
             .collect::<Vec<_>>();
         let new_base = store
-            .lsm_replace_base_v6(
+            .replace_base_v6(
                 &segs,
                 Some((base_id, delta_ids.clone())),
                 &roots,
@@ -2230,7 +2344,7 @@ impl TieredIndex {
         }
 
         // 清理旧段文件（best-effort；失败不影响正确性）
-        let dir = lsm_dir_from_store_path(&store_path);
+        let dir = store.derived_lsm_dir_path();
         for id in layers_snapshot.iter().map(|l| l.id) {
             if id == 0 || id == new_base.id {
                 continue;
@@ -2261,14 +2375,6 @@ fn pathbuf_from_bytes(bytes: impl AsRef<[u8]>) -> PathBuf {
     {
         PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
     }
-}
-
-fn lsm_dir_from_store_path(path: &PathBuf) -> PathBuf {
-    let ext = path.extension().and_then(|s| s.to_str());
-    if ext == Some("d") || path.is_dir() {
-        return path.clone();
-    }
-    path.with_extension("d")
 }
 
 #[cfg(test)]
@@ -2480,7 +2586,7 @@ mod tests {
         let root = unique_tmp_dir("query-dsl-no-leak");
         std::fs::create_dir_all(&root)?;
 
-        let store = SnapshotStore::new(root.join("index.db"));
+        let store = Arc::new(SnapshotStore::new(root.join("index.db")));
         let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
 
         let p = root.join("x.txt");
@@ -2488,7 +2594,7 @@ mod tests {
         idx.apply_events(&[mk_event(1, EventType::Create, p.clone())]);
 
         // flush: 让旧元数据进入 disk layer
-        idx.snapshot_now(&store).await?;
+        idx.snapshot_now(store.clone()).await?;
         assert!(!idx.disk_layers.read().is_empty());
 
         // 修改文件：新元数据进入 L2（size 变大）
@@ -2591,7 +2697,7 @@ mod tests {
         let alpha = root.join("alpha_test.txt");
         let gamma = root.join("gamma_test.txt");
 
-        let store = SnapshotStore::new(root.join("index.db"));
+        let store = Arc::new(SnapshotStore::new(root.join("index.db")));
 
         // base: alpha
         let base_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
@@ -2647,7 +2753,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let alpha = root.join("alpha_test.txt");
-        let store = SnapshotStore::new(root.join("index.db"));
+        let store = Arc::new(SnapshotStore::new(root.join("index.db")));
 
         // base: alpha
         let base_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
@@ -2708,7 +2814,7 @@ mod tests {
         let a = root.join("a.txt");
         std::fs::write(&a, b"x").unwrap();
 
-        let store = SnapshotStore::new(root.join("index.db"));
+        let store = Arc::new(SnapshotStore::new(root.join("index.db")));
 
         // seg1 (older): (dev=1, ino=100, path=/a.txt)
         let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
@@ -2942,7 +3048,7 @@ mod tests {
 
         let root = unique_tmp_dir("lsm-compact-prefix");
         std::fs::create_dir_all(&root).unwrap();
-        let store = SnapshotStore::new(root.join("index.db"));
+        let store = Arc::new(SnapshotStore::new(root.join("index.db")));
 
         let mk_seg = |ino: u64, name: &str| {
             let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
@@ -3022,9 +3128,7 @@ mod tests {
             vec![1, 2, 3]
         );
 
-        idx.compact_layers(store.path().to_path_buf(), prefix)
-            .await
-            .unwrap();
+        idx.compact_layers(store.clone(), prefix).await.unwrap();
 
         let layer_ids = idx
             .disk_layers

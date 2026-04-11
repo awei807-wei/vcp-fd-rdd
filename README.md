@@ -8,7 +8,15 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前主线实现沿 v0.5.1 路线演进（性能与安全加固：事件通道扩容、AtomicBool dirty flag、全量扫描上限、Trigram 交集优化、DocId 溢出安全化）。
+> 当前 tests 分支发布版本为 v0.5.2（运行时路径隔离、ignore 规则贯通、存储层抽象与健康检查扩展）。
+
+## v0.5.2 更新
+
+- **多用户运行路径隔离**：默认 `--snapshot-path` / `--uds-socket` 优先落到 `$XDG_RUNTIME_DIR/fd-rdd/`，回退 `/run/user/$UID/fd-rdd/` 与 `/tmp/fd-rdd-$UID...`，避免多用户共享 `/tmp` 冲突
+- **ignore 规则贯通**：冷扫、fast-sync、即时扫描与增量事件过滤统一支持 `.gitignore`、`.ignore`、`.git/info/exclude` 与全局 gitignore；新增 `--no-ignore`
+- **存储层通用化**：`TieredIndex` 改为依赖 `StorageBackend` / `WriteAheadLog` 抽象，降低对 `SnapshotStore` / `WalStore` 的直接耦合
+- **健康检查增强**：`/health` 与 `MemoryReport` 新增 `last_snapshot_time`、`watch_failures`、`watcher_degraded`、`degraded_roots`、`issues`
+- **兼容性测试补强**：补齐 snapshot v2-v7 与 WAL v1/v2 的兼容 / 损坏拒绝 / 升级路径测试
 
 ## v0.5.1 更新
 
@@ -203,7 +211,9 @@ cargo build --release --no-default-features
 说明：
 
 - `--root` 可重复传入，用于覆盖多个索引源。
+- 默认 `--snapshot-path` / `--uds-socket` 会优先落到 `$XDG_RUNTIME_DIR/fd-rdd/`，回退 `/run/user/$UID/fd-rdd/`，最后才使用 `/tmp/fd-rdd-$UID...`，避免多用户互相冲突。
 - 默认会跳过 `.` 开头的文件/目录；如需将 dotfiles / dotdirs 纳入冷启动全扫、后台重建与增量补扫，请显式加 `--include-hidden`。
+- 默认会读取 `.gitignore`、`.ignore`、`.git/info/exclude` 和全局 gitignore；如需关闭这套规则，可显式传入 `--no-ignore`。
 
 查询：
 
@@ -225,8 +235,19 @@ UDS 流式查询（推荐用于大结果集；边收边输出，不聚合）：
 说明：
 
 - UDS 服务除 socket 文件 `0600` 外，还会校验 peer credential；默认仅接受“同一有效 UID”或 `root` 发起的连接，单独的同 GID 不构成放行条件。
+- `fd-rdd-query --spawn` 会在 socket 不可达时尝试按当前 socket 路径拉起 `fd-rdd` 守护进程。
 - `mode=exact` 下的 1-2 字符短查询会先走“短组件候选索引”再做精确过滤，减少退化全扫的概率。
 - `PathArena` 当前仍以 `path_len: u16` 编码路径；root-relative 路径超过 `65535` bytes 时会跳过该条索引并输出告警，而不是写入损坏占位记录。
+
+健康检查：
+
+```bash
+curl "http://127.0.0.1:6060/health"
+```
+
+说明：
+
+- `/health` 会额外返回 `index_health`、`last_snapshot_time`、`watch_failures`、`watcher_degraded`、`degraded_roots`、`overflow_drops`、`rescan_signals` 与 `issues`，便于判断索引是否处于降级轮询或尚未写出首个快照。
 
 ## 内存与长期运行（如何判断“好用”）
 
@@ -324,6 +345,13 @@ python3 scripts/fs-churn.py \
     --report-interval-secs 5 \
     --trim-interval-secs 0
 ```
+
+## TODO
+
+- 补齐 `~/.config/fd-rdd/config.toml` 的全量字段接线；当前优先级已经是 `CLI > 配置文件 > 默认值`，但 `http_port`、`snapshot_interval_secs`、`include_hidden`、`log_level` 等仍未全部贯通到启动路径。
+- 提供 `systemd --user` 单元模板和更稳妥的守护进程自启约定；同时收口 `fd-rdd-query --spawn` 在“无显式 root/config”场景下的安全默认，避免误扫整个 `$HOME`。
+- 完成 `content:` 全文索引，复用现有全局 `DocId`、事件增量链路以及 LSM + mmap 存储布局。
+- 为全文索引补齐内容过滤策略：大文件阈值、二进制文件跳过、ignore 规则复用、内容哈希去重。
 
 ## 许可证
 
