@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 const DEFAULT_SEARCH_LIMIT: usize = 100;
 const MAX_SEARCH_LIMIT: usize = 10_000;
@@ -49,6 +50,14 @@ pub struct StatusResponse {
     pub indexed_count: usize,
 }
 
+#[derive(Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub uptime_secs: u64,
+    pub index_entries: usize,
+    pub version: &'static str,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct QueryServerConfig {
     default_limit: usize,
@@ -70,6 +79,7 @@ impl Default for QueryServerConfig {
 struct QueryServerState {
     index: Arc<TieredIndex>,
     config: QueryServerConfig,
+    start_time: Instant,
 }
 
 pub struct QueryServer {
@@ -89,10 +99,12 @@ impl QueryServer {
         let state = QueryServerState {
             index: self.index,
             config: self.config,
+            start_time: Instant::now(),
         };
         let app = Router::new()
             .route("/search", get(search_handler))
             .route("/status", get(status_handler))
+            .route("/health", get(health_handler))
             .route("/scan", post(scan_handler))
             .with_state(state);
 
@@ -177,6 +189,16 @@ async fn search_handler(
 async fn status_handler(State(state): State<QueryServerState>) -> Json<StatusResponse> {
     Json(StatusResponse {
         indexed_count: state.index.file_count(),
+    })
+}
+
+async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthResponse> {
+    let uptime = state.start_time.elapsed().as_secs();
+    Json(HealthResponse {
+        status: "ok",
+        uptime_secs: uptime,
+        index_entries: state.index.file_count(),
+        version: env!("CARGO_PKG_VERSION"),
     })
 }
 
