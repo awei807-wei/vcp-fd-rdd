@@ -106,6 +106,7 @@ pub struct FsScanRDD {
     pub parts: Vec<Partition>,
     parallelism: usize,
     include_hidden: bool,
+    follow_links: bool,
 }
 
 impl FsScanRDD {
@@ -123,6 +124,7 @@ impl FsScanRDD {
             parts,
             parallelism: 1,
             include_hidden: false,
+            follow_links: true,
         }
     }
 
@@ -135,6 +137,12 @@ impl FsScanRDD {
     /// 控制是否将 `.` 开头的文件/目录纳入扫描。
     pub fn with_hidden(mut self, include_hidden: bool) -> Self {
         self.include_hidden = include_hidden;
+        self
+    }
+
+    /// 控制是否跟随符号链接（默认 true；`ignore` crate 内置循环检测）。
+    pub fn with_follow_links(mut self, follow_links: bool) -> Self {
+        self.follow_links = follow_links;
         self
     }
 
@@ -155,7 +163,7 @@ impl FsScanRDD {
         }
 
         for p in self.partitions() {
-            scan_partition_parallel(p, self.parallelism, self.include_hidden, sink.clone());
+            scan_partition_parallel(p, self.parallelism, self.include_hidden, self.follow_links, sink.clone());
         }
     }
 }
@@ -168,9 +176,12 @@ impl BuildRDD<FileMeta> for FsScanRDD {
     fn compute(&self, part: &Partition) -> Box<dyn Iterator<Item = FileMeta> + Send> {
         use ignore::WalkBuilder;
 
+        let mut visited: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+
         let walker = WalkBuilder::new(&part.root)
             .max_depth(Some(part.max_depth))
             .hidden(!self.include_hidden)
+            .follow_links(self.follow_links)
             .ignore(true)
             .git_ignore(true)
             .build();
@@ -178,9 +189,13 @@ impl BuildRDD<FileMeta> for FsScanRDD {
         let iter = walker
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
-            .filter_map(|e| {
+            .filter_map(move |e| {
                 let meta = e.metadata().ok()?;
                 let file_key = FileKey::from_path_and_metadata(e.path(), &meta)?;
+                // ino+dev 去重：同一文件可能通过多条符号链接路径到达
+                if !visited.insert((file_key.dev, file_key.ino)) {
+                    return None;
+                }
                 Some(FileMeta {
                     file_key,
                     path: e.path().to_path_buf(),
@@ -199,13 +214,17 @@ fn scan_partition_parallel(
     part: &Partition,
     parallelism: usize,
     include_hidden: bool,
+    follow_links: bool,
     sink: Arc<dyn Fn(FileMeta) + Send + Sync>,
 ) {
     use ignore::{WalkBuilder, WalkState};
 
+    let visited: Arc<dashmap::DashSet<(u64, u64)>> = Arc::new(dashmap::DashSet::new());
+
     let walker = WalkBuilder::new(&part.root)
         .max_depth(Some(part.max_depth))
         .hidden(!include_hidden)
+        .follow_links(follow_links)
         .ignore(true)
         .git_ignore(true)
         .threads(parallelism)
@@ -213,6 +232,7 @@ fn scan_partition_parallel(
 
     walker.run(|| {
         let sink = sink.clone();
+        let visited = visited.clone();
         Box::new(move |entry| {
             let Ok(e) = entry else {
                 return WalkState::Continue;
@@ -226,6 +246,10 @@ fn scan_partition_parallel(
             let Some(file_key) = FileKey::from_path_and_metadata(e.path(), &meta) else {
                 return WalkState::Continue;
             };
+            // ino+dev 去重：避免符号链接导致同一文件被多次索引
+            if !visited.insert((file_key.dev, file_key.ino)) {
+                return WalkState::Continue;
+            }
 
             sink(FileMeta {
                 file_key,
