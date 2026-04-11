@@ -54,8 +54,14 @@ mod tests {
     #[test]
     fn should_index_respects_size_limit() {
         assert!(ContentFilter::should_index(Path::new("a.txt"), 1024));
-        assert!(ContentFilter::should_index(Path::new("b.rs"), MAX_INDEX_SIZE));
-        assert!(!ContentFilter::should_index(Path::new("c.bin"), MAX_INDEX_SIZE + 1));
+        assert!(ContentFilter::should_index(
+            Path::new("b.rs"),
+            MAX_INDEX_SIZE
+        ));
+        assert!(!ContentFilter::should_index(
+            Path::new("c.bin"),
+            MAX_INDEX_SIZE + 1
+        ));
     }
 
     #[test]
@@ -68,7 +74,10 @@ mod tests {
     #[test]
     fn content_hash_deterministic() {
         let data = b"some file content";
-        assert_eq!(ContentFilter::content_hash(data), ContentFilter::content_hash(data));
+        assert_eq!(
+            ContentFilter::content_hash(data),
+            ContentFilter::content_hash(data)
+        );
     }
 
     #[test]

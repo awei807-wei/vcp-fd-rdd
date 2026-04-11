@@ -1,9 +1,10 @@
 use clap::Parser;
-use fd_rdd::config::{Config, default_socket_path};
+use fd_rdd::config::{default_snapshot_path, default_socket_path, Config};
+use fd_rdd::event::ignore_filter::IgnoreFilter;
 use fd_rdd::event::EventPipeline;
 use fd_rdd::index::TieredIndex;
-use fd_rdd::query::QueryServer;
 use fd_rdd::query::SocketServer;
+use fd_rdd::query::{HealthTelemetry, QueryServer};
 use fd_rdd::storage::snapshot::SnapshotStore;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ struct Args {
     #[arg(long = "root", value_name = "PATH")]
     roots: Vec<PathBuf>,
 
-    /// 快照路径（默认: $XDG_DATA_HOME/fd-rdd/index.db 或 /tmp/fd-rdd/index.db）
+    /// 快照路径（默认: $XDG_RUNTIME_DIR/fd-rdd/index.db，回退到 /run/user/$UID/... 或 /tmp/fd-rdd-$UID/...）
     ///
     /// - legacy 单文件：index.db（兼容读取 v2~v6；v6 为 mmap 段式容器）
     /// - LSM 目录：同路径派生的 index.d/（MANIFEST.bin + seg-*.db/.del + events.wal）
@@ -82,6 +83,10 @@ struct Args {
     #[arg(long = "ignore-path", value_name = "PATH")]
     ignore_paths: Vec<PathBuf>,
 
+    /// 禁用 `.gitignore` / `.ignore` / git exclude / global gitignore 规则
+    #[arg(long)]
+    no_ignore: bool,
+
     /// overlay 强制 flush 阈值（路径数）。达到阈值会唤醒 snapshot_loop 立即执行一次 snapshot_now（0=禁用）
     #[arg(long, default_value_t = 250_000)]
     auto_flush_overlay_paths: u64,
@@ -131,30 +136,38 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let ignore_enabled = !args.no_ignore && cfg.ignore_enabled;
+
     // 2) 快照存储
-    let snapshot_path = args.snapshot_path.unwrap_or_else(|| {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-            .join("fd-rdd")
-            .join("index.db")
-    });
+    let snapshot_path = args.snapshot_path.unwrap_or_else(default_snapshot_path);
     let store = Arc::new(SnapshotStore::new(snapshot_path));
 
     // 3) 从快照加载或空索引启动
     let index = if args.no_snapshot {
-        Arc::new(TieredIndex::empty_with_hidden(roots, args.include_hidden))
+        Arc::new(TieredIndex::empty_with_options(
+            roots,
+            args.include_hidden,
+            ignore_enabled,
+        ))
     } else {
-        TieredIndex::load_with_hidden(store.as_ref(), roots, args.include_hidden).await?
+        TieredIndex::load_with_options(store.as_ref(), roots, args.include_hidden, ignore_enabled)
+            .await?
     };
     index.set_auto_flush_limits(args.auto_flush_overlay_paths, args.auto_flush_overlay_bytes);
     index.set_periodic_flush_batch_limits(args.batch_flush_min_events, args.batch_flush_min_bytes);
     // WAL：即使 --no_snapshot，也允许记录后续事件（仅不回放历史）。
-    let _ = index.attach_wal(&store);
+    let _ = index.attach_wal(store.as_ref());
 
     // 4) 若索引为空，后台全量构建
     if index.file_count() == 0 && !args.no_build {
         index.spawn_full_build();
     }
+
+    let ignore_filter = if ignore_enabled {
+        Some(IgnoreFilter::from_roots(&index.roots))
+    } else {
+        None
+    };
 
     // 5) 启动事件管道（bounded + debounce）
     let pipeline = if args.no_watch {
@@ -166,18 +179,36 @@ async fn main() -> anyhow::Result<()> {
         ignores.push(store.path().to_path_buf());
         ignores.push(store.derived_lsm_dir_path());
 
-        let pipeline = EventPipeline::new_with_config_and_ignores(
-            index.clone(),
-            args.debounce_ms,
-            args.event_channel_size,
-            ignores,
+        let pipeline = Arc::new(
+            EventPipeline::new_with_config_and_ignores(
+                index.clone(),
+                args.debounce_ms,
+                args.event_channel_size,
+                ignores,
+            )
+            .with_ignore_filter(ignore_filter.clone()),
         );
         pipeline.start().await?;
         Some(pipeline)
     };
 
     // 6) 启动 HTTP 查询服务
-    let query_server = QueryServer::new(index.clone());
+    let health_provider = {
+        let index = index.clone();
+        let pipeline = pipeline.clone();
+        Arc::new(move || {
+            let stats = pipeline.as_ref().map(|p| p.stats()).unwrap_or_default();
+            HealthTelemetry {
+                last_snapshot_time: index.last_snapshot_time(),
+                watch_failures: stats.watch_failures,
+                watcher_degraded: stats.watcher_degraded,
+                degraded_roots: stats.degraded_roots,
+                overflow_drops: stats.overflow_drops,
+                rescan_signals: stats.rescan_signals,
+            }
+        })
+    };
+    let query_server = QueryServer::new(index.clone()).with_health_provider(health_provider);
     let http_port = args.http_port;
     tokio::spawn(async move {
         if let Err(e) = query_server.run(http_port).await {
@@ -186,7 +217,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 6.5) 启动 UDS 查询服务（CLI > config > default_socket_path()）
-    let uds_path = args.uds_socket
+    let uds_path = args
+        .uds_socket
         .or(cfg.socket_path)
         .unwrap_or_else(default_socket_path);
     {
@@ -249,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
     // 9) 优雅退出：Ctrl+C → 最终快照
     tokio::signal::ctrl_c().await?;
     info!("Shutting down, writing final snapshot...");
-    if let Err(e) = index.snapshot_now(&store).await {
+    if let Err(e) = index.snapshot_now(store.clone()).await {
         tracing::error!("Final snapshot failed: {}", e);
     }
     info!("Goodbye.");

@@ -225,7 +225,11 @@ async fn snapshot_v6_v7_skipped_by_load_if_valid() {
         write_raw_snapshot(&db_path, ver, b"v6-or-v7-body");
         let store = SnapshotStore::new(db_path);
         let result = store.load_if_valid().await.unwrap();
-        assert!(result.is_none(), "v{} should be skipped by load_if_valid", ver);
+        assert!(
+            result.is_none(),
+            "v{} should be skipped by load_if_valid",
+            ver
+        );
     }
 }
 

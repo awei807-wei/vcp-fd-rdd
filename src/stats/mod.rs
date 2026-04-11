@@ -127,6 +127,12 @@ pub struct EventPipelineStats {
     pub overflow_drops: u64,
     /// notify/inotify rescan 信号次数（表示可能漏事件，需要补扫）
     pub rescan_signals: u64,
+    /// watcher 注册/运行中累计失败次数（例如目录加 watch 失败）。
+    pub watch_failures: u64,
+    /// watcher 当前是否处于降级状态（存在未被 watch 的目录）。
+    pub watcher_degraded: bool,
+    /// 当前处于降级轮询的目录数。
+    pub degraded_roots: usize,
     /// raw_events(Vec<notify::Event>) capacity
     pub raw_events_capacity: usize,
     /// merged(HashMap<FileIdentifier, EventRecord>) capacity
@@ -419,6 +425,16 @@ impl fmt::Display for MemoryReport {
             f,
             "║   rescan:       {:>10}                       ║",
             self.event_pipeline.rescan_signals
+        )?;
+        writeln!(
+            f,
+            "║   watch_fail:   {:>10}                       ║",
+            self.event_pipeline.watch_failures
+        )?;
+        writeln!(
+            f,
+            "║   degraded:     {:>10}  (roots={:>5})        ║",
+            self.event_pipeline.watcher_degraded, self.event_pipeline.degraded_roots
         )?;
         writeln!(
             f,

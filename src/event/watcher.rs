@@ -141,7 +141,11 @@ pub fn watch_roots(
     let mut failed = Vec::new();
     for root in roots {
         if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
-            tracing::warn!("Failed to watch {:?}: {} — will fallback to polling", root, e);
+            tracing::warn!(
+                "Failed to watch {:?}: {} — will fallback to polling",
+                root,
+                e
+            );
             failed.push(root.clone());
         }
     }

@@ -107,6 +107,7 @@ pub struct FsScanRDD {
     parallelism: usize,
     include_hidden: bool,
     follow_links: bool,
+    ignore_enabled: bool,
 }
 
 impl FsScanRDD {
@@ -125,6 +126,7 @@ impl FsScanRDD {
             parallelism: 1,
             include_hidden: false,
             follow_links: true,
+            ignore_enabled: true,
         }
     }
 
@@ -146,6 +148,12 @@ impl FsScanRDD {
         self
     }
 
+    /// 控制是否启用 `.gitignore` / `.ignore` / git exclude / git global 规则。
+    pub fn with_ignore_rules(mut self, ignore_enabled: bool) -> Self {
+        self.ignore_enabled = ignore_enabled;
+        self
+    }
+
     /// 按指定并行度遍历所有文件元数据（用于冷启动/重建的弹性构建）。
     ///
     /// 注意：这是 FsScanRDD 的专用入口，不改变 `BuildRDD` 的 Iterator 抽象，
@@ -163,7 +171,14 @@ impl FsScanRDD {
         }
 
         for p in self.partitions() {
-            scan_partition_parallel(p, self.parallelism, self.include_hidden, self.follow_links, sink.clone());
+            scan_partition_parallel(
+                p,
+                self.parallelism,
+                self.include_hidden,
+                self.follow_links,
+                self.ignore_enabled,
+                sink.clone(),
+            );
         }
     }
 }
@@ -178,19 +193,34 @@ impl BuildRDD<FileMeta> for FsScanRDD {
 
         let mut visited: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
 
-        let walker = WalkBuilder::new(&part.root)
+        let mut builder = WalkBuilder::new(&part.root);
+        builder
             .max_depth(Some(part.max_depth))
             .hidden(!self.include_hidden)
             .follow_links(self.follow_links)
-            .ignore(true)
-            .git_ignore(true)
-            .build();
+            .ignore(self.ignore_enabled)
+            .git_ignore(self.ignore_enabled)
+            .git_global(self.ignore_enabled)
+            .git_exclude(self.ignore_enabled);
+        let walker = builder.build();
 
         let iter = walker
-            .filter_map(|e| e.ok())
+            .filter_map(|e| match e {
+                Ok(entry) => Some(entry),
+                Err(err) => {
+                    log_walk_error(&err);
+                    None
+                }
+            })
             .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
             .filter_map(move |e| {
-                let meta = e.metadata().ok()?;
+                let meta = match e.metadata() {
+                    Ok(meta) => meta,
+                    Err(err) => {
+                        log_metadata_error(e.path(), &err);
+                        return None;
+                    }
+                };
                 let file_key = FileKey::from_path_and_metadata(e.path(), &meta)?;
                 // ino+dev 去重：同一文件可能通过多条符号链接路径到达
                 if !visited.insert((file_key.dev, file_key.ino)) {
@@ -215,33 +245,45 @@ fn scan_partition_parallel(
     parallelism: usize,
     include_hidden: bool,
     follow_links: bool,
+    ignore_enabled: bool,
     sink: Arc<dyn Fn(FileMeta) + Send + Sync>,
 ) {
     use ignore::{WalkBuilder, WalkState};
 
     let visited: Arc<dashmap::DashSet<(u64, u64)>> = Arc::new(dashmap::DashSet::new());
 
-    let walker = WalkBuilder::new(&part.root)
+    let mut builder = WalkBuilder::new(&part.root);
+    builder
         .max_depth(Some(part.max_depth))
         .hidden(!include_hidden)
         .follow_links(follow_links)
-        .ignore(true)
-        .git_ignore(true)
-        .threads(parallelism)
-        .build_parallel();
+        .ignore(ignore_enabled)
+        .git_ignore(ignore_enabled)
+        .git_global(ignore_enabled)
+        .git_exclude(ignore_enabled)
+        .threads(parallelism);
+    let walker = builder.build_parallel();
 
     walker.run(|| {
         let sink = sink.clone();
         let visited = visited.clone();
         Box::new(move |entry| {
-            let Ok(e) = entry else {
-                return WalkState::Continue;
+            let e = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    log_walk_error(&err);
+                    return WalkState::Continue;
+                }
             };
             if !e.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                 return WalkState::Continue;
             }
-            let Ok(meta) = e.metadata() else {
-                return WalkState::Continue;
+            let meta = match e.metadata() {
+                Ok(meta) => meta,
+                Err(err) => {
+                    log_metadata_error(e.path(), &err);
+                    return WalkState::Continue;
+                }
             };
             let Some(file_key) = FileKey::from_path_and_metadata(e.path(), &meta) else {
                 return WalkState::Continue;
@@ -263,6 +305,14 @@ fn scan_partition_parallel(
             WalkState::Continue
         })
     });
+}
+
+fn log_walk_error(err: &ignore::Error) {
+    tracing::warn!("scan walker skipped entry: {}", err);
+}
+
+fn log_metadata_error(path: &std::path::Path, err: &ignore::Error) {
+    tracing::warn!("scan metadata failed for {}: {}", path.display(), err);
 }
 
 /// BuildLineage：仅记录构建流水线的阶段性记录，有硬上限（环形缓冲区）

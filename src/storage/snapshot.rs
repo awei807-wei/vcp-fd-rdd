@@ -1481,6 +1481,12 @@ impl crate::storage::traits::SegmentStore for SnapshotStore {
         self.load_v6_mmap_if_valid(expected_roots)
     }
 
+    fn load_if_valid<'a>(
+        &'a self,
+    ) -> crate::storage::traits::StorageFuture<'a, anyhow::Result<Option<LoadedSnapshot>>> {
+        Box::pin(async move { SnapshotStore::load_if_valid(self).await })
+    }
+
     fn load_lsm_if_valid(
         &self,
         expected_roots: &[PathBuf],
@@ -1498,6 +1504,45 @@ impl crate::storage::traits::SegmentStore for SnapshotStore {
 
     fn gc_stale_segments(&self) -> anyhow::Result<usize> {
         self.gc_stale_segments()
+    }
+}
+
+impl crate::storage::traits::SegmentWriter for SnapshotStore {
+    fn append_delta_v6<'a>(
+        &'a self,
+        segs: &'a V6Segments,
+        deleted_paths: &'a [Vec<u8>],
+        expected_roots: &'a [PathBuf],
+        wal_seal_id: u64,
+    ) -> crate::storage::traits::StorageFuture<'a, anyhow::Result<LsmSegmentLoaded>> {
+        Box::pin(async move {
+            self.lsm_append_delta_v6(segs, deleted_paths, expected_roots, wal_seal_id)
+                .await
+        })
+    }
+
+    fn replace_base_v6<'a>(
+        &'a self,
+        segs: &'a V6Segments,
+        expected_prev: Option<(u64, Vec<u64>)>,
+        expected_roots: &'a [PathBuf],
+        wal_seal_id: u64,
+    ) -> crate::storage::traits::StorageFuture<'a, anyhow::Result<LsmSegmentLoaded>> {
+        Box::pin(async move {
+            self.lsm_replace_base_v6(segs, expected_prev, expected_roots, wal_seal_id)
+                .await
+        })
+    }
+}
+
+impl crate::storage::traits::WalFactory for SnapshotStore {
+    fn open_wal(
+        &self,
+    ) -> anyhow::Result<std::sync::Arc<dyn crate::storage::traits::WriteAheadLog + Send + Sync>>
+    {
+        Ok(std::sync::Arc::new(
+            crate::storage::wal::WalStore::open_in_dir(self.derived_lsm_dir_path())?,
+        ))
     }
 }
 

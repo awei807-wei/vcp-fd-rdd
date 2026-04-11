@@ -1047,7 +1047,8 @@ impl PersistentIndex {
         let arena = self.arena.read().clone();
         let metas = self.metas.read().clone();
         let tombstones = self.tombstones.read().iter().collect::<Vec<DocId>>();
-        self.dirty.store(false, std::sync::atomic::Ordering::Release);
+        self.dirty
+            .store(false, std::sync::atomic::Ordering::Release);
         IndexSnapshotV5 {
             roots_hash: self.roots_hash(),
             arena,
@@ -1692,7 +1693,7 @@ mod tests {
         });
 
         let m = create_matcher("alpha", true);
-        let r = idx.query(m.as_ref());
+        let r = idx.query(m.as_ref(), 100);
         assert_eq!(r.len(), 1);
         assert!(r[0].path.to_string_lossy().contains("alpha_test"));
     }
@@ -1718,11 +1719,11 @@ mod tests {
         });
 
         let m = create_matcher("ab", true);
-        let r = idx.query(m.as_ref());
+        let r = idx.query(m.as_ref(), 100);
         assert_eq!(r.len(), 2);
 
         let m = create_matcher("a", true);
-        let r = idx.query(m.as_ref());
+        let r = idx.query(m.as_ref(), 100);
         assert_eq!(r.len(), 2);
     }
 
@@ -1741,7 +1742,7 @@ mod tests {
 
         assert_eq!(idx.file_count(), 0);
         let m = create_matcher("aaaa", true);
-        assert!(idx.query(m.as_ref()).is_empty());
+        assert!(idx.query(m.as_ref(), 100).is_empty());
     }
 
     #[test]
@@ -1768,6 +1769,6 @@ mod tests {
 
         assert_eq!(idx.file_count(), 0);
         let m = create_matcher("short-name", true);
-        assert!(idx.query(m.as_ref()).is_empty());
+        assert!(idx.query(m.as_ref(), 100).is_empty());
     }
 }

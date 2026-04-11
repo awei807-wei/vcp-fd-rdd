@@ -8,23 +8,35 @@ use std::sync::Arc;
 pub struct IndexBuilder {
     pub roots: Vec<PathBuf>,
     pub include_hidden: bool,
+    pub ignore_enabled: bool,
 }
 
 impl IndexBuilder {
     pub fn new(roots: Vec<PathBuf>) -> Self {
-        Self::new_with_hidden(roots, false)
+        Self::new_with_options(roots, false, true)
     }
 
     pub fn new_with_hidden(roots: Vec<PathBuf>, include_hidden: bool) -> Self {
+        Self::new_with_options(roots, include_hidden, true)
+    }
+
+    pub fn new_with_options(
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+    ) -> Self {
         Self {
             roots,
             include_hidden,
+            ignore_enabled,
         }
     }
 
     /// 全量构建：扫描所有 roots，流式灌入 PersistentIndex
     pub fn full_build(&self, index: &PersistentIndex) {
-        let rdd = FsScanRDD::from_roots(self.roots.clone()).with_hidden(self.include_hidden);
+        let rdd = FsScanRDD::from_roots(self.roots.clone())
+            .with_hidden(self.include_hidden)
+            .with_ignore_rules(self.ignore_enabled);
         let mut count = 0usize;
 
         rdd.for_each(|meta: FileMeta| {
@@ -54,6 +66,7 @@ impl IndexBuilder {
 
         let rdd = FsScanRDD::from_roots(self.roots.clone())
             .with_hidden(self.include_hidden)
+            .with_ignore_rules(self.ignore_enabled)
             .with_parallelism(parallelism);
         let count = Arc::new(AtomicUsize::new(0));
         let idx = index.clone();
@@ -78,7 +91,9 @@ impl IndexBuilder {
 
     /// 增量补扫：扫描指定目录，补充缺失条目
     pub fn incremental_scan(&self, index: &PersistentIndex, dirs: Vec<PathBuf>) {
-        let rdd = FsScanRDD::from_roots(dirs).with_hidden(self.include_hidden);
+        let rdd = FsScanRDD::from_roots(dirs)
+            .with_hidden(self.include_hidden)
+            .with_ignore_rules(self.ignore_enabled);
         let mut count = 0usize;
 
         rdd.for_each(|meta: FileMeta| {

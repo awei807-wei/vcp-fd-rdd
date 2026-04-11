@@ -275,10 +275,7 @@ impl crate::storage::traits::WriteAheadLog for WalStore {
         self.cleanup_sealed_up_to(seal_id)
     }
 
-    fn replay_since_seal(
-        &self,
-        checkpoint_seal_id: u64,
-    ) -> anyhow::Result<WalReplayResult> {
+    fn replay_since_seal(&self, checkpoint_seal_id: u64) -> anyhow::Result<WalReplayResult> {
         self.replay_since_seal(checkpoint_seal_id)
     }
 }

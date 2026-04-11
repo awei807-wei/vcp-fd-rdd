@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+#[cfg(unix)]
 use fd_rdd::config::default_socket_path;
 use std::path::PathBuf;
 
@@ -9,6 +10,7 @@ enum QueryModeArg {
 }
 
 impl QueryModeArg {
+    #[cfg(unix)]
     fn as_protocol(self) -> &'static str {
         match self {
             Self::Exact => "exact",

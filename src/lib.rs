@@ -9,6 +9,7 @@ pub const ALLOCATOR_KIND: &str = if cfg!(feature = "mimalloc") {
     "system"
 };
 
+pub mod config;
 pub mod core;
 pub mod event;
 pub mod index;
@@ -16,4 +17,3 @@ pub mod query;
 pub mod stats;
 pub mod storage;
 pub mod util;
-pub mod config;
