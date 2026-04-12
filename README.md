@@ -405,6 +405,10 @@ python3 scripts/fs-churn.py \
   - [ ] UDS 权限：别的用户 /root 能不能访问你的 UDS socket，权限拦截是不是正常
   - [ ] 短查询优化：1-2 字符的短查询，会不会触发短组件索引优化，不会退化全扫
 - [ ] 添加配置项 --follow-symlinks（默认 false），在 walker 和事件监听层禁用符号链接跟随，防止 Steam Proton 的 dosdevices/z: 递归索引整个根目录。
+### 小一点的毛病
+  - [ ] 很多地方用了unwrap，还有let _ = xxx吞错误，比如删文件的时候忽略错误，需要补错误处理
+  - [ ] 各个版本的快照、WAL 的兼容代码，写的有点重复，比如 v1 到 v7 的加载逻辑，堆了不少重复的判断
+  - [ ] 少部分 unsafe 没加安全注释：mmap 的 unsafe 代码，没有加注释说明 “这个 unsafe 为什么是安全的”，Rust 的 unsafe 惯例是要加注释说明安全边界的，这个地方有点随意。 
 ## 许可证
 
 MIT License (c) 2026 fd-rdd Contributors
