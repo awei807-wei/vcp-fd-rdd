@@ -17,7 +17,7 @@ use tracing::info;
     about = "fd-rdd: atomic-snapshot file indexer"
 )]
 struct Args {
-    /// 要索引的根目录（可重复传入）；未传入则默认使用 $HOME（以及存在时的 /tmp/vcp_test_data）
+    /// 要索引的根目录（可重复传入）；必须至少指定一个（可以是 $HOME）
     #[arg(long = "root", value_name = "PATH")]
     roots: Vec<PathBuf>,
 
@@ -87,6 +87,11 @@ struct Args {
     #[arg(long)]
     no_ignore: bool,
 
+    /// 跟随符号链接（默认不跟随）。启用后扫描和 watcher 会进入符号链接指向的目录。
+    /// 注意：已有 inode 去重可防止无限递归，但跟随可能导致索引范围远超预期。
+    #[arg(long)]
+    follow_symlinks: bool,
+
     /// overlay 强制 flush 阈值（路径数）。达到阈值会唤醒 snapshot_loop 立即执行一次 snapshot_now（0=禁用）
     #[arg(long, default_value_t = 250_000)]
     auto_flush_overlay_paths: u64,
@@ -121,19 +126,14 @@ async fn main() -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    // 1) 确定索引根目录 (CLI > config > default)
+    // 1) 确定索引根目录 (CLI > config > 报错退出)
     let mut roots = args.roots;
     if roots.is_empty() {
         roots = cfg.roots.clone();
     }
     if roots.is_empty() {
-        let home_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-        roots.push(home_dir);
-
-        let test_data = std::path::PathBuf::from("/tmp/vcp_test_data");
-        if test_data.exists() {
-            roots.push(test_data);
-        }
+        eprintln!("错误: 必须通过 --root <PATH> 指定至少一个索引根目录（例如 --root $HOME）");
+        std::process::exit(1);
     }
 
     let ignore_enabled = !args.no_ignore && cfg.ignore_enabled;

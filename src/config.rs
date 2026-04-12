@@ -18,7 +18,9 @@ pub fn default_socket_path() -> PathBuf {
     {
         let dir = PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()))
             .join("fd-rdd");
-        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("Failed to create socket dir {}: {e}", dir.display());
+        }
         return dir.join("fd-rdd.sock");
     }
 
@@ -26,15 +28,21 @@ pub fn default_socket_path() -> PathBuf {
     {
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
             let dir = PathBuf::from(runtime_dir).join("fd-rdd");
-            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::warn!("Failed to create socket dir {}: {e}", dir.display());
+            }
             return dir.join("fd-rdd.sock");
         }
 
+        // SAFETY: libc::getuid() is a simple syscall that returns the real user ID.
+        // It has no failure mode and requires no preconditions.
         let uid = unsafe { libc::getuid() };
         let run_user_dir = PathBuf::from(format!("/run/user/{}", uid));
         if run_user_dir.is_dir() {
             let dir = run_user_dir.join("fd-rdd");
-            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::warn!("Failed to create socket dir {}: {e}", dir.display());
+            }
             return dir.join("fd-rdd.sock");
         }
 
@@ -65,7 +73,9 @@ pub fn default_snapshot_path() -> PathBuf {
     {
         let dir = PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()))
             .join("fd-rdd");
-        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
+        }
         return dir.join("index.db");
     }
 
@@ -73,20 +83,28 @@ pub fn default_snapshot_path() -> PathBuf {
     {
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
             let dir = PathBuf::from(runtime_dir).join("fd-rdd");
-            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
+            }
             return dir.join("index.db");
         }
 
+        // SAFETY: libc::getuid() is a simple syscall that returns the real user ID.
+        // It has no failure mode and requires no preconditions.
         let uid = unsafe { libc::getuid() };
         let run_user_dir = PathBuf::from(format!("/run/user/{}", uid));
         if run_user_dir.is_dir() {
             let dir = run_user_dir.join("fd-rdd");
-            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
+            }
             return dir.join("index.db");
         }
 
         let dir = PathBuf::from(format!("/tmp/fd-rdd-{}", uid));
-        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
+        }
         return dir.join("index.db");
     }
 
@@ -95,14 +113,18 @@ pub fn default_snapshot_path() -> PathBuf {
         let dir = dirs::data_local_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("fd-rdd");
-        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
+        }
         return dir.join("index.db");
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let dir = std::env::temp_dir().join("fd-rdd");
-        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
+        }
         dir.join("index.db")
     }
 }
@@ -125,6 +147,8 @@ pub struct Config {
     pub snapshot_interval_secs: u64,
     /// Include hidden (dot) files.
     pub include_hidden: bool,
+    /// Follow symlinks during scan and watch.
+    pub follow_symlinks: bool,
 }
 
 impl Default for Config {
@@ -137,6 +161,7 @@ impl Default for Config {
             http_port: 6060,
             snapshot_interval_secs: 300,
             include_hidden: false,
+            follow_symlinks: false,
         }
     }
 }

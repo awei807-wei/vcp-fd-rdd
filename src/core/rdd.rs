@@ -125,7 +125,7 @@ impl FsScanRDD {
             parts,
             parallelism: 1,
             include_hidden: false,
-            follow_links: true,
+            follow_links: false,
             ignore_enabled: true,
         }
     }

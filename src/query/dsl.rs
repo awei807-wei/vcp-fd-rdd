@@ -1052,6 +1052,11 @@ fn parse_dm(s: &str) -> Result<DateRange, QueryCompileError> {
 #[cfg(unix)]
 fn local_today_range() -> Result<DateRange, String> {
     use std::mem::MaybeUninit;
+    // SAFETY: libc::time, libc::localtime_r are standard POSIX functions.
+    // time(NULL) returns the current calendar time; localtime_r converts it to
+    // a broken-down local time. Both are thread-safe and have well-defined error
+    // returns that we check below. MaybeUninit::zeroed() ensures the tm struct
+    // is zero-initialized before localtime_r writes into it.
     unsafe {
         let now: libc::time_t = libc::time(std::ptr::null_mut());
         if now == (-1 as libc::time_t) {
@@ -1102,6 +1107,10 @@ fn parse_local_date_range(s: &str) -> Result<DateRange, String> {
 
 #[cfg(unix)]
 fn local_date_range(year: i32, month: i32, day: i32) -> Result<DateRange, String> {
+    // SAFETY: mktime is a standard POSIX function that converts broken-down local time
+    // to calendar time. It modifies the tm struct in-place (normalizing fields) and
+    // returns -1 on error. We check the return value. The tm struct is zero-initialized
+    // via std::mem::zeroed() and then populated with valid date fields.
     unsafe fn mktime_local(mut tm: libc::tm) -> Result<libc::time_t, String> {
         tm.tm_isdst = -1;
         let t = libc::mktime(&mut tm as *mut libc::tm);
@@ -1112,6 +1121,8 @@ fn local_date_range(year: i32, month: i32, day: i32) -> Result<DateRange, String
         }
     }
 
+    // SAFETY: std::mem::zeroed() produces a valid all-zeros libc::tm struct.
+    // We then set the date fields to valid values before passing to mktime_local.
     unsafe {
         let mut tm0: libc::tm = std::mem::zeroed();
         tm0.tm_year = year - 1900;

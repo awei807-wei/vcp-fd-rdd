@@ -186,6 +186,10 @@ impl MmapIndex {
             return None;
         }
 
+        // SAFETY: We have already validated the rkyv archive via check_archived_root
+        // (stored in self.validated_rkyv OnceLock) which verified the byte layout is valid.
+        // archived_root simply reinterprets the validated bytes as the archived type
+        // without copying. The payload lifetime is tied to the MmapSnapshotV6 Arc.
         let archived = unsafe { rkyv::archived_root::<Vec<FileKeyEntry>>(payload) };
         let slice = archived.as_slice();
         let mut lo = 0usize;

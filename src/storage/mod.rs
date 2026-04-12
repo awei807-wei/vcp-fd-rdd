@@ -1,3 +1,4 @@
+pub mod checksum;
 pub mod mmap;
 pub mod serde;
 pub mod snapshot;

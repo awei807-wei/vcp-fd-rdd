@@ -176,13 +176,17 @@ impl FzfIntegration {
     }
 
     pub fn match_query(&self, keyword: &str, entries: Vec<FileMeta>) -> Vec<(FileMeta, i64)> {
+        let config = ScoreConfig::from_query(keyword);
         let mut results = Vec::new();
         for entry in entries {
-            if let Some(score) = self
+            if let Some(fuzzy_score) = self
                 .matcher
                 .fuzzy_match(&entry.path.to_string_lossy(), keyword)
             {
-                results.push((entry, score));
+                // 综合评分：fuzzy matcher 分数 + 排序权重（深度/噪声目录/隐藏文件等）
+                let rank_score = score_result(&entry, &config);
+                let combined = fuzzy_score + rank_score;
+                results.push((entry, combined));
             }
         }
         results.sort_by_key(|k| std::cmp::Reverse(k.1));
