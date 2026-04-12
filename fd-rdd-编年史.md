@@ -1,4 +1,4 @@
-# fd-rdd 编年史（立项 -> 2026-02-16）
+# fd-rdd 编年史（立项 -> 2026-04-12）
 
 > 目的：把“为什么这么做、先后顺序、关键分歧与落地结果”按时间线写清楚，便于对外讨论。
 
@@ -150,3 +150,50 @@
 - 在 manifest 中记录 `last_build_ts`（实现上为 `last_build_ns`）。
 - 冷启动加载 LSM 段之前，递归遍历 roots 下的目录树，仅对目录做 `stat`（不对文件做 `stat`），并在发现任意目录 `mtime > last_build_ns` 时 early-exit。
 - 一旦判 stale：不把旧 disk segments 挂载进查询链路（避免触页与脏结果），并触发后台 full rebuild 重建一致性。
+
+## 6. 2026-02-17：v0.4.0 语义锚定（身份合并）与查询/存储架构补强
+
+这一阶段的主题是：把“文件事件”从路径视角升级为身份视角，并用更强的层契约把后续演进钉死在可维护的轨道上。
+
+- 语义锚定：引入 `FileIdentifier`（路径/文件身份双来源），rename 升级为“双身份”语义，事件合并从“按路径覆盖”升级为“按身份归并 + path_hint”。
+- WAL 协议升级：WAL v2 以“非破坏性升级”方式落地（v1 seal 归档，回放端同时支持 v1/v2），避免线上升级把历史数据变成不可恢复状态。
+- 层契约明确：抽象出 `IndexLayer`（query_keys/get_meta）并写清契约，为后续 mmap layer、MergedView 的可替换性铺路。
+
+影响与结果：
+
+- rename/覆盖等现实文件系统语义不再被“路径最后写入者”误导，漂移窗口显著收敛。
+- 后续“多层索引合并”的复杂度被强制约束在明确的层边界内，不再靠散落的约定维持一致性。
+
+## 7. 2026-02-18：MergedView / Zero-copy 演进与测试锚定
+
+这一阶段的主题是：把“多段、多层、多版本”的现实，收敛成一个稳定可解释的查询视图，并把关键语义用测试钉死。
+
+- MergedView：v6 快照增加 FileKeyMap 段；PersistentIndex/MmapIndex 都实现 `IndexLayer`；TieredIndex 查询改为“FileKey newest→oldest 去重 + path 屏蔽集合”，对 rename-from tombstone、同路径替换写等场景更贴近用户预期。
+- Zero-copy Evolution：FileKeyMap 段加入 magic/header 与 rkyv gate，兼容 legacy 与 rkyv 双格式；rkyv 校验用 OnceLock 缓存，避免热路径重复线性校验。
+- 预过滤与回归：trigram 预过滤扩展到路径组件并引入哨兵能力探测，对旧段安全降级；新增级联查询覆盖语义回归测试，保证“新段覆盖旧段”的行为长期不退化。
+- LSM Hygiene：校验升级为 CRC32C 并兼容旧段；compaction/replace-base 走 live-only 重写，推动 tombstone 物理回收从“想法”变成“默认路径”。
+
+小结：到 v0.4.0 这一轮，系统从“可用”进一步走到“可演进”，关键语义有了结构化表达与可自动验证的锚点。
+
+## 8. 2026-03：从“可用”到“可治理”（内存观测、压测脚本与链路补齐）
+
+这一月的主题是：把难以讨论的现象变成可观测、可复现、可裁决的指标，并把 daemon/client 的链路从“能跑”补齐为“可长期用”。
+
+- 内存治理：围绕 RSS/Private_Dirty 的“高水位不回吐”问题，补齐 MemoryReport 拆项与归因口径（index_estimated/non-index PD/heap 高水位信号、disk tombstones 等），让“是否增长”从主观印象变成数据问题。
+- 压测与验收脚本化：fs-churn 增加 soak/plateau/verdict 等脚本与归因摘要，形成一键 PASS/FAIL 的最小验收闭环，并把 warmup/settle 等细节固化为可复现流程。
+- 守护进程链路：落地 UDS 流式查询与 fast-sync 语义，逐步把 overflow 的补偿从“必然全量 rebuild”迁移到“优先增量修复（必要时再重建）”。
+- 写入节奏治理：为周期性 flush 增加最小事件数/字节数门槛，小批次变更继续保留在 WAL/L2，避免段文件在低频波动下被碎片化增长。
+- 查询语义升级：引入 Query DSL（AND/OR/NOT/短语、doc/pic/video、ext/dm/size、wfn/regex + Smart-Case），让“写代码找文件”的表达力从单字符串跃迁到可组合语义。
+- 多索引源与隐藏项：明确多 `--root` 的使用方式，并提供 `--include-hidden` 作为显式开关，在保持默认行为的同时允许纳入 dotfiles/dotdirs。
+
+## 9. 2026-04：查询与安全收口（验证器补强、fuzzy 接入、排序重构、模块拆分）
+
+这一月的主题是：对外体验与安全边界同步收口，同时把核心模块拆开，为后续继续迭代留出工程空间。
+
+- 可靠性补强：DAG 规划器与 verifier 从“占位/空壳”升级为可用实现（拓扑、并行层、缺口检测），并接入 overflow/recovery 链路，减少隐性漂移。
+- fuzzy 查询接入：`FzfIntegration` 同时接入 HTTP `/search`、UDS 协议与 `fd-rdd-query` 客户端，新增显式 `mode=fuzzy`，并把 fuzzy 分数与 rank 分数做综合排序。
+- 性能与安全修复：提升 event channel 默认容量应对批量变更；dirty flag 改为 AtomicBool 消除竞态；PersistentIndex 查询增加 limit 防止无界结果；trigram 交集优化降低持锁成本；DocId 溢出改为显式失败而非静默截断。
+- 对外接口增强：补齐更多过滤器与排序/高亮等查询体验要素，并提供即时扫描 API 以支持“对指定目录立刻索引”的交互需求。
+- 安全收口（2026-04-12）：HTTP 默认监听改为 `127.0.0.1`；`--root` 改为必传并移除默认遍历 `$HOME`；`fd-rdd-query --spawn` 透传 root，避免 daemon 无 root 误扫。
+- 评分体系重构（2026-04-12）：从“深度主导”升级为多维启发式（match quality × basename 乘子 + 边界感知 + Smart dot-file + node_modules 动态隔离，深度降级为 tiebreaker），解决深层项目中“浅层无关结果抢榜”的常见失败。
+- 工程结构：将超大单文件 `tiered.rs` 拆分为 13 个子模块，职责分离，降低后续改动成本与回归风险。
