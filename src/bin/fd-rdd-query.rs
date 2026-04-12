@@ -35,9 +35,13 @@ struct Args {
     #[arg(long, value_enum, default_value_t = QueryModeArg::Exact)]
     mode: QueryModeArg,
 
-    /// 若连不上 socket，尝试自动拉起 fd-rdd Daemon（`fd-rdd --uds-socket <PATH>`）
+    /// 若连不上 socket，尝试自动拉起 fd-rdd Daemon（`fd-rdd --uds-socket <PATH> --root <PATH>`）
     #[arg(long)]
     spawn: bool,
+
+    /// spawn 时传给 fd-rdd 的索引根目录（可重复；--spawn 时必须至少指定一个）
+    #[arg(long = "root", value_name = "PATH")]
+    roots: Vec<PathBuf>,
 
     /// 查询表达式（支持 AND/OR/NOT/过滤器；详见 README）
     query: String,
@@ -62,11 +66,19 @@ async fn main() -> anyhow::Result<()> {
     let mut stream = match UnixStream::connect(&socket).await {
         Ok(s) => s,
         Err(e) if args.spawn => {
+            if args.roots.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "--spawn 需要至少指定一个 --root <PATH> 作为索引根目录"
+                ));
+            }
             // best-effort：按需拉起 daemon；失败则继续返回原错误。
-            let _ = std::process::Command::new("fd-rdd")
-                .arg("--uds-socket")
-                .arg(socket.to_string_lossy().to_string())
-                .spawn();
+            let mut cmd = std::process::Command::new("fd-rdd");
+            cmd.arg("--uds-socket")
+                .arg(socket.to_string_lossy().to_string());
+            for root in &args.roots {
+                cmd.arg("--root").arg(root);
+            }
+            let _ = cmd.spawn();
 
             // 等待 socket 可用（最多 5s）
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

@@ -231,132 +231,11 @@ fn compute_file_checksum_with(
     Ok(hasher.finalize())
 }
 
-enum Checksum32 {
-    Simple(SimpleChecksum),
-    Crc32c(Crc32c),
-}
-
-impl Checksum32 {
-    fn update(&mut self, data: &[u8]) {
-        match self {
-            Checksum32::Simple(s) => s.update(data),
-            Checksum32::Crc32c(c) => c.update(data),
-        }
-    }
-
-    fn finalize(self) -> u32 {
-        match self {
-            Checksum32::Simple(s) => s.finalize(),
-            Checksum32::Crc32c(c) => c.finalize(),
-        }
-    }
-}
-
-struct SimpleChecksum {
-    hash: u32,
-    pending: [u8; 4],
-    pending_len: usize,
-}
-
-impl SimpleChecksum {
-    fn new() -> Self {
-        Self {
-            hash: 0,
-            pending: [0u8; 4],
-            pending_len: 0,
-        }
-    }
-
-    fn update(&mut self, mut data: &[u8]) {
-        if self.pending_len > 0 {
-            let need = 4 - self.pending_len;
-            let take = need.min(data.len());
-            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&data[..take]);
-            self.pending_len += take;
-            data = &data[take..];
-
-            if self.pending_len == 4 {
-                self.process_chunk(self.pending);
-                self.pending_len = 0;
-                self.pending = [0u8; 4];
-            }
-        }
-
-        while data.len() >= 4 {
-            let chunk: [u8; 4] = data[..4].try_into().expect("slice len checked");
-            self.process_chunk(chunk);
-            data = &data[4..];
-        }
-
-        if !data.is_empty() {
-            self.pending[..data.len()].copy_from_slice(data);
-            self.pending_len = data.len();
-        }
-    }
-
-    fn finalize(mut self) -> u32 {
-        if self.pending_len > 0 {
-            let mut buf = [0u8; 4];
-            buf[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
-            self.process_chunk(buf);
-        }
-        self.hash
-    }
-
-    fn process_chunk(&mut self, chunk: [u8; 4]) {
-        self.hash = self.hash.wrapping_add(u32::from_le_bytes(chunk));
-        self.hash = self.hash.rotate_left(7);
-    }
-}
-
-/// CRC32C (Castagnoli) 校验：u32 输出，支持流式 update。
-///
-/// 说明：
-/// - 初值 0xFFFF_FFFF，finalize 取反（标准 CRC32C 约定）
-/// - 使用 reflected 多项式 0x82F63B78
-struct Crc32c {
-    state: u32,
-}
-
-impl Crc32c {
-    fn new() -> Self {
-        Self { state: 0xFFFF_FFFF }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        for &b in data {
-            let idx = (self.state as u8) ^ b;
-            self.state = (self.state >> 8) ^ CRC32C_TABLE[idx as usize];
-        }
-    }
-
-    fn finalize(self) -> u32 {
-        !self.state
-    }
-}
-
-// CRC32C 查表（reflected poly = 0x82F63B78）
-const CRC32C_TABLE: [u32; 256] = {
-    const POLY: u32 = 0x82F6_3B78;
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (POLY & mask);
-            j += 1;
-        }
-        table[i] = crc;
-        i += 1;
-    }
-    table
-};
+use crate::storage::checksum::{Checksum32, Crc32c, SimpleChecksum, simple_checksum};
 
 struct ChecksumWriter<'a, W: Write> {
     inner: &'a mut W,
-    checksum: SimpleChecksum,
+    checksum: Crc32c,
     bytes: u64,
 }
 
@@ -364,7 +243,7 @@ impl<'a, W: Write> ChecksumWriter<'a, W> {
     fn new(inner: &'a mut W) -> Self {
         Self {
             inner,
-            checksum: SimpleChecksum::new(),
+            checksum: Crc32c::new(),
             bytes: 0,
         }
     }
@@ -699,7 +578,10 @@ impl SnapshotStore {
         let roots = decode_roots_segment(&roots_bytes).unwrap_or_default();
 
         // finally mmap (keep cold)
-        let mmap = unsafe { Mmap::map(&file)? };
+        // SAFETY: The file is opened read-only and we use map_copy_read_only (MAP_PRIVATE)
+        // so that external modifications to the file after mapping do not affect
+        // the process memory. The mapping lifetime is tied to the Arc<Mmap>.
+        let mmap = unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file)? };
         let mmap = std::sync::Arc::new(mmap);
 
         Ok(Some(MmapSnapshotV6 {
@@ -888,7 +770,9 @@ impl SnapshotStore {
         // 5) fsync(dir) — 确保目录项更新落盘
         if let Some(parent) = path.parent() {
             if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
+                if let Err(e) = dir.sync_all() {
+                    tracing::warn!("fsync directory failed: {e}");
+                }
             }
         }
 
@@ -1025,7 +909,9 @@ impl SnapshotStore {
         std::fs::rename(&tmp_path, &path)?;
         if let Some(parent) = path.parent() {
             if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
+                if let Err(e) = dir.sync_all() {
+                    tracing::warn!("fsync directory failed: {e}");
+                }
             }
         }
 
@@ -1042,7 +928,7 @@ impl SnapshotStore {
 // LSM directory layout (Manifest + segments)
 
 const LSM_MANIFEST_MAGIC: u32 = 0x314D_534C; // "LSM1" little-endian
-const LSM_MANIFEST_VERSION: u32 = 3;
+const LSM_MANIFEST_VERSION: u32 = 4;
 const LSM_MANIFEST_HEADER_SIZE: usize = 4 + 4 + 4 + 4; // magic + ver + body_len + checksum
 
 // Safety guards: these values are read from disk; cap to avoid OOM on corrupted files.
@@ -1135,6 +1021,7 @@ fn lsm_decode_manifest_body(body: &[u8]) -> anyhow::Result<LsmManifest> {
 }
 
 fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
+    use crate::storage::checksum::crc32c_checksum;
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut hdr = [0u8; LSM_MANIFEST_HEADER_SIZE];
@@ -1143,7 +1030,7 @@ fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
     let ver = u32::from_le_bytes(hdr[4..8].try_into()?);
     let body_len = u32::from_le_bytes(hdr[8..12].try_into()?) as usize;
     let checksum = u32::from_le_bytes(hdr[12..16].try_into()?);
-    if magic != LSM_MANIFEST_MAGIC || !(ver == 1 || ver == 2 || ver == LSM_MANIFEST_VERSION) {
+    if magic != LSM_MANIFEST_MAGIC || !(ver == 1 || ver == 2 || ver == 3 || ver == LSM_MANIFEST_VERSION) {
         anyhow::bail!("LSM manifest magic/version mismatch");
     }
     if body_len > MAX_LSM_MANIFEST_BODY_BYTES {
@@ -1156,7 +1043,24 @@ fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
     }
     let mut body = vec![0u8; body_len];
     f.read_exact(&mut body)?;
-    if simple_checksum(&body) != checksum {
+
+    // v4+ uses CRC32C; v1-v3 use legacy SimpleChecksum
+    let checksum_ok = if ver >= 4 {
+        crc32c_checksum(&body) == checksum
+    } else {
+        if simple_checksum(&body) == checksum {
+            tracing::warn!(
+                "Loading legacy LSM manifest v{} from {}; consider upgrading to v{} (CRC32C)",
+                ver,
+                path.display(),
+                LSM_MANIFEST_VERSION
+            );
+            true
+        } else {
+            false
+        }
+    };
+    if !checksum_ok {
         anyhow::bail!("LSM manifest checksum mismatch");
     }
     lsm_decode_manifest_body(&body)
@@ -1171,9 +1075,10 @@ fn now_unix_nanos() -> u64 {
 }
 
 fn lsm_write_manifest_atomic(path: &Path, m: &LsmManifest) -> anyhow::Result<()> {
+    use crate::storage::checksum::crc32c_checksum;
     let body = lsm_encode_manifest_body(m);
     let body_len: u32 = body.len().try_into().unwrap_or(u32::MAX);
-    let checksum = simple_checksum(&body);
+    let checksum = crc32c_checksum(&body);
 
     let tmp = path.with_extension("bin.tmp");
     let mut f = std::fs::File::create(&tmp)?;
@@ -1546,12 +1451,7 @@ impl crate::storage::traits::WalFactory for SnapshotStore {
     }
 }
 
-/// 简单校验和（非加密，仅用于完整性检测）
-fn simple_checksum(data: &[u8]) -> u32 {
-    let mut c = SimpleChecksum::new();
-    c.update(data);
-    c.finalize()
-}
+// simple_checksum is now imported from crate::storage::checksum
 
 #[cfg(test)]
 mod tests {

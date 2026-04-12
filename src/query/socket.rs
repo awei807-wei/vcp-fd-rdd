@@ -38,6 +38,8 @@ mod imp {
     impl PeerAuthPolicy {
         fn current_process() -> Self {
             Self {
+                // SAFETY: libc::geteuid() and libc::getegid() are simple syscalls that return
+                // the effective user/group ID. They have no failure mode and require no preconditions.
                 owner_uid: unsafe { libc::geteuid() },
                 owner_gid: unsafe { libc::getegid() },
                 allow_root: true,
@@ -118,14 +120,22 @@ mod imp {
         ) -> anyhow::Result<()> {
             let path: PathBuf = path.to_path_buf();
             if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!("Failed to create socket parent dir {}: {e}", parent.display());
+                }
             }
-            let _ = std::fs::remove_file(&path);
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("Failed to remove old socket file {}: {e}", path.display());
+                }
+            }
             let listener = UnixListener::bind(&path)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!("Failed to set socket permissions on {}: {e}", path.display());
+                }
             }
             tracing::info!("Unix Socket Server listening on {}", path.display());
 
@@ -145,7 +155,11 @@ mod imp {
                 }
             }
 
-            let _ = std::fs::remove_file(&path);
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("Failed to remove socket file on shutdown {}: {e}", path.display());
+                }
+            }
             Ok(())
         }
     }

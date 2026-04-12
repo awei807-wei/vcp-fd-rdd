@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
+use crate::storage::checksum::crc32c_checksum;
 
 const WAL_MAGIC: u32 = 0x314C_4157; // "WAL1"
-const WAL_VERSION: u32 = 2;
+const WAL_VERSION: u32 = 3;
 
 // Safety guard: WAL records are expected to be small (path + metadata). Treat any huge length as
 // corruption to avoid memory DoS via `vec![0u8; len]`.
@@ -20,9 +21,12 @@ fn now_seal_id() -> u64 {
         .unwrap_or(0)
 }
 
+fn wal_checksum(data: &[u8]) -> u32 {
+    crc32c_checksum(data)
+}
+
+/// Legacy WAL checksum (used in v1/v2 WAL files).
 fn crc32_simple(data: &[u8]) -> u32 {
-    // 复用 snapshot.rs 的 SimpleChecksum 语义：轻量、足够发现截断/随机翻转。
-    // 不是强校验（非 cryptographic）。
     let mut s: u32 = 0;
     for &b in data {
         s = s.wrapping_add(b as u32);
@@ -167,11 +171,11 @@ impl WalStore {
         if events.is_empty() {
             return Ok(());
         }
-        let mut f = self.file.lock().unwrap();
+        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
         for ev in events {
             let payload = encode_event(ev);
             let len: u32 = payload.len().try_into().unwrap_or(u32::MAX);
-            let crc = crc32_simple(&payload);
+            let crc = wal_checksum(&payload);
             f.write_all(&len.to_le_bytes())?;
             f.write_all(&crc.to_le_bytes())?;
             f.write_all(&payload[..len as usize])?;
@@ -183,7 +187,7 @@ impl WalStore {
     /// seal：把当前 WAL rename 成 sealed 文件，并创建新的空 WAL。
     /// 返回 seal_id（用于与 manifest checkpoint 关联）。
     pub fn seal(&self) -> anyhow::Result<u64> {
-        let mut f = self.file.lock().unwrap();
+        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
         f.flush()?;
 
         let id = now_seal_id();
@@ -196,7 +200,7 @@ impl WalStore {
         }
 
         let newf = open_or_init(&self.current)?;
-        *self.file.lock().unwrap() = newf;
+        *self.file.lock().unwrap_or_else(|e| e.into_inner()) = newf;
         Ok(id)
     }
 
@@ -209,7 +213,9 @@ impl WalStore {
             let p = ent.path();
             if let Some(id) = parse_seal_id(&p) {
                 if id <= seal_id {
-                    let _ = std::fs::remove_file(p);
+                    if let Err(e) = std::fs::remove_file(&p) {
+                        tracing::warn!("Failed to remove sealed WAL {}: {e}", p.display());
+                    }
                 }
             }
         }
@@ -332,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_v1_file_is_sealed_and_replayed_after_upgrade_to_v2() {
+    fn wal_v1_file_is_sealed_and_replayed_after_upgrade_to_v3() {
         let dir = unique_tmp_dir("upgrade");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -366,7 +372,7 @@ mod tests {
             f.flush().unwrap();
         }
 
-        // 打开时应触发 v1 -> v2 非破坏性升级（rename 为 sealed-*.v1）
+        // 打开时应触发 v1 -> v3 非破坏性升级（rename 为 sealed-*.v1）
         let wal = WalStore::open_in_dir(dir.clone()).unwrap();
 
         let sealed_v1 = std::fs::read_dir(&dir)
@@ -425,15 +431,16 @@ fn open_or_init(path: &Path) -> anyhow::Result<File> {
 
     let magic = u32::from_le_bytes(hdr[0..4].try_into()?);
     let ver = u32::from_le_bytes(hdr[4..8].try_into()?);
-    if magic == WAL_MAGIC && ver == 1 && WAL_VERSION == 2 {
-        // v1 -> v2：非破坏性升级
+    if magic == WAL_MAGIC && (ver == 1 || ver == 2) && WAL_VERSION == 3 {
+        // v1/v2 -> v3：非破坏性升级
         // 关键点：绝不能 truncate，否则会丢事件。
         drop(f);
         let id = now_seal_id();
+        let suffix = if ver == 1 { ".v1" } else { ".v2" };
         let sealed = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join(format!("events.wal.seal-{id:016x}.v1"));
+            .join(format!("events.wal.seal-{id:016x}{suffix}"));
         std::fs::rename(path, &sealed)?;
 
         let mut nf = OpenOptions::new()
@@ -451,8 +458,8 @@ fn open_or_init(path: &Path) -> anyhow::Result<File> {
             .read(true)
             .append(true)
             .open(path)?;
-    } else if magic != WAL_MAGIC || (ver != 1 && ver != 2) {
-        // 不兼容：truncate 重新开始（保守）。v1/v2 以外视为垃圾文件。
+    } else if magic != WAL_MAGIC || (ver != 1 && ver != 2 && ver != 3) {
+        // 不兼容：truncate 重新开始（保守）。v1/v2/v3 以外视为垃圾文件。
         let mut nf = OpenOptions::new()
             .create(true)
             .write(true)
@@ -502,8 +509,16 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, usize)> {
     }
     let magic = u32::from_le_bytes(hdr[0..4].try_into()?);
     let ver = u32::from_le_bytes(hdr[4..8].try_into()?);
-    if magic != WAL_MAGIC || (ver != 1 && ver != 2) {
+    if magic != WAL_MAGIC || (ver != 1 && ver != 2 && ver != 3) {
         return Ok((Vec::new(), 0));
+    }
+
+    if ver == 1 || ver == 2 {
+        tracing::warn!(
+            "Loading legacy WAL v{} from {}; consider upgrading to v3 (CRC32C)",
+            ver,
+            path.display()
+        );
     }
 
     let mut out = Vec::new();
@@ -511,7 +526,8 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, usize)> {
     let mut pos: u64 = 8; // header consumed
     loop {
         let mut lb = [0u8; 8];
-        if let Err(_) = f.read_exact(&mut lb) {
+        if f.read_exact(&mut lb).is_err() {
+            // EOF or truncated header: normal end of file
             break;
         }
         pos = pos.saturating_add(8);
@@ -522,17 +538,29 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, usize)> {
             break;
         }
         let mut buf = vec![0u8; len];
-        if let Err(_) = f.read_exact(&mut buf) {
+        if f.read_exact(&mut buf).is_err() {
+            // Truncated payload: real IO error, stop reading
             truncated_tail += 1;
             break;
         }
         pos = pos.saturating_add(len as u64);
-        if crc32_simple(&buf) != crc {
-            // 校验失败：视为截断/损坏，停止读取（保守）。
+
+        // CRC verification: v3 uses CRC32C, v1/v2 use legacy crc32_simple
+        let crc_ok = if ver >= 3 {
+            crc32c_checksum(&buf) == crc
+        } else {
+            crc32_simple(&buf) == crc
+        };
+
+        if !crc_ok {
+            // CRC mismatch: skip this record and continue to the next one
             truncated_tail += 1;
-            break;
+            continue;
         }
-        if let Some(ev) = decode_event(ver, &buf) {
+
+        // Decode version: v3 uses v2 encoding format
+        let decode_ver = if ver >= 3 { 2 } else { ver };
+        if let Some(ev) = decode_event(decode_ver, &buf) {
             out.push(ev);
         }
     }

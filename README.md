@@ -8,7 +8,40 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前 tests 分支发布版本为 v0.5.2（运行时路径隔离、ignore 规则贯通、存储层抽象与健康检查扩展）。
+> 当前 tests 分支发布版本为 v0.5.4（数据完整性加固、错误处理强化、依赖优化、测试覆盖补全）。
+
+## v0.5.4 更新
+
+- **数据完整性加固**：
+  - 快照与 WAL 全面升级为 CRC32C 校验（替换旧版 SimpleChecksum 玩具校验），有效防止数据损坏
+  - mmap 快照加载后持续校验文件状态，防止外部篡改导致内存安全问题
+  - WAL 读取遇到损坏记录时跳过坏记录并继续处理后续事件，避免一条坏记录丢失所有增量数据
+- **错误处理强化**：
+  - 文件锁、IO 操作、解析错误全面补充兜底处理，避免 unwrap/expect 导致守护进程崩溃
+  - 清理旧文件、删除 socket 等操作失败时输出带上下文的警告日志，不再静默吞错误
+  - 锁 poison 处理改为兼容模式，单个线程 panic 不会导致整个进程崩溃
+- **依赖优化**：tokio 从 full 特性改为按需引用（rt-multi-thread、sync、fs、time、signal），显著减小二进制体积
+- **测试覆盖补全**：新增 10 个 P1 级测试模块，覆盖符号链接安全、ignore 规则、多 root 隔离、事件处理、WAL/快照恢复、LSM compaction、查询过滤、watch 降级等核心场景
+- **符号链接安全**：新增 `--follow-symlinks`（默认 false）配置项，防止 Steam Proton 等场景递归索引整个根目录；开启时自动检测循环软链避免死循环
+- **代码规范**：mmap unsafe 代码补充 SAFETY 注释，说明安全边界；legacy 校验算法加版本告警，引导用户升级
+
+## v0.5.3 更新
+
+- **安全加固**：HTTP 服务默认监听 `127.0.0.1`（原为 `0.0.0.0`），仅接受本地连接
+- **CLI 安全收口**：`--root` 改为必传参数，不传时报错退出；移除"默认遍历 $HOME"行为
+- **--spawn 根目录透传**：`fd-rdd-query --spawn` 拉起 daemon 时透传 `--root`，避免 daemon 无 root 时报错
+- **核心模块拆分**：`tiered.rs`（3151 行）拆分为 13 个子模块（arena / disk_layer / query_plan / rebuild / events / snapshot / compaction / sync / memory / load / query / tests / mod），提升可维护性
+- **搜索排序重构**：评分引擎升级为多维启发式系统（Multi-factor Heuristics）
+  - 核心公式：`FinalScore = (MatchQuality × BasenameMultiplier) + BoundaryBonus - LengthPenalty - ContextPenalty`
+  - 深度降级为 Tiebreaker（每层仅 -0.5 分），不再是主权重
+  - Basename 命中时匹配质量 ×2.5
+  - "单词起始位"感应：边界字符（`.`/`-`/`_`/` `）后匹配 +12、CamelCase 过渡 +8
+  - "完美边界"翻倍：匹配前一字符为 `.` 或 `/` 时，整体质量 ×2
+  - Smart Dot-file 处理：query 含 `.` 或 basename 命中时豁免隐藏目录降权
+  - node_modules 物理隔离：query 不含 `"node"` 时权重 ×0.1（近乎屏蔽但仍可搜）
+  - 噪声目录（`target`/`cache`/`vendor` 等）-200 分
+  - query 含路径分隔符时自动跳过深度和噪声目录惩罚
+  - fuzzy 搜索整合 rank score（matcher score + rank score 综合排序）
 
 ## v0.5.3 更新
 
@@ -228,7 +261,7 @@ cargo build --release --no-default-features
 
 说明：
 
-- `--root` 可重复传入，用于覆盖多个索引源。
+- `--root` 可重复传入，用于覆盖多个索引源。**v0.5.3 起 `--root` 为必传参数**，不传时程序报错退出。
 - 默认 `--snapshot-path` / `--uds-socket` 会优先落到 `$XDG_RUNTIME_DIR/fd-rdd/`，回退 `/run/user/$UID/fd-rdd/`，最后才使用 `/tmp/fd-rdd-$UID...`，避免多用户互相冲突。
 - 默认会跳过 `.` 开头的文件/目录；如需将 dotfiles / dotdirs 纳入冷启动全扫、后台重建与增量补扫，请显式加 `--include-hidden`。
 - 默认会读取 `.gitignore`、`.ignore`、`.git/info/exclude` 和全局 gitignore；如需关闭这套规则，可显式传入 `--no-ignore`。
@@ -245,15 +278,15 @@ curl -G "http://127.0.0.1:6060/search" --data-urlencode "q=mdt" --data-urlencode
 UDS 流式查询（推荐用于大结果集；边收边输出，不聚合）：
 
 ```bash
-./target/release/fd-rdd-query --socket /tmp/fd-rdd.sock --limit 2000 "main.rs"
-./target/release/fd-rdd-query --socket /tmp/fd-rdd.sock --spawn --limit 2000 "*.rs"
-./target/release/fd-rdd-query --socket /tmp/fd-rdd.sock --mode fuzzy --limit 200 "mdt"
+./target/release/fd-rdd-query --socket /tmp/fd-rdd.sock --limit 2000 “main.rs”
+./target/release/fd-rdd-query --socket /tmp/fd-rdd.sock --spawn --root /path/to/scan --limit 2000 “*.rs”
+./target/release/fd-rdd-query --socket /tmp/fd-rdd.sock --mode fuzzy --limit 200 “mdt”
 ```
 
 说明：
 
-- UDS 服务除 socket 文件 `0600` 外，还会校验 peer credential；默认仅接受“同一有效 UID”或 `root` 发起的连接，单独的同 GID 不构成放行条件。
-- `fd-rdd-query --spawn` 会在 socket 不可达时尝试按当前 socket 路径拉起 `fd-rdd` 守护进程。
+- UDS 服务除 socket 文件 `0600` 外，还会校验 peer credential；默认仅接受”同一有效 UID”或 `root` 发起的连接，单独的同 GID 不构成放行条件。
+- `fd-rdd-query --spawn` 会在 socket 不可达时尝试按当前 socket 路径拉起 `fd-rdd` 守护进程。**v0.5.3 起需同时指定 `--root`**，用于告知 daemon 索引哪些目录。
 - `mode=exact` 下的 1-2 字符短查询会先走“短组件候选索引”再做精确过滤，减少退化全扫的概率。
 - `PathArena` 当前仍以 `path_len: u16` 编码路径；root-relative 路径超过 `65535` bytes 时会跳过该条索引并输出告警，而不是写入损坏占位记录。
 
@@ -367,7 +400,7 @@ python3 scripts/fs-churn.py \
 ## TODO
 ### 展望
 - [ ] 补齐 `~/.config/fd-rdd/config.toml` 的全量字段接线；当前优先级已经是 `CLI > 配置文件 > 默认值`，但 `http_port`、`snapshot_interval_secs`、`include_hidden`、`log_level` 等仍未全部贯通到启动路径。
-- [ ] 提供 `systemd --user` 单元模板和更稳妥的守护进程自启约定；同时收口 `fd-rdd-query --spawn` 在“无显式 root/config”场景下的安全默认，避免误扫整个 `$HOME`。
+- [ ] 提供 `systemd --user` 单元模板和更稳妥的守护进程自启约定；同时收口 `fd-rdd-query --spawn` 在”无显式 root/config”场景下的安全默认，避免误扫整个 `$HOME`。
 - [ ] 完成 `content:` 全文索引，复用现有全局 `DocId`、事件增量链路以及 LSM + mmap 存储布局。
 - [ ] 为全文索引补齐内容过滤策略：大文件阈值、二进制文件跳过、ignore 规则复用、内容哈希去重。
 ### 缺陷

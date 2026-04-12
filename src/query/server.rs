@@ -138,7 +138,7 @@ impl QueryServer {
             .route("/scan", post(scan_handler))
             .with_state(state);
 
-        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
         tracing::info!("HTTP Query Server listening on port {}", port);
         axum::serve(listener, app).await?;
         Ok(())

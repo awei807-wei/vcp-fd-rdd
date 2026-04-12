@@ -1,6 +1,6 @@
 [package]
 name = "fd-rdd"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 authors = ["Piko & Aegis"]
 description = "Event-driven elastic file indexer with RDD lineage"
@@ -16,7 +16,7 @@ crossbeam = "0.8"
 arc-swap = "1.6"
 
 # 异步运行时
-tokio = { version = "1.35", features = ["full", "rt-multi-thread"] }
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "signal", "sync", "fs"] }
 
 # Web 接口 (Axum)
 axum = "0.7"

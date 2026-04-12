@@ -8,12 +8,16 @@ pub fn maybe_trim_rss() {
     extern "C" {
         fn mi_collect(force: bool);
     }
+    // SAFETY: mi_collect is a well-defined mimalloc API that triggers garbage collection.
+    // It is safe to call at any time; the `force` parameter requests aggressive collection.
     unsafe { mi_collect(true) };
 }
 
 #[cfg(all(not(feature = "mimalloc"), target_os = "linux", target_env = "gnu"))]
 pub fn maybe_trim_rss() {
     // glibc malloc 的主动回吐：释放尽可能多的空闲块回 OS。
+    // SAFETY: libc::malloc_trim(0) is a glibc extension that releases free memory back to
+    // the OS. The argument 0 means "trim as much as possible". It is safe to call at any time.
     unsafe {
         libc::malloc_trim(0);
     }
