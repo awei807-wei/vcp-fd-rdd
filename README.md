@@ -347,11 +347,12 @@ python3 scripts/fs-churn.py \
 ```
 
 ## TODO
-
+### 展望
 - 补齐 `~/.config/fd-rdd/config.toml` 的全量字段接线；当前优先级已经是 `CLI > 配置文件 > 默认值`，但 `http_port`、`snapshot_interval_secs`、`include_hidden`、`log_level` 等仍未全部贯通到启动路径。
 - 提供 `systemd --user` 单元模板和更稳妥的守护进程自启约定；同时收口 `fd-rdd-query --spawn` 在“无显式 root/config”场景下的安全默认，避免误扫整个 `$HOME`。
 - 完成 `content:` 全文索引，复用现有全局 `DocId`、事件增量链路以及 LSM + mmap 存储布局。
 - 为全文索引补齐内容过滤策略：大文件阈值、二进制文件跳过、ignore 规则复用、内容哈希去重。
+### 缺陷
 - 旧版本快照、WAL 使用自研的SimpleChecksum做校验，本质是字节累加 + 简单旋转的玩具校验，碰撞概率极高，根本无法有效识别数据 corruption
 - mmap 快照存在严重的内存安全隐患：仅在加载时做了一次校验，加载完成后就不再管文件状态 ——mmap 是共享文件映射，外部程序修改快照文件会直接篡改进程的内存，随时可能触发越界访问、进程 panic，甚至更严重的内存安全问题，完全不符合 “可恢复” 能力。
 - WAL 的错误处理逻辑极端脆弱：读取 WAL 时只要碰到一条损坏记录，直接中断整个读取流程，后面所有的增量事件全部丢弃，一条坏记录就能丢光所有后续的变更数据，
@@ -359,7 +360,7 @@ python3 scripts/fs-churn.py \
 - 大量静默吞错误：清理旧 sealed 文件、清理 socket 文件时，全用let _ = xxx忽略错误，删除失败连警告日志都没有，用户碰到磁盘满、权限不足的情况，完全得不到提醒，旧文件堆着占满磁盘都不知道。
 - tokio 直接启用了full全量特性，把大量用不到的功能打包进二进制，完全不会按需启用特性，导致最终编译出的程序体积巨大。
 - 整个测试目录只有两个测试文件，核心的事件处理、WAL 恢复、mmap 安全校验全没有自动化测试。
-
+- 添加配置项 --follow-symlinks（默认 false），在 walker 和事件监听层禁用符号链接跟随，防止 Steam Proton 的 dosdevices/z: 递归索引整个根目录。
 ## 许可证
 
 MIT License (c) 2026 fd-rdd Contributors
