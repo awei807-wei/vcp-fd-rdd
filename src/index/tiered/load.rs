@@ -5,7 +5,6 @@ use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::index::mmap_index::MmapIndex;
-use crate::storage::snapshot::LoadedSnapshot;
 use crate::storage::traits::StorageBackend;
 
 use super::arena::{deleted_paths_stats, path_arena_set_from_paths, PathArenaSet};
@@ -252,22 +251,7 @@ impl TieredIndex {
         }
 
         let l2 = match store.load_if_valid().await {
-            Ok(Some(LoadedSnapshot::V5(snap))) => {
-                tracing::info!("Loaded index snapshot v5: {} docs", snap.metas.len());
-                PersistentIndex::from_snapshot_v5(snap, roots.clone())
-            }
-            Ok(Some(LoadedSnapshot::V4(snap))) => {
-                tracing::info!("Loaded index snapshot v4: {} docs", snap.metas.len());
-                PersistentIndex::from_snapshot_v4(snap, roots.clone())
-            }
-            Ok(Some(LoadedSnapshot::V3(snap))) => {
-                tracing::info!("Loaded index snapshot v3: {} files", snap.files.len());
-                PersistentIndex::from_snapshot_v3(snap, roots.clone())
-            }
-            Ok(Some(LoadedSnapshot::V2(snap))) => {
-                tracing::info!("Loaded index snapshot v2: {} files", snap.files.len());
-                PersistentIndex::from_snapshot_v2(snap, roots.clone())
-            }
+            Ok(Some(snap)) => snap.into_persistent_index(roots.clone()),
             Ok(None) => {
                 tracing::info!("No valid snapshot, starting with empty index");
                 PersistentIndex::new_with_roots(roots.clone())

@@ -76,17 +76,21 @@ impl IgnoreFilter {
     /// If the path doesn't belong to any known root, it is *not* ignored.
     pub fn is_ignored(&self, path: &Path) -> bool {
         let is_dir = path.is_dir();
-        if !self.global.is_empty()
-            && self
-                .global
-                .matched_path_or_any_parents(path, is_dir)
-                .is_ignore()
-        {
-            return true;
+
+        if !self.global.is_empty() {
+            let global_root = self.global.path();
+            if path.starts_with(global_root) {
+                let rel = path.strip_prefix(global_root).unwrap_or(path);
+                if self.global.matched_path_or_any_parents(rel, is_dir).is_ignore() {
+                    return true;
+                }
+            }
         }
+
         for (root, gi) in &self.matchers {
             if path.starts_with(root) {
-                if gi.matched_path_or_any_parents(path, is_dir).is_ignore() {
+                let rel = path.strip_prefix(root).unwrap_or(path);
+                if gi.matched_path_or_any_parents(rel, is_dir).is_ignore() {
                     return true;
                 }
             }
