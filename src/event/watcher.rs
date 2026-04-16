@@ -98,7 +98,7 @@ mod tests {
         let drops = AtomicU64::new(0);
         let rescans = AtomicU64::new(0);
         let (tx, _rx) = mpsc::channel(16);
-        let dirty = DirtyTracker::new(16);
+        let dirty = DirtyTracker::new(16, vec![]);
 
         let ev = notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
         handle_notify_result(&tx, Some(dirty.as_ref()), &drops, &rescans, Ok(ev));

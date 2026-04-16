@@ -157,7 +157,7 @@ impl EventPipeline {
         let roots = self.index.roots.clone();
         let overflow_drops = self.overflow_drops.clone();
         let rescan_signals = self.rescan_signals.clone();
-        let dirty = DirtyTracker::new(self.channel_size.saturating_mul(4).max(1024));
+        let dirty = DirtyTracker::new(self.channel_size.saturating_mul(4).max(1024), roots.clone());
         let keep_cap = self.channel_size.max(256);
         let (mut rx, mut watcher) = EventWatcher::start(
             &roots,

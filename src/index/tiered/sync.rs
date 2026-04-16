@@ -343,11 +343,20 @@ impl TieredIndex {
             DirtyScope::All { cutoff_ns } => {
                 collect_dirs_changed_since(&self.roots, ignore_prefixes, cutoff_ns)
             }
-            DirtyScope::Dirs { dirs, .. } => {
-                let mut v = dirs;
-                v.sort();
-                v.dedup();
-                v
+            DirtyScope::Dirs { dirs, cutoff_ns } => {
+                let root_set: HashSet<_> = self.roots.iter().cloned().collect();
+                let (root_dirs, leaf_dirs): (Vec<_>, Vec<_>) =
+                    dirs.into_iter().partition(|d| root_set.contains(d));
+
+                let mut out = if !root_dirs.is_empty() {
+                    collect_dirs_changed_since(&root_dirs, ignore_prefixes, cutoff_ns)
+                } else {
+                    Vec::new()
+                };
+                out.extend(leaf_dirs);
+                out.sort();
+                out.dedup();
+                out
             }
         };
 
