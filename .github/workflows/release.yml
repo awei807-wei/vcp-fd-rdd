@@ -12,11 +12,11 @@ jobs:
     strategy:
       matrix:
         target:
+          - x86_64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
-    
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -24,21 +24,19 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross
-        run: cargo install cross
+        run: cargo install cross --locked
 
       - name: Build with cross
-        run: |
-          cd fd-rdd
-          cross build --release --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
-          cd fd-rdd/target/${{ matrix.target }}/release
-          tar -czvf fd-rdd-${{ matrix.target }}.tar.gz fd-rdd
-          
+          cd target/${{ matrix.target }}/release
+          tar -czvf fd-rdd-${{ matrix.target }}.tar.gz fd-rdd fd-rdd-query
+
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          files: fd-rdd/target/${{ matrix.target }}/release/fd-rdd-${{ matrix.target }}.tar.gz
+          files: target/${{ matrix.target }}/release/fd-rdd-${{ matrix.target }}.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

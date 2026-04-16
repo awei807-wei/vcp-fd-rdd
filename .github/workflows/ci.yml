@@ -26,11 +26,68 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Verify lockfile matches manifest
+        run: cargo update -w --locked
+
       - name: cargo check
         run: cargo check --all-targets
 
       - name: cargo test
         run: cargo test
 
+      - name: cargo build --release
+        run: cargo build --release
+
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  smoke:
+    name: Smoke test (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run smoke-search-syntax.sh
+        run: |
+          mkdir -p /tmp/fd-rdd-smoke-root /tmp/fd-rdd-smoke-data
+          ./target/release/fd-rdd \
+            --root /tmp/fd-rdd-smoke-root \
+            --snapshot-path /tmp/fd-rdd-smoke-data/index.db \
+            --http-port 6060 \
+            --snapshot-interval-secs 0 \
+            >/tmp/fd-rdd-daemon.log 2>&1 &
+          DAEMON_PID=$!
+          # Wait for HTTP ready
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:6060/status >/dev/null 2>&1; then
+              echo "Daemon ready"
+              break
+            fi
+            sleep 0.5
+          done
+          # Give watcher a moment to settle
+          sleep 2
+          ./scripts/smoke-search-syntax.sh \
+            --root /tmp/fd-rdd-smoke-root \
+            --cleanup \
+            --timeout 30 \
+            --base-url http://127.0.0.1:6060
+          SMOKE_EXIT=$?
+          kill $DAEMON_PID 2>/dev/null || true
+          wait $DAEMON_PID 2>/dev/null || true
+          if [[ $SMOKE_EXIT -ne 0 ]]; then
+            echo "=== Daemon log (last 40 lines) ==="
+            tail -40 /tmp/fd-rdd-daemon.log
+          fi
+          exit $SMOKE_EXIT
