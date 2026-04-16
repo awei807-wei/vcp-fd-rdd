@@ -331,7 +331,7 @@ async fn lsm_layering_delete_blocks_base() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&base_idx.export_segments_v6(), None, &[root.clone()], 0)
+        .lsm_replace_base_v6(&base_idx.export_segments_v6(), None, std::slice::from_ref(&root), 0)
         .await
         .unwrap();
     store.gc_stale_segments().unwrap();
@@ -351,7 +351,7 @@ async fn lsm_layering_delete_blocks_base() {
         .lsm_append_delta_v6(
             &delta_idx.export_segments_v6(),
             &deleted,
-            &[root.clone()],
+            std::slice::from_ref(&root),
             0,
         )
         .await
@@ -387,7 +387,7 @@ async fn lsm_delete_then_recreate_prefers_newest() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&base_idx.export_segments_v6(), None, &[root.clone()], 0)
+        .lsm_replace_base_v6(&base_idx.export_segments_v6(), None, std::slice::from_ref(&root), 0)
         .await
         .unwrap();
     store.gc_stale_segments().unwrap();
@@ -396,7 +396,7 @@ async fn lsm_delete_then_recreate_prefers_newest() {
     let d1 = PersistentIndex::new_with_roots(vec![root.clone()]);
     let deleted = vec![alpha.as_os_str().as_encoded_bytes().to_vec()];
     store
-        .lsm_append_delta_v6(&d1.export_segments_v6(), &deleted, &[root.clone()], 0)
+        .lsm_append_delta_v6(&d1.export_segments_v6(), &deleted, std::slice::from_ref(&root), 0)
         .await
         .unwrap();
 
@@ -411,7 +411,7 @@ async fn lsm_delete_then_recreate_prefers_newest() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&d2.export_segments_v6(), &[], &[root.clone()], 0)
+        .lsm_append_delta_v6(&d2.export_segments_v6(), &[], std::slice::from_ref(&root), 0)
         .await
         .unwrap();
 
@@ -448,7 +448,7 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
+        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, std::slice::from_ref(&root), 0)
         .await
         .unwrap();
 
@@ -463,7 +463,7 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], &[root.clone()], 0)
+        .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], std::slice::from_ref(&root), 0)
         .await
         .unwrap();
 
@@ -502,7 +502,7 @@ async fn query_rename_from_tombstone_blocks_old_path() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
+        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, std::slice::from_ref(&root), 0)
         .await
         .unwrap();
 
@@ -518,7 +518,7 @@ async fn query_rename_from_tombstone_blocks_old_path() {
     });
     let deleted = vec![old.as_os_str().as_encoded_bytes().to_vec()];
     store
-        .lsm_append_delta_v6(&seg2.export_segments_v6(), &deleted, &[root.clone()], 0)
+        .lsm_append_delta_v6(&seg2.export_segments_v6(), &deleted, std::slice::from_ref(&root), 0)
         .await
         .unwrap();
 
@@ -565,7 +565,7 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
+        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, std::slice::from_ref(&root), 0)
         .await
         .unwrap();
 
@@ -580,7 +580,7 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], &[root.clone()], 0)
+        .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], std::slice::from_ref(&root), 0)
         .await
         .unwrap();
 
@@ -595,7 +595,7 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&seg3.export_segments_v6(), &[], &[root.clone()], 0)
+        .lsm_append_delta_v6(&seg3.export_segments_v6(), &[], std::slice::from_ref(&root), 0)
         .await
         .unwrap();
 
@@ -644,7 +644,7 @@ async fn lsm_offline_dir_mtime_change_skips_disk_segments() {
         .lsm_replace_base_v6(
             &base_idx.export_segments_v6(),
             None,
-            &[content_root.clone()],
+            std::slice::from_ref(&content_root),
             0,
         )
         .await
@@ -688,7 +688,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
         .lsm_replace_base_v6(
             &mk_seg(1, "base.txt").export_segments_v6(),
             None,
-            &[root.clone()],
+            std::slice::from_ref(&root),
             10,
         )
         .await
@@ -697,7 +697,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
         .lsm_append_delta_v6(
             &mk_seg(2, "delta-1.txt").export_segments_v6(),
             &[],
-            &[root.clone()],
+            std::slice::from_ref(&root),
             11,
         )
         .await
@@ -706,7 +706,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
         .lsm_append_delta_v6(
             &mk_seg(3, "delta-2.txt").export_segments_v6(),
             &[],
-            &[root.clone()],
+            std::slice::from_ref(&root),
             12,
         )
         .await
@@ -715,7 +715,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
         .lsm_append_delta_v6(
             &mk_seg(4, "delta-3.txt").export_segments_v6(),
             &[],
-            &[root.clone()],
+            std::slice::from_ref(&root),
             13,
         )
         .await
@@ -724,7 +724,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
         .lsm_append_delta_v6(
             &mk_seg(5, "delta-4.txt").export_segments_v6(),
             &[],
-            &[root.clone()],
+            std::slice::from_ref(&root),
             14,
         )
         .await
@@ -761,7 +761,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
     assert_eq!(layer_ids[1..], [4, 5]);
     assert!(layer_ids[0] > 5);
 
-    let loaded = store.load_lsm_if_valid(&[root.clone()]).unwrap().unwrap();
+    let loaded = store.load_lsm_if_valid(std::slice::from_ref(&root)).unwrap().unwrap();
     assert_eq!(loaded.base.as_ref().map(|b| b.id), Some(layer_ids[0]));
     assert_eq!(
         loaded.deltas.iter().map(|d| d.id).collect::<Vec<_>>(),

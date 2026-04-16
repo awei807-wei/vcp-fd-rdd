@@ -29,10 +29,10 @@ fn watch_nonexistent_root_reports_failure() {
     let rescans = Arc::new(AtomicU64::new(0));
 
     let (mut _rx, mut watcher) =
-        EventWatcher::start(&[root.clone()], 64, drops, rescans, None).unwrap();
+        EventWatcher::start(std::slice::from_ref(&root), 64, drops, rescans, None).unwrap();
 
     // watch_roots should report the non-existent root as failed
-    let failed = watch_roots(&mut watcher, &[root.clone()]);
+    let failed = watch_roots(&mut watcher, std::slice::from_ref(&root));
     assert!(
         !failed.is_empty(),
         "Should report failure for non-existent directory"
@@ -50,9 +50,9 @@ fn watch_existing_root_succeeds() {
     let rescans = Arc::new(AtomicU64::new(0));
 
     let (_rx, mut watcher) =
-        EventWatcher::start(&[root.clone()], 64, drops, rescans, None).unwrap();
+        EventWatcher::start(std::slice::from_ref(&root), 64, drops, rescans, None).unwrap();
 
-    let failed = watch_roots(&mut watcher, &[root.clone()]);
+    let failed = watch_roots(&mut watcher, std::slice::from_ref(&root));
     assert!(
         failed.is_empty(),
         "Should succeed for existing directory"

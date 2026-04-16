@@ -46,7 +46,7 @@ fn pathbuf_from_bytes(bytes: impl AsRef<[u8]>) -> PathBuf {
     {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
-        return PathBuf::from(OsString::from_vec(bytes.to_vec()));
+        PathBuf::from(OsString::from_vec(bytes.to_vec()))
     }
     #[cfg(not(unix))]
     {

@@ -86,7 +86,7 @@ impl GlobMatcher {
     pub fn new(pattern: &str, mode: GlobMode, case_sensitive: bool) -> Self {
         // 提取通配符前的固定前缀
         let prefix = pattern
-            .split(|c| c == '*' || c == '?')
+            .split(['*', '?'])
             .next()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
@@ -418,7 +418,7 @@ impl Matcher for ExtMatcher {
             .iter()
             .map(|b| b.to_ascii_lowercase())
             .collect();
-        self.exts_lc.iter().any(|e| *e == ext_lc)
+        self.exts_lc.contains(&ext_lc)
     }
 
     fn case_sensitive(&self) -> bool {
@@ -451,7 +451,7 @@ pub struct PathInitialsMatcher {
 impl PathInitialsMatcher {
     pub fn new(input: &str) -> Self {
         let segments = input
-            .split(|c: char| c == '/' || c == '\\')
+            .split(['/', '\\'])
             .filter(|s| !s.is_empty())
             .map(|s| s.to_lowercase())
             .collect();
@@ -467,7 +467,7 @@ impl Matcher for PathInitialsMatcher {
 
         // Split path into segments
         let path_segs: Vec<&str> = path
-            .split(|c: char| c == '/' || c == '\\')
+            .split(['/', '\\'])
             .filter(|s| !s.is_empty())
             .collect();
 

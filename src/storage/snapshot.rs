@@ -1124,18 +1124,16 @@ fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
     // v4+ uses CRC32C; v1-v3 use legacy SimpleChecksum
     let checksum_ok = if ver >= 4 {
         crc32c_checksum(&body) == checksum
+    } else if simple_checksum(&body) == checksum {
+        tracing::warn!(
+            "Loading legacy LSM manifest v{} from {}; consider upgrading to v{} (CRC32C)",
+            ver,
+            path.display(),
+            LSM_MANIFEST_VERSION
+        );
+        true
     } else {
-        if simple_checksum(&body) == checksum {
-            tracing::warn!(
-                "Loading legacy LSM manifest v{} from {}; consider upgrading to v{} (CRC32C)",
-                ver,
-                path.display(),
-                LSM_MANIFEST_VERSION
-            );
-            true
-        } else {
-            false
-        }
+        false
     };
     if !checksum_ok {
         anyhow::bail!("LSM manifest checksum mismatch");
@@ -1579,7 +1577,7 @@ mod tests {
         store.write_atomic_v6(&segs).await.unwrap();
 
         let snap = store
-            .load_v6_mmap_if_valid(&[root.clone()])
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
             .unwrap()
             .expect("load v6");
 
@@ -1626,7 +1624,7 @@ mod tests {
         store.write_atomic_v6(&segs).await.unwrap();
 
         let snap = store
-            .load_v6_mmap_if_valid(&[root.clone()])
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
             .unwrap()
             .expect("load v6");
 
@@ -1730,7 +1728,7 @@ mod tests {
         f.write_all(&b).unwrap();
         f.sync_all().unwrap();
 
-        let snap = store.load_v6_mmap_if_valid(&[root.clone()]).unwrap();
+        let snap = store.load_v6_mmap_if_valid(std::slice::from_ref(&root)).unwrap();
         assert!(snap.is_none());
     }
 
@@ -1753,7 +1751,7 @@ mod tests {
         });
         let base = idx.export_segments_v6();
         store
-            .lsm_replace_base_v6(&base, None, &[root.clone()], 0)
+            .lsm_replace_base_v6(&base, None, std::slice::from_ref(&root), 0)
             .await
             .unwrap();
 
@@ -1770,12 +1768,12 @@ mod tests {
         });
         let delta = delta_idx.export_segments_v6();
         let appended = store
-            .lsm_append_delta_v6(&delta, &[], &[root.clone()], 0)
+            .lsm_append_delta_v6(&delta, &[], std::slice::from_ref(&root), 0)
             .await
             .unwrap();
 
         std::fs::remove_file(store.lsm_seg_db_path(appended.id)).unwrap();
-        let loaded = store.load_lsm_if_valid(&[root.clone()]).unwrap();
+        let loaded = store.load_lsm_if_valid(std::slice::from_ref(&root)).unwrap();
         assert!(loaded.is_none());
     }
 
@@ -1798,12 +1796,12 @@ mod tests {
         });
         let segs = idx.export_segments_v6();
         let appended = store
-            .lsm_append_delta_v6(&segs, &[], &[root.clone()], 0)
+            .lsm_append_delta_v6(&segs, &[], std::slice::from_ref(&root), 0)
             .await
             .unwrap();
 
         std::fs::write(store.lsm_seg_del_path(appended.id), b"bad-sidecar").unwrap();
-        let loaded = store.load_lsm_if_valid(&[root.clone()]).unwrap();
+        let loaded = store.load_lsm_if_valid(std::slice::from_ref(&root)).unwrap();
         assert!(loaded.is_none());
     }
 

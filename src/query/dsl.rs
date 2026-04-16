@@ -166,7 +166,7 @@ impl Filter {
                 };
                 let ext = ext.to_string_lossy();
                 let ext_lc = ascii_lower_bytes(ext.as_bytes());
-                exts.iter().any(|e| *e == ext_lc)
+                exts.contains(&ext_lc)
             }
             Filter::Size(sf) => apply_cmp(sf.op, meta.size, sf.bytes),
             Filter::DateModified(dr) => {
@@ -417,10 +417,12 @@ fn best_anchor_in_branch(
     }
 }
 
+type AnchorScoreResult = Result<Option<(i64, Arc<dyn Matcher>)>, QueryCompileError>;
+
 fn best_anchor_in_branch_scored(
     expr: &Expr,
     case_sensitive: bool,
-) -> Result<Option<(i64, Arc<dyn Matcher>)>, QueryCompileError> {
+) -> AnchorScoreResult {
     match expr {
         Expr::Or(_) => Ok(None),
         Expr::True => Ok(None),
@@ -603,7 +605,7 @@ fn parse_atom_expr(word: &str, case_sensitive: &mut bool) -> Result<Expr, QueryC
         Some("ext") => {
             let v = unquote(tail)?;
             let list = v
-                .split(|c| c == ';' || c == ',')
+                .split([';', ','])
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
@@ -722,7 +724,7 @@ fn split_prefix(word: &str) -> (Option<&str>, &str) {
 fn unquote(s: &str) -> Result<String, QueryCompileError> {
     let s = s.trim();
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        return Ok(unescape_quoted(&s[1..s.len() - 1])?);
+        return unescape_quoted(&s[1..s.len() - 1]);
     }
     Ok(s.to_string())
 }
@@ -1154,7 +1156,7 @@ fn local_date_range(year: i32, month: i32, day: i32) -> Result<DateRange, String
 
 #[cfg(unix)]
 fn time_t_to_system_time(t: libc::time_t) -> std::time::SystemTime {
-    let secs: i64 = t as i64;
+    let secs: i64 = t;
     if secs >= 0 {
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
     } else {

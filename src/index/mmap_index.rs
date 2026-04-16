@@ -65,12 +65,15 @@ fn for_each_short_component(path: &Path, mut f: impl FnMut(&[u8])) {
     }
 }
 
+type ShortComponentCache = parking_lot::Mutex<Option<Arc<HashMap<Box<[u8]>, RoaringTreemap>>>>;
+
+
 pub struct MmapIndex {
     snap: Arc<MmapSnapshotV6>,
     tomb_cache: parking_lot::Mutex<Option<RoaringTreemap>>,
     // 兼容旧段：若缺少 mmap 内的 file_key_map 段，则按需构建一次排序 map（以 bytes 形式存储，便于二分查找）。
     filekey_map_cache: parking_lot::Mutex<Option<Arc<Vec<u8>>>>,
-    short_component_cache: parking_lot::Mutex<Option<Arc<HashMap<Box<[u8]>, RoaringTreemap>>>>,
+    short_component_cache: ShortComponentCache,
     #[cfg(feature = "rkyv")]
     validated_rkyv: OnceLock<anyhow::Result<()>>,
 }
@@ -403,7 +406,7 @@ impl MmapIndex {
         }
         bitmaps.sort_by_key(|b| b.len());
         let mut iter = bitmaps.into_iter();
-        let mut acc = iter.next().unwrap_or_else(RoaringTreemap::new);
+        let mut acc = iter.next().unwrap_or_default();
         for b in iter {
             acc &= &b;
             if acc.is_empty() {
@@ -438,7 +441,7 @@ impl MmapIndex {
             for_each_short_component(path.as_path(), |component| {
                 cache
                     .entry(Box::<[u8]>::from(component))
-                    .or_insert_with(RoaringTreemap::new)
+                    .or_default()
                     .insert(docid);
             });
         }
@@ -548,9 +551,7 @@ impl MmapIndex {
         }
 
         let arena = self.snap.path_arena_bytes();
-        let Some((file_key, root_id, path_off, path_len, size, mtime)) = self.meta_at(docid) else {
-            return None;
-        };
+        let (file_key, root_id, path_off, path_len, size, mtime) = self.meta_at(docid)?;
         let start = path_off as usize;
         let end = start.saturating_add(path_len as usize);
         let rel = arena.get(start..end)?;
@@ -744,7 +745,7 @@ mod tests {
         store.write_atomic_v6(&segs).await.unwrap();
 
         let mut snap = store
-            .load_v6_mmap_if_valid(&[root.clone()])
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
             .unwrap()
             .expect("load v6");
 
@@ -777,7 +778,7 @@ mod tests {
                 let tri = [w[0], w[1], w[2]];
                 tri_idx
                     .entry(tri)
-                    .or_insert_with(RoaringBitmap::new)
+                    .or_default()
                     .insert(*docid);
             }
         }
@@ -848,7 +849,7 @@ mod tests {
         store.write_atomic_v6(&segs).await.unwrap();
 
         let snap = store
-            .load_v6_mmap_if_valid(&[root.clone()])
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
             .unwrap()
             .expect("load v6");
         let mmap_idx = MmapIndex::new(snap);
@@ -894,7 +895,7 @@ mod tests {
         store.write_atomic_v6(&segs).await.unwrap();
 
         let snap = store
-            .load_v6_mmap_if_valid(&[root.clone()])
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
             .unwrap()
             .expect("load v6");
         let mmap_idx = MmapIndex::new(snap);

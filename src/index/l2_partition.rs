@@ -176,6 +176,12 @@ pub struct IndexSnapshotV2 {
     pub tombstones: HashSet<FileKey>,
 }
 
+impl Default for IndexSnapshotV2 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IndexSnapshotV2 {
     pub fn new() -> Self {
         Self {
@@ -193,6 +199,12 @@ pub struct IndexSnapshotV3 {
     pub tombstones: HashSet<FileKey>,
 }
 
+impl Default for IndexSnapshotV3 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IndexSnapshotV3 {
     pub fn new() -> Self {
         Self {
@@ -208,6 +220,12 @@ pub struct IndexSnapshotV4 {
     pub arena: PathArena,
     pub metas: Vec<CompactMetaV4>,
     pub tombstones: Vec<u32>,
+}
+
+impl Default for IndexSnapshotV4 {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IndexSnapshotV4 {
@@ -342,6 +360,12 @@ pub struct PersistentIndex {
 
     /// 脏标记（自上次快照后是否有变更）
     dirty: std::sync::atomic::AtomicBool,
+}
+
+impl Default for PersistentIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PersistentIndex {
@@ -496,13 +520,13 @@ impl PersistentIndex {
                 for_each_component_trigram(abs_path.as_path(), |tri| {
                     trigram_index
                         .entry(tri)
-                        .or_insert_with(RoaringTreemap::new)
+                        .or_default()
                         .insert(docid);
                 });
                 for_each_short_component(abs_path.as_path(), |component| {
                     short_component_index
                         .entry(Box::<[u8]>::from(component))
-                        .or_insert_with(RoaringTreemap::new)
+                        .or_default()
                         .insert(docid);
                 });
             }
@@ -1439,13 +1463,13 @@ impl PersistentIndex {
         for_each_component_trigram(path, |tri| {
             tri_idx
                 .entry(tri)
-                .or_insert_with(RoaringTreemap::new)
+                .or_default()
                 .insert(docid);
         });
         for_each_short_component(path, |component| {
             short_idx
                 .entry(Box::<[u8]>::from(component))
-                .or_insert_with(RoaringTreemap::new)
+                .or_default()
                 .insert(docid);
         });
     }

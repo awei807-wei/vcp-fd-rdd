@@ -10,3 +10,4 @@ __pycache__/
 
 # HelloAGENTS 知识库/方案包仅保留在本地，不纳入 Git 追踪
 /helloagents/
+.snow/

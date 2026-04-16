@@ -4,6 +4,7 @@ use std::time::Instant;
 use crate::core::{EventType, FileIdentifier};
 
 #[derive(Debug)]
+#[derive(Default)]
 pub(super) struct RebuildState {
     pub(super) in_progress: bool,
     pub(super) pending_events: std::collections::HashMap<FileIdentifier, PendingEvent>,
@@ -15,17 +16,6 @@ pub(super) struct RebuildState {
     pub(super) scheduled: bool,
 }
 
-impl Default for RebuildState {
-    fn default() -> Self {
-        Self {
-            in_progress: false,
-            pending_events: std::collections::HashMap::new(),
-            last_started_at: None,
-            requested: false,
-            scheduled: false,
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub(super) struct PendingEvent {

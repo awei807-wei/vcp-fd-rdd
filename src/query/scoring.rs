@@ -113,7 +113,7 @@ impl ScoreConfig {
         let query_has_node = query_lower.contains("node");
 
         let query_basename = query_lower
-            .rsplit(|c: char| c == '/' || c == '\\')
+            .rsplit(['/', '\\'])
             .next()
             .unwrap_or(&query_lower)
             .to_string();
@@ -133,7 +133,7 @@ impl ScoreConfig {
 /// 隐藏**目录**（.开头的目录段，不含文件名本身）是否出现在路径中。
 /// 注意：文件名本身以 `.` 开头不惩罚（如 `.config.json`、`.eslintrc` 是常用文件）。
 fn path_has_hidden_dir(path: &str) -> bool {
-    let segments: Vec<&str> = path.split(|c: char| c == '/' || c == '\\').collect();
+    let segments: Vec<&str> = path.split(['/', '\\']).collect();
     // 最后一段是文件名，不检查
     for seg in segments.iter().take(segments.len().saturating_sub(1)) {
         if seg.starts_with('.') && seg.len() > 1 {
@@ -146,7 +146,7 @@ fn path_has_hidden_dir(path: &str) -> bool {
 /// 路径是否经过"噪声目录"。
 fn path_in_junk_dir(path: &str) -> bool {
     let lower = path.to_lowercase();
-    for seg in lower.split(|c: char| c == '/' || c == '\\') {
+    for seg in lower.split(['/', '\\']) {
         if seg.is_empty() {
             continue;
         }
@@ -162,7 +162,7 @@ fn path_in_junk_dir(path: &str) -> bool {
 /// 路径是否经过 node_modules 等 "Low Priority Zone"。
 fn path_in_node_zone(path: &str) -> bool {
     let lower = path.to_lowercase();
-    for seg in lower.split(|c: char| c == '/' || c == '\\') {
+    for seg in lower.split(['/', '\\']) {
         if seg.is_empty() {
             continue;
         }
@@ -486,7 +486,7 @@ fn compute_path_initials_highlights(path: &str, query: &str) -> Vec<[usize; 2]> 
 
     // Split query by separators
     let query_segments: Vec<&str> = query
-        .split(|c: char| c == '/' || c == '\\')
+        .split(['/', '\\'])
         .filter(|s| !s.is_empty())
         .collect();
 

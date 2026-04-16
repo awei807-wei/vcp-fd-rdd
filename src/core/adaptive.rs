@@ -7,6 +7,12 @@ pub struct AdaptiveScheduler {
     system: System,
 }
 
+impl Default for AdaptiveScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AdaptiveScheduler {
     pub fn new() -> Self {
         let mut sys = System::new();

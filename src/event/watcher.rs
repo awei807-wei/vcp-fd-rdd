@@ -31,7 +31,7 @@ fn handle_notify_result(
                     d.record_overflow_paths(&event.paths);
                 }
                 let drops = overflow_drops.fetch_add(1, Ordering::Relaxed);
-                if drops % 1000 == 0 {
+                if drops.is_multiple_of(1000) {
                     eprintln!(
                         "[fd-rdd] event channel overflow, total drops: {}",
                         drops + 1
@@ -79,36 +79,6 @@ impl EventWatcher {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::event::recovery::DirtyScope;
-
-    #[test]
-    fn reject_zero_channel_size() {
-        let drops = Arc::new(AtomicU64::new(0));
-        let rescans = Arc::new(AtomicU64::new(0));
-        let roots: Vec<std::path::PathBuf> = Vec::new();
-        let res = EventWatcher::start(&roots, 0, drops, rescans, None);
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn rescan_event_marks_dirty_all() {
-        let drops = AtomicU64::new(0);
-        let rescans = AtomicU64::new(0);
-        let (tx, _rx) = mpsc::channel(16);
-        let dirty = DirtyTracker::new(16, vec![]);
-
-        let ev = notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
-        handle_notify_result(&tx, Some(dirty.as_ref()), &drops, &rescans, Ok(ev));
-        assert_eq!(rescans.load(Ordering::Relaxed), 1);
-
-        let scope = dirty.try_begin_sync(0, 0, 0);
-        assert!(matches!(scope, Some(DirtyScope::All { .. })));
-    }
-}
-
 /// 检查 Linux inotify watch 上限，不够时发出警告。
 /// 非 Linux 平台直接返回 None。
 pub fn check_inotify_limit(root_count: usize) -> Option<u64> {
@@ -150,4 +120,34 @@ pub fn watch_roots(
         }
     }
     failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::recovery::DirtyScope;
+
+    #[test]
+    fn reject_zero_channel_size() {
+        let drops = Arc::new(AtomicU64::new(0));
+        let rescans = Arc::new(AtomicU64::new(0));
+        let roots: Vec<std::path::PathBuf> = Vec::new();
+        let res = EventWatcher::start(&roots, 0, drops, rescans, None);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn rescan_event_marks_dirty_all() {
+        let drops = AtomicU64::new(0);
+        let rescans = AtomicU64::new(0);
+        let (tx, _rx) = mpsc::channel(16);
+        let dirty = DirtyTracker::new(16, vec![]);
+
+        let ev = notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        handle_notify_result(&tx, Some(dirty.as_ref()), &drops, &rescans, Ok(ev));
+        assert_eq!(rescans.load(Ordering::Relaxed), 1);
+
+        let scope = dirty.try_begin_sync(0, 0, 0);
+        assert!(matches!(scope, Some(DirtyScope::All { .. })));
+    }
 }

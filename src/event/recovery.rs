@@ -192,7 +192,7 @@ impl DirtyTracker {
             // fast-sync 完成后，dirty set 往往已 drain/clear；此时可回收 HashSet 的高水位桶数组，
             // 避免“风暴一次把 capacity 顶上去”后常驻不降，从而把 PD plateau 粘住。
             let mut st = self.state.lock();
-            let keep = self.max_dirty_dirs.min(2048).max(64);
+            let keep = self.max_dirty_dirs.clamp(64, 2048);
             if st.dirty_dirs.capacity() > keep.saturating_mul(2) {
                 st.dirty_dirs.shrink_to(keep);
             }

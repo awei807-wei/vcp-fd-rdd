@@ -37,7 +37,7 @@ pub fn pathbuf_from_encoded_vec(bytes: Vec<u8>) -> PathBuf {
     {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
-        return PathBuf::from(OsString::from_vec(bytes));
+        PathBuf::from(OsString::from_vec(bytes))
     }
     #[cfg(not(unix))]
     {

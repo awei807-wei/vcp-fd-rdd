@@ -1,4 +1,6 @@
+#![allow(clippy::too_many_arguments)]
 use std::path::PathBuf;
+
 use std::sync::Arc;
 
 use crate::index::l1_cache::L1Cache;

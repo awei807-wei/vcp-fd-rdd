@@ -94,7 +94,7 @@ pub fn execute_query(
     results
 }
 
-fn sort_results(results: &mut Vec<FileMeta>, keyword: &str, sort: SortColumn, order: SortOrder) {
+fn sort_results(results: &mut [FileMeta], keyword: &str, sort: SortColumn, order: SortOrder) {
     results.sort_by(|a, b| {
         let cmp = match sort {
             SortColumn::Score => {
@@ -168,6 +168,12 @@ pub struct FzfIntegration {
     matcher: SkimMatcherV2,
 }
 
+impl Default for FzfIntegration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FzfIntegration {
     pub fn new() -> Self {
         Self {
@@ -219,7 +225,7 @@ impl FzfIntegration {
 
 fn fuzzy_candidate_limit(file_count: usize, limit: usize) -> usize {
     let scaled = limit.saturating_mul(FUZZY_CANDIDATE_MULTIPLIER);
-    let bounded = scaled.max(FUZZY_MIN_CANDIDATES).min(FUZZY_MAX_CANDIDATES);
+    let bounded = scaled.clamp(FUZZY_MIN_CANDIDATES, FUZZY_MAX_CANDIDATES);
     bounded.max(limit.max(1)).min(file_count.max(1))
 }
 

@@ -46,7 +46,7 @@ pub fn default_socket_path() -> PathBuf {
             return dir.join("fd-rdd.sock");
         }
 
-        return PathBuf::from(format!("/tmp/fd-rdd-{}.sock", uid));
+        PathBuf::from(format!("/tmp/fd-rdd-{}.sock", uid))
     }
 
     #[cfg(target_os = "windows")]
@@ -105,7 +105,7 @@ pub fn default_snapshot_path() -> PathBuf {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
         }
-        return dir.join("index.db");
+        dir.join("index.db")
     }
 
     #[cfg(target_os = "windows")]

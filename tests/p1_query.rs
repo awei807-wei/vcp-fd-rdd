@@ -3,7 +3,7 @@
 //! Validates filter effectiveness, fuzzy matching, streaming UDS queries,
 //! UDS permission checks, and short query optimization.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fd_rdd::core::{FileKey, FileMeta};
@@ -17,8 +17,8 @@ fn unique_tmp_dir(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("fd-rdd-query-{}-{}", tag, nanos))
 }
 
-fn build_index_with_files(root: &PathBuf, files: &[(&str, u64)]) -> Arc<TieredIndex> {
-    let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+fn build_index_with_files(root: &Path, files: &[(&str, u64)]) -> Arc<TieredIndex> {
+    let index = Arc::new(TieredIndex::empty(vec![root.to_path_buf()]));
     let l2 = index.l2.load_full();
     for (i, (name, size)) in files.iter().enumerate() {
         let path = root.join(name);
@@ -115,7 +115,7 @@ fn large_result_set_query_does_not_oom() {
     // Query that matches all files
     let results = index.query_limit("data", 10_000);
     assert!(
-        results.len() > 0,
+        !results.is_empty(),
         "Should return results for broad query"
     );
 

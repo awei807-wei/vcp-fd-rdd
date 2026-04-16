@@ -24,10 +24,10 @@ impl FileKey {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            return Some(Self {
+            Some(Self {
                 dev: meta.dev(),
                 ino: meta.ino(),
-            });
+            })
         }
 
         #[cfg(windows)]
