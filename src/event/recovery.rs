@@ -38,6 +38,7 @@ struct DirtyState {
 #[derive(Debug)]
 pub struct DirtyTracker {
     max_dirty_dirs: usize,
+    roots: Vec<PathBuf>,
     state: Mutex<DirtyState>,
     first_dirty_ns: AtomicU64,
     last_activity_ns: AtomicU64,
@@ -46,9 +47,10 @@ pub struct DirtyTracker {
 }
 
 impl DirtyTracker {
-    pub fn new(max_dirty_dirs: usize) -> Arc<Self> {
+    pub fn new(max_dirty_dirs: usize, roots: Vec<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             max_dirty_dirs: max_dirty_dirs.max(1),
+            roots,
             state: Mutex::new(DirtyState {
                 dirty_all: false,
                 dirty_dirs: HashSet::new(),
@@ -77,11 +79,18 @@ impl DirtyTracker {
         }
 
         for p in paths {
-            // 以 parent dir 为粒度；路径本身可能是文件或目录，这里不做 stat。
-            if let Some(parent) = p.parent() {
-                st.dirty_dirs.insert(parent.to_path_buf());
-            } else if p.is_absolute() {
-                st.dirty_dirs.insert(Path::new("/").to_path_buf());
+            // 优先映射到对应的 root，避免 parent dir 过多导致提前降级为 dirty_all。
+            let target = self
+                .roots
+                .iter()
+                .filter(|r| p.starts_with(r))
+                .max_by_key(|r| r.as_os_str().len())
+                .cloned()
+                .or_else(|| p.parent().map(|parent| parent.to_path_buf()))
+                .or_else(|| if p.is_absolute() { Some(Path::new("/").to_path_buf()) } else { None });
+
+            if let Some(dir) = target {
+                st.dirty_dirs.insert(dir);
             }
         }
 

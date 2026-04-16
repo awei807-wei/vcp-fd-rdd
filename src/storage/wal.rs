@@ -252,10 +252,30 @@ impl WalStore {
         truncated += t;
         events.append(&mut cur);
 
+        // Deduplicate by (id, timestamp), keeping the last occurrence.
+        // This prevents duplicate index entries when WAL contains duplicate
+        // records from abnormal writes or partial flushes.
+        let mut last_pos = std::collections::HashMap::new();
+        for (idx, ev) in events.iter().enumerate() {
+            last_pos.insert((ev.id.clone(), ev.timestamp), idx);
+        }
+        let mut keep = vec![false; events.len()];
+        for &idx in last_pos.values() {
+            keep[idx] = true;
+        }
+        let mut retained = Vec::with_capacity(last_pos.len());
+        for (idx, ev) in events.drain(..).enumerate() {
+            if keep[idx] {
+                retained.push(ev);
+            }
+        }
+        events = retained;
+
         // 统一为单调 seq（WAL 内部 seq 只用于排序/回放稳定性）。
         for (i, e) in events.iter_mut().enumerate() {
             e.seq = i as u64 + 1;
         }
+
 
         Ok(WalReplayResult {
             events,
