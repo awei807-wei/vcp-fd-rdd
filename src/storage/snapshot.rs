@@ -3,6 +3,7 @@ use crate::index::l2_partition::IndexSnapshotV3;
 use crate::index::l2_partition::IndexSnapshotV4;
 use crate::index::l2_partition::IndexSnapshotV5;
 use crate::index::l2_partition::V6Segments;
+use crate::index::l2_partition::PersistentIndex;
 use memmap2::Mmap;
 use std::collections::HashSet;
 use std::io::Seek;
@@ -53,6 +54,79 @@ pub enum LoadedSnapshot {
     V4(IndexSnapshotV4),
     V3(IndexSnapshotV3),
     V2(IndexSnapshotV2),
+}
+
+/// 统一的老版本快照反序列化 trait：用于消除 v2-v5 的复制粘贴式分发。
+pub trait LegacySnapshot: Sized {
+    const VERSION_NAME: &'static str;
+    fn deserialize_bincode(body: &[u8]) -> anyhow::Result<Self>;
+    fn into_loaded(self) -> LoadedSnapshot;
+}
+
+macro_rules! impl_legacy_snapshot {
+    ($ty:ty, $name:expr) => {
+        impl LegacySnapshot for $ty {
+            const VERSION_NAME: &'static str = $name;
+            fn deserialize_bincode(body: &[u8]) -> anyhow::Result<Self> {
+                Ok(bincode::deserialize::<$ty>(body)?)
+            }
+            fn into_loaded(self) -> LoadedSnapshot {
+                LoadedSnapshot::from(self)
+            }
+        }
+    };
+}
+
+impl_legacy_snapshot!(IndexSnapshotV2, "v2");
+impl_legacy_snapshot!(IndexSnapshotV3, "v3");
+impl_legacy_snapshot!(IndexSnapshotV4, "v4");
+impl_legacy_snapshot!(IndexSnapshotV5, "v5");
+
+impl From<IndexSnapshotV2> for LoadedSnapshot {
+    fn from(v: IndexSnapshotV2) -> Self { LoadedSnapshot::V2(v) }
+}
+impl From<IndexSnapshotV3> for LoadedSnapshot {
+    fn from(v: IndexSnapshotV3) -> Self { LoadedSnapshot::V3(v) }
+}
+impl From<IndexSnapshotV4> for LoadedSnapshot {
+    fn from(v: IndexSnapshotV4) -> Self { LoadedSnapshot::V4(v) }
+}
+impl From<IndexSnapshotV5> for LoadedSnapshot {
+    fn from(v: IndexSnapshotV5) -> Self { LoadedSnapshot::V5(v) }
+}
+
+fn load_legacy_snapshot<T: LegacySnapshot>(body: &[u8]) -> anyhow::Result<Option<LoadedSnapshot>> {
+    match T::deserialize_bincode(body) {
+        Ok(snap) => Ok(Some(snap.into_loaded())),
+        Err(e) => {
+            tracing::warn!("Snapshot {} deserialize failed: {}", T::VERSION_NAME, e);
+            Ok(None)
+        }
+    }
+}
+
+impl LoadedSnapshot {
+    /// 将加载出的老版本快照转换为 PersistentIndex，统一消除 tiered/load.rs 里的复制粘贴。
+    pub fn into_persistent_index(self, roots: Vec<PathBuf>) -> PersistentIndex {
+        match self {
+            LoadedSnapshot::V5(snap) => {
+                tracing::info!("Loaded index snapshot v5: {} docs", snap.metas.len());
+                PersistentIndex::from_snapshot_v5(snap, roots)
+            }
+            LoadedSnapshot::V4(snap) => {
+                tracing::info!("Loaded index snapshot v4: {} docs", snap.metas.len());
+                PersistentIndex::from_snapshot_v4(snap, roots)
+            }
+            LoadedSnapshot::V3(snap) => {
+                tracing::info!("Loaded index snapshot v3: {} files", snap.files.len());
+                PersistentIndex::from_snapshot_v3(snap, roots)
+            }
+            LoadedSnapshot::V2(snap) => {
+                tracing::info!("Loaded index snapshot v2: {} files", snap.files.len());
+                PersistentIndex::from_snapshot_v2(snap, roots)
+            }
+        }
+    }
 }
 
 /// v6：mmap 段式快照（只读视图）
@@ -680,38 +754,11 @@ impl SnapshotStore {
             return Ok(None);
         }
 
-        if version == VERSION_COMPAT_V2 {
-            match bincode::deserialize::<IndexSnapshotV2>(body) {
-                Ok(v2) => Ok(Some(LoadedSnapshot::V2(v2))),
-                Err(e) => {
-                    tracing::warn!("Snapshot v2 deserialize failed: {}", e);
-                    Ok(None)
-                }
-            }
-        } else if version == VERSION_COMPAT_V3 {
-            match bincode::deserialize::<IndexSnapshotV3>(body) {
-                Ok(snap) => Ok(Some(LoadedSnapshot::V3(snap))),
-                Err(e) => {
-                    tracing::warn!("Snapshot v3 deserialize failed: {}", e);
-                    Ok(None)
-                }
-            }
-        } else if version == VERSION_COMPAT_V4 {
-            match bincode::deserialize::<IndexSnapshotV4>(body) {
-                Ok(snap) => Ok(Some(LoadedSnapshot::V4(snap))),
-                Err(e) => {
-                    tracing::warn!("Snapshot v4 deserialize failed: {}", e);
-                    Ok(None)
-                }
-            }
-        } else {
-            match bincode::deserialize::<IndexSnapshotV5>(body) {
-                Ok(snap) => Ok(Some(LoadedSnapshot::V5(snap))),
-                Err(e) => {
-                    tracing::warn!("Snapshot v5 deserialize failed: {}", e);
-                    Ok(None)
-                }
-            }
+        match version {
+            VERSION_COMPAT_V2 => load_legacy_snapshot::<IndexSnapshotV2>(body),
+            VERSION_COMPAT_V3 => load_legacy_snapshot::<IndexSnapshotV3>(body),
+            VERSION_COMPAT_V4 => load_legacy_snapshot::<IndexSnapshotV4>(body),
+            _ => load_legacy_snapshot::<IndexSnapshotV5>(body),
         }
     }
 
