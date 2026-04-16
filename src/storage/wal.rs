@@ -199,6 +199,11 @@ impl WalStore {
             std::fs::rename(&self.current, &sealed)?;
         }
 
+        // fsync(dir) after rename to ensure the directory entry is persisted.
+        if let Ok(dir) = std::fs::File::open(&self.dir) {
+            let _ = dir.sync_all();
+        }
+
         let newf = open_or_init(&self.current)?;
         *self.file.lock().unwrap_or_else(|e| e.into_inner()) = newf;
         Ok(id)
@@ -442,6 +447,13 @@ fn open_or_init(path: &Path) -> anyhow::Result<File> {
             .unwrap_or_else(|| Path::new("."))
             .join(format!("events.wal.seal-{id:016x}{suffix}"));
         std::fs::rename(path, &sealed)?;
+
+        // fsync(dir) after rename to ensure the directory entry is persisted.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
 
         let mut nf = OpenOptions::new()
             .create(true)

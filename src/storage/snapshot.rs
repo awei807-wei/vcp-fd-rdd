@@ -658,20 +658,50 @@ impl SnapshotStore {
         let mmap = unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file)? };
         let mmap = std::sync::Arc::new(mmap);
 
+        let path_arena = match ranges.get(&(V6SegKind::PathArena as u32)) {
+            Some(r) => r.clone(),
+            None => {
+                tracing::warn!("Snapshot v6 missing path_arena segment");
+                return Ok(None);
+            }
+        };
+        let metas = match ranges.get(&(V6SegKind::Metas as u32)) {
+            Some(r) => r.clone(),
+            None => {
+                tracing::warn!("Snapshot v6 missing metas segment");
+                return Ok(None);
+            }
+        };
+        let trigram_table = match ranges.get(&(V6SegKind::TrigramTable as u32)) {
+            Some(r) => r.clone(),
+            None => {
+                tracing::warn!("Snapshot v6 missing trigram_table segment");
+                return Ok(None);
+            }
+        };
+        let postings_blob = match ranges.get(&(V6SegKind::PostingsBlob as u32)) {
+            Some(r) => r.clone(),
+            None => {
+                tracing::warn!("Snapshot v6 missing postings_blob segment");
+                return Ok(None);
+            }
+        };
+        let tombstones = match ranges.get(&(V6SegKind::Tombstones as u32)) {
+            Some(r) => r.clone(),
+            None => {
+                tracing::warn!("Snapshot v6 missing tombstones segment");
+                return Ok(None);
+            }
+        };
+
         Ok(Some(MmapSnapshotV6 {
             mmap,
             roots,
-            path_arena: ranges.get(&(V6SegKind::PathArena as u32)).unwrap().clone(),
-            metas: ranges.get(&(V6SegKind::Metas as u32)).unwrap().clone(),
-            trigram_table: ranges
-                .get(&(V6SegKind::TrigramTable as u32))
-                .unwrap()
-                .clone(),
-            postings_blob: ranges
-                .get(&(V6SegKind::PostingsBlob as u32))
-                .unwrap()
-                .clone(),
-            tombstones: ranges.get(&(V6SegKind::Tombstones as u32)).unwrap().clone(),
+            path_arena,
+            metas,
+            trigram_table,
+            postings_blob,
+            tombstones,
             file_key_map: ranges.get(&(V6SegKind::FileKeyMap as u32)).cloned(),
         }))
     }
