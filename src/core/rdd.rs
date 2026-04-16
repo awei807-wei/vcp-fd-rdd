@@ -59,7 +59,7 @@ impl FileKey {
 #[cfg_attr(feature = "rkyv", archive(check_bytes))]
 pub struct FileKeyEntry {
     pub key: FileKey,
-    pub doc_id: u32,
+    pub doc_id: u64,
 }
 
 /// 文件元数据

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{collections::HashMap, path::Component};
 
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 
 #[cfg(feature = "rkyv")]
 use crate::core::FileKeyEntry;
@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 const META_REC_SIZE: usize = 40;
 // TrigramEntryV6：3 + 1 + 4 + 4 = 12B
 const TRI_REC_SIZE: usize = 12;
-// FileKeyMap：dev(8) + ino(8) + docid(4) = 20B
+// FileKeyMap：dev(8) + ino(8) + docid(4) = 20B（v6 兼容；运行时读作 u64）
 const FILEKEY_MAP_REC_SIZE: usize = 20;
 
 const FKM_MAGIC: [u8; 4] = *b"FKM\0";
@@ -67,10 +67,10 @@ fn for_each_short_component(path: &Path, mut f: impl FnMut(&[u8])) {
 
 pub struct MmapIndex {
     snap: Arc<MmapSnapshotV6>,
-    tomb_cache: parking_lot::Mutex<Option<RoaringBitmap>>,
+    tomb_cache: parking_lot::Mutex<Option<RoaringTreemap>>,
     // 兼容旧段：若缺少 mmap 内的 file_key_map 段，则按需构建一次排序 map（以 bytes 形式存储，便于二分查找）。
     filekey_map_cache: parking_lot::Mutex<Option<Arc<Vec<u8>>>>,
-    short_component_cache: parking_lot::Mutex<Option<Arc<HashMap<Box<[u8]>, RoaringBitmap>>>>,
+    short_component_cache: parking_lot::Mutex<Option<Arc<HashMap<Box<[u8]>, RoaringTreemap>>>>,
     #[cfg(feature = "rkyv")]
     validated_rkyv: OnceLock<anyhow::Result<()>>,
 }
@@ -95,21 +95,23 @@ impl MmapIndex {
         self.snap.metas_bytes().len() / META_REC_SIZE
     }
 
-    fn tombstones(&self) -> RoaringBitmap {
+    fn tombstones(&self) -> RoaringTreemap {
         let mut g = self.tomb_cache.lock();
         if let Some(b) = g.as_ref() {
             return b.clone();
         }
         let bytes = self.snap.tombstones_bytes();
         let mut cur = Cursor::new(bytes);
-        let b = RoaringBitmap::deserialize_from(&mut cur).unwrap_or_else(|_| RoaringBitmap::new());
+        let b = roaring::RoaringBitmap::deserialize_from(&mut cur)
+            .map(|bm| bm.iter().map(|v| v as u64).collect::<RoaringTreemap>())
+            .unwrap_or_else(|_| RoaringTreemap::new());
         *g = Some(b.clone());
         b
     }
 
     fn meta_at(
         &self,
-        docid: u32,
+        docid: u64,
     ) -> Option<(FileKey, u16, u32, u16, u64, Option<std::time::SystemTime>)> {
         let bytes = self.snap.metas_bytes();
         let i = (docid as usize).checked_mul(META_REC_SIZE)?;
@@ -140,7 +142,7 @@ impl MmapIndex {
         ))
     }
 
-    fn lookup_docid_in_legacy_map(bytes: &[u8], key: FileKey) -> Option<u32> {
+    fn lookup_docid_in_legacy_map(bytes: &[u8], key: FileKey) -> Option<u64> {
         let n = bytes.len() / FILEKEY_MAP_REC_SIZE;
         if n == 0 {
             return None;
@@ -171,11 +173,11 @@ impl MmapIndex {
             return None;
         }
         let docid = u32::from_le_bytes(rec[16..20].try_into().ok()?);
-        Some(docid)
+        Some(docid as u64)
     }
 
     #[cfg(feature = "rkyv")]
-    fn lookup_docid_in_rkyv_map(&self, payload: &[u8], key: FileKey) -> Option<u32> {
+    fn lookup_docid_in_rkyv_map(&self, payload: &[u8], key: FileKey) -> Option<u64> {
         let res = self.validated_rkyv.get_or_init(|| {
             // 只在首次访问校验一次（O(N)），后续查询走 archived_root + O(logN) 二分。
             rkyv::check_archived_root::<Vec<FileKeyEntry>>(payload)
@@ -215,7 +217,7 @@ impl MmapIndex {
         Some(e.doc_id)
     }
 
-    fn lookup_docid_by_filekey(&self, key: FileKey) -> Option<u32> {
+    fn lookup_docid_by_filekey(&self, key: FileKey) -> Option<u64> {
         if let Some(bytes) = self.snap.file_key_map_bytes() {
             // 兼容：测试/旧数据可能出现空 range（0..0）。空表等价于“缺失”，走 fallback。
             if !bytes.is_empty() {
@@ -282,8 +284,8 @@ impl MmapIndex {
         tracing::info!("MmapIndex: missing/empty file_key_map, building fallback cache");
 
         let tomb = self.tombstones();
-        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u32;
-        let mut pairs: Vec<(FileKey, u32)> = Vec::with_capacity(n as usize);
+        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u64;
+        let mut pairs: Vec<(FileKey, u64)> = Vec::with_capacity(n as usize);
         for docid in 0..n {
             if tomb.contains(docid) {
                 continue;
@@ -305,11 +307,11 @@ impl MmapIndex {
         Self::lookup_docid_in_legacy_map(arc.as_slice(), key)
     }
 
-    fn posting_for_trigram(&self, tri: [u8; 3]) -> Option<RoaringBitmap> {
+    fn posting_for_trigram(&self, tri: [u8; 3]) -> Option<RoaringTreemap> {
         let table = self.snap.trigram_table_bytes();
         let n = table.len() / TRI_REC_SIZE;
         if n == 0 {
-            return Some(RoaringBitmap::new());
+            return Some(RoaringTreemap::new());
         }
 
         let mut lo = 0usize;
@@ -326,13 +328,13 @@ impl MmapIndex {
             }
         }
         if lo >= n {
-            return Some(RoaringBitmap::new());
+            return Some(RoaringTreemap::new());
         }
         let off = lo * TRI_REC_SIZE;
         let rec = &table[off..off + TRI_REC_SIZE];
         let key = [rec[0], rec[1], rec[2]];
         if key != tri {
-            return Some(RoaringBitmap::new());
+            return Some(RoaringTreemap::new());
         }
 
         let posting_off = u32::from_le_bytes(rec[4..8].try_into().ok()?) as usize;
@@ -340,7 +342,9 @@ impl MmapIndex {
         let blob = self.snap.postings_blob_bytes();
         let bytes = blob.get(posting_off..posting_off + posting_len)?;
         let mut cur = Cursor::new(bytes);
-        RoaringBitmap::deserialize_from(&mut cur).ok()
+        roaring::RoaringBitmap::deserialize_from(&mut cur)
+            .map(|bm| bm.iter().map(|v| v as u64).collect::<RoaringTreemap>())
+            .ok()
     }
 
     fn trigram_key_exists(&self, tri: [u8; 3]) -> bool {
@@ -386,20 +390,20 @@ impl MmapIndex {
         bytes.windows(3).map(|w| [w[0], w[1], w[2]]).collect()
     }
 
-    fn trigram_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringBitmap> {
+    fn trigram_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringTreemap> {
         let hint = matcher.literal_hint()?;
         let tris = Self::hint_trigrams(hint);
         if tris.is_empty() {
             return None;
         }
 
-        let mut bitmaps: Vec<RoaringBitmap> = Vec::with_capacity(tris.len());
+        let mut bitmaps: Vec<RoaringTreemap> = Vec::with_capacity(tris.len());
         for tri in tris {
             bitmaps.push(self.posting_for_trigram(tri)?);
         }
         bitmaps.sort_by_key(|b| b.len());
         let mut iter = bitmaps.into_iter();
-        let mut acc = iter.next().unwrap_or_else(RoaringBitmap::new);
+        let mut acc = iter.next().unwrap_or_else(RoaringTreemap::new);
         for b in iter {
             acc &= &b;
             if acc.is_empty() {
@@ -408,16 +412,15 @@ impl MmapIndex {
         }
         Some(acc)
     }
-
-    fn short_component_cache(&self) -> Arc<HashMap<Box<[u8]>, RoaringBitmap>> {
+    fn short_component_cache(&self) -> Arc<HashMap<Box<[u8]>, RoaringTreemap>> {
         if let Some(cache) = self.short_component_cache.lock().clone() {
             return cache;
         }
 
         let tomb = self.tombstones();
         let arena = self.snap.path_arena_bytes();
-        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u32;
-        let mut cache: HashMap<Box<[u8]>, RoaringBitmap> = HashMap::new();
+        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u64;
+        let mut cache: HashMap<Box<[u8]>, RoaringTreemap> = HashMap::new();
 
         for docid in 0..n {
             if tomb.contains(docid) {
@@ -435,7 +438,7 @@ impl MmapIndex {
             for_each_short_component(path.as_path(), |component| {
                 cache
                     .entry(Box::<[u8]>::from(component))
-                    .or_insert_with(RoaringBitmap::new)
+                    .or_insert_with(RoaringTreemap::new)
                     .insert(docid);
             });
         }
@@ -444,8 +447,7 @@ impl MmapIndex {
         *self.short_component_cache.lock() = Some(cache.clone());
         cache
     }
-
-    fn short_hint_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringBitmap> {
+    fn short_hint_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringTreemap> {
         if !self.has_trigram_sentinel() {
             return None;
         }
@@ -454,7 +456,7 @@ impl MmapIndex {
         let cache = self.short_component_cache();
         let table = self.snap.trigram_table_bytes();
         let n = table.len() / TRI_REC_SIZE;
-        let mut acc = RoaringBitmap::new();
+        let mut acc = RoaringTreemap::new();
 
         for i in 0..n {
             let off = i * TRI_REC_SIZE;
@@ -473,10 +475,8 @@ impl MmapIndex {
                 acc |= posting.clone();
             }
         }
-
         Some(acc)
     }
-
     pub fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
         // 能力感知：无哨兵视为旧段（trigram 不覆盖目录组件），禁用预过滤避免假阴性。
         let candidates = if self.has_trigram_sentinel() {
@@ -515,7 +515,7 @@ impl MmapIndex {
             return out;
         }
 
-        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u32;
+        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u64;
         for docid in 0..n {
             if tomb.contains(docid) {
                 continue;
@@ -614,7 +614,7 @@ impl MmapIndex {
             return out;
         }
 
-        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u32;
+        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u64;
         for docid in 0..n {
             if tomb.contains(docid) {
                 continue;
@@ -649,7 +649,7 @@ impl MmapIndex {
     pub fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
         let tomb = self.tombstones();
         let arena = self.snap.path_arena_bytes();
-        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u32;
+        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u64;
         for docid in 0..n {
             if tomb.contains(docid) {
                 continue;
@@ -712,6 +712,7 @@ mod tests {
     use crate::query::matcher::create_matcher;
     use crate::storage::snapshot::SnapshotStore;
     use std::collections::HashMap;
+    use roaring::RoaringBitmap;
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
