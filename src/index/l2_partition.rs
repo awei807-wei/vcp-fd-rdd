@@ -1,5 +1,5 @@
 use parking_lot::RwLock;
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -51,7 +51,7 @@ struct ResolvedFsMeta {
 }
 
 /// DocId：L2 内部紧凑文档编号（posting 的元素类型）
-pub type DocId = u32;
+pub type DocId = u64;
 
 /// 从查询词中提取 trigram 列表
 fn query_trigrams(query: &str) -> Vec<Trigram> {
@@ -207,7 +207,7 @@ impl IndexSnapshotV3 {
 pub struct IndexSnapshotV4 {
     pub arena: PathArena,
     pub metas: Vec<CompactMetaV4>,
-    pub tombstones: Vec<DocId>,
+    pub tombstones: Vec<u32>,
 }
 
 impl IndexSnapshotV4 {
@@ -227,7 +227,7 @@ pub struct IndexSnapshotV5 {
     pub roots_hash: u64,
     pub arena: PathArena,
     pub metas: Vec<CompactMeta>,
-    pub tombstones: Vec<DocId>,
+    pub tombstones: Vec<u32>,
 }
 
 impl IndexSnapshotV5 {
@@ -332,13 +332,13 @@ pub struct PersistentIndex {
     /// 路径反查：hash(path_bytes) -> DocId（或少量冲突列表）
     path_hash_to_id: RwLock<HashMap<u64, OneOrManyDocId>>,
 
-    /// Trigram 倒排索引：trigram -> RoaringBitmap(DocId)
-    trigram_index: RwLock<HashMap<Trigram, RoaringBitmap>>,
-    /// 短组件索引：长度 1-2 的标准化路径组件 -> RoaringBitmap(DocId)
-    short_component_index: RwLock<HashMap<Box<[u8]>, RoaringBitmap>>,
+    /// Trigram 倒排索引：trigram -> RoaringTreemap(DocId)
+    trigram_index: RwLock<HashMap<Trigram, RoaringTreemap>>,
+    /// 短组件索引：长度 1-2 的标准化路径组件 -> RoaringTreemap(DocId)
+    short_component_index: RwLock<HashMap<Box<[u8]>, RoaringTreemap>>,
 
     /// 墓碑标记（DocId）
-    tombstones: RwLock<RoaringBitmap>,
+    tombstones: RwLock<RoaringTreemap>,
 
     /// 脏标记（自上次快照后是否有变更）
     dirty: std::sync::atomic::AtomicBool,
@@ -365,7 +365,7 @@ impl PersistentIndex {
             path_hash_to_id: RwLock::new(HashMap::new()),
             trigram_index: RwLock::new(HashMap::new()),
             short_component_index: RwLock::new(HashMap::new()),
-            tombstones: RwLock::new(RoaringBitmap::new()),
+            tombstones: RwLock::new(RoaringTreemap::new()),
             dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -385,7 +385,7 @@ impl PersistentIndex {
         {
             *idx.metas.write() = snap.metas;
             *idx.arena.write() = snap.arena;
-            *idx.tombstones.write() = snap.tombstones.into_iter().collect();
+            *idx.tombstones.write() = snap.tombstones.into_iter().map(|v| v as u64).collect();
             idx.dirty.store(false, std::sync::atomic::Ordering::Release);
         }
 
@@ -429,7 +429,7 @@ impl PersistentIndex {
         {
             *idx.metas.write() = new_metas;
             *idx.arena.write() = new_arena;
-            *idx.tombstones.write() = tombstones.into_iter().collect();
+            *idx.tombstones.write() = tombstones.into_iter().map(|v| v as u64).collect();
             idx.dirty.store(false, std::sync::atomic::Ordering::Release);
         }
 
@@ -471,10 +471,7 @@ impl PersistentIndex {
         short_component_index.clear();
 
         for (docid_usize, meta) in metas.iter().enumerate() {
-            let docid: DocId = match docid_usize.try_into() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let docid: DocId = docid_usize as DocId;
             filekey_to_docid.insert(meta.file_key, docid);
 
             if tomb.contains(docid) {
@@ -499,13 +496,13 @@ impl PersistentIndex {
                 for_each_component_trigram(abs_path.as_path(), |tri| {
                     trigram_index
                         .entry(tri)
-                        .or_insert_with(RoaringBitmap::new)
+                        .or_insert_with(RoaringTreemap::new)
                         .insert(docid);
                 });
                 for_each_short_component(abs_path.as_path(), |component| {
                     short_component_index
                         .entry(Box::<[u8]>::from(component))
-                        .or_insert_with(RoaringBitmap::new)
+                        .or_insert_with(RoaringTreemap::new)
                         .insert(docid);
                 });
             }
@@ -639,7 +636,7 @@ impl PersistentIndex {
         let (off, len) = self.arena.write().push_bytes(rel_bytes)?;
 
         let mut metas = self.metas.write();
-        let docid: DocId = metas.len().try_into().ok()?;
+        let docid: DocId = metas.len() as DocId;
         metas.push(CompactMeta {
             file_key,
             root_id,
@@ -741,7 +738,7 @@ impl PersistentIndex {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, m)| {
-                        let docid: DocId = i.try_into().ok()?;
+                        let docid: DocId = i as DocId;
                         if tombstones.contains(docid) {
                             return None;
                         }
@@ -783,10 +780,7 @@ impl PersistentIndex {
         let tombstones = self.tombstones.read();
 
         for (i, m) in metas.iter().enumerate() {
-            let docid: DocId = match i.try_into() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let docid: DocId = i as DocId;
             if tombstones.contains(docid) {
                 continue;
             }
@@ -1046,7 +1040,7 @@ impl PersistentIndex {
     pub fn export_snapshot_v5(&self) -> IndexSnapshotV5 {
         let arena = self.arena.read().clone();
         let metas = self.metas.read().clone();
-        let tombstones = self.tombstones.read().iter().collect::<Vec<DocId>>();
+        let tombstones = self.tombstones.read().iter().map(|v| v as u32).collect::<Vec<u32>>();
         self.dirty
             .store(false, std::sync::atomic::Ordering::Release);
         IndexSnapshotV5 {
@@ -1109,10 +1103,11 @@ impl PersistentIndex {
             metas_bytes.extend_from_slice(&ns.to_le_bytes());
         }
 
-        // Tombstones 段：Roaring serialized bytes
+        // Tombstones 段：RoaringBitmap serialized bytes（v6 兼容格式；v8 后再切 Treemap）
         let tombstones = self.tombstones.read();
         let mut tombstones_bytes = Vec::new();
-        tombstones
+        let tomb_bitmap: roaring::RoaringBitmap = tombstones.iter().map(|v| v as u32).collect();
+        tomb_bitmap
             .serialize_into(&mut tombstones_bytes)
             .expect("write to vec");
 
@@ -1128,7 +1123,8 @@ impl PersistentIndex {
         let mut postings_blob_bytes = Vec::new();
         for (tri, posting) in tri_idx.iter() {
             let mut buf = Vec::new();
-            posting.serialize_into(&mut buf).expect("write to vec");
+            let posting_bitmap: roaring::RoaringBitmap = posting.iter().map(|v| v as u32).collect();
+            posting_bitmap.serialize_into(&mut buf).expect("write to vec");
             let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
             let len: u32 = buf.len().try_into().unwrap_or(u32::MAX);
             postings_blob_bytes.write_all(&buf).expect("write to vec");
@@ -1141,7 +1137,7 @@ impl PersistentIndex {
         const TRIGRAM_SENTINEL: [u8; 3] = [0, 0, 0];
         if !tri_idx.contains_key(&TRIGRAM_SENTINEL) {
             let mut buf = Vec::new();
-            RoaringBitmap::new()
+            roaring::RoaringBitmap::new()
                 .serialize_into(&mut buf)
                 .expect("write to vec");
             let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
@@ -1208,7 +1204,7 @@ impl PersistentIndex {
             for (k, docid) in pairs {
                 filekey_map_bytes.extend_from_slice(&k.dev.to_le_bytes());
                 filekey_map_bytes.extend_from_slice(&k.ino.to_le_bytes());
-                filekey_map_bytes.extend_from_slice(&docid.to_le_bytes());
+                filekey_map_bytes.extend_from_slice(&(docid as u32).to_le_bytes());
             }
         }
 
@@ -1291,11 +1287,11 @@ impl PersistentIndex {
             + size_of::<HashMap<u64, OneOrManyDocId>>() as u64
             + path_many_bytes;
 
-        // trigram：HashMap<Trigram, RoaringBitmap> 的 entry + Roaring 的压缩存储量（serialized_size）
-        let trigram_entry_bytes = size_of::<(Trigram, RoaringBitmap)>() as u64;
+        // trigram：HashMap<Trigram, RoaringTreemap> 的 entry + Roaring 的压缩存储量（serialized_size）
+        let trigram_entry_bytes = size_of::<(Trigram, RoaringTreemap)>() as u64;
         let trigram_map_bytes = trigram_index.capacity() as u64 * (trigram_entry_bytes + 1)
-            + size_of::<HashMap<Trigram, RoaringBitmap>>() as u64;
-        let short_component_entry_bytes = size_of::<(Box<[u8]>, RoaringBitmap)>() as u64;
+            + size_of::<HashMap<Trigram, RoaringTreemap>>() as u64;
+        let short_component_entry_bytes = size_of::<(Box<[u8]>, RoaringTreemap)>() as u64;
         let mut short_component_heap_bytes: u64 = 0;
         for (component, posting) in short_component_index.iter() {
             short_component_heap_bytes += component.len() as u64;
@@ -1303,12 +1299,12 @@ impl PersistentIndex {
         }
         let short_component_bytes = short_component_index.capacity() as u64
             * (short_component_entry_bytes + 1)
-            + size_of::<HashMap<Box<[u8]>, RoaringBitmap>>() as u64
+            + size_of::<HashMap<Box<[u8]>, RoaringTreemap>>() as u64
             + short_component_heap_bytes;
         let trigram_bytes = trigram_map_bytes + trigram_heap_bytes + short_component_bytes;
 
-        // tombstones：RoaringBitmap
-        let tomb_bytes = size_of::<RoaringBitmap>() as u64 + tombstones.serialized_size() as u64;
+        // tombstones：RoaringTreemap
+        let tomb_bytes = size_of::<RoaringTreemap>() as u64 + tombstones.serialized_size() as u64;
         let roaring_serialized_bytes = trigram_heap_bytes + tombstones.serialized_size() as u64;
 
         let core_table_bytes = metas_bytes + filekey_to_docid_bytes;
@@ -1443,13 +1439,13 @@ impl PersistentIndex {
         for_each_component_trigram(path, |tri| {
             tri_idx
                 .entry(tri)
-                .or_insert_with(RoaringBitmap::new)
+                .or_insert_with(RoaringTreemap::new)
                 .insert(docid);
         });
         for_each_short_component(path, |component| {
             short_idx
                 .entry(Box::<[u8]>::from(component))
-                .or_insert_with(RoaringBitmap::new)
+                .or_insert_with(RoaringTreemap::new)
                 .insert(docid);
         });
     }
@@ -1508,7 +1504,7 @@ impl PersistentIndex {
         })
     }
 
-    fn trigram_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringBitmap> {
+    fn trigram_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringTreemap> {
         let hint = matcher.literal_hint()?;
         let s = String::from_utf8_lossy(hint);
         let tris = query_trigrams(s.as_ref());
@@ -1520,17 +1516,17 @@ impl PersistentIndex {
         let mut sorted_tris = tris.clone();
         sorted_tris.sort_by_key(|t| tri_idx.get(t).map(|b| b.len()).unwrap_or(0));
 
-        let mut acc: Option<RoaringBitmap> = None;
+        let mut acc: Option<RoaringTreemap> = None;
         for tri in &sorted_tris {
             let Some(posting) = tri_idx.get(tri) else {
-                return Some(RoaringBitmap::new());
+                return Some(RoaringTreemap::new());
             };
             match acc {
                 None => acc = Some(posting.clone()),
                 Some(ref mut a) => {
                     *a &= posting;
                     if a.is_empty() {
-                        return Some(RoaringBitmap::new());
+                        return Some(RoaringTreemap::new());
                     }
                 }
             }
@@ -1538,11 +1534,11 @@ impl PersistentIndex {
         Some(acc.unwrap_or_default())
     }
 
-    fn short_hint_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringBitmap> {
+    fn short_hint_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringTreemap> {
         let hint = normalize_short_hint(matcher.literal_hint()?)?;
         let tri_idx = self.trigram_index.read();
         let short_idx = self.short_component_index.read();
-        let mut acc = RoaringBitmap::new();
+        let mut acc = RoaringTreemap::new();
 
         for (tri, posting) in tri_idx.iter() {
             if trigram_matches_short_hint(*tri, &hint) {
@@ -1598,10 +1594,7 @@ impl IndexLayer for PersistentIndex {
             None => {
                 // 无法用 trigram 加速（查询词太短），全量过滤（不构造 PathBuf）。
                 for (i, m) in metas.iter().enumerate() {
-                    let docid: DocId = match i.try_into() {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+                    let docid: DocId = i as DocId;
                     if tombstones.contains(docid) {
                         continue;
                     }

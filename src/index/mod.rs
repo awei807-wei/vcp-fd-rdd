@@ -16,6 +16,9 @@ use crate::query::Matcher;
 pub trait IndexLayer: Send + Sync {
     fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey>;
     fn get_meta(&self, key: FileKey) -> Option<FileMeta>;
+    fn file_count_estimate(&self) -> usize {
+        0
+    }
 }
 
 pub use l1_cache::L1Cache;
