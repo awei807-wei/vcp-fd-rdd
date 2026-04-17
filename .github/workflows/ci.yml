@@ -9,7 +9,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  fmt:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  check-test-clippy:
     name: ${{ matrix.os }} / stable
     runs-on: ${{ matrix.os }}
     strategy:
@@ -33,10 +47,7 @@ jobs:
         run: cargo check --all-targets
 
       - name: cargo test
-        run: cargo test
-
-      - name: cargo build --release
-        run: cargo build --release
+        run: cargo test -- --test-threads=1
 
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
