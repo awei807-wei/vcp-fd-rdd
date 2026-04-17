@@ -838,13 +838,13 @@ impl PersistentIndex {
 
     pub fn apply_file_metas(&self, metas: &[FileMeta]) {
         for meta in metas.iter().cloned() {
-            self.upsert(meta);
+            self.upsert_rename(meta);
         }
     }
 
     pub fn apply_file_metas_drain(&self, metas: &mut Vec<FileMeta>) {
         for meta in metas.drain(..) {
-            self.upsert(meta);
+            self.upsert_rename(meta);
         }
     }
 
