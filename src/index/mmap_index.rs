@@ -67,7 +67,6 @@ fn for_each_short_component(path: &Path, mut f: impl FnMut(&[u8])) {
 
 type ShortComponentCache = parking_lot::Mutex<Option<Arc<HashMap<Box<[u8]>, RoaringTreemap>>>>;
 
-
 pub struct MmapIndex {
     snap: Arc<MmapSnapshotV6>,
     tomb_cache: parking_lot::Mutex<Option<RoaringTreemap>>,
@@ -712,8 +711,8 @@ mod tests {
     use crate::index::PersistentIndex;
     use crate::query::matcher::create_matcher;
     use crate::storage::snapshot::SnapshotStore;
-    use std::collections::HashMap;
     use roaring::RoaringBitmap;
+    use std::collections::HashMap;
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -776,10 +775,7 @@ mod tests {
             }
             for w in bytes.windows(3) {
                 let tri = [w[0], w[1], w[2]];
-                tri_idx
-                    .entry(tri)
-                    .or_default()
-                    .insert(*docid);
+                tri_idx.entry(tri).or_default().insert(*docid);
             }
         }
 

@@ -184,7 +184,11 @@ impl MemoryReport {
             })
             .map(|pages| {
                 let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-                let page_size = if page_size <= 0 { 4096 } else { page_size as u64 };
+                let page_size = if page_size <= 0 {
+                    4096
+                } else {
+                    page_size as u64
+                };
                 pages.saturating_mul(page_size)
             })
             .unwrap_or(0)

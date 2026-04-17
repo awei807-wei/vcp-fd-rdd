@@ -55,11 +55,9 @@ fn basic_keyword_query() {
 
     let results = index.query("readme");
     assert_eq!(results.len(), 2, "Should find both readme files");
-    assert!(results.iter().all(|m| m
-        .path
-        .to_string_lossy()
-        .to_lowercase()
-        .contains("readme")));
+    assert!(results
+        .iter()
+        .all(|m| m.path.to_string_lossy().to_lowercase().contains("readme")));
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -114,10 +112,7 @@ fn large_result_set_query_does_not_oom() {
 
     // Query that matches all files
     let results = index.query_limit("data", 10_000);
-    assert!(
-        !results.is_empty(),
-        "Should return results for broad query"
-    );
+    assert!(!results.is_empty(), "Should return results for broad query");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -176,10 +171,9 @@ fn chinese_keyword_query() {
     // 中文双字查询
     let results = index.query("文档");
     assert_eq!(results.len(), 2, "Should find both 文档 files");
-    assert!(results.iter().all(|m| m
-        .path
-        .to_string_lossy()
-        .contains("文档")));
+    assert!(results
+        .iter()
+        .all(|m| m.path.to_string_lossy().contains("文档")));
 
     // 中文单字查询（触发短组件索引优化）
     let results = index.query("中");

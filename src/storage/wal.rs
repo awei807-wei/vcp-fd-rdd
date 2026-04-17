@@ -276,7 +276,6 @@ impl WalStore {
             e.seq = i as u64 + 1;
         }
 
-
         Ok(WalReplayResult {
             events,
             sealed_used: sealed.len(),

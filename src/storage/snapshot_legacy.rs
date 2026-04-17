@@ -44,19 +44,29 @@ impl_legacy_snapshot!(IndexSnapshotV4, "v4");
 impl_legacy_snapshot!(IndexSnapshotV5, "v5");
 
 impl From<IndexSnapshotV2> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV2) -> Self { LoadedSnapshot::V2(v) }
+    fn from(v: IndexSnapshotV2) -> Self {
+        LoadedSnapshot::V2(v)
+    }
 }
 impl From<IndexSnapshotV3> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV3) -> Self { LoadedSnapshot::V3(v) }
+    fn from(v: IndexSnapshotV3) -> Self {
+        LoadedSnapshot::V3(v)
+    }
 }
 impl From<IndexSnapshotV4> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV4) -> Self { LoadedSnapshot::V4(v) }
+    fn from(v: IndexSnapshotV4) -> Self {
+        LoadedSnapshot::V4(v)
+    }
 }
 impl From<IndexSnapshotV5> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV5) -> Self { LoadedSnapshot::V5(v) }
+    fn from(v: IndexSnapshotV5) -> Self {
+        LoadedSnapshot::V5(v)
+    }
 }
 
-pub fn load_legacy_snapshot<T: LegacySnapshot>(body: &[u8]) -> anyhow::Result<Option<LoadedSnapshot>> {
+pub fn load_legacy_snapshot<T: LegacySnapshot>(
+    body: &[u8],
+) -> anyhow::Result<Option<LoadedSnapshot>> {
     match T::deserialize_bincode(body) {
         Ok(snap) => Ok(Some(snap.into_loaded())),
         Err(e) => {

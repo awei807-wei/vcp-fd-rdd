@@ -2,14 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
-use crate::core::{
-    EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Task,
-};
+use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Task};
 use crate::event::recovery::{DirtyScope, DirtyTracker};
 use crate::index::l2_partition::PersistentIndex;
 use crate::util::maybe_trim_rss;
 
-use super::{REBUILD_COOLDOWN, TieredIndex};
+use super::{TieredIndex, REBUILD_COOLDOWN};
 
 fn visit_dirs_since(
     roots: &[PathBuf],
@@ -83,7 +81,11 @@ fn visit_dirs_since(
     false
 }
 
-pub(super) fn dir_tree_changed_since(roots: &[PathBuf], ignore_prefixes: &[PathBuf], cutoff_ns: u64) -> bool {
+pub(super) fn dir_tree_changed_since(
+    roots: &[PathBuf],
+    ignore_prefixes: &[PathBuf],
+    cutoff_ns: u64,
+) -> bool {
     visit_dirs_since(
         roots,
         ignore_prefixes,

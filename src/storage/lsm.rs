@@ -110,7 +110,9 @@ pub fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
     let ver = u32::from_le_bytes(hdr[4..8].try_into()?);
     let body_len = u32::from_le_bytes(hdr[8..12].try_into()?) as usize;
     let checksum = u32::from_le_bytes(hdr[12..16].try_into()?);
-    if magic != LSM_MANIFEST_MAGIC || !(ver == 1 || ver == 2 || ver == 3 || ver == LSM_MANIFEST_VERSION) {
+    if magic != LSM_MANIFEST_MAGIC
+        || !(ver == 1 || ver == 2 || ver == 3 || ver == LSM_MANIFEST_VERSION)
+    {
         anyhow::bail!("LSM manifest magic/version mismatch");
     }
     if body_len > MAX_LSM_MANIFEST_BODY_BYTES {
@@ -194,7 +196,10 @@ pub fn parse_lsm_seg_id(name: &str) -> Option<u64> {
 const LSM_DEL_MAGIC: u32 = 0x314C_4544; // "DEL1"
 const LSM_DEL_VERSION: u32 = 1;
 
-pub fn lsm_write_deleted_paths_atomic(path: &Path, deleted_paths: &[Vec<u8>]) -> anyhow::Result<()> {
+pub fn lsm_write_deleted_paths_atomic(
+    path: &Path,
+    deleted_paths: &[Vec<u8>],
+) -> anyhow::Result<()> {
     let tmp = path.with_extension("del.tmp");
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(&LSM_DEL_MAGIC.to_le_bytes())?;
@@ -556,7 +561,9 @@ mod tests {
             .unwrap();
 
         std::fs::remove_file(store.lsm_seg_db_path(appended.id)).unwrap();
-        let loaded = store.load_lsm_if_valid(std::slice::from_ref(&root)).unwrap();
+        let loaded = store
+            .load_lsm_if_valid(std::slice::from_ref(&root))
+            .unwrap();
         assert!(loaded.is_none());
     }
 
@@ -584,7 +591,9 @@ mod tests {
             .unwrap();
 
         std::fs::write(store.lsm_seg_del_path(appended.id), b"bad-sidecar").unwrap();
-        let loaded = store.load_lsm_if_valid(std::slice::from_ref(&root)).unwrap();
+        let loaded = store
+            .load_lsm_if_valid(std::slice::from_ref(&root))
+            .unwrap();
         assert!(loaded.is_none());
     }
 

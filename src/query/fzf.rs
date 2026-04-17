@@ -343,17 +343,24 @@ mod tests {
 
         // Search for "中文" should match the first and third
         let results = fzf.match_query("中文", entries.clone());
-        assert_eq!(results.len(), 2, "fuzzy match should find 2 Chinese matches");
+        assert_eq!(
+            results.len(),
+            2,
+            "fuzzy match should find 2 Chinese matches"
+        );
         let paths: Vec<_> = results.iter().map(|(m, _)| m.path.clone()).collect();
         assert!(paths.contains(&PathBuf::from("/tmp/中文文档.txt")));
         assert!(paths.contains(&PathBuf::from("/tmp/中文文件.txt")));
 
         // Search for "文档" should match the first and second
         let results2 = fzf.match_query("文档", entries.clone());
-        assert_eq!(results2.len(), 2, "fuzzy match should find 2 Chinese matches for 文档");
+        assert_eq!(
+            results2.len(),
+            2,
+            "fuzzy match should find 2 Chinese matches for 文档"
+        );
         let paths2: Vec<_> = results2.iter().map(|(m, _)| m.path.clone()).collect();
         assert!(paths2.contains(&PathBuf::from("/tmp/中文文档.txt")));
         assert!(paths2.contains(&PathBuf::from("/tmp/英文文档.txt")));
     }
-
 }

@@ -518,10 +518,7 @@ impl PersistentIndex {
                     rel_bytes,
                 );
                 for_each_component_trigram(abs_path.as_path(), |tri| {
-                    trigram_index
-                        .entry(tri)
-                        .or_default()
-                        .insert(docid);
+                    trigram_index.entry(tri).or_default().insert(docid);
                 });
                 for_each_short_component(abs_path.as_path(), |component| {
                     short_component_index
@@ -1064,7 +1061,12 @@ impl PersistentIndex {
     pub fn export_snapshot_v5(&self) -> IndexSnapshotV5 {
         let arena = self.arena.read().clone();
         let metas = self.metas.read().clone();
-        let tombstones = self.tombstones.read().iter().map(|v| v as u32).collect::<Vec<u32>>();
+        let tombstones = self
+            .tombstones
+            .read()
+            .iter()
+            .map(|v| v as u32)
+            .collect::<Vec<u32>>();
         self.dirty
             .store(false, std::sync::atomic::Ordering::Release);
         IndexSnapshotV5 {
@@ -1148,7 +1150,9 @@ impl PersistentIndex {
         for (tri, posting) in tri_idx.iter() {
             let mut buf = Vec::new();
             let posting_bitmap: roaring::RoaringBitmap = posting.iter().map(|v| v as u32).collect();
-            posting_bitmap.serialize_into(&mut buf).expect("write to vec");
+            posting_bitmap
+                .serialize_into(&mut buf)
+                .expect("write to vec");
             let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
             let len: u32 = buf.len().try_into().unwrap_or(u32::MAX);
             postings_blob_bytes.write_all(&buf).expect("write to vec");
@@ -1461,10 +1465,7 @@ impl PersistentIndex {
         let mut tri_idx = self.trigram_index.write();
         let mut short_idx = self.short_component_index.write();
         for_each_component_trigram(path, |tri| {
-            tri_idx
-                .entry(tri)
-                .or_default()
-                .insert(docid);
+            tri_idx.entry(tri).or_default().insert(docid);
         });
         for_each_short_component(path, |component| {
             short_idx
@@ -1820,12 +1821,20 @@ mod tests {
         // 单个中文字符（3 字节）应匹配包含该字符的所有文件
         let m = create_matcher("中", true);
         let r = idx.query(m.as_ref(), 100);
-        assert_eq!(r.len(), 3, "'中' should match /tmp/中, /tmp/中文 and /tmp/中文文档.txt");
+        assert_eq!(
+            r.len(),
+            3,
+            "'中' should match /tmp/中, /tmp/中文 and /tmp/中文文档.txt"
+        );
 
         // 两个中文字符（6 字节）应匹配包含这两个字符的文件
         let m = create_matcher("中文", true);
         let r = idx.query(m.as_ref(), 100);
-        assert_eq!(r.len(), 2, "'中文' should match /tmp/中文 and /tmp/中文文档.txt");
+        assert_eq!(
+            r.len(),
+            2,
+            "'中文' should match /tmp/中文 and /tmp/中文文档.txt"
+        );
     }
 
     #[test]
@@ -1847,7 +1856,12 @@ mod tests {
 
         let m2 = create_matcher("文件", true);
         let r2 = idx.query(m2.as_ref(), 100);
-        assert_eq!(r2.len(), 1, "expected 1 result for '文件', got {}", r2.len());
+        assert_eq!(
+            r2.len(),
+            1,
+            "expected 1 result for '文件', got {}",
+            r2.len()
+        );
     }
 
     #[test]
@@ -1873,7 +1887,11 @@ mod tests {
         // Single Chinese character "文" (3 UTF-8 bytes) should generate exactly one trigram
         let m = create_matcher("文", true);
         let r = idx.query(m.as_ref(), 100);
-        assert_eq!(r.len(), 2, "single Chinese char should match both files containing 文");
+        assert_eq!(
+            r.len(),
+            2,
+            "single Chinese char should match both files containing 文"
+        );
     }
 
     #[test]
@@ -1899,7 +1917,11 @@ mod tests {
         // Two Chinese characters "文档" should match both
         let m = create_matcher("文档", true);
         let r = idx.query(m.as_ref(), 100);
-        assert_eq!(r.len(), 2, "two Chinese chars should match both files containing 文档");
+        assert_eq!(
+            r.len(),
+            2,
+            "two Chinese chars should match both files containing 文档"
+        );
 
         // "中文" should match only the first
         let m2 = create_matcher("中文", true);

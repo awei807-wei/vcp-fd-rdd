@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use fd_rdd::event::watcher::{EventWatcher, watch_roots};
+use fd_rdd::event::watcher::{watch_roots, EventWatcher};
 
 fn unique_tmp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -53,10 +53,7 @@ fn watch_existing_root_succeeds() {
         EventWatcher::start(std::slice::from_ref(&root), 64, drops, rescans, None).unwrap();
 
     let failed = watch_roots(&mut watcher, std::slice::from_ref(&root));
-    assert!(
-        failed.is_empty(),
-        "Should succeed for existing directory"
-    );
+    assert!(failed.is_empty(), "Should succeed for existing directory");
 
     let _ = std::fs::remove_dir_all(&root);
 }

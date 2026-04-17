@@ -1,8 +1,6 @@
 use crate::core::FileMeta;
-use crate::query::filter::{
-    doc_exts, normalize_ext_list, pic_exts, video_exts, Filter,
-};
 use crate::query::dsl_parser::{tokenize, Parser};
+use crate::query::filter::{doc_exts, normalize_ext_list, pic_exts, video_exts, Filter};
 use crate::query::matcher::{
     contains_path_separator, create_matcher, ExtMatcher, MatchAllMatcher, Matcher,
     PathInitialsMatcher, PathScope, RegexMatcher, WfnMatcher,
@@ -341,10 +339,7 @@ fn best_anchor_in_branch(
 
 type AnchorScoreResult = Result<Option<(i64, Arc<dyn Matcher>)>, QueryCompileError>;
 
-fn best_anchor_in_branch_scored(
-    expr: &Expr,
-    case_sensitive: bool,
-) -> AnchorScoreResult {
+fn best_anchor_in_branch_scored(expr: &Expr, case_sensitive: bool) -> AnchorScoreResult {
     match expr {
         Expr::Or(_) => Ok(None),
         Expr::True => Ok(None),
@@ -573,5 +568,4 @@ mod tests {
         // this should still match
         assert!(q.matches(&meta("/tmp/中文文档.txt", 1, None)));
     }
-
 }

@@ -128,7 +128,10 @@ impl TieredIndex {
         }
     }
 
-    pub(super) fn capture_l2_for_apply(&self, events: &[EventRecord]) -> (Arc<PersistentIndex>, bool) {
+    pub(super) fn capture_l2_for_apply(
+        &self,
+        events: &[EventRecord],
+    ) -> (Arc<PersistentIndex>, bool) {
         let mut st = self.rebuild_state.lock();
         if !st.in_progress {
             drop(st);

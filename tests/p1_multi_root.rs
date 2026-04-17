@@ -60,16 +60,10 @@ fn multi_root_files_have_correct_paths() {
     // Verify paths are under the correct root
     for p in &seen {
         if p.ends_with("only_a.txt") {
-            assert!(
-                p.starts_with(&root_a),
-                "only_a.txt should be under root_a"
-            );
+            assert!(p.starts_with(&root_a), "only_a.txt should be under root_a");
         }
         if p.ends_with("only_b.txt") {
-            assert!(
-                p.starts_with(&root_b),
-                "only_b.txt should be under root_b"
-            );
+            assert!(p.starts_with(&root_b), "only_b.txt should be under root_b");
         }
     }
 

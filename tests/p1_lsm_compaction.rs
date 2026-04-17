@@ -39,10 +39,7 @@ async fn lsm_snapshot_write_and_reload() {
             seq: i + 1,
             timestamp: std::time::SystemTime::now(),
             event_type: EventType::Create,
-            id: FileIdentifier::Fid {
-                dev: 1,
-                ino: i + 1,
-            },
+            id: FileIdentifier::Fid { dev: 1, ino: i + 1 },
             path_hint: Some(path),
         }];
         index.apply_events(&events);

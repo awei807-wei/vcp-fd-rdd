@@ -466,10 +466,7 @@ impl Matcher for PathInitialsMatcher {
         }
 
         // Split path into segments
-        let path_segs: Vec<&str> = path
-            .split(['/', '\\'])
-            .filter(|s| !s.is_empty())
-            .collect();
+        let path_segs: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
 
         let mut qi = 0; // query segment index
         let mut pi = 0; // path segment index
@@ -742,5 +739,4 @@ mod tests {
         assert!(m.matches("/tmp/vcp文档.txt"));
         assert!(!m.matches("/tmp/vcp文件.txt"));
     }
-
 }

@@ -7,8 +7,8 @@ mod memory;
 mod query;
 mod query_plan;
 pub(crate) mod rebuild;
-pub(crate) mod sync;
 mod snapshot;
+pub(crate) mod sync;
 
 #[cfg(test)]
 mod tests;

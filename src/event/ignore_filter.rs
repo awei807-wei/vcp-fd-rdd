@@ -81,7 +81,11 @@ impl IgnoreFilter {
             let global_root = self.global.path();
             if path.starts_with(global_root) {
                 let rel = path.strip_prefix(global_root).unwrap_or(path);
-                if self.global.matched_path_or_any_parents(rel, is_dir).is_ignore() {
+                if self
+                    .global
+                    .matched_path_or_any_parents(rel, is_dir)
+                    .is_ignore()
+                {
                     return true;
                 }
             }
@@ -102,9 +106,8 @@ impl IgnoreFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::test_util::unique_tmp_dir;
-
+    use std::fs;
 
     #[test]
     fn ignores_matching_paths() {

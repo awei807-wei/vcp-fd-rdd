@@ -1,5 +1,5 @@
 use crate::index::l2_partition::V6Segments;
-use crate::storage::checksum::{Checksum32, Crc32c, SimpleChecksum, simple_checksum};
+use crate::storage::checksum::{simple_checksum, Checksum32, Crc32c, SimpleChecksum};
 use crate::storage::snapshot::{
     SnapshotStore, HEADER_SIZE, MAGIC, MAX_V6_MANIFEST_BYTES, MAX_V6_ROOTS_SEGMENT_BYTES,
     STATE_COMMITTED, STATE_INCOMPLETE, VERSION_CURRENT, VERSION_V6, VERSION_V7,
@@ -149,7 +149,11 @@ pub(crate) fn decode_roots_segment(mut bytes: &[u8]) -> anyhow::Result<Vec<Vec<u
     Ok(roots)
 }
 
-pub(crate) fn read_file_range(file: &mut std::fs::File, offset: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn read_file_range(
+    file: &mut std::fs::File,
+    offset: u64,
+    len: u64,
+) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
 
     file.seek(SeekFrom::Start(offset))?;
@@ -828,7 +832,9 @@ mod tests {
         f.write_all(&b).unwrap();
         f.sync_all().unwrap();
 
-        let snap = store.load_v6_mmap_if_valid(std::slice::from_ref(&root)).unwrap();
+        let snap = store
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
+            .unwrap();
         assert!(snap.is_none());
     }
 }

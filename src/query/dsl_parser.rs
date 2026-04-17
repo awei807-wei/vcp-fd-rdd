@@ -1,4 +1,6 @@
-use crate::query::dsl::{Atom, CmpOp, DateRange, EntryKind, Expr, MediaKind, QueryCompileError, SizeFilter};
+use crate::query::dsl::{
+    Atom, CmpOp, DateRange, EntryKind, Expr, MediaKind, QueryCompileError, SizeFilter,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Op {
@@ -203,7 +205,10 @@ pub(crate) fn build_or_and(
     Ok(Expr::Or(built))
 }
 
-pub(crate) fn parse_atom_expr(word: &str, case_sensitive: &mut bool) -> Result<Expr, QueryCompileError> {
+pub(crate) fn parse_atom_expr(
+    word: &str,
+    case_sensitive: &mut bool,
+) -> Result<Expr, QueryCompileError> {
     let (head, tail) = split_prefix(word);
 
     match head {
@@ -571,7 +576,9 @@ fn local_date_range(year: i32, month: i32, day: i32) -> Result<DateRange, String
         let a = (14 - m) / 12;
         let yy = y + 4800 - a;
         let mm = m + 12 * a - 3;
-        d as i64 + (153 * mm as i64 + 2) / 5 + 365 * yy as i64 + yy as i64 / 4 - yy as i64 / 100 + yy as i64 / 400 - 32045
+        d as i64 + (153 * mm as i64 + 2) / 5 + 365 * yy as i64 + yy as i64 / 4 - yy as i64 / 100
+            + yy as i64 / 400
+            - 32045
     };
 
     let days = jdn(year, month, day);

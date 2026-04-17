@@ -49,8 +49,8 @@ impl TieredIndex {
         let rebuild = {
             use std::mem::size_of;
 
-            use crate::core::{EventType, FileIdentifier};
             use super::rebuild::PendingEvent;
+            use crate::core::{EventType, FileIdentifier};
 
             let st = self.rebuild_state.lock();
             let mut key_bytes = 0u64;

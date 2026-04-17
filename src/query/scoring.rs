@@ -284,7 +284,11 @@ fn boundary_aware_match(path: &str, basename: &str, needle: &str) -> (f64, bool,
         }
 
         // 检测"完美边界"：匹配前一个字符是 `.` 或 `/`
-        let perfect = start > 0 && path[..start].chars().next_back().map_or(false, is_perfect_boundary);
+        let perfect = start > 0
+            && path[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_perfect_boundary);
 
         if instance_score > best_score {
             best_score = instance_score;
@@ -424,8 +428,7 @@ pub fn score_result(meta: &FileMeta, config: &ScoreConfig) -> i64 {
         }
 
         // 4d) 深度仅作为"最后的仲裁"（Tie-breaker）
-        let depth =
-            path_str.matches('/').count() + path_str.matches('\\').count();
+        let depth = path_str.matches('/').count() + path_str.matches('\\').count();
         score -= (depth as f64) * DEPTH_TIEBREAKER_FACTOR;
     }
 
@@ -471,7 +474,11 @@ fn compute_substring_highlights(haystack: &str, needle: &str) -> Vec<[usize; 2]>
         let abs_pos = start + pos;
         highlights.push([abs_pos, abs_pos + n_lower.len()]);
         // Advance by at least one UTF-8 character to avoid landing inside a multi-byte char
-        let advance = h_lower[abs_pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        let advance = h_lower[abs_pos..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
         start = abs_pos + advance;
         if start >= h_lower.len() {
             break;
@@ -488,10 +495,7 @@ fn compute_path_initials_highlights(path: &str, query: &str) -> Vec<[usize; 2]> 
     let mut highlights = Vec::new();
 
     // Split query by separators
-    let query_segments: Vec<&str> = query
-        .split(['/', '\\'])
-        .filter(|s| !s.is_empty())
-        .collect();
+    let query_segments: Vec<&str> = query.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
 
     if query_segments.is_empty() {
         return highlights;
@@ -662,7 +666,10 @@ mod tests {
         let nm_file = meta("/home/project/node_modules/express/index.js", 100, None);
         let s = score_result(&nm_file, &config);
         // 不应被压缩到极低分
-        assert!(s > 50, "node_modules file with node query should not be suppressed, got {s}");
+        assert!(
+            s > 50,
+            "node_modules file with node query should not be suppressed, got {s}"
+        );
     }
 
     // ── 其他噪声目录惩罚 ──
@@ -746,10 +753,7 @@ mod tests {
         let s3 = score_result(&depth3, &config);
         let s8 = score_result(&depth8, &config);
         // 深度差 5 层，每层 -0.5，差值约 2-3 分（而非旧方案的 50+ 分）
-        assert!(
-            s3 > s8,
-            "depth3={s3} should be > depth8={s8} (tiebreaker)"
-        );
+        assert!(s3 > s8, "depth3={s3} should be > depth8={s8} (tiebreaker)");
         // 差距不应太大——证明深度是 tiebreaker 而非主因
         let gap = s3 - s8;
         assert!(
@@ -882,7 +886,10 @@ mod tests {
         let after_chinese = meta("/中文-测试.txt", 100, None);
         let s = score_result(&after_chinese, &config);
         // 至少应该正常评分不 panic
-        assert!(s > 0, "score after chinese boundary should be positive, got {s}");
+        assert!(
+            s > 0,
+            "score after chinese boundary should be positive, got {s}"
+        );
     }
 
     // ── ScoreConfig 感知测试 ──
@@ -945,7 +952,11 @@ mod tests {
     #[test]
     fn highlight_chinese_substring() {
         let h = compute_highlights("/tmp/中文文档.txt", "文档");
-        assert_eq!(h, vec![[11, 17]], "文档 is 6 bytes, should highlight at correct byte positions");
+        assert_eq!(
+            h,
+            vec![[11, 17]],
+            "文档 is 6 bytes, should highlight at correct byte positions"
+        );
     }
 
     #[test]
@@ -958,8 +969,8 @@ mod tests {
     fn highlight_chinese_path_initials() {
         let h = compute_highlights("/tmp/中文目录/文档备份.txt", "tmp/中文/文档");
         assert_eq!(h.len(), 3);
-        assert_eq!(h[0], [1, 4]);   // "tmp"
-        assert_eq!(h[1], [5, 11]);  // "中文"
+        assert_eq!(h[0], [1, 4]); // "tmp"
+        assert_eq!(h[1], [5, 11]); // "中文"
         assert_eq!(h[2], [18, 24]); // "文档"
     }
 }

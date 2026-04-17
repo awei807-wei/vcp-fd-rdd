@@ -11,7 +11,7 @@ use super::arena::{deleted_paths_stats, path_arena_set_from_paths};
 use super::disk_layer::DiskLayer;
 use super::pathbuf_from_bytes;
 use super::{
-    COMPACTION_COOLDOWN, COMPACTION_DELTA_THRESHOLD, COMPACTION_MAX_DELTAS_PER_RUN, TieredIndex,
+    TieredIndex, COMPACTION_COOLDOWN, COMPACTION_DELTA_THRESHOLD, COMPACTION_MAX_DELTAS_PER_RUN,
 };
 
 impl TieredIndex {

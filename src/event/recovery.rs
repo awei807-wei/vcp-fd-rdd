@@ -87,7 +87,13 @@ impl DirtyTracker {
                 .max_by_key(|r| r.as_os_str().len())
                 .cloned()
                 .or_else(|| p.parent().map(|parent| parent.to_path_buf()))
-                .or_else(|| if p.is_absolute() { Some(Path::new("/").to_path_buf()) } else { None });
+                .or_else(|| {
+                    if p.is_absolute() {
+                        Some(Path::new("/").to_path_buf())
+                    } else {
+                        None
+                    }
+                });
 
             if let Some(dir) = target {
                 st.dirty_dirs.insert(dir);

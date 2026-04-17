@@ -121,7 +121,10 @@ mod imp {
             let path: PathBuf = path.to_path_buf();
             if let Some(parent) = path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    tracing::warn!("Failed to create socket parent dir {}: {e}", parent.display());
+                    tracing::warn!(
+                        "Failed to create socket parent dir {}: {e}",
+                        parent.display()
+                    );
                 }
             }
             if let Err(e) = std::fs::remove_file(&path) {
@@ -133,8 +136,13 @@ mod imp {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
-                    tracing::warn!("Failed to set socket permissions on {}: {e}", path.display());
+                if let Err(e) =
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                {
+                    tracing::warn!(
+                        "Failed to set socket permissions on {}: {e}",
+                        path.display()
+                    );
                 }
             }
             tracing::info!("Unix Socket Server listening on {}", path.display());
@@ -157,7 +165,10 @@ mod imp {
 
             if let Err(e) = std::fs::remove_file(&path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!("Failed to remove socket file on shutdown {}: {e}", path.display());
+                    tracing::warn!(
+                        "Failed to remove socket file on shutdown {}: {e}",
+                        path.display()
+                    );
                 }
             }
             Ok(())

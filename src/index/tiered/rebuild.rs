@@ -3,8 +3,7 @@ use std::time::Instant;
 
 use crate::core::{EventType, FileIdentifier};
 
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct RebuildState {
     pub(super) in_progress: bool,
     pub(super) pending_events: std::collections::HashMap<FileIdentifier, PendingEvent>,
@@ -15,7 +14,6 @@ pub(super) struct RebuildState {
     /// 冷却期触发的延迟 rebuild 是否已调度（避免重复 spawn sleep 线程）
     pub(super) scheduled: bool,
 }
-
 
 #[derive(Clone, Debug)]
 pub(super) struct PendingEvent {

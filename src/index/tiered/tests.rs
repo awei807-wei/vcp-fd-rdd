@@ -1,10 +1,10 @@
 use super::*;
-use std::sync::Arc;
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::event::recovery::DirtyScope;
 use crate::stats::EventPipelineStats;
 use crate::storage::snapshot::SnapshotStore;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn mk_event(seq: u64, event_type: EventType, path: PathBuf) -> EventRecord {
     EventRecord {
@@ -331,7 +331,12 @@ async fn lsm_layering_delete_blocks_base() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&base_idx.export_segments_v6(), None, std::slice::from_ref(&root), 0)
+        .lsm_replace_base_v6(
+            &base_idx.export_segments_v6(),
+            None,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
     store.gc_stale_segments().unwrap();
@@ -387,7 +392,12 @@ async fn lsm_delete_then_recreate_prefers_newest() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&base_idx.export_segments_v6(), None, std::slice::from_ref(&root), 0)
+        .lsm_replace_base_v6(
+            &base_idx.export_segments_v6(),
+            None,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
     store.gc_stale_segments().unwrap();
@@ -396,7 +406,12 @@ async fn lsm_delete_then_recreate_prefers_newest() {
     let d1 = PersistentIndex::new_with_roots(vec![root.clone()]);
     let deleted = vec![alpha.as_os_str().as_encoded_bytes().to_vec()];
     store
-        .lsm_append_delta_v6(&d1.export_segments_v6(), &deleted, std::slice::from_ref(&root), 0)
+        .lsm_append_delta_v6(
+            &d1.export_segments_v6(),
+            &deleted,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -411,7 +426,12 @@ async fn lsm_delete_then_recreate_prefers_newest() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&d2.export_segments_v6(), &[], std::slice::from_ref(&root), 0)
+        .lsm_append_delta_v6(
+            &d2.export_segments_v6(),
+            &[],
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -448,7 +468,12 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, std::slice::from_ref(&root), 0)
+        .lsm_replace_base_v6(
+            &seg1.export_segments_v6(),
+            None,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -463,7 +488,12 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], std::slice::from_ref(&root), 0)
+        .lsm_append_delta_v6(
+            &seg2.export_segments_v6(),
+            &[],
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -502,7 +532,12 @@ async fn query_rename_from_tombstone_blocks_old_path() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, std::slice::from_ref(&root), 0)
+        .lsm_replace_base_v6(
+            &seg1.export_segments_v6(),
+            None,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -518,7 +553,12 @@ async fn query_rename_from_tombstone_blocks_old_path() {
     });
     let deleted = vec![old.as_os_str().as_encoded_bytes().to_vec()];
     store
-        .lsm_append_delta_v6(&seg2.export_segments_v6(), &deleted, std::slice::from_ref(&root), 0)
+        .lsm_append_delta_v6(
+            &seg2.export_segments_v6(),
+            &deleted,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -565,7 +605,12 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, std::slice::from_ref(&root), 0)
+        .lsm_replace_base_v6(
+            &seg1.export_segments_v6(),
+            None,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -580,7 +625,12 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], std::slice::from_ref(&root), 0)
+        .lsm_append_delta_v6(
+            &seg2.export_segments_v6(),
+            &[],
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -595,7 +645,12 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&seg3.export_segments_v6(), &[], std::slice::from_ref(&root), 0)
+        .lsm_append_delta_v6(
+            &seg3.export_segments_v6(),
+            &[],
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -761,7 +816,10 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
     assert_eq!(layer_ids[1..], [4, 5]);
     assert!(layer_ids[0] > 5);
 
-    let loaded = store.load_lsm_if_valid(std::slice::from_ref(&root)).unwrap().unwrap();
+    let loaded = store
+        .load_lsm_if_valid(std::slice::from_ref(&root))
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.base.as_ref().map(|b| b.id), Some(layer_ids[0]));
     assert_eq!(
         loaded.deltas.iter().map(|d| d.id).collect::<Vec<_>>(),
