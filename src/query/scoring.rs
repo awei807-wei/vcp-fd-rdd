@@ -33,9 +33,7 @@ const JUNK_DIR_NAMES: &[&str] = &[
     "venv",
     ".venv",
     "env",
-    ".env",
     ".eggs",
-    ".tox",
 ];
 
 /// 含 `node` 关键字的 Low Priority Zone 目录名。
@@ -535,11 +533,6 @@ fn compute_path_initials_highlights(path: &str, query: &str) -> Vec<[usize; 2]> 
             pi += 1;
         }
         qi += 1;
-    }
-
-    // If not all query segments matched, return empty highlights
-    if qi > query_segments.len() {
-        return Vec::new();
     }
 
     highlights

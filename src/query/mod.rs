@@ -1,4 +1,6 @@
 pub mod dsl;
+pub mod dsl_parser;
+pub mod filter;
 pub mod fzf;
 pub mod matcher;
 pub mod scoring;
