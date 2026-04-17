@@ -1788,4 +1788,26 @@ mod tests {
         let m = create_matcher("short-name", true);
         assert!(idx.query(m.as_ref(), 100).is_empty());
     }
+
+    #[test]
+    fn chinese_exact_query_via_trigram() {
+        let idx = PersistentIndex::new();
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: PathBuf::from("/tmp/中文文件.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        let m = create_matcher("中文", true);
+        let r = idx.query(m.as_ref(), 100);
+        assert_eq!(r.len(), 1, "expected 1 result for '中文', got {}", r.len());
+        assert!(r[0].path.to_string_lossy().contains("中文文件"));
+
+        let m2 = create_matcher("文件", true);
+        let r2 = idx.query(m2.as_ref(), 100);
+        assert_eq!(r2.len(), 1, "expected 1 result for '文件', got {}", r2.len());
+    }
 }

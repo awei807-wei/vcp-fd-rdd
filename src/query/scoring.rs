@@ -467,7 +467,7 @@ fn compute_substring_highlights(haystack: &str, needle: &str) -> Vec<[usize; 2]>
     while let Some(pos) = h_lower[start..].find(&n_lower) {
         let abs_pos = start + pos;
         highlights.push([abs_pos, abs_pos + n_lower.len()]);
-        start = abs_pos + 1;
+        start = abs_pos + n_lower.len();
         if start >= h_lower.len() {
             break;
         }
@@ -893,5 +893,29 @@ mod tests {
     fn highlight_empty_query() {
         let h = compute_highlights("/home/user/test.txt", "");
         assert!(h.is_empty());
+    }
+
+    #[test]
+    fn highlight_chinese_substring() {
+        let h = compute_highlights("/tmp/中文文档.txt", "文档");
+        // "/tmp/中文文档.txt" = /tmp/(中)(文)(文)(档).txt
+        // bytes: /tmp/=5, 中=5-8, 文=8-11, 文=11-14, 档=14-17, .txt=17-21
+        // "文档" = 文(11-14) + 档(14-17), match at [11, 17]
+        assert_eq!(h, vec![[11, 17]], "文档 should highlight at [11,17]");
+    }
+
+
+    #[test]
+    fn highlight_chinese_multiple_occurrences() {
+        let h = compute_highlights("/tmp/中文中文.txt", "中文");
+        // 中文 = bytes 5-11, next 中文 = bytes 11-17
+        assert_eq!(h, vec![[5, 11], [11, 17]]);
+    }
+
+    #[test]
+    fn highlight_mixed_ascii_chinese() {
+        let h = compute_highlights("/tmp/abc中文文档.txt", "中文");
+        // /tmp/abc = 8 bytes, 中 = 8-11, 文 = 11-14
+        assert_eq!(h, vec![[8, 14]]);
     }
 }
