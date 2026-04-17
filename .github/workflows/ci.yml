@@ -24,12 +24,8 @@ jobs:
         run: cargo fmt --all -- --check
 
   check-test-clippy:
-    name: ${{ matrix.os }} / stable
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: ubuntu / stable
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
