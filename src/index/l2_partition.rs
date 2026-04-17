@@ -20,20 +20,20 @@ use crate::util::{
 type Trigram = [u8; 3];
 
 fn normalize_short_hint(hint: &[u8]) -> Option<Vec<u8>> {
-    let normalized = String::from_utf8_lossy(hint).to_lowercase().into_bytes();
-    if (1..=2).contains(&normalized.len()) {
-        Some(normalized)
+    let s = String::from_utf8_lossy(hint).to_lowercase();
+    let char_count = s.chars().count();
+    if (1..=2).contains(&char_count) {
+        Some(s.into_bytes())
     } else {
         None
     }
 }
 
 fn trigram_matches_short_hint(tri: Trigram, hint: &[u8]) -> bool {
-    match hint.len() {
-        1 => tri.contains(&hint[0]),
-        2 => tri[0..2] == hint[..] || tri[1..3] == hint[..],
-        _ => false,
+    if hint.len() > tri.len() {
+        return false;
     }
+    tri.windows(hint.len()).any(|window| window == hint)
 }
 
 fn short_component_matches(component: &[u8], hint: &[u8]) -> bool {
@@ -92,9 +92,9 @@ fn for_each_short_component(path: &Path, mut f: impl FnMut(&[u8])) {
             continue;
         };
         let lower = os.to_string_lossy().to_lowercase();
-        let bytes = lower.as_bytes();
-        if (1..=2).contains(&bytes.len()) {
-            f(bytes);
+        let char_count = lower.chars().count();
+        if (1..=2).contains(&char_count) {
+            f(lower.as_bytes());
         }
     }
 }
@@ -1787,5 +1787,44 @@ mod tests {
         assert_eq!(idx.file_count(), 0);
         let m = create_matcher("short-name", true);
         assert!(idx.query(m.as_ref(), 100).is_empty());
+    }
+
+    #[test]
+    fn chinese_short_literal_query_uses_short_component_candidates() {
+        let idx = PersistentIndex::new();
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: PathBuf::from("/tmp/中"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 2 },
+            path: PathBuf::from("/tmp/中文"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 3 },
+            path: PathBuf::from("/tmp/中文文档.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        // 单个中文字符（3 字节）应匹配包含该字符的所有文件
+        let m = create_matcher("中", true);
+        let r = idx.query(m.as_ref(), 100);
+        assert_eq!(r.len(), 3, "'中' should match /tmp/中, /tmp/中文 and /tmp/中文文档.txt");
+
+        // 两个中文字符（6 字节）应匹配包含这两个字符的文件
+        let m = create_matcher("中文", true);
+        let r = idx.query(m.as_ref(), 100);
+        assert_eq!(r.len(), 2, "'中文' should match /tmp/中文 and /tmp/中文文档.txt");
     }
 }
