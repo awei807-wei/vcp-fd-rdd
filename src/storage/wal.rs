@@ -662,13 +662,7 @@ fn decode_event_v2(buf: &[u8]) -> Option<EventRecord> {
 mod tests {
     use super::*;
 
-    fn unique_tmp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("fd-rdd-wal-{}-{}", tag, nanos))
-    }
+    use crate::test_util::unique_tmp_dir;
 
     #[test]
     fn wal_append_seal_replay_respects_checkpoint() {
