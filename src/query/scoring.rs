@@ -178,14 +178,14 @@ fn path_in_node_zone(path: &str) -> bool {
 /// 判断字符是否为"完美边界"分隔符（`.` 或 `/`/`\`）。
 /// 当匹配起始位紧跟此类字符时，整体匹配质量翻倍。
 #[inline]
-fn is_perfect_boundary(c: u8) -> bool {
-    matches!(c, b'.' | b'/' | b'\\')
+fn is_perfect_boundary(c: char) -> bool {
+    matches!(c, '.' | '/' | '\\')
 }
 
 /// 判断字符是否为"单词边界分隔符"。
 #[inline]
-fn is_boundary_char(c: u8) -> bool {
-    matches!(c, b'/' | b'\\' | b'.' | b'-' | b'_' | b' ')
+fn is_boundary_char(c: char) -> bool {
+    matches!(c, '/' | '\\' | '.' | '-' | '_' | ' ') || !c.is_alphanumeric()
 }
 
 /// 为字符串中每个字节位置标记"位格"分数。
@@ -196,28 +196,31 @@ fn is_boundary_char(c: u8) -> bool {
 /// - CamelCase 中的大写字母（前一个字符为小写）
 ///
 /// 返回 `(boundary_score, camel_score)` 的数组（与 haystack 字节等长）。
-fn compute_position_bonuses(haystack: &[u8]) -> Vec<(f64, f64)> {
+fn compute_position_bonuses(haystack: &str) -> Vec<(f64, f64)> {
     let len = haystack.len();
     let mut bonuses = vec![(0.0_f64, 0.0_f64); len];
 
-    for i in 0..len {
+    let mut prev_char = None;
+    for (i, cur) in haystack.char_indices() {
         // 字符串首字母
         if i == 0 {
             bonuses[i].0 = STRING_START_BONUS;
+            prev_char = Some(cur);
             continue;
         }
-        let prev = haystack[i - 1];
-        let cur = haystack[i];
 
-        // 紧跟在边界字符之后
-        if is_boundary_char(prev) {
-            bonuses[i].0 = BOUNDARY_BONUS_PER_CHAR;
-        }
+        if let Some(prev) = prev_char {
+            // 紧跟在边界字符之后
+            if is_boundary_char(prev) {
+                bonuses[i].0 = BOUNDARY_BONUS_PER_CHAR;
+            }
 
-        // CamelCase: 前一字符小写，当前字符大写
-        if prev.is_ascii_lowercase() && cur.is_ascii_uppercase() {
-            bonuses[i].1 = CAMEL_BOUNDARY_BONUS_PER_CHAR;
+            // CamelCase: 前一字符小写，当前字符大写
+            if prev.is_ascii_lowercase() && cur.is_ascii_uppercase() {
+                bonuses[i].1 = CAMEL_BOUNDARY_BONUS_PER_CHAR;
+            }
         }
+        prev_char = Some(cur);
     }
     bonuses
 }
@@ -239,7 +242,7 @@ fn boundary_aware_match(path: &str, basename: &str, needle: &str) -> (f64, bool,
     let needle_lower: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
     let path_lower: Vec<u8> = path_bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
 
-    let bonuses = compute_position_bonuses(path_bytes);
+    let bonuses = compute_position_bonuses(path);
 
     let mut best_score = 0.0_f64;
     let mut best_perfect = false;
@@ -281,7 +284,7 @@ fn boundary_aware_match(path: &str, basename: &str, needle: &str) -> (f64, bool,
         }
 
         // 检测"完美边界"：匹配前一个字符是 `.` 或 `/`
-        let perfect = start > 0 && is_perfect_boundary(path_bytes[start - 1]);
+        let perfect = start > 0 && path[..start].chars().next_back().map_or(false, is_perfect_boundary);
 
         if instance_score > best_score {
             best_score = instance_score;
@@ -836,6 +839,48 @@ mod tests {
             s_slash > s_emb,
             "readme.md={s_slash} should rank higher than myreadme.md={s_emb} (perfect boundary after /)"
         );
+    }
+
+    #[test]
+    fn score_chinese_boundary_bonus() {
+        // 中文字符紧跟在 `/` 或 `.` 之后时应获得边界奖励
+        let config = ScoreConfig::from_query("测试");
+        let with_slash = meta("/中文/测试.txt", 100, None);
+        let embedded = meta("/中文测试.txt", 100, None);
+        let s_slash = score_result(&with_slash, &config);
+        let s_emb = score_result(&embedded, &config);
+        assert!(
+            s_slash > s_emb,
+            "chinese after slash={s_slash} should rank higher than embedded={s_emb}"
+        );
+    }
+
+    #[test]
+    fn compute_position_bonuses_chinese_char_boundary() {
+        // 直接测试 compute_position_bonuses 对多字节字符的边界奖励映射
+        let bonuses = compute_position_bonuses("/中文/测试.txt");
+        // UTF-8 字节位置: /(0) 中(1-3) 文(4-6) /(7) 测(8-10) 试(11-13) .(14) t(15) x(16) t(17)
+        // 首字符奖励在位置 0
+        assert_eq!(bonuses[0].0, STRING_START_BONUS);
+        // "中" 紧跟 "/" 后，应获得边界奖励
+        assert_eq!(bonuses[1].0, BOUNDARY_BONUS_PER_CHAR);
+        // "测" 紧跟 "/" 后，应获得边界奖励
+        assert_eq!(bonuses[8].0, BOUNDARY_BONUS_PER_CHAR);
+        // "t" 紧跟 "." 后，应获得边界奖励
+        assert_eq!(bonuses[15].0, BOUNDARY_BONUS_PER_CHAR);
+        // 中文字符中间字节不应有奖励
+        assert_eq!(bonuses[2].0, 0.0);
+        assert_eq!(bonuses[9].0, 0.0);
+    }
+
+    #[test]
+    fn score_non_ascii_alphanumeric_boundary() {
+        // 非 ASCII 字母数字（如中文）后面也应识别为边界
+        let config = ScoreConfig::from_query("test");
+        let after_chinese = meta("/中文-测试.txt", 100, None);
+        let s = score_result(&after_chinese, &config);
+        // 至少应该正常评分不 panic
+        assert!(s > 0, "score after chinese boundary should be positive, got {s}");
     }
 
     // ── ScoreConfig 感知测试 ──
