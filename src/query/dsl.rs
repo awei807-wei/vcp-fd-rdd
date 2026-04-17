@@ -521,4 +521,57 @@ mod tests {
         let q3 = compile_query(r#"regex:"/a/x/.*\\.js$""#).unwrap();
         assert!(q3.matches(&meta("/a/x/VCPPlugin.js", 1, None))); // fullpath 模式
     }
+
+    #[test]
+    fn chinese_text_query_contains() {
+        let q = compile_query("文档").unwrap();
+        assert!(q.matches(&meta("/tmp/中文文档.txt", 1, None)));
+        assert!(!q.matches(&meta("/tmp/中文文件.txt", 1, None)));
+    }
+
+    #[test]
+    fn chinese_quoted_phrase_query() {
+        let q = compile_query("\"中文文档\"").unwrap();
+        assert!(q.matches(&meta("/tmp/中文文档.txt", 1, None)));
+        assert!(!q.matches(&meta("/tmp/中文文件.txt", 1, None)));
+    }
+
+    #[test]
+    fn chinese_and_query() {
+        let q = compile_query("中文 文档").unwrap();
+        assert!(q.matches(&meta("/tmp/中文文档.txt", 1, None)));
+        assert!(!q.matches(&meta("/tmp/中文文件.txt", 1, None)));
+    }
+
+    #[test]
+    fn chinese_with_ext_filter() {
+        let q = compile_query("文档 ext:txt").unwrap();
+        assert!(q.matches(&meta("/tmp/中文文档.txt", 1, None)));
+        assert!(!q.matches(&meta("/tmp/中文文档.jpg", 1, None)));
+    }
+
+    #[test]
+    fn chinese_wfn_basename_match() {
+        let q = compile_query("wfn:中文文档.txt").unwrap();
+        assert!(q.matches(&meta("/tmp/中文文档.txt", 1, None)));
+        assert!(!q.matches(&meta("/tmp/我的文档.txt", 1, None)));
+    }
+
+    #[test]
+    fn chinese_mixed_ascii_query() {
+        let q = compile_query("vcp文档").unwrap();
+        assert!(q.matches(&meta("/tmp/vcp文档.txt", 1, None)));
+        assert!(!q.matches(&meta("/tmp/vcp文件.txt", 1, None)));
+    }
+
+    #[test]
+    fn chinese_case_sensitive_smart_case() {
+        // Chinese chars are not uppercase, so smart-case should stay insensitive
+        let q = compile_query("文档").unwrap();
+        assert!(q.matches(&meta("/tmp/中文文档.txt", 1, None)));
+        // Since case is insensitive by default and Chinese has no case,
+        // this should still match
+        assert!(q.matches(&meta("/tmp/中文文档.txt", 1, None)));
+    }
+
 }

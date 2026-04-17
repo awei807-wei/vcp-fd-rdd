@@ -1810,4 +1810,105 @@ mod tests {
         let r2 = idx.query(m2.as_ref(), 100);
         assert_eq!(r2.len(), 1, "expected 1 result for '文件', got {}", r2.len());
     }
+
+    #[test]
+    fn roaring_posting_chinese_single_char_query() {
+        let idx = PersistentIndex::new();
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: PathBuf::from("/tmp/中文文档.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 2 },
+            path: PathBuf::from("/tmp/英文文档.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        // Single Chinese character "文" (3 UTF-8 bytes) should generate exactly one trigram
+        let m = create_matcher("文", true);
+        let r = idx.query(m.as_ref(), 100);
+        assert_eq!(r.len(), 2, "single Chinese char should match both files containing 文");
+    }
+
+    #[test]
+    fn roaring_posting_chinese_two_char_query() {
+        let idx = PersistentIndex::new();
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: PathBuf::from("/tmp/中文文档.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 2 },
+            path: PathBuf::from("/tmp/我的文档.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        // Two Chinese characters "文档" should match both
+        let m = create_matcher("文档", true);
+        let r = idx.query(m.as_ref(), 100);
+        assert_eq!(r.len(), 2, "two Chinese chars should match both files containing 文档");
+
+        // "中文" should match only the first
+        let m2 = create_matcher("中文", true);
+        let r2 = idx.query(m2.as_ref(), 100);
+        assert_eq!(r2.len(), 1, "中文 should match only first file");
+        assert!(r2[0].path.to_string_lossy().contains("中文文档"));
+    }
+
+    #[test]
+    fn roaring_posting_chinese_mixed_with_ascii() {
+        let idx = PersistentIndex::new();
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: PathBuf::from("/tmp/vcp文档.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 2 },
+            path: PathBuf::from("/tmp/vcp文件.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        let m = create_matcher("vcp文档", true);
+        let r = idx.query(m.as_ref(), 100);
+        assert_eq!(r.len(), 1, "mixed ASCII+Chinese query should match exactly");
+        assert!(r[0].path.to_string_lossy().contains("vcp文档"));
+    }
+
+    #[test]
+    fn roaring_posting_chinese_no_false_positive() {
+        let idx = PersistentIndex::new();
+        idx.upsert(FileMeta {
+            file_key: FileKey { dev: 1, ino: 1 },
+            path: PathBuf::from("/tmp/中文文档.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        let m = create_matcher("文件", true);
+        let r = idx.query(m.as_ref(), 100);
+        assert!(r.is_empty(), "文件 should not match 文档");
+    }
 }

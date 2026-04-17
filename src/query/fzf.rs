@@ -310,4 +310,50 @@ mod tests {
         assert_eq!(fuzzy[0].path, wanted);
         Ok(())
     }
+
+    #[test]
+    fn fuzzy_match_chinese_characters() {
+        let fzf = FzfIntegration::new();
+        let entries = vec![
+            FileMeta {
+                file_key: crate::core::FileKey { dev: 0, ino: 1 },
+                path: PathBuf::from("/tmp/中文文档.txt"),
+                size: 1,
+                mtime: None,
+                ctime: None,
+                atime: None,
+            },
+            FileMeta {
+                file_key: crate::core::FileKey { dev: 0, ino: 2 },
+                path: PathBuf::from("/tmp/英文文档.txt"),
+                size: 1,
+                mtime: None,
+                ctime: None,
+                atime: None,
+            },
+            FileMeta {
+                file_key: crate::core::FileKey { dev: 0, ino: 3 },
+                path: PathBuf::from("/tmp/中文文件.txt"),
+                size: 1,
+                mtime: None,
+                ctime: None,
+                atime: None,
+            },
+        ];
+
+        // Search for "中文" should match the first and third
+        let results = fzf.match_query("中文", entries.clone());
+        assert_eq!(results.len(), 2, "fuzzy match should find 2 Chinese matches");
+        let paths: Vec<_> = results.iter().map(|(m, _)| m.path.clone()).collect();
+        assert!(paths.contains(&PathBuf::from("/tmp/中文文档.txt")));
+        assert!(paths.contains(&PathBuf::from("/tmp/中文文件.txt")));
+
+        // Search for "文档" should match the first and second
+        let results2 = fzf.match_query("文档", entries.clone());
+        assert_eq!(results2.len(), 2, "fuzzy match should find 2 Chinese matches for 文档");
+        let paths2: Vec<_> = results2.iter().map(|(m, _)| m.path.clone()).collect();
+        assert!(paths2.contains(&PathBuf::from("/tmp/中文文档.txt")));
+        assert!(paths2.contains(&PathBuf::from("/tmp/英文文档.txt")));
+    }
+
 }

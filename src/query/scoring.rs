@@ -467,7 +467,9 @@ fn compute_substring_highlights(haystack: &str, needle: &str) -> Vec<[usize; 2]>
     while let Some(pos) = h_lower[start..].find(&n_lower) {
         let abs_pos = start + pos;
         highlights.push([abs_pos, abs_pos + n_lower.len()]);
-        start = abs_pos + n_lower.len();
+        // Advance by at least one UTF-8 character to avoid landing inside a multi-byte char
+        let advance = h_lower[abs_pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        start = abs_pos + advance;
         if start >= h_lower.len() {
             break;
         }
@@ -898,24 +900,21 @@ mod tests {
     #[test]
     fn highlight_chinese_substring() {
         let h = compute_highlights("/tmp/中文文档.txt", "文档");
-        // "/tmp/中文文档.txt" = /tmp/(中)(文)(文)(档).txt
-        // bytes: /tmp/=5, 中=5-8, 文=8-11, 文=11-14, 档=14-17, .txt=17-21
-        // "文档" = 文(11-14) + 档(14-17), match at [11, 17]
-        assert_eq!(h, vec![[11, 17]], "文档 should highlight at [11,17]");
+        assert_eq!(h, vec![[11, 17]], "文档 is 6 bytes, should highlight at correct byte positions");
     }
-
 
     #[test]
     fn highlight_chinese_multiple_occurrences() {
-        let h = compute_highlights("/tmp/中文中文.txt", "中文");
-        // 中文 = bytes 5-11, next 中文 = bytes 11-17
-        assert_eq!(h, vec![[5, 11], [11, 17]]);
+        let h = compute_highlights("/中文文档/中文文件.txt", "中文");
+        assert_eq!(h, vec![[1, 7], [14, 20]], "中文 is 6 bytes each");
     }
 
     #[test]
-    fn highlight_mixed_ascii_chinese() {
-        let h = compute_highlights("/tmp/abc中文文档.txt", "中文");
-        // /tmp/abc = 8 bytes, 中 = 8-11, 文 = 11-14
-        assert_eq!(h, vec![[8, 14]]);
+    fn highlight_chinese_path_initials() {
+        let h = compute_highlights("/tmp/中文目录/文档备份.txt", "tmp/中文/文档");
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[0], [1, 4]);   // "tmp"
+        assert_eq!(h[1], [5, 11]);  // "中文"
+        assert_eq!(h[2], [18, 24]); // "文档"
     }
 }
