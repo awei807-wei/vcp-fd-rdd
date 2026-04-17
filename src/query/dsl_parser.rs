@@ -85,14 +85,22 @@ impl Parser {
     }
 }
 
+#[inline]
+fn is_token_separator(b: &[u8], i: usize) -> bool {
+    if b[i].is_ascii_whitespace() {
+        return true;
+    }
+    b[i] == 0xE3 && i + 2 < b.len() && b[i + 1] == 0x80 && b[i + 2] == 0x80
+}
+
 pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, QueryCompileError> {
     let mut out = Vec::new();
     let mut i = 0usize;
     let b = input.as_bytes();
 
     while i < b.len() {
-        while i < b.len() && b[i].is_ascii_whitespace() {
-            i += 1;
+        while i < b.len() && is_token_separator(b, i) {
+            i += if b[i].is_ascii_whitespace() { 1 } else { 3 };
         }
         if i >= b.len() {
             break;
@@ -133,7 +141,7 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, QueryCompileError> {
                 continue;
             }
 
-            if c.is_ascii_whitespace() || c == b'|' || c == b'!' {
+            if is_token_separator(b, i) || c == b'|' || c == b'!' {
                 break;
             }
             if c == b'"' {
@@ -593,5 +601,28 @@ fn time_t_to_system_time(t: libc::time_t) -> std::time::SystemTime {
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
     } else {
         std::time::UNIX_EPOCH - std::time::Duration::from_secs((-secs) as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_fullwidth_space() {
+        let input = "hello\u{3000}world";
+        let tokens = tokenize(input).unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], Token::Word("hello".to_string()));
+        assert_eq!(tokens[1], Token::Word("world".to_string()));
+    }
+
+    #[test]
+    fn tokenize_mixed_spaces() {
+        let input = "hello \u{3000} world";
+        let tokens = tokenize(input).unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], Token::Word("hello".to_string()));
+        assert_eq!(tokens[1], Token::Word("world".to_string()));
     }
 }
