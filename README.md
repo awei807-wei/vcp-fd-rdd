@@ -418,6 +418,14 @@ python3 scripts/fs-churn.py \
 - [ ] Leveled 代际 Compaction：实现更平滑的分层合并策略，替代当前简单的”最多合并 2 个旧段”逻辑，降低写放大并控制段数增长。
 - [ ] 增强版 WAL 语义：支持可配置的 fsync 策略（每次写入/批量/异步）、事件去重、Gap 校验（检测 WAL 中的记录缺失或损坏），提升持久化可靠性和恢复能力。
 
+### v0.5.6 更新（中文搜索修复）
+
+- **修复** `compute_substring_highlights` UTF-8 边界 panic：匹配后错误使用 `start = abs_pos + 1`，中文字符（3 字节）导致下一轮切片落在字符中间，触发 panic 并使 HTTP 查询线程崩溃；已改为按匹配子串实际字节长度推进。
+- **修复** 中文路径边界加分失效：`is_boundary_char` 原仅检查 ASCII 边界字符，中文无法获得边界加分；改为以 `char` 为单位判断，非字母数字字符（含中文）均被视为边界。
+- **修复** 中文短查询优化被跳过：`normalize_short_hint` 按字节长度判断 1-2 字符，单个中文字符 = 3 字节导致短组件索引优化失效；改为按字符数判断。
+- **修复** 全角空格 `U+3000` 未识别为分隔符：`tokenize` 仅使用 `is_ascii_whitespace()`，导致以全角空格分隔的中文查询词被错误合并；新增 `is_token_separator()` 统一检测 ASCII 空白与全角空格。
+- **测试**：在 `scoring.rs`、`l2_partition.rs`、`dsl_parser.rs`、`matcher.rs`、`dsl.rs`、`fzf.rs` 中新增 15+ 个中文搜索相关单元测试，全部通过。
+
 ### 待修复缺陷
 
 - [x] 核心流程仍存在 unwrap 导致的崩溃风险：LSM 合并等关键路径中使用 `store.lsm_manifest_wal_seal_id().unwrap()`，manifest 读取失败会直接导致守护进程崩溃，需要改为错误传播或降级处理。（v0.5.5 已修复：snapshot.rs 中 v6 mmap 加载的 5 处 unwrap 改为 match 降级返回 `Ok(None)`）

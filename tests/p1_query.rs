@@ -156,3 +156,43 @@ fn short_query_works() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// 26. 中文关键字查询
+#[test]
+fn chinese_keyword_query() {
+    let root = unique_tmp_dir("query-chinese");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let index = build_index_with_files(
+        &root,
+        &[
+            ("中文文档.txt", 100),
+            ("英文文档.txt", 200),
+            ("中文报告.md", 50),
+            ("readme.txt", 80),
+        ],
+    );
+
+    // 中文双字查询
+    let results = index.query("文档");
+    assert_eq!(results.len(), 2, "Should find both 文档 files");
+    assert!(results.iter().all(|m| m
+        .path
+        .to_string_lossy()
+        .contains("文档")));
+
+    // 中文单字查询（触发短组件索引优化）
+    let results = index.query("中");
+    assert_eq!(results.len(), 2, "Should find files containing 中");
+
+    // 中文混合 ASCII 查询
+    let results = index.query("中文报告");
+    assert_eq!(results.len(), 1, "Should find exactly 中文报告.md");
+    assert!(results[0].path.to_string_lossy().contains("中文报告"));
+
+    // 不匹配查询
+    let results = index.query("文件");
+    assert!(results.is_empty(), "文件 should not match any file");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
