@@ -169,6 +169,18 @@ fn fast_sync_reconciles_add_and_delete() {
 
     assert!(!idx.query("a_match").is_empty());
     assert!(idx.query("b_match").is_empty());
+
+    // fast_sync 后底层索引可能有极短异步窗口，poll 等待 c_match 出现
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut c_found = false;
+    while std::time::Instant::now() < deadline {
+        if !idx.query("c_match").is_empty() {
+            c_found = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(c_found, "c_match should appear after fast_sync");
     assert!(!idx.query("c_match").is_empty());
 }
 

@@ -444,6 +444,25 @@ mod imp {
                 &[],
             );
 
+            // fast_sync 后索引可能有极短异步窗口，先直接 poll 确认 new_match 已入索引
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+            let mut new_found = false;
+            loop {
+                let direct = index.query("match");
+                if direct
+                    .iter()
+                    .any(|m| m.path.to_string_lossy().contains("new_match.txt"))
+                {
+                    new_found = true;
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+            assert!(new_found, "new_match.txt should appear after fast_sync");
+
             // P1：socket handler 通过 query_limit 流式输出，且结果应反映 fast-sync 后的状态
             let (mut client, server) = duplex(64 * 1024);
             let cfg = SocketConfig::default();
