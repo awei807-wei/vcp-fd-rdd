@@ -103,15 +103,8 @@ impl IgnoreFilter {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::test_util::unique_tmp_dir;
 
-    fn unique_tmp_dir(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("fd-rdd-ignore-{}-{}", tag, nanos))
-    }
 
     #[test]
     fn ignores_matching_paths() {
