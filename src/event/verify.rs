@@ -195,22 +195,8 @@ mod tests {
     use crate::core::{EventType, FileIdentifier};
     use std::fs;
     use std::time::SystemTime;
+    use crate::test_util::unique_tmp_dir;
 
-    fn unique_tmp_dir(prefix: &str) -> PathBuf {
-        let ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "fd-rdd-verify-{}-{}-{}",
-            prefix,
-            std::process::id(),
-            ns
-        ));
-        fs::create_dir_all(&p).unwrap();
-        p
-    }
 
     fn ev(seq: u64, path: PathBuf) -> EventRecord {
         EventRecord {
@@ -225,6 +211,8 @@ mod tests {
     #[test]
     fn verifier_detects_sequence_gap() {
         let root = unique_tmp_dir("gap-detect");
+        fs::create_dir_all(&root).unwrap();
+
         let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
         let verifier = ElasticVerifier::new(index);
 
@@ -245,6 +233,8 @@ mod tests {
     #[test]
     fn verifier_repairs_gap_with_fast_sync() -> anyhow::Result<()> {
         let root = unique_tmp_dir("gap-repair");
+        fs::create_dir_all(&root).unwrap();
+
         let alpha = root.join("alpha_match.txt");
         let beta = root.join("beta_match.txt");
         fs::write(&alpha, b"a")?;

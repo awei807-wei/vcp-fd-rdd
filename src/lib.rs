@@ -17,3 +17,5 @@ pub mod query;
 pub mod stats;
 pub mod storage;
 pub mod util;
+#[cfg(test)] pub mod test_util;
+
