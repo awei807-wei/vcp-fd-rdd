@@ -696,4 +696,51 @@ mod tests {
         let m = PathInitialsMatcher::new("");
         assert!(m.matches("/any/path"));
     }
+
+    // ── Chinese (CJK) matching ──
+
+    #[test]
+    fn exact_contains_chinese_match() {
+        let m = create_matcher("文档", true);
+        assert!(m.matches("/tmp/中文文档.txt"));
+        assert!(m.matches("/tmp/我的文档.txt"));
+        assert!(!m.matches("/tmp/中文文件.txt"));
+    }
+
+    #[test]
+    fn exact_contains_chinese_case_insensitive() {
+        // Chinese has no case, but ensure ascii_insensitive path still works
+        let m = create_matcher("文档", false);
+        assert!(m.matches("/tmp/中文文档.txt"));
+        assert!(!m.matches("/tmp/中文WENDANG.txt"));
+    }
+
+    #[test]
+    fn glob_segment_chinese_match() {
+        let m = create_matcher("*文档*", true);
+        assert!(m.matches("/tmp/中文文档.txt"));
+        assert!(m.matches("/tmp/我的文档备份.txt"));
+        assert!(!m.matches("/tmp/中文文件.txt"));
+    }
+
+    #[test]
+    fn glob_literal_hint_chinese_extraction() {
+        let m = create_matcher("*回忆录*", true);
+        assert_eq!(m.literal_hint(), Some("回忆录".as_bytes()));
+    }
+
+    #[test]
+    fn path_initials_chinese_prefix_match() {
+        let m = PathInitialsMatcher::new("tmp/中文/文档");
+        assert!(m.matches("/tmp/中文目录/文档备份.txt"));
+        assert!(!m.matches("/tmp/英文目录/文档备份.txt"));
+    }
+
+    #[test]
+    fn chinese_mixed_with_ascii_contains() {
+        let m = create_matcher("vcp文档", true);
+        assert!(m.matches("/tmp/vcp文档.txt"));
+        assert!(!m.matches("/tmp/vcp文件.txt"));
+    }
+
 }

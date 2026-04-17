@@ -467,7 +467,9 @@ fn compute_substring_highlights(haystack: &str, needle: &str) -> Vec<[usize; 2]>
     while let Some(pos) = h_lower[start..].find(&n_lower) {
         let abs_pos = start + pos;
         highlights.push([abs_pos, abs_pos + n_lower.len()]);
-        start = abs_pos + 1;
+        // Advance by at least one UTF-8 character to avoid landing inside a multi-byte char
+        let advance = h_lower[abs_pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        start = abs_pos + advance;
         if start >= h_lower.len() {
             break;
         }
@@ -894,4 +896,26 @@ mod tests {
         let h = compute_highlights("/home/user/test.txt", "");
         assert!(h.is_empty());
     }
+
+    #[test]
+    fn highlight_chinese_substring() {
+        let h = compute_highlights("/tmp/中文文档.txt", "文档");
+        assert_eq!(h, vec![[11, 17]], "文档 is 6 bytes, should highlight at correct byte positions");
+    }
+
+    #[test]
+    fn highlight_chinese_multiple_occurrences() {
+        let h = compute_highlights("/中文文档/中文文件.txt", "中文");
+        assert_eq!(h, vec![[1, 7], [14, 20]], "中文 is 6 bytes each");
+    }
+
+    #[test]
+    fn highlight_chinese_path_initials() {
+        let h = compute_highlights("/tmp/中文目录/文档备份.txt", "tmp/中文/文档");
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[0], [1, 4]);   // "tmp"
+        assert_eq!(h[1], [5, 11]);  // "中文"
+        assert_eq!(h[2], [18, 24]); // "文档"
+    }
+
 }
