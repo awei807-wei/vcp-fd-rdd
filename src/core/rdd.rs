@@ -34,9 +34,10 @@ impl FileKey {
         {
             use std::hash::{Hash, Hasher};
 
-            // Windows stable std does not expose a true inode/file-id for rename-stable identity.
-            // Fall back to a path-based key to keep the project buildable on Windows. This degrades
-            // rename semantics to delete+create (still correct for query results).
+            // TODO: Windows stable std does not expose a true inode/file-id for rename-stable identity.
+            // The current path-hash fallback degrades rename semantics to delete+create.
+            // Add compensation logic (e.g., GetFileInformationByHandle) to preserve rename-stable
+            // identity on Windows.
             let _ = meta;
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             _path.as_os_str().as_encoded_bytes().hash(&mut hasher);
@@ -341,17 +342,8 @@ impl BuildLineage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::unique_tmp_dir;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_tmp_dir(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("fd-rdd-rdd-{}-{}", tag, nanos))
-    }
 
     #[test]
     fn scan_skips_hidden_files_by_default() {

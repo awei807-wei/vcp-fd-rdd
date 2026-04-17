@@ -1,6 +1,5 @@
 pub mod adaptive;
 pub mod lineage;
-pub mod partition;
 pub mod rdd;
 
 pub use adaptive::{AdaptiveScheduler, ExecutionStrategy, Task};

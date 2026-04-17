@@ -66,43 +66,11 @@ pub struct EventPipeline {
 
 impl EventPipeline {
     pub fn new(index: Arc<TieredIndex>) -> Self {
-        Self {
-            index,
-            debounce_ms: 100,
-            channel_size: 4096,
-            ignore_paths: Vec::new(),
-            ignore_filter: None,
-            total_events: Arc::new(AtomicU64::new(0)),
-            last_batch_size: Arc::new(AtomicU64::new(0)),
-            overflow_drops: Arc::new(AtomicU64::new(0)),
-            rescan_signals: Arc::new(AtomicU64::new(0)),
-            watch_failures: Arc::new(AtomicU64::new(0)),
-            watcher_degraded: Arc::new(AtomicBool::new(false)),
-            degraded_roots: Arc::new(AtomicU64::new(0)),
-            raw_events_capacity: Arc::new(AtomicU64::new(0)),
-            merged_map_capacity: Arc::new(AtomicU64::new(0)),
-            records_capacity: Arc::new(AtomicU64::new(0)),
-        }
+        Self::new_with_config_and_ignores(index, 100, 4096, Vec::new())
     }
 
     pub fn new_with_config(index: Arc<TieredIndex>, debounce_ms: u64, channel_size: usize) -> Self {
-        Self {
-            index,
-            debounce_ms,
-            channel_size,
-            ignore_paths: Vec::new(),
-            ignore_filter: None,
-            total_events: Arc::new(AtomicU64::new(0)),
-            last_batch_size: Arc::new(AtomicU64::new(0)),
-            overflow_drops: Arc::new(AtomicU64::new(0)),
-            rescan_signals: Arc::new(AtomicU64::new(0)),
-            watch_failures: Arc::new(AtomicU64::new(0)),
-            watcher_degraded: Arc::new(AtomicBool::new(false)),
-            degraded_roots: Arc::new(AtomicU64::new(0)),
-            raw_events_capacity: Arc::new(AtomicU64::new(0)),
-            merged_map_capacity: Arc::new(AtomicU64::new(0)),
-            records_capacity: Arc::new(AtomicU64::new(0)),
-        }
+        Self::new_with_config_and_ignores(index, debounce_ms, channel_size, Vec::new())
     }
 
     pub fn new_with_config_and_ignores(
