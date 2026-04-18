@@ -1,6 +1,8 @@
 # fd-rdd（Linux 文件索引守护进程）
 
-`fd-rdd` 是一个事件驱动的 Linux 文件索引服务：常驻守护进程对外提供 HTTP 查询接口，索引在后台持续增量更新，并能在事件风暴/溢出后自我修复。
+`fd-rdd` 是一个 **Linux-only** 的事件驱动文件索引服务：常驻守护进程对外提供 HTTP 查询接口，索引在后台持续增量更新，并能在事件风暴/溢出后自我修复。
+
+> **平台声明**：fd-rdd 以 **Linux** 为主平台；macOS 编译为实验性支持，功能与性能不做保证。Windows 支持已移除。
 
 本项目的重点是：
 
@@ -8,7 +10,17 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前 tests 分支发布版本为 v0.5.7（竞态修复、配置化启动、持久化路径、中文搜索修复、存储层健壮性加固、WAL 去重、事件溢出增量恢复、版本兼容重构）。
+> 当前 tests 分支发布版本为 v0.5.8（平台清理、安全加固、配置全量接线、竞态修复、配置化启动、持久化路径、中文搜索修复、存储层健壮性加固、WAL 去重、事件溢出增量恢复、版本兼容重构）。
+
+## v0.5.8 更新（平台清理、安全加固与配置全量接线）
+
+- **清理** Windows 支持：删除 `src/core/rdd.rs` 中的 Windows / fallback 条件编译块；`src/stats/mod.rs` 三个函数加 `#[cfg(target_os = "linux")]`；`src/config.rs` 删除 Windows socket / snapshot 路径；CI 声明 Linux-only。
+- **修复** WAL 掉电安全：`append_record` 写入后调用 `sync_data()`；CRC 校验失败时由 `continue` 改为 `break`；`len.try_into()` 失败时 `bail!` 而非静默截断为 `u32::MAX`。
+- **修复** socket OOM / 慢 loris：`read_to_end` 改为 `take(max_request_bytes + 1)` 先限长再读取，增加 2 秒读超时。
+- **修复** lsm_append_delta_v6 并发竞争：增加 `compaction_lock: tokio::sync::Mutex<()>` 串行化 delta 追加与 base 替换。
+- **修复** HTTP 查询协作式取消：`spawn_blocking` 内每处理 256 条候选检查一次 `Arc<AtomicBool>` 取消标志，timeout 后任务自行返回。
+- **接入** config 全量字段：`http_port`、`snapshot_interval_secs`、`include_hidden`、`follow_symlinks`、`log_level` 均按 `CLI > config.toml > 默认值` 合并生效；`tracing-subscriber` 启用 `env-filter` 支持动态日志级别。
+- **接入** `follow_symlinks` 贯通三层：`TieredIndex`、`FsScanRDD`、fast-sync / immediate scan 均透传该参数。
 
 ## v0.5.7 更新（竞态修复、配置化启动与持久化路径）
 

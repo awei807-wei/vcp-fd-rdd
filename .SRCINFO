@@ -1,6 +1,6 @@
 pkgbase = fd-rdd-git
 	pkgdesc = Event-driven elastic file indexer with RDD lineage and glob support
-	pkgver = 0.2.0
+	pkgver = 0.5.8
 	pkgrel = 3
 	url = https://github.com/awei807-wei/vcp-fd-rdd
 	arch = x86_64
