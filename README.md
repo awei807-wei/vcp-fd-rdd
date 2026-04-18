@@ -149,6 +149,22 @@ curl "http://127.0.0.1:6060/health"
   --report-interval-secs 60              # 内存报告周期
 ```
 
+### 配置文件（推荐）
+
+推荐通过 `~/.config/fd-rdd/config.toml` 管理配置，避免长命令行参数：
+
+```toml
+# ~/.config/fd-rdd/config.toml
+roots = ["/home/username"]
+include_hidden = true
+snapshot_interval_secs = 300
+http_port = 6060
+ignore_enabled = true
+log_level = "info"
+```
+
+配置加载优先级：`CLI 参数 > config.toml > 默认值`。配置好后直接运行 `./target/release/fd-rdd` 即可启动。
+
 更多参数见 `./target/release/fd-rdd --help`。
 
 ## 更新日志

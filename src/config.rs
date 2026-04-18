@@ -65,7 +65,7 @@ pub fn default_socket_path() -> PathBuf {
 ///
 /// - Linux: `$XDG_RUNTIME_DIR/fd-rdd/index.db`
 ///   fallback: `/run/user/$UID/fd-rdd/index.db`
-///   fallback: `/tmp/fd-rdd-$UID/index.db`
+///   fallback: `~/.local/share/fd-rdd/index.db`
 /// - macOS: `$TMPDIR/fd-rdd/index.db`
 /// - Windows: `%LOCALAPPDATA%/fd-rdd/index.db`
 pub fn default_snapshot_path() -> PathBuf {
@@ -101,7 +101,12 @@ pub fn default_snapshot_path() -> PathBuf {
             return dir.join("index.db");
         }
 
-        let dir = PathBuf::from(format!("/tmp/fd-rdd-{}", uid));
+        // 使用持久化用户数据目录，避免 tmpfs RSS 问题
+        let dir = dirs::data_local_dir()
+            .unwrap_or_else(|| {
+                PathBuf::from(format!("/tmp/fd-rdd-{}", uid))
+            })
+            .join("fd-rdd");
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
         }

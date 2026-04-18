@@ -5,11 +5,12 @@ Documentation=https://github.com/AegisCompute/fd-rdd
 
 [Service]
 Type=simple
+# 请确保 ~/.config/fd-rdd/config.toml 已配置 root 等参数
+# 或使用 ExecStart=%h/.vcp/bin/fd-rdd --root /home/%u --snapshot-path %h/.local/share/fd-rdd/index.db
 ExecStart=%h/.vcp/bin/fd-rdd
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
-Environment=XDG_RUNTIME_DIR=/run/user/%U
 
 # Resource limits
 CPUQuota=80%
