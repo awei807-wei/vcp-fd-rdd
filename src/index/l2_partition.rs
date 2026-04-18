@@ -358,6 +358,11 @@ pub struct PersistentIndex {
     /// 墓碑标记（DocId）
     tombstones: RwLock<RoaringTreemap>,
 
+    /// 写锁：保证 upsert 路径中 alloc_docid → insert_trigrams → insert_path_hash 的原子性，
+    /// 避免查询线程在 trigram_index 和 metas 之间看到不一致状态。
+    /// 注意：这会降低并发写入性能，但是正确性所必需的。
+    upsert_lock: RwLock<()>,
+
     /// 脏标记（自上次快照后是否有变更）
     dirty: std::sync::atomic::AtomicBool,
 }
@@ -390,6 +395,7 @@ impl PersistentIndex {
             trigram_index: RwLock::new(HashMap::new()),
             short_component_index: RwLock::new(HashMap::new()),
             tombstones: RwLock::new(RoaringTreemap::new()),
+            upsert_lock: RwLock::new(()),
             dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -609,6 +615,7 @@ impl PersistentIndex {
             };
 
             // posting/path_hash 先写（与 query 锁顺序一致：trigram -> metas）
+            let _guard = self.upsert_lock.write();
             self.insert_trigrams(docid, meta.path.as_path());
             self.insert_path_hash(docid, meta.path.as_path());
 
@@ -621,6 +628,7 @@ impl PersistentIndex {
                 existing.mtime = meta.mtime;
             } else {
                 // 极端情况：docid 槽位不存在，降级为 append
+                let _guard = self.upsert_lock.write();
                 if let Some(docid_new) =
                     self.alloc_docid(fkey, new_root_id, &new_rel_bytes, meta.size, meta.mtime)
                 {
@@ -636,6 +644,7 @@ impl PersistentIndex {
         }
 
         // 新文件：分配 docid 并写入
+        let _guard = self.upsert_lock.write();
         let Some(docid) =
             self.alloc_docid(fkey, new_root_id, &new_rel_bytes, meta.size, meta.mtime)
         else {
