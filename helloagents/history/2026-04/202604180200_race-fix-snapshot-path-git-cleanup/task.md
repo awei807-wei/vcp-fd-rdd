@@ -1,9 +1,10 @@
 # 任务清单：竞态修复、路径治理与 git 历史清理（2026-04-18）
 
 状态符号:
+
 - [ ] 待执行
 - [√] 已完成
-- [X] 执行失败
+- [x] 执行失败
 - [-] 已跳过
 - [?] 待确认
 
@@ -18,6 +19,8 @@
 
 - [√] 修复 PersistentIndex upsert 竞态：引入 `upsert_lock` 写锁，保证
   `alloc_docid → insert_trigrams → insert_path_hash` 的原子性
+- [√] 并发重构升级为 Shadow Delta + 全量锁卫士：提取纯函数进行 Phase 1 无锁计算，
+  Phase 2 按查询顺序同时持有全部写锁并统一释放，彻底消除死锁与越界 Panic 陷阱
 - [√] 修复 Linux `default_snapshot_path()`：fallback 从 `/tmp` (tmpfs)
   改为 `dirs::data_local_dir()` (`~/.local/share/fd-rdd/`)，避免 LSM mmap 计入 RSS
 - [√] 更新 systemd 服务文件 `scripts/fd-rdd.service`，引导使用 config.toml

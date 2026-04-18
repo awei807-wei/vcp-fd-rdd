@@ -14,6 +14,7 @@
 - **代码质量治理（2026-04-17）—— 测试工具统一**：新建 `src/test_util.rs` 提供共享 `unique_tmp_dir`，替换 `rdd.rs` / `verify.rs` / `ignore_filter.rs` / `wal.rs` / `snapshot.rs` 中 5 处重复定义；`JUNK_DIR_NAMES` 去重 `.tox`；`encode_roots_segment` 补充 `/` 插入设计注释
 
 - **竞态修复（2026-04-18）—— PersistentIndex upsert 锁顺序**：`alloc_docid` 与 `insert_trigrams` 原分属独立锁序列，存在可见性窗口导致 query 线程看到不一致状态（metas 已更新但 trigram_index 未更新）而漏查新文件；引入 `upsert_lock` 写锁将完整 upsert 流程串行化，以并发写入性能为代价换取查询一致性
+- **并发重构（2026-04-18）—— Shadow Delta + 全量锁卫士**：将 upsert 路径拆分为 Phase 1 无锁纯计算（提取 trigram/short component/path hash）与 Phase 2 全量锁卫士（按查询顺序同时持有全部写锁并统一释放），彻底消除死锁与越界 Panic 陷阱；锁持有时间从毫秒级压缩到微秒级，并发写入性能显著回升
 - **路径治理（2026-04-18）—— Linux 默认 snapshot 路径持久化**：`default_snapshot_path()` 的 Linux fallback 从 `/tmp/fd-rdd-$UID` (tmpfs) 改为 `dirs::data_local_dir()` (`~/.local/share/fd-rdd/`)，避免 LSM mmap segment 被计入 RSS 导致内存虚高；同步更新 systemd 服务文件与 README 中 config.toml 使用说明
 - **历史治理（2026-04-18）—— 清理 [Snow Team] 自动提交**：使用 `git filter-branch` 重写所有分支历史，移除 `[Snow Team]` 前缀；删除遗留 `snow-team/*` 分支及 `refs/original` 备份，统一提交信息风格
 
