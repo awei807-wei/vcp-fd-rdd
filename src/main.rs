@@ -96,6 +96,10 @@ struct Args {
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     follow_symlinks: Option<bool>,
 
+    /// Show the effective configuration and exit (diagnostic)
+    #[arg(long)]
+    show_config: bool,
+
     /// overlay 强制 flush 阈值（路径数）。达到阈值会唤醒 snapshot_loop 立即执行一次 snapshot_now（0=禁用）
     #[arg(long, default_value_t = 250_000)]
     auto_flush_overlay_paths: u64,
@@ -144,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 1) 确定索引根目录 (CLI > config > 报错退出)
-    let mut roots = args.roots;
+    let mut roots = args.roots.clone();
     if roots.is_empty() {
         roots = cfg.roots.clone();
     }
@@ -164,8 +168,94 @@ async fn main() -> anyhow::Result<()> {
     // 2) 快照存储
     let snapshot_path = args
         .snapshot_path
+        .clone()
         .or(cfg.snapshot_path.clone())
         .unwrap_or_else(default_snapshot_path);
+
+    let uds_path = args
+        .uds_socket
+        .clone()
+        .or(cfg.socket_path.clone())
+        .unwrap_or_else(default_socket_path);
+
+    // --show-config: print effective config and exit
+    if args.show_config {
+        let roots_src = if !args.roots.is_empty() {
+            "CLI --root"
+        } else if !cfg.roots.is_empty() {
+            "config.toml"
+        } else {
+            "(required, none provided)"
+        };
+        let snapshot_src = if args.snapshot_path.is_some() {
+            "CLI --snapshot-path"
+        } else if cfg.snapshot_path.is_some() {
+            "config.toml"
+        } else {
+            "default"
+        };
+        let http_src = if args.http_port.is_some() {
+            "CLI --http-port"
+        } else if cfg.http_port != 6060 {
+            "config.toml"
+        } else {
+            "default"
+        };
+        let interval_src = if args.snapshot_interval_secs.is_some() {
+            "CLI --snapshot-interval-secs"
+        } else if cfg.snapshot_interval_secs != 300 {
+            "config.toml"
+        } else {
+            "default"
+        };
+        let hidden_src = if args.include_hidden.is_some() {
+            "CLI --include-hidden"
+        } else if cfg.include_hidden {
+            "config.toml"
+        } else {
+            "default"
+        };
+        let follow_src = if args.follow_symlinks.is_some() {
+            "CLI --follow-symlinks"
+        } else if cfg.follow_symlinks {
+            "config.toml"
+        } else {
+            "default"
+        };
+        let ignore_src = if args.no_ignore {
+            "CLI --no-ignore"
+        } else if !cfg.ignore_enabled {
+            "config.toml"
+        } else {
+            "default"
+        };
+        let log_src = if args.log_level.is_some() {
+            "CLI --log-level"
+        } else if !cfg.log_level.is_empty() && cfg.log_level != "info" {
+            "config.toml"
+        } else {
+            "default"
+        };
+        let uds_src = if args.uds_socket.is_some() {
+            "CLI --uds-socket"
+        } else if cfg.socket_path.is_some() {
+            "config.toml"
+        } else {
+            "default"
+        };
+
+        println!("roots:                {:?}  [from: {}]", roots, roots_src);
+        println!("snapshot_path:        {}  [from: {}]", snapshot_path.display(), snapshot_src);
+        println!("http_port:            {}  [from: {}]", http_port, http_src);
+        println!("snapshot_interval:    {}s [from: {}]", snapshot_interval_secs, interval_src);
+        println!("include_hidden:       {}  [from: {}]", include_hidden, hidden_src);
+        println!("follow_symlinks:      {}  [from: {}]", follow_symlinks, follow_src);
+        println!("ignore_enabled:       {}  [from: {}]", ignore_enabled, ignore_src);
+        println!("log_level:            {}  [from: {}]", log_level, log_src);
+        println!("uds_socket:           {}  [from: {}]", uds_path.display(), uds_src);
+        return Ok(());
+    }
+
     let store = Arc::new(SnapshotStore::new(snapshot_path));
 
     // 3) 从快照加载或空索引启动
@@ -249,10 +339,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 6.5) 启动 UDS 查询服务（CLI > config > default_socket_path()）
-    let uds_path = args
-        .uds_socket
-        .or(cfg.socket_path)
-        .unwrap_or_else(default_socket_path);
     {
         let socket_server = SocketServer::new(index.clone());
         let path = uds_path.clone();

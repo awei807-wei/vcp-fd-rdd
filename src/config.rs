@@ -102,9 +102,9 @@ pub fn default_snapshot_path() -> PathBuf {
 /// Expand `~` and `~/` to the user's home directory.
 fn expand_path(path: &std::path::Path) -> PathBuf {
     let s = path.to_string_lossy();
-    if s.starts_with("~/") {
+    if let Some(rest) = s.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(&s[2..]);
+            return home.join(rest);
         }
     } else if s == "~" {
         if let Some(home) = dirs::home_dir() {

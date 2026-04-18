@@ -46,7 +46,7 @@ cargo build --release --no-default-features
 
 ```toml
 # ~/.config/fd-rdd/config.toml
-roots = ["/home/username"]
+roots = ["~"]
 include_hidden = true
 snapshot_interval_secs = 300
 http_port = 6060
@@ -165,7 +165,7 @@ curl "http://127.0.0.1:6060/health"
 
 ```toml
 # ~/.config/fd-rdd/config.toml
-roots = ["/home/username/code", "/home/username/documents"]
+roots = ["~/code", "~/documents"]
 include_hidden = true
 follow_symlinks = false
 ignore_enabled = true
@@ -176,21 +176,28 @@ log_level = "info"
 
 支持的字段：
 
-| 字段                     | 类型           | 说明                                                           |
-| ------------------------ | -------------- | -------------------------------------------------------------- |
-| `roots`                  | `Vec<PathBuf>` | 索引根目录，**必填**                                           |
-| `include_hidden`         | `bool`         | 是否索引隐藏文件（默认 `false`）                               |
-| `follow_symlinks`        | `bool`         | 是否跟随符号链接（默认 `false`）                               |
-| `ignore_enabled`         | `bool`         | 是否启用 `.gitignore`（默认 `true`）                           |
-| `snapshot_interval_secs` | `u64`          | 自动快照落盘周期（默认 `300`）                                 |
-| `http_port`              | `u16`          | HTTP 查询端口（默认 `6060`）                                   |
-| `log_level`              | `String`       | 日志级别：`trace`/`debug`/`info`/`warn`/`error`（默认 `info`） |
+| 字段                     | 类型              | 说明                                                           |
+| ------------------------ | ----------------- | -------------------------------------------------------------- |
+| `roots`                  | `Vec<PathBuf>`    | 索引根目录，**必填**                                           |
+| `include_hidden`         | `bool`            | 是否索引隐藏文件（默认 `false`）                               |
+| `follow_symlinks`        | `bool`            | 是否跟随符号链接（默认 `false`）                               |
+| `ignore_enabled`         | `bool`            | 是否启用 `.gitignore`（默认 `true`）                           |
+| `snapshot_interval_secs` | `u64`             | 自动快照落盘周期（默认 `300`）                                 |
+| `http_port`              | `u16`             | HTTP 查询端口（默认 `6060`）                                   |
+| `snapshot_path`          | `Option<PathBuf>` | 快照数据库路径（默认自动选择）                                 |
+| `log_level`              | `String`          | 日志级别：`trace`/`debug`/`info`/`warn`/`error`（默认 `info`） |
 
 配置加载优先级：`CLI 参数 > config.toml > 默认值`。配置好后直接运行 `./target/release/fd-rdd` 即可启动。
 
 ### 命令行覆盖
 
 所有配置项均可通过命令行参数临时覆盖，适用于调试或一次性任务：
+
+查看当前生效配置及来源：
+
+```bash
+./target/release/fd-rdd --show-config
+```
 
 ```bash
 ./target/release/fd-rdd \
@@ -206,14 +213,12 @@ log_level = "info"
 
 ## 更新日志
 
-- **v0.5.8** — 平台清理、安全加固与配置全量接线
-  - **清理** Windows 支持：删除 `src/core/rdd.rs` 中的 Windows / fallback 条件编译块；`src/stats/mod.rs` 三个函数加 `#[cfg(target_os = "linux")]`；`src/config.rs` 删除 Windows socket / snapshot 路径；CI 声明 Linux-only。
-  - **修复** WAL 掉电安全：`append_record` 写入后调用 `sync_data()`；CRC 校验失败时由 `continue` 改为 `break`；`len.try_into()` 失败时 `bail!` 而非静默截断为 `u32::MAX`。
-  - **修复** socket OOM / 慢 loris：`read_to_end` 改为 `take(max_request_bytes + 1)` 先限长再读取，增加 2 秒读超时。
-  - **修复** lsm_append_delta_v6 并发竞争：增加 `compaction_lock: tokio::sync::Mutex<()>` 串行化 delta 追加与 base 替换。
-  - **修复** HTTP 查询协作式取消：`spawn_blocking` 内每处理 256 条候选检查一次 `Arc<AtomicBool>` 取消标志，timeout 后任务自行返回。
-  - **接入** config 全量字段：`http_port`、`snapshot_interval_secs`、`include_hidden`、`follow_symlinks`、`log_level` 均按 `CLI > config.toml > 默认值` 合并生效；`tracing-subscriber` 启用 `env-filter` 支持动态日志级别。
-  - **接入** `follow_symlinks` 贯通三层：`TieredIndex`、`FsScanRDD`、fast-sync / immediate scan 均透传该参数。
+- **v0.5.9** — 配置系统重构：自动创建、tilde 展开与诊断命令
+  - **新增** `Config::load()` 自动创建默认配置：首次启动时若 `~/.config/fd-rdd/config.toml` 不存在，自动创建并写入默认配置（`roots = ["~"]` 等），创建失败则回退到内存默认值。
+  - **新增** `~` / `~/` 路径展开：配置文件中 `roots`、`socket_path`、`snapshot_path` 均支持 tilde 展开，无需硬编码绝对路径。
+  - **新增** `snapshot_path` 配置字段：用户可通过 `config.toml` 指定快照数据库路径。
+  - **新增** `--show-config` 诊断命令：启动时打印每个配置项的最终生效值及其来源（`CLI`、`config.toml` 或 `default`），解决配置混用时的可审计性问题。
+  - **修复** clippy `manual_strip` 警告。
 
 完整历史更新与缺陷修复记录见 [CHANGELOG.md](./CHANGELOG.md)（如不存在则参考 Git 历史）。
 
