@@ -44,11 +44,13 @@ fn visit_dirs_since(
             continue;
         }
 
-        if let Ok(modified) = md.modified() {
-            let changed = cutoff_ns == 0 || modified > cutoff;
-            if on_dir(&dir, changed) {
-                return true;
-            }
+        let changed = if let Ok(modified) = md.modified() {
+            cutoff_ns == 0 || modified > cutoff
+        } else {
+            true // 保守地认为已变化（部分文件系统不支持 mtime）
+        };
+        if on_dir(&dir, changed) {
+            return true;
         }
 
         let rd = match std::fs::read_dir(&dir) {
