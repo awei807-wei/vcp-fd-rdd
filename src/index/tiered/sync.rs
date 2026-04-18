@@ -383,13 +383,48 @@ impl TieredIndex {
             return report;
         }
 
-        // 2) 扫描目录：生成 upsert events。
+        let dirty_dirs: HashSet<PathBuf> = dirs.iter().cloned().collect();
+        let mut seq: u64 = 0;
+
+        // 2) 删除对齐（必须先于 upsert）：
+        //    避免"upsert 复用已删除 inode → 旧路径被覆盖 → delete 对齐找不到"的竞态。
+        //    注意：for_each_live_meta 内部持有读锁，期间不能调用 apply_events（会死锁）。
+        let l2 = self.l2.load_full();
+        let mut delete_events: Vec<EventRecord> = Vec::new();
+        l2.for_each_live_meta(|m| {
+            let Some(parent) = m.path.parent() else {
+                return;
+            };
+            if !dirty_dirs.contains(parent) {
+                return;
+            };
+
+            match std::fs::symlink_metadata(&m.path) {
+                Ok(_) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return,
+            };
+            seq = seq.wrapping_add(1);
+            delete_events.push(EventRecord {
+                seq,
+                timestamp: std::time::SystemTime::now(),
+                event_type: EventType::Delete,
+                id: FileIdentifier::Path(m.path),
+                path_hint: None,
+            });
+        });
+
+        report.delete_events = delete_events.len();
+        for chunk in delete_events.chunks(2048) {
+            self.apply_events(chunk);
+        }
+
+        // 3) 扫描目录：生成 upsert events。
         //
         // 说明：这里不再构建"文件名集合（HashSet<OsString>）"用于删除对齐，
         // 因为它会在大目录下产生大量短命分配，容易把非索引 PD 顶到高水位。
         let mut upsert_events: Vec<EventRecord> = Vec::with_capacity(2048);
         let mut upsert_metas: Vec<FileMeta> = Vec::with_capacity(2048);
-        let mut seq: u64 = 0;
 
         for dir in dirs.iter() {
             report.dirs_scanned += 1;
@@ -460,40 +495,6 @@ impl TieredIndex {
         if !upsert_events.is_empty() {
             self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
             upsert_events.clear();
-        }
-
-        let dirty_dirs: HashSet<PathBuf> = dirs.into_iter().collect();
-
-        // 3) 删除对齐：只对齐"被标记 dirty 的目录"下的条目（但对文件做轻量存在性检查，避免构建巨大的 names set）。
-        // 注意：for_each_live_meta 内部持有读锁，期间不能调用 apply_events（会死锁）。
-        let l2 = self.l2.load_full();
-        let mut delete_events: Vec<EventRecord> = Vec::new();
-        l2.for_each_live_meta(|m| {
-            let Some(parent) = m.path.parent() else {
-                return;
-            };
-            if !dirty_dirs.contains(parent) {
-                return;
-            };
-
-            match std::fs::symlink_metadata(&m.path) {
-                Ok(_) => return,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return,
-            };
-            seq = seq.wrapping_add(1);
-            delete_events.push(EventRecord {
-                seq,
-                timestamp: std::time::SystemTime::now(),
-                event_type: EventType::Delete,
-                id: FileIdentifier::Path(m.path),
-                path_hint: None,
-            });
-        });
-
-        report.delete_events = delete_events.len();
-        for chunk in delete_events.chunks(2048) {
-            self.apply_events(chunk);
         }
 
         report

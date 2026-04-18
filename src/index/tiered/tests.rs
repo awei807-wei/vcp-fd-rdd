@@ -21,7 +21,8 @@ fn unique_tmp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-{}-{}", tag, nanos))
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("fd-rdd-{}-{}-{}", tag, pid, nanos))
 }
 
 #[test]
@@ -162,7 +163,10 @@ fn fast_sync_reconciles_add_and_delete() {
 
     let b_exists = std::fs::symlink_metadata(&b).is_ok();
     let file_count = std::fs::read_dir(&root).unwrap().count();
-    eprintln!("[fast_sync debug] before fast_sync: b_exists={}, file_count={}", b_exists, file_count);
+    eprintln!(
+        "[fast_sync debug] before fast_sync: b_exists={}, file_count={}",
+        b_exists, file_count
+    );
 
     let r = idx.fast_sync(
         DirtyScope::Dirs {
