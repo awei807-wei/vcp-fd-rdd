@@ -99,6 +99,25 @@ fn for_each_short_component(path: &Path, mut f: impl FnMut(&[u8])) {
     }
 }
 
+// ── Phase 1: Pure compute functions (no locks) ──
+
+fn collect_component_trigrams(path: &Path) -> Vec<Trigram> {
+    let mut out = Vec::new();
+    for_each_component_trigram(path, |tri| out.push(tri));
+    out
+}
+
+fn collect_short_components(path: &Path) -> Vec<Box<[u8]>> {
+    let mut out = Vec::new();
+    for_each_short_component(path, |component| out.push(Box::from(component)));
+    out
+}
+
+fn compute_path_hash(path: &Path) -> u64 {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    path_hash_bytes(bytes)
+}
+
 /// Path blob arena：所有路径的连续字节存储
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PathArena {
@@ -554,8 +573,13 @@ impl PersistentIndex {
     fn upsert_inner(&self, meta: FileMeta, force_path_update: bool) {
         let fkey = meta.file_key;
         let (new_root_id, new_rel_bytes) = self.split_root_relative_bytes(meta.path.as_path());
+        let full_path = meta.path.as_path();
 
-        // 先查 docid（只持有 mapping 的读锁）
+        // ── Phase 1: 纯计算（无任何锁） ──
+        let new_trigrams = collect_component_trigrams(full_path);
+        let new_short_components = collect_short_components(full_path);
+        let new_path_hash = compute_path_hash(full_path);
+
         let existing_docid = { self.filekey_to_docid.read().get(&fkey).copied() };
 
         if let Some(docid) = existing_docid {
@@ -600,94 +624,153 @@ impl PersistentIndex {
                 return;
             }
 
-            // rename：先移除旧路径关联
-            if old_len != 0 {
-                if let Some(old_path) = self.absolute_path_buf(old_root_id, old_off, old_len) {
-                    self.remove_trigrams(docid, &old_path);
-                    self.remove_path_hash(docid, &old_path);
-                }
-            }
+            // rename：Phase 1 读旧路径
+            let old_path = if old_len != 0 {
+                self.absolute_path_buf(old_root_id, old_off, old_len)
+            } else {
+                None
+            };
+            let old_trigrams = old_path.as_ref().map(|p| collect_component_trigrams(p));
+            let old_short_components = old_path.as_ref().map(|p| collect_short_components(p));
+            let old_path_hash = old_path.as_ref().map(|p| compute_path_hash(p));
 
-            let Some((new_off, new_len)) = self.arena.write().push_bytes(&new_rel_bytes) else {
-                self.tombstones.write().insert(docid);
+            // ── Phase 2: 原子 Apply（一次性持全量写锁） ──
+            let _guard = self.upsert_lock.write();
+            let mut tri_w = self.trigram_index.write();
+            let mut short_w = self.short_component_index.write();
+            let mut ph_w = self.path_hash_to_id.write();
+            let mut metas_w = self.metas.write();
+            let mut arena_w = self.arena.write();
+            let mut fk_w = self.filekey_to_docid.write();
+            let mut tomb_w = self.tombstones.write();
+
+            let Some((new_off, new_len)) = arena_w.push_bytes(&new_rel_bytes) else {
+                tomb_w.insert(docid);
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
             };
 
-            // posting/path_hash 先写（与 query 锁顺序一致：trigram -> metas）
-            let _guard = self.upsert_lock.write();
-            self.insert_trigrams(docid, meta.path.as_path());
-            self.insert_path_hash(docid, meta.path.as_path());
+            // remove old postings / path_hash
+            if let Some(_old_p) = old_path {
+                if let Some(ref tris) = old_trigrams {
+                    for tri in tris {
+                        if let Some(map) = tri_w.get_mut(tri) {
+                            map.remove(docid);
+                        }
+                    }
+                }
+                if let Some(ref shorts) = old_short_components {
+                    for comp in shorts {
+                        if let Some(map) = short_w.get_mut(comp) {
+                            map.remove(docid);
+                        }
+                    }
+                }
+                if let Some(ph) = old_path_hash {
+                    let should_remove = if let Some(v) = ph_w.get_mut(&ph) {
+                        v.remove(docid)
+                    } else {
+                        false
+                    };
+                    if should_remove {
+                        ph_w.remove(&ph);
+                    }
+                }
+            }
 
-            let mut metas = self.metas.write();
-            if let Some(existing) = metas.get_mut(docid as usize) {
+            // insert new postings / path_hash
+            for tri in &new_trigrams {
+                tri_w.entry(*tri).or_default().insert(docid);
+            }
+            for comp in &new_short_components {
+                short_w.entry(comp.clone()).or_default().insert(docid);
+            }
+            match ph_w.entry(new_path_hash) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    e.get_mut().insert(docid);
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(OneOrManyDocId::One(docid));
+                }
+            }
+
+            // update metas
+            if let Some(existing) = metas_w.get_mut(docid as usize) {
                 existing.root_id = new_root_id;
                 existing.path_off = new_off;
                 existing.path_len = new_len;
                 existing.size = meta.size;
                 existing.mtime = meta.mtime;
             } else {
-                // 极端情况：docid 槽位不存在，降级为 append
-                let _guard = self.upsert_lock.write();
-                if let Some(docid_new) =
-                    self.alloc_docid(fkey, new_root_id, &new_rel_bytes, meta.size, meta.mtime)
-                {
-                    self.insert_trigrams(docid_new, meta.path.as_path());
-                    self.insert_path_hash(docid_new, meta.path.as_path());
-                }
+                // 极端情况：docid 槽位不存在，追加新槽位
+                let docid_new: DocId = metas_w.len() as DocId;
+                metas_w.push(CompactMeta {
+                    file_key: fkey,
+                    root_id: new_root_id,
+                    path_off: new_off,
+                    path_len: new_len,
+                    size: meta.size,
+                    mtime: meta.mtime,
+                });
+                fk_w.insert(fkey, docid_new);
             }
 
-            // rename 视为“存在且活跃”
-            self.tombstones.write().remove(docid);
+            tomb_w.remove(docid);
             self.dirty.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
 
-        // 新文件：分配 docid 并写入
+        // ── 新文件：一次性原子写入 ──
         let _guard = self.upsert_lock.write();
-        let Some(docid) =
-            self.alloc_docid(fkey, new_root_id, &new_rel_bytes, meta.size, meta.mtime)
-        else {
+        let mut tri_w = self.trigram_index.write();
+        let mut short_w = self.short_component_index.write();
+        let mut ph_w = self.path_hash_to_id.write();
+        let mut metas_w = self.metas.write();
+        let mut arena_w = self.arena.write();
+        let mut fk_w = self.filekey_to_docid.write();
+        let mut tomb_w = self.tombstones.write();
+
+        let Some((new_off, new_len)) = arena_w.push_bytes(&new_rel_bytes) else {
             return;
         };
-        self.insert_trigrams(docid, meta.path.as_path());
-        self.insert_path_hash(docid, meta.path.as_path());
+
+        let docid: DocId = metas_w.len() as DocId;
+        metas_w.push(CompactMeta {
+            file_key: fkey,
+            root_id: new_root_id,
+            path_off: new_off,
+            path_len: new_len,
+            size: meta.size,
+            mtime: meta.mtime,
+        });
+
+        for tri in &new_trigrams {
+            tri_w.entry(*tri).or_default().insert(docid);
+        }
+        for comp in &new_short_components {
+            short_w.entry(comp.clone()).or_default().insert(docid);
+        }
+        match ph_w.entry(new_path_hash) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().insert(docid);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(OneOrManyDocId::One(docid));
+            }
+        }
+        fk_w.insert(fkey, docid);
+        tomb_w.remove(docid);
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    fn alloc_docid(
-        &self,
-        file_key: FileKey,
-        root_id: u16,
-        rel_bytes: &[u8],
-        size: u64,
-        mtime: Option<std::time::SystemTime>,
-    ) -> Option<DocId> {
-        let (off, len) = self.arena.write().push_bytes(rel_bytes)?;
-
-        let mut metas = self.metas.write();
-        let docid: DocId = metas.len() as DocId;
-        metas.push(CompactMeta {
-            file_key,
-            root_id,
-            path_off: off,
-            path_len: len,
-            size,
-            mtime,
-        });
-
-        self.filekey_to_docid.write().insert(file_key, docid);
-        self.tombstones.write().remove(docid);
-        Some(docid)
-    }
-
-    /// 标记删除（tombstone）
+    /// 标记删除（tombstone）— Phase 1 读旧路径 + Phase 2 原子移除
     pub fn mark_deleted(&self, file_key: FileKey) {
         let docid = { self.filekey_to_docid.read().get(&file_key).copied() };
         let Some(docid) = docid else {
             return;
         };
 
+        // Phase 1: 读旧路径（只持读锁）
         let path = {
             let metas = self.metas.read();
             metas
@@ -695,14 +778,45 @@ impl PersistentIndex {
                 .and_then(|m| self.absolute_path_buf(m.root_id, m.path_off, m.path_len))
         };
 
-        if let Some(p) = path {
-            self.remove_trigrams(docid, &p);
-            self.remove_path_hash(docid, &p);
+        let trigrams = path.as_ref().map(|p| collect_component_trigrams(p));
+        let short_components = path.as_ref().map(|p| collect_short_components(p));
+        let path_hash = path.as_ref().map(|p| compute_path_hash(p));
+
+        // Phase 2: 原子 Apply（一次性持全量写锁）
+        let _guard = self.upsert_lock.write();
+        let mut tri_w = self.trigram_index.write();
+        let mut short_w = self.short_component_index.write();
+        let mut ph_w = self.path_hash_to_id.write();
+        let mut fk_w = self.filekey_to_docid.write();
+        let mut tomb_w = self.tombstones.write();
+
+        if let Some(ref tris) = trigrams {
+            for tri in tris {
+                if let Some(map) = tri_w.get_mut(tri) {
+                    map.remove(docid);
+                }
+            }
+        }
+        if let Some(ref shorts) = short_components {
+            for comp in shorts {
+                if let Some(map) = short_w.get_mut(comp) {
+                    map.remove(docid);
+                }
+            }
+        }
+        if let Some(ph) = path_hash {
+            let should_remove = if let Some(v) = ph_w.get_mut(&ph) {
+                v.remove(docid)
+            } else {
+                false
+            };
+            if should_remove {
+                ph_w.remove(&ph);
+            }
         }
 
-        // 保留 doc 槽位，但移除 filekey 映射，避免 inode 复用/重新扫描复用 docid
-        self.filekey_to_docid.write().remove(&file_key);
-        self.tombstones.write().insert(docid);
+        fk_w.remove(&file_key);
+        tomb_w.insert(docid);
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 
@@ -997,6 +1111,7 @@ impl PersistentIndex {
         from_fid: Option<FileKey>,
         to_path: Option<Cow<'_, Path>>,
     ) {
+        // ── Phase 1: Resolve metadata ──
         let to_meta = to_path.as_deref().and_then(Self::resolve_path_meta);
         let fallback_meta = if to_meta.is_none() {
             from_best_path.and_then(Self::resolve_path_meta)
@@ -1004,6 +1119,7 @@ impl PersistentIndex {
             None
         };
 
+        // Read docid (read-only)
         let docid_opt = if let Some(fk) = from_fid {
             self.filekey_to_docid.read().get(&fk).copied()
         } else {
@@ -1011,24 +1127,71 @@ impl PersistentIndex {
         };
 
         if let Some(docid) = docid_opt {
+            // ── Phase 1: Read old meta + path (read locks only) ──
             let old = {
                 let metas = self.metas.read();
                 metas.get(docid as usize).cloned()
             };
 
             if let Some(mut m) = old {
-                if let Some(old_path) = self.absolute_path_buf(m.root_id, m.path_off, m.path_len) {
-                    self.remove_trigrams(docid, &old_path);
-                    self.remove_path_hash(docid, &old_path);
-                } else if let Some(path) = from_best_path {
-                    self.remove_trigrams(docid, path);
-                    self.remove_path_hash(docid, path);
+                let old_path = self
+                    .absolute_path_buf(m.root_id, m.path_off, m.path_len)
+                    .or_else(|| from_best_path.map(PathBuf::from));
+
+                let old_trigrams = old_path.as_ref().map(|p| collect_component_trigrams(p));
+                let old_short_components = old_path.as_ref().map(|p| collect_short_components(p));
+                let old_path_hash = old_path.as_ref().map(|p| compute_path_hash(p));
+
+                // Prepare new path bits
+                let new_path_data = to_path.as_ref().map(|tp| {
+                    let tp_owned = tp.as_ref().to_path_buf();
+                    let (root_id, rel_bytes) = self.split_root_relative_bytes(tp_owned.as_path());
+                    let tris = collect_component_trigrams(tp_owned.as_path());
+                    let shorts = collect_short_components(tp_owned.as_path());
+                    let ph = compute_path_hash(tp_owned.as_path());
+                    (tp_owned, root_id, rel_bytes, tris, shorts, ph)
+                });
+
+                // ── Phase 2: Atomic Apply (all write locks held) ──
+                let _guard = self.upsert_lock.write();
+                let mut tri_w = self.trigram_index.write();
+                let mut short_w = self.short_component_index.write();
+                let mut ph_w = self.path_hash_to_id.write();
+                let mut metas_w = self.metas.write();
+                let mut arena_w = self.arena.write();
+                let mut tomb_w = self.tombstones.write();
+
+                // remove old postings / path_hash
+                if let Some(ref tris) = old_trigrams {
+                    for tri in tris {
+                        if let Some(map) = tri_w.get_mut(tri) {
+                            map.remove(docid);
+                        }
+                    }
+                }
+                if let Some(ref shorts) = old_short_components {
+                    for comp in shorts {
+                        if let Some(map) = short_w.get_mut(comp) {
+                            map.remove(docid);
+                        }
+                    }
+                }
+                if let Some(ph) = old_path_hash {
+                    let should_remove = if let Some(v) = ph_w.get_mut(&ph) {
+                        v.remove(docid)
+                    } else {
+                        false
+                    };
+                    if should_remove {
+                        ph_w.remove(&ph);
+                    }
                 }
 
-                if let Some(to_path) = to_path {
-                    let to_path = to_path.into_owned();
-                    let (root_id, rel_bytes) = self.split_root_relative_bytes(to_path.as_path());
-                    if let Some((off, len)) = self.arena.write().push_bytes(&rel_bytes) {
+                // Insert new path
+                if let Some((_tp_owned, root_id, ref rel_bytes, ref tris, ref shorts, ph)) =
+                    new_path_data
+                {
+                    if let Some((off, len)) = arena_w.push_bytes(rel_bytes) {
                         m.root_id = root_id;
                         m.path_off = off;
                         m.path_len = len;
@@ -1037,17 +1200,29 @@ impl PersistentIndex {
                         m.size = meta.size;
                         m.mtime = meta.mtime;
                     }
-                    self.insert_trigrams(docid, to_path.as_path());
-                    self.insert_path_hash(docid, to_path.as_path());
+                    for tri in tris {
+                        tri_w.entry(*tri).or_default().insert(docid);
+                    }
+                    for comp in shorts {
+                        short_w.entry(comp.clone()).or_default().insert(docid);
+                    }
+                    match ph_w.entry(ph) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            e.get_mut().insert(docid);
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(OneOrManyDocId::One(docid));
+                        }
+                    }
                 } else if let Some(meta) = fallback_meta {
                     m.size = meta.size;
                     m.mtime = meta.mtime;
                 }
 
-                if let Some(slot) = self.metas.write().get_mut(docid as usize) {
+                if let Some(slot) = metas_w.get_mut(docid as usize) {
                     *slot = m;
                 }
-                self.tombstones.write().remove(docid);
+                tomb_w.remove(docid);
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
             }
             return;
@@ -1447,62 +1622,6 @@ impl PersistentIndex {
             root_bytes_for_id(&self.roots_bytes, root_id),
             rel,
         ))
-    }
-
-    fn remove_trigrams(&self, docid: DocId, path: &Path) {
-        let mut tri_idx = self.trigram_index.write();
-        let mut short_idx = self.short_component_index.write();
-        for_each_component_trigram(path, |tri| {
-            if let Some(posting) = tri_idx.get_mut(&tri) {
-                posting.remove(docid);
-                if posting.is_empty() {
-                    tri_idx.remove(&tri);
-                }
-            }
-        });
-        for_each_short_component(path, |component| {
-            if let Some(posting) = short_idx.get_mut(component) {
-                posting.remove(docid);
-                if posting.is_empty() {
-                    short_idx.remove(component);
-                }
-            }
-        });
-    }
-
-    fn insert_trigrams(&self, docid: DocId, path: &Path) {
-        let mut tri_idx = self.trigram_index.write();
-        let mut short_idx = self.short_component_index.write();
-        for_each_component_trigram(path, |tri| {
-            tri_idx.entry(tri).or_default().insert(docid);
-        });
-        for_each_short_component(path, |component| {
-            short_idx
-                .entry(Box::<[u8]>::from(component))
-                .or_default()
-                .insert(docid);
-        });
-    }
-
-    fn insert_path_hash(&self, docid: DocId, path: &Path) {
-        let bytes = path.as_os_str().as_encoded_bytes();
-        let h = path_hash_bytes(bytes);
-        let mut map = self.path_hash_to_id.write();
-        map.entry(h)
-            .and_modify(|v| v.insert(docid))
-            .or_insert(OneOrManyDocId::One(docid));
-    }
-
-    fn remove_path_hash(&self, docid: DocId, path: &Path) {
-        let bytes = path.as_os_str().as_encoded_bytes();
-        let h = path_hash_bytes(bytes);
-        let mut map = self.path_hash_to_id.write();
-        if let Some(v) = map.get_mut(&h) {
-            let empty = v.remove(docid);
-            if empty {
-                map.remove(&h);
-            }
-        }
     }
 
     fn lookup_docid_by_path(&self, path: &Path) -> Option<DocId> {
