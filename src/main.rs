@@ -162,7 +162,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(cfg.snapshot_interval_secs);
 
     // 2) 快照存储
-    let snapshot_path = args.snapshot_path.unwrap_or_else(default_snapshot_path);
+    let snapshot_path = args
+        .snapshot_path
+        .or(cfg.snapshot_path.clone())
+        .unwrap_or_else(default_snapshot_path);
     let store = Arc::new(SnapshotStore::new(snapshot_path));
 
     // 3) 从快照加载或空索引启动

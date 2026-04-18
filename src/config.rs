@@ -99,12 +99,29 @@ pub fn default_snapshot_path() -> PathBuf {
     }
 }
 
+/// Expand `~` and `~/` to the user's home directory.
+fn expand_path(path: &std::path::Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(&s[2..]);
+        }
+    } else if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Top-level configuration loaded from `~/.config/fd-rdd/config.toml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// UDS socket path override.
     pub socket_path: Option<PathBuf>,
+    /// Snapshot database path override.
+    pub snapshot_path: Option<PathBuf>,
     /// Index root directories.
     pub roots: Vec<PathBuf>,
     /// Whether .gitignore / .ignore rules are applied during scan.
@@ -125,6 +142,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             socket_path: None,
+            snapshot_path: None,
             roots: Vec::new(),
             ignore_enabled: true,
             log_level: "info".to_string(),
@@ -149,10 +167,28 @@ impl Config {
             return Ok(Self::default());
         };
         if !path.exists() {
-            return Ok(Self::default());
+            // Auto-create default config file
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let default_toml = r#"# fd-rdd default configuration
+# Priority: CLI args > config.toml > defaults
+
+roots = ["~"]
+include_hidden = true
+snapshot_interval_secs = 300
+ignore_enabled = true
+log_level = "info"
+http_port = 6060
+follow_symlinks = false
+"#;
+            let _ = std::fs::write(&path, default_toml);
         }
         let text = std::fs::read_to_string(&path)?;
-        let cfg: Config = toml::from_str(&text)?;
+        let mut cfg: Config = toml::from_str(&text)?;
+        cfg.roots = cfg.roots.into_iter().map(|p| expand_path(&p)).collect();
+        cfg.socket_path = cfg.socket_path.map(|p| expand_path(&p));
+        cfg.snapshot_path = cfg.snapshot_path.map(|p| expand_path(&p));
         Ok(cfg)
     }
 }
