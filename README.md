@@ -8,7 +8,14 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前 tests 分支发布版本为 v0.5.6（中文搜索修复、存储层健壮性加固、WAL 去重、事件溢出增量恢复、版本兼容重构）。
+> 当前 tests 分支发布版本为 v0.5.7（竞态修复、配置化启动、持久化路径、中文搜索修复、存储层健壮性加固、WAL 去重、事件溢出增量恢复、版本兼容重构）。
+
+## v0.5.7 更新（竞态修复、配置化启动与持久化路径）
+
+- **修复** `PersistentIndex` upsert 竞态条件：旧锁顺序（`metas → trigram`）与查询路径（`trigram → metas`）不一致，导致可见性撕裂与死锁。引入 **Shadow Delta（影子合并）** 重构，将 trigram 提取、bitmap 构建等纯计算逻辑与锁分离，改为在原子提交阶段一次性持有全部写锁（`trigram → short_component → path_hash → metas → arena → filekey → tombstones`），消除中间状态暴露与死锁风险。
+- **新增** 支持 `config.toml` 启动：`~/.config/fd-rdd/config.toml` 配置 `roots`、`snapshot_interval_secs`、`http_port`、`include_hidden` 等字段，CLI 参数仍可覆盖配置值，不再依赖 shell 脚本硬编码长命令行。
+- **修复** Linux 默认 snapshot 路径不再落入 tmpfs：原 fallback 链最终命中 `/tmp/fd-rdd-$UID`，重启后索引全部丢失；改为持久化磁盘路径 `~/.local/share/fd-rdd/index.db`，使用 `dirs::data_local_dir()` 自动适配 XDG 规范。
+- **清理** git 历史：`git filter-branch` 移除所有 `[Snow Team]` 自动提交前缀，删除 13 个 `snow-team/*` 分支，压缩近期工作为干净提交。
 
 ## v0.5.6 更新（中文搜索修复）
 
