@@ -245,14 +245,34 @@ async fn main() -> anyhow::Result<()> {
         };
 
         println!("roots:                {:?}  [from: {}]", roots, roots_src);
-        println!("snapshot_path:        {}  [from: {}]", snapshot_path.display(), snapshot_src);
+        println!(
+            "snapshot_path:        {}  [from: {}]",
+            snapshot_path.display(),
+            snapshot_src
+        );
         println!("http_port:            {}  [from: {}]", http_port, http_src);
-        println!("snapshot_interval:    {}s [from: {}]", snapshot_interval_secs, interval_src);
-        println!("include_hidden:       {}  [from: {}]", include_hidden, hidden_src);
-        println!("follow_symlinks:      {}  [from: {}]", follow_symlinks, follow_src);
-        println!("ignore_enabled:       {}  [from: {}]", ignore_enabled, ignore_src);
+        println!(
+            "snapshot_interval:    {}s [from: {}]",
+            snapshot_interval_secs, interval_src
+        );
+        println!(
+            "include_hidden:       {}  [from: {}]",
+            include_hidden, hidden_src
+        );
+        println!(
+            "follow_symlinks:      {}  [from: {}]",
+            follow_symlinks, follow_src
+        );
+        println!(
+            "ignore_enabled:       {}  [from: {}]",
+            ignore_enabled, ignore_src
+        );
         println!("log_level:            {}  [from: {}]", log_level, log_src);
-        println!("uds_socket:           {}  [from: {}]", uds_path.display(), uds_src);
+        println!(
+            "uds_socket:           {}  [from: {}]",
+            uds_path.display(),
+            uds_src
+        );
         return Ok(());
     }
 
