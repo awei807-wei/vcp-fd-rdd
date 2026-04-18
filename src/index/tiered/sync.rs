@@ -395,7 +395,7 @@ impl TieredIndex {
             builder
                 .max_depth(Some(1))
                 .hidden(!self.include_hidden)
-                .follow_links(false)
+                .follow_links(self.follow_symlinks)
                 .ignore(self.ignore_enabled)
                 .git_ignore(self.ignore_enabled)
                 .git_global(self.ignore_enabled)
@@ -516,7 +516,7 @@ impl TieredIndex {
             builder
                 .max_depth(Some(1))
                 .hidden(!self.include_hidden)
-                .follow_links(false)
+                .follow_links(self.follow_symlinks)
                 .ignore(self.ignore_enabled)
                 .git_ignore(self.ignore_enabled)
                 .git_global(self.ignore_enabled)

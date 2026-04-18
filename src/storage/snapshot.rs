@@ -34,11 +34,15 @@ pub(crate) const MAX_V6_ROOTS_SEGMENT_BYTES: u64 = 1024 * 1024; // 1 MiB
 /// - 加载时校验 magic + version + data_len + checksum，任何不一致都拒绝
 pub struct SnapshotStore {
     path: PathBuf,
+    pub(crate) compaction_lock: tokio::sync::Mutex<()>,
 }
 
 impl SnapshotStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            compaction_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     pub fn path(&self) -> &Path {

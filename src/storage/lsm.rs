@@ -44,18 +44,21 @@ pub struct LsmLoadedLayers {
     pub wal_seal_id: u64,
 }
 
-pub fn lsm_encode_manifest_body(m: &LsmManifest) -> Vec<u8> {
+pub fn lsm_encode_manifest_body(m: &LsmManifest) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(8 + 8 + 4 + m.delta_ids.len() * 8 + 8 + 8);
     out.extend_from_slice(&m.next_id.to_le_bytes());
     out.extend_from_slice(&m.base_id.to_le_bytes());
-    let n: u32 = m.delta_ids.len().try_into().unwrap_or(u32::MAX);
+    if m.delta_ids.len() > u32::MAX as usize {
+        anyhow::bail!("LSM manifest delta_ids count overflow");
+    }
+    let n = m.delta_ids.len() as u32;
     out.extend_from_slice(&n.to_le_bytes());
     for &id in m.delta_ids.iter().take(n as usize) {
         out.extend_from_slice(&id.to_le_bytes());
     }
     out.extend_from_slice(&m.wal_seal_id.to_le_bytes());
     out.extend_from_slice(&m.last_build_ns.to_le_bytes());
-    out
+    Ok(out)
 }
 
 pub fn lsm_decode_manifest_body(body: &[u8]) -> anyhow::Result<LsmManifest> {
@@ -155,7 +158,7 @@ fn now_unix_nanos() -> u64 {
 }
 
 pub fn lsm_write_manifest_atomic(path: &Path, m: &LsmManifest) -> anyhow::Result<()> {
-    let body = lsm_encode_manifest_body(m);
+    let body = lsm_encode_manifest_body(m)?;
     let body_len: u32 = body.len().try_into().unwrap_or(u32::MAX);
     let checksum = crc32c_checksum(&body);
 
@@ -408,6 +411,8 @@ impl SnapshotStore {
         expected_roots: &[PathBuf],
         wal_seal_id: u64,
     ) -> anyhow::Result<LsmSegmentLoaded> {
+        let _guard = self.compaction_lock.lock().await;
+
         let dir = self.lsm_dir_path();
         tokio::fs::create_dir_all(&dir).await?;
 
@@ -461,6 +466,8 @@ impl SnapshotStore {
         expected_roots: &[PathBuf],
         wal_seal_id: u64,
     ) -> anyhow::Result<LsmSegmentLoaded> {
+        let _guard = self.compaction_lock.lock().await;
+
         let dir = self.lsm_dir_path();
         tokio::fs::create_dir_all(&dir).await?;
 

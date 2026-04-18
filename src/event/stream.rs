@@ -221,7 +221,10 @@ impl EventPipeline {
 
                 // .gitignore filtering
                 if let Some(ref gi) = ignore_filter {
-                    raw_events.retain(|ev| !ev.paths.iter().any(|p| gi.is_ignored(p)));
+                    raw_events.retain(|ev| {
+                        let is_dir = is_dir_from_event_kind(ev.kind);
+                        !ev.paths.iter().any(|p| gi.is_ignored(p, is_dir))
+                    });
                 }
 
                 // 合并去重
@@ -316,6 +319,14 @@ fn should_ignore_event(ev: &notify::Event, ignore_prefixes: &[PathBuf]) -> bool 
         }
     }
     false
+}
+
+fn is_dir_from_event_kind(kind: notify::EventKind) -> bool {
+    matches!(
+        kind,
+        notify::EventKind::Create(notify::event::CreateKind::Folder)
+            | notify::EventKind::Remove(notify::event::RemoveKind::Folder)
+    )
 }
 
 #[derive(Default)]

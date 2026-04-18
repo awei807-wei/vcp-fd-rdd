@@ -21,36 +21,11 @@ impl FileKey {
         _path: &std::path::Path,
         meta: &std::fs::Metadata,
     ) -> Option<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Some(Self {
-                dev: meta.dev(),
-                ino: meta.ino(),
-            })
-        }
-
-        #[cfg(windows)]
-        {
-            use std::hash::{Hash, Hasher};
-
-            // TODO: Windows stable std does not expose a true inode/file-id for rename-stable identity.
-            // The current path-hash fallback degrades rename semantics to delete+create.
-            // Add compensation logic (e.g., GetFileInformationByHandle) to preserve rename-stable
-            // identity on Windows.
-            let _ = meta;
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            _path.as_os_str().as_encoded_bytes().hash(&mut hasher);
-            let h = hasher.finish();
-            return Some(Self { dev: 0, ino: h });
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = path;
-            let _ = meta;
-            None
-        }
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
     }
 }
 

@@ -9,26 +9,29 @@ pub struct IndexBuilder {
     pub roots: Vec<PathBuf>,
     pub include_hidden: bool,
     pub ignore_enabled: bool,
+    pub follow_symlinks: bool,
 }
 
 impl IndexBuilder {
     pub fn new(roots: Vec<PathBuf>) -> Self {
-        Self::new_with_options(roots, false, true)
+        Self::new_with_options(roots, false, true, false)
     }
 
     pub fn new_with_hidden(roots: Vec<PathBuf>, include_hidden: bool) -> Self {
-        Self::new_with_options(roots, include_hidden, true)
+        Self::new_with_options(roots, include_hidden, true, false)
     }
 
     pub fn new_with_options(
         roots: Vec<PathBuf>,
         include_hidden: bool,
         ignore_enabled: bool,
+        follow_symlinks: bool,
     ) -> Self {
         Self {
             roots,
             include_hidden,
             ignore_enabled,
+            follow_symlinks,
         }
     }
 
@@ -36,6 +39,7 @@ impl IndexBuilder {
     pub fn full_build(&self, index: &PersistentIndex) {
         let rdd = FsScanRDD::from_roots(self.roots.clone())
             .with_hidden(self.include_hidden)
+            .with_follow_links(self.follow_symlinks)
             .with_ignore_rules(self.ignore_enabled);
         let mut count = 0usize;
 
@@ -66,6 +70,7 @@ impl IndexBuilder {
 
         let rdd = FsScanRDD::from_roots(self.roots.clone())
             .with_hidden(self.include_hidden)
+            .with_follow_links(self.follow_symlinks)
             .with_ignore_rules(self.ignore_enabled)
             .with_parallelism(parallelism);
         let count = Arc::new(AtomicUsize::new(0));
@@ -93,6 +98,7 @@ impl IndexBuilder {
     pub fn incremental_scan(&self, index: &PersistentIndex, dirs: Vec<PathBuf>) {
         let rdd = FsScanRDD::from_roots(dirs)
             .with_hidden(self.include_hidden)
+            .with_follow_links(self.follow_symlinks)
             .with_ignore_rules(self.ignore_enabled);
         let mut count = 0usize;
 

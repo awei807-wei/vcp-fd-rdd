@@ -190,8 +190,14 @@ mod imp {
         cfg: SocketConfig,
         mut socket: impl AsyncRead + AsyncWrite + Unpin,
     ) -> anyhow::Result<()> {
+        let read_timeout = std::time::Duration::from_secs(5);
         let mut req: Vec<u8> = Vec::with_capacity(256);
-        let n = socket.read_to_end(&mut req).await?;
+        let mut limited = (&mut socket).take(cfg.max_request_bytes as u64 + 1);
+        let n = match tokio::time::timeout(read_timeout, limited.read_to_end(&mut req)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!("socket read timeout"),
+        };
         if n == 0 {
             return Ok(());
         }

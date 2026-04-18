@@ -12,7 +12,6 @@ use std::path::PathBuf;
 ///   fallback: `/run/user/$UID/fd-rdd/fd-rdd.sock`
 ///   fallback: `/tmp/fd-rdd-$UID.sock`
 /// - macOS: `$TMPDIR/fd-rdd/fd-rdd.sock` (TMPDIR is already per-user)
-/// - Windows: `\\.\pipe\fd-rdd-{username}`
 pub fn default_socket_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -48,17 +47,6 @@ pub fn default_socket_path() -> PathBuf {
 
         PathBuf::from(format!("/tmp/fd-rdd-{}.sock", uid))
     }
-
-    #[cfg(target_os = "windows")]
-    {
-        let username = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
-        return PathBuf::from(format!(r"\\.\pipe\fd-rdd-{}", username));
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        PathBuf::from("/tmp/fd-rdd.sock")
-    }
 }
 
 /// Returns the platform-appropriate default snapshot path (user-isolated).
@@ -67,7 +55,6 @@ pub fn default_socket_path() -> PathBuf {
 ///   fallback: `/run/user/$UID/fd-rdd/index.db`
 ///   fallback: `~/.local/share/fd-rdd/index.db`
 /// - macOS: `$TMPDIR/fd-rdd/index.db`
-/// - Windows: `%LOCALAPPDATA%/fd-rdd/index.db`
 pub fn default_snapshot_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -103,30 +90,8 @@ pub fn default_snapshot_path() -> PathBuf {
 
         // 使用持久化用户数据目录，避免 tmpfs RSS 问题
         let dir = dirs::data_local_dir()
-            .unwrap_or_else(|| {
-                PathBuf::from(format!("/tmp/fd-rdd-{}", uid))
-            })
+            .unwrap_or_else(|| PathBuf::from(format!("/tmp/fd-rdd-{}", uid)))
             .join("fd-rdd");
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
-        }
-        dir.join("index.db")
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let dir = dirs::data_local_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("fd-rdd");
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
-        }
-        return dir.join("index.db");
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let dir = std::env::temp_dir().join("fd-rdd");
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
         }

@@ -4,7 +4,18 @@
 
 ## Unreleased
 
-- **缺陷修复（2026-04-17）—— 中文搜索 UTF-8 越界 panic**：`src/query/scoring.rs` 中 `compute_substring_highlights` 匹配后使用 `start = abs_pos + 1` 推进索引，中文字符（3 字节）导致下一轮切片落在字符中间，触发 `byte index X is not a char boundary` panic 并使 HTTP 查询线程崩溃；修复为 `start = abs_pos + n_lower.len()`，按匹配子串实际字节长度推进
+- **配置治理（P1-3）—— CLI 与 config.toml 全量接线**：`src/main.rs` 将 `http_port`、`snapshot_interval_secs`、`include_hidden`、`follow_symlinks`、`log_level` 改为 `Option<T>`，启动时按 `CLI > config.toml > 默认值` 合并；`tracing-subscriber` 启用 `env-filter` 特性以支持动态日志级别；修复 `args.http_port` 在就绪日志中未使用合并值的问题
+- **follow_symlinks 贯通（P1-2）**：`TieredIndex::empty_with_options` / `load_with_options` / `load_or_empty_with_options` 新增 `follow_symlinks` 参数；`IndexBuilder` 新增 `follow_symlinks` 字段并透传至 `FsScanRDD::with_follow_links`；`sync.rs` 的 `fast_sync` 与 `scan_dirs_immediate` 将 `ignore::WalkBuilder::follow_links(false)` 硬编码改为 `self.follow_symlinks`，实现配置值在冷扫、增量补扫、即时扫描三层全贯通
+- **平台清理 —— 移除 Windows 支持**：`src/config.rs` 删除 Windows socket 路径 (`\\.\pipe\fd-rdd-{username}`) 与 snapshot 路径 (`dirs::data_local_dir()` on Windows) 的条件编译块及文档；`src/core/rdd.rs` 删除 Windows / fallback 分支，保留 Unix 逻辑；`src/stats/mod.rs` 三个函数加 `#[cfg(target_os = "linux")]`；CI/release 工作流声明 Linux-only 并标记 macOS 为实验性
+- **缺陷修复（B3）—— WAL append 后 fsync**：`wal.rs` 的 `append_record` 在写入后调用 `sync_data()`，防止掉电丢失未落盘事件
+- **缺陷修复（B4）—— WAL CRC mismatch 中断回放**：`wal.rs` 的 `replay_since_seal` 中遇到 CRC 校验失败记录时由 `continue` 改为 `break`，避免后续有效事件被错误跳过
+- **缺陷修复（B6）—— socket OOM / 慢 loris 防护**：`query/socket.rs` 将 `read_to_end` 改为 `take(max_request_bytes + 1)` 先限长再读取，增加 2 秒读超时，消除恶意客户端通过超大请求或慢速发送耗尽内存的风险
+- **缺陷修复（B8）—— HTTP 查询协作式取消**：`query/server.rs` 的 `spawn_blocking` 查询内每处理 256 条候选检查一次 `Arc<AtomicBool>` 取消标志；timeout 后设置标志位，任务自行提前返回，避免线程池饿死
+- **缺陷修复（B11）—— lsm_append_delta_v6 并发竞争**：`storage/snapshot.rs` 新增 `compaction_lock: tokio::sync::Mutex<()>`，`lsm_append_delta_v6()` 与 `lsm_replace_base_v6()` 开头均获取该锁，串行化 delta 追加与 base 替换，防止同 id segment 文件覆盖
+- **缺陷修复（B17）—— /scan 端点路径数量限制**：`query/server.rs` 的 `POST /scan` 由 `paths.iter().take(10)` 静默截断改为显式校验，超过 10 个路径时返回 `400 Bad Request`
+- **缺陷修复（B18）—— LSM manifest delta_ids 溢出**：`storage/lsm.rs` 中 `unwrap_or(u32::MAX)` 改为显式 `bail!`，拒绝非法 delta_ids 数量而非静默截断
+- **缺陷修复（B20）—— ignore_filter 目录状态推断**：`event/ignore_filter.rs` 的 `is_ignored` 新增 `is_dir: bool` 参数，`event/stream.rs` 通过 `notify::EventKind` 推断目录/文件状态并传入，消除每事件 `path.is_dir()` syscall
+- **缺陷修复（B22）—— WAL len try_into 安全化**：`wal.rs` 中将 `len.try_into().unwrap_or(u32::MAX)` 改为 `bail!`，拒绝非法长度而非静默写入 `u32::MAX`
 - **体验修复（2026-04-17）—— 中文路径边界加分**：`src/query/scoring.rs` 中 `is_boundary_char` 原仅检查 ASCII 边界字符，中文字节无法获得边界加分；改为以 `char` 为单位判断，增加 `!c.is_alphanumeric()`，使非字母数字字符（含中文）均被视为边界；`compute_position_bonuses` 改用 `char_indices()` 迭代，确保多字节字符首字节正确得分
 - **体验修复（2026-04-17）—— 中文短查询优化失效**：`src/index/l2_partition.rs` 中 `normalize_short_hint` 按字节长度判断 1-2 字符，单个中文字符 = 3 字节导致短组件索引优化被跳过；改为按 `chars().count()` 判断，`trigram_matches_short_hint` 改为通用 `windows()` 匹配
 - **体验修复（2026-04-17）—— 全角空格未识别为分隔符**：`src/query/dsl_parser.rs` 中 `tokenize` 仅使用 `is_ascii_whitespace()`，中文全角空格 `U+3000`（`E3 80 80`）被忽略导致查询词合并；新增 `is_token_separator()` 统一检测 ASCII 空白与全角空格

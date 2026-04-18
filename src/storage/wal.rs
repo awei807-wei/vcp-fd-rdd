@@ -174,13 +174,17 @@ impl WalStore {
         let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
         for ev in events {
             let payload = encode_event(ev);
-            let len: u32 = payload.len().try_into().unwrap_or(u32::MAX);
+            if payload.len() > u32::MAX as usize {
+                anyhow::bail!("WAL payload length overflow: {} bytes", payload.len());
+            }
+            let len = payload.len() as u32;
             let crc = wal_checksum(&payload);
             f.write_all(&len.to_le_bytes())?;
             f.write_all(&crc.to_le_bytes())?;
             f.write_all(&payload[..len as usize])?;
         }
         f.flush()?;
+        f.sync_data()?;
         Ok(())
     }
 
@@ -189,6 +193,7 @@ impl WalStore {
     pub fn seal(&self) -> anyhow::Result<u64> {
         let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
         f.flush()?;
+        f.sync_data()?;
 
         let id = now_seal_id();
         let sealed = self.dir.join(format!("events.wal.seal-{id:016x}"));
@@ -477,9 +482,9 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, usize)> {
         };
 
         if !crc_ok {
-            // CRC mismatch: skip this record and continue to the next one
+            // CRC mismatch: stop reading to preserve verified records
             truncated_tail += 1;
-            continue;
+            break;
         }
 
         // Decode version: v3 uses v2 encoding format

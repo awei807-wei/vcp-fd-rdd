@@ -67,20 +67,25 @@ impl TieredIndex {
     pub fn empty(roots: Vec<PathBuf>) -> Self {
         Self::empty_with_hidden(roots, false)
     }
-
     /// 直接以空索引启动，并指定是否包含隐藏项。
     pub fn empty_with_hidden(roots: Vec<PathBuf>, include_hidden: bool) -> Self {
-        Self::empty_with_options(roots, include_hidden, true)
+        Self::empty_with_options(roots, include_hidden, true, false)
     }
 
     pub fn empty_with_options(
         roots: Vec<PathBuf>,
         include_hidden: bool,
         ignore_enabled: bool,
+        follow_symlinks: bool,
     ) -> Self {
         let l1 = L1Cache::with_capacity(1000);
         let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
-        let l3 = IndexBuilder::new_with_options(roots.clone(), include_hidden, ignore_enabled);
+        let l3 = IndexBuilder::new_with_options(
+            roots.clone(),
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+        );
         Self::new(
             l1,
             l2,
@@ -88,7 +93,7 @@ impl TieredIndex {
             roots,
             include_hidden,
             ignore_enabled,
-            false,
+            follow_symlinks,
             Vec::new(),
         )
     }
@@ -100,7 +105,7 @@ impl TieredIndex {
         store: &S,
         roots: Vec<PathBuf>,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::load_with_options(store, roots, false, true).await
+        Self::load_with_options(store, roots, false, true, false).await
     }
 
     pub async fn load_with_hidden<S: StorageBackend + ?Sized>(
@@ -108,7 +113,7 @@ impl TieredIndex {
         roots: Vec<PathBuf>,
         include_hidden: bool,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::load_with_options(store, roots, include_hidden, true).await
+        Self::load_with_options(store, roots, include_hidden, true, false).await
     }
 
     pub async fn load_with_options<S: StorageBackend + ?Sized>(
@@ -116,9 +121,17 @@ impl TieredIndex {
         roots: Vec<PathBuf>,
         include_hidden: bool,
         ignore_enabled: bool,
+        follow_symlinks: bool,
     ) -> anyhow::Result<Arc<Self>> {
         let index = Arc::new(
-            Self::load_or_empty_with_options(store, roots, include_hidden, ignore_enabled).await?,
+            Self::load_or_empty_with_options(
+                store,
+                roots,
+                include_hidden,
+                ignore_enabled,
+                follow_symlinks,
+            )
+            .await?,
         );
 
         // 1) 物理清理不在 MANIFEST 里的孤儿文件（best-effort）
@@ -137,7 +150,7 @@ impl TieredIndex {
         store: &S,
         roots: Vec<PathBuf>,
     ) -> anyhow::Result<Self> {
-        Self::load_or_empty_with_options(store, roots, false, true).await
+        Self::load_or_empty_with_options(store, roots, false, true, false).await
     }
 
     /// 从快照加载或空索引启动，并指定是否包含隐藏项。
@@ -146,7 +159,7 @@ impl TieredIndex {
         roots: Vec<PathBuf>,
         include_hidden: bool,
     ) -> anyhow::Result<Self> {
-        Self::load_or_empty_with_options(store, roots, include_hidden, true).await
+        Self::load_or_empty_with_options(store, roots, include_hidden, true, false).await
     }
 
     pub async fn load_or_empty_with_options<S: StorageBackend + ?Sized>(
@@ -154,9 +167,15 @@ impl TieredIndex {
         roots: Vec<PathBuf>,
         include_hidden: bool,
         ignore_enabled: bool,
+        follow_symlinks: bool,
     ) -> anyhow::Result<Self> {
         let l1 = L1Cache::with_capacity(1000);
-        let l3 = IndexBuilder::new_with_options(roots.clone(), include_hidden, ignore_enabled);
+        let l3 = IndexBuilder::new_with_options(
+            roots.clone(),
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+        );
 
         // 冷启动离线变更检测（仅 LSM 目录布局）：
         // - LSM 段可能包含停机期间的"幽灵记录"（已删除文件但索引仍在）。
@@ -177,7 +196,7 @@ impl TieredIndex {
                     roots,
                     include_hidden,
                     ignore_enabled,
-                    false,
+                    follow_symlinks,
                     Vec::new(),
                 ));
             }
@@ -218,7 +237,7 @@ impl TieredIndex {
                 roots,
                 include_hidden,
                 ignore_enabled,
-                false,
+                follow_symlinks,
                 layers,
             );
             idx.attach_wal(store)?;
@@ -243,7 +262,7 @@ impl TieredIndex {
                 roots,
                 include_hidden,
                 ignore_enabled,
-                false,
+                follow_symlinks,
                 vec![base],
             );
             idx.attach_wal(store)?;
@@ -271,7 +290,7 @@ impl TieredIndex {
             roots,
             include_hidden,
             ignore_enabled,
-            false,
+            follow_symlinks,
             Vec::new(),
         );
         idx.attach_wal(store)?;

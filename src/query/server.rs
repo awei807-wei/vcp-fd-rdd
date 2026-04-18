@@ -1,6 +1,6 @@
 use crate::index::TieredIndex;
 use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
-use crate::query::{execute_query, QueryMode, SortColumn, SortOrder};
+use crate::query::{execute_query_with_cancel, QueryMode, SortColumn, SortOrder};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -169,8 +170,18 @@ async fn search_handler(
     let kw_clone = keyword.clone();
     let sort = SortColumn::parse(params.sort.as_deref());
     let order = SortOrder::parse(params.order.as_deref());
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_inner = cancelled.clone();
     let search_task = tokio::task::spawn_blocking(move || {
-        execute_query(index.as_ref(), &kw_clone, limit, mode, sort, order)
+        execute_query_with_cancel(
+            index.as_ref(),
+            &kw_clone,
+            limit,
+            mode,
+            sort,
+            order,
+            Some(cancelled_inner.as_ref()),
+        )
     });
     let results = match tokio::time::timeout(state.config.query_timeout, search_task).await {
         Ok(Ok(results)) => results,
@@ -182,6 +193,7 @@ async fn search_handler(
             ));
         }
         Err(_) => {
+            cancelled.store(true, Ordering::Relaxed);
             tracing::warn!(
                 "HTTP search timed out after {:?} (limit={}, mode={})",
                 state.config.query_timeout,
@@ -278,8 +290,14 @@ async fn scan_handler(
             "paths must not be empty".to_string(),
         ));
     }
+    if params.paths.len() > 10 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "too many paths: max 10".to_string(),
+        ));
+    }
 
-    let dirs: Vec<PathBuf> = params.paths.iter().take(10).map(PathBuf::from).collect();
+    let dirs: Vec<PathBuf> = params.paths.iter().map(PathBuf::from).collect();
 
     let index = state.index.clone();
     let (scanned, elapsed_ms) =

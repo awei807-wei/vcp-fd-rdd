@@ -41,20 +41,24 @@ struct Args {
     no_build: bool,
 
     /// 将 `.` 开头的文件/目录纳入冷启动全扫、后台重建与增量补扫
-    #[arg(long)]
-    include_hidden: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    include_hidden: Option<bool>,
 
     /// HTTP 查询端口
-    #[arg(long, default_value_t = 6060)]
-    http_port: u16,
+    #[arg(long, value_name = "PORT")]
+    http_port: Option<u16>,
 
     /// Unix domain socket 查询地址（可选）：用于流式输出（避免 HTTP/JSON 聚合带来的峰值）
     #[arg(long, value_name = "PATH")]
     uds_socket: Option<PathBuf>,
 
     /// 快照写入间隔（秒）
-    #[arg(long, default_value_t = 300)]
-    snapshot_interval_secs: u64,
+    #[arg(long, value_name = "SECS")]
+    snapshot_interval_secs: Option<u64>,
+
+    /// 日志级别（trace/debug/info/warn/error）
+    #[arg(long, value_name = "LEVEL")]
+    log_level: Option<String>,
 
     /// 内存报告间隔（秒）
     #[arg(long, default_value_t = 60)]
@@ -89,8 +93,8 @@ struct Args {
 
     /// 跟随符号链接（默认不跟随）。启用后扫描和 watcher 会进入符号链接指向的目录。
     /// 注意：已有 inode 去重可防止无限递归，但跟随可能导致索引范围远超预期。
-    #[arg(long)]
-    follow_symlinks: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    follow_symlinks: Option<bool>,
 
     /// overlay 强制 flush 阈值（路径数）。达到阈值会唤醒 snapshot_loop 立即执行一次 snapshot_now（0=禁用）
     #[arg(long, default_value_t = 250_000)]
@@ -111,15 +115,28 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
     let args = Args::parse();
 
     // Load config file (~/.config/fd-rdd/config.toml); fall back to defaults on missing file.
     let cfg = Config::load().unwrap_or_else(|e| {
-        tracing::warn!("Failed to load config file, using defaults: {}", e);
+        eprintln!("Failed to load config file, using defaults: {}", e);
         Config::default()
     });
+
+    // Initialize tracing with merged log level (CLI > config > default).
+    let log_level = args
+        .log_level
+        .as_deref()
+        .or_else(|| {
+            if cfg.log_level.is_empty() {
+                None
+            } else {
+                Some(&cfg.log_level)
+            }
+        })
+        .unwrap_or("info");
+    let env_filter = tracing_subscriber::EnvFilter::new(log_level);
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     info!(
         "Starting fd-rdd v{}: atomic-snapshot file indexer",
@@ -137,6 +154,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let ignore_enabled = !args.no_ignore && cfg.ignore_enabled;
+    let include_hidden = args.include_hidden.unwrap_or(cfg.include_hidden);
+    let follow_symlinks = args.follow_symlinks.unwrap_or(cfg.follow_symlinks);
+    let http_port = args.http_port.unwrap_or(cfg.http_port);
+    let snapshot_interval_secs = args
+        .snapshot_interval_secs
+        .unwrap_or(cfg.snapshot_interval_secs);
 
     // 2) 快照存储
     let snapshot_path = args.snapshot_path.unwrap_or_else(default_snapshot_path);
@@ -146,12 +169,19 @@ async fn main() -> anyhow::Result<()> {
     let index = if args.no_snapshot {
         Arc::new(TieredIndex::empty_with_options(
             roots,
-            args.include_hidden,
+            include_hidden,
             ignore_enabled,
+            follow_symlinks,
         ))
     } else {
-        TieredIndex::load_with_options(store.as_ref(), roots, args.include_hidden, ignore_enabled)
-            .await?
+        TieredIndex::load_with_options(
+            store.as_ref(),
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+        )
+        .await?
     };
     index.set_auto_flush_limits(args.auto_flush_overlay_paths, args.auto_flush_overlay_bytes);
     index.set_periodic_flush_batch_limits(args.batch_flush_min_events, args.batch_flush_min_bytes);
@@ -209,7 +239,6 @@ async fn main() -> anyhow::Result<()> {
         })
     };
     let query_server = QueryServer::new(index.clone()).with_health_provider(health_provider);
-    let http_port = args.http_port;
     tokio::spawn(async move {
         if let Err(e) = query_server.run(http_port).await {
             tracing::error!("Query server error: {}", e);
@@ -234,7 +263,6 @@ async fn main() -> anyhow::Result<()> {
     // 7) 启动定期快照循环（每 300 秒）
     let snap_index = index.clone();
     let snap_store = store.clone();
-    let snapshot_interval_secs = args.snapshot_interval_secs;
     tokio::spawn(async move {
         snap_index
             .snapshot_loop(snap_store, snapshot_interval_secs)
@@ -275,7 +303,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!(
         "fd-rdd ready. Query via: http://localhost:{}/search?q=keyword",
-        args.http_port
+        http_port
     );
 
     // 9) 优雅退出：Ctrl+C → 最终快照

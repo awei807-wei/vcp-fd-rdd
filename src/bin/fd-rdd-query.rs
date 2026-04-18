@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut stream = match UnixStream::connect(&socket).await {
         Ok(s) => s,
-        Err(e) if args.spawn => {
+        Err(_e) if args.spawn => {
             if args.roots.is_empty() {
                 return Err(anyhow::anyhow!(
                     "--spawn 需要至少指定一个 --root <PATH> 作为索引根目录"

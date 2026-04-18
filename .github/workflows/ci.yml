@@ -1,4 +1,5 @@
 name: CI
+# Linux-only project: CI runs exclusively on Ubuntu.
 
 on:
   push:

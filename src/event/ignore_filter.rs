@@ -74,9 +74,7 @@ impl IgnoreFilter {
     ///
     /// The path is matched against the gitignore of the root it falls under.
     /// If the path doesn't belong to any known root, it is *not* ignored.
-    pub fn is_ignored(&self, path: &Path) -> bool {
-        let is_dir = path.is_dir();
-
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         if !self.global.is_empty() {
             let global_root = self.global.path();
             if path.starts_with(global_root) {
@@ -117,8 +115,8 @@ mod tests {
         fs::write(root.join("app.log"), "log").unwrap();
 
         let filter = IgnoreFilter::from_roots(std::slice::from_ref(&root));
-        assert!(filter.is_ignored(&root.join("app.log")));
-        assert!(!filter.is_ignored(&root.join("main.rs")));
+        assert!(filter.is_ignored(&root.join("app.log"), false));
+        assert!(!filter.is_ignored(&root.join("main.rs"), false));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -129,7 +127,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let filter = IgnoreFilter::from_roots(std::slice::from_ref(&root));
-        assert!(!filter.is_ignored(&root.join("anything.txt")));
+        assert!(!filter.is_ignored(&root.join("anything.txt"), false));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -142,7 +140,7 @@ mod tests {
 
         let filter = IgnoreFilter::from_roots(std::slice::from_ref(&root));
         // Path outside the root should not be ignored
-        assert!(!filter.is_ignored(Path::new("/some/other/path/app.log")));
+        assert!(!filter.is_ignored(Path::new("/some/other/path/app.log"), false));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -155,9 +153,9 @@ mod tests {
         fs::write(root.join(".git").join("info").join("exclude"), "cache/\n").unwrap();
 
         let filter = IgnoreFilter::from_roots(std::slice::from_ref(&root));
-        assert!(filter.is_ignored(&root.join("foo.tmp")));
-        assert!(filter.is_ignored(&root.join("cache").join("x.txt")));
-        assert!(!filter.is_ignored(&root.join("keep.rs")));
+        assert!(filter.is_ignored(&root.join("foo.tmp"), false));
+        assert!(filter.is_ignored(&root.join("cache").join("x.txt"), false));
+        assert!(!filter.is_ignored(&root.join("keep.rs"), false));
 
         let _ = fs::remove_dir_all(root);
     }

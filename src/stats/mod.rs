@@ -173,7 +173,8 @@ pub struct RebuildStats {
 }
 
 impl MemoryReport {
-    /// 从 /proc/self/statm 读取进程 RSS
+    /// 从 /proc/self/statm 读取进程 RSS（Linux-only）。
+    #[cfg(target_os = "linux")]
     pub fn read_process_rss() -> u64 {
         std::fs::read_to_string("/proc/self/statm")
             .ok()
@@ -194,7 +195,14 @@ impl MemoryReport {
             .unwrap_or(0)
     }
 
-    /// 从 /proc/self/smaps_rollup 读取关键指标（kB → bytes）。
+    /// 非 Linux 平台返回 0。
+    #[cfg(not(target_os = "linux"))]
+    pub fn read_process_rss() -> u64 {
+        0
+    }
+
+    /// 从 /proc/self/smaps_rollup 读取关键指标（kB → bytes；Linux-only）。
+    #[cfg(target_os = "linux")]
     pub fn read_smaps_rollup() -> Option<SmapsRollupStats> {
         let s = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
         let mut out = SmapsRollupStats::default();
@@ -219,7 +227,14 @@ impl MemoryReport {
         Some(out)
     }
 
-    /// 从 /proc/self/stat 读取 minflt/majflt（minor/major page faults）。
+    /// 非 Linux 平台返回 None。
+    #[cfg(not(target_os = "linux"))]
+    pub fn read_smaps_rollup() -> Option<SmapsRollupStats> {
+        None
+    }
+
+    /// 从 /proc/self/stat 读取 minflt/majflt（minor/major page faults；Linux-only）。
+    #[cfg(target_os = "linux")]
     pub fn read_faults() -> Option<FaultStats> {
         let s = std::fs::read_to_string("/proc/self/stat").ok()?;
         let rparen = s.rfind(')')?;
@@ -232,6 +247,12 @@ impl MemoryReport {
         let minflt: u64 = parts.get(7)?.parse().ok()?;
         let majflt: u64 = parts.get(9)?.parse().ok()?;
         Some(FaultStats { minflt, majflt })
+    }
+
+    /// 非 Linux 平台返回 None。
+    #[cfg(not(target_os = "linux"))]
+    pub fn read_faults() -> Option<FaultStats> {
+        None
     }
 }
 

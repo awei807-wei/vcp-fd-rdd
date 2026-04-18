@@ -3,6 +3,7 @@ use crate::index::TieredIndex;
 use crate::query::scoring::{score_result, ScoreConfig};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const FUZZY_CANDIDATE_MULTIPLIER: usize = 20;
 const FUZZY_MIN_CANDIDATES: usize = 512;
@@ -85,11 +86,35 @@ pub fn execute_query(
     sort: SortColumn,
     order: SortOrder,
 ) -> Vec<FileMeta> {
+    execute_query_with_cancel(index, keyword, limit, mode, sort, order, None)
+}
+
+pub fn execute_query_with_cancel(
+    index: &TieredIndex,
+    keyword: &str,
+    limit: usize,
+    mode: QueryMode,
+    sort: SortColumn,
+    order: SortOrder,
+    cancel: Option<&AtomicBool>,
+) -> Vec<FileMeta> {
     let mut results = match mode {
-        QueryMode::Exact => index.query_limit(keyword, limit),
-        QueryMode::Fuzzy => FzfIntegration::new().query_index(index, keyword, limit),
+        QueryMode::Exact => {
+            if let Some(c) = cancel {
+                if c.load(Ordering::Relaxed) {
+                    return Vec::new();
+                }
+            }
+            index.query_limit(keyword, limit)
+        }
+        QueryMode::Fuzzy => FzfIntegration::new().query_index(index, keyword, limit, cancel),
     };
 
+    if let Some(c) = cancel {
+        if c.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+    }
     sort_results(&mut results, keyword, sort, order);
     results
 }
@@ -181,10 +206,23 @@ impl FzfIntegration {
         }
     }
 
-    pub fn match_query(&self, keyword: &str, entries: Vec<FileMeta>) -> Vec<(FileMeta, i64)> {
+    pub fn match_query(
+        &self,
+        keyword: &str,
+        entries: Vec<FileMeta>,
+        cancel: Option<&AtomicBool>,
+    ) -> Vec<(FileMeta, i64)> {
+        const CHECK_INTERVAL: usize = 256;
         let config = ScoreConfig::from_query(keyword);
         let mut results = Vec::new();
-        for entry in entries {
+        for (i, entry) in entries.into_iter().enumerate() {
+            if i % CHECK_INTERVAL == 0 {
+                if let Some(c) = cancel {
+                    if c.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            }
             if let Some(fuzzy_score) = self
                 .matcher
                 .fuzzy_match(&entry.path.to_string_lossy(), keyword)
@@ -199,7 +237,13 @@ impl FzfIntegration {
         results
     }
 
-    pub fn query_index(&self, index: &TieredIndex, keyword: &str, limit: usize) -> Vec<FileMeta> {
+    pub fn query_index(
+        &self,
+        index: &TieredIndex,
+        keyword: &str,
+        limit: usize,
+        cancel: Option<&AtomicBool>,
+    ) -> Vec<FileMeta> {
         if limit == 0 {
             return Vec::new();
         }
@@ -215,7 +259,13 @@ impl FzfIntegration {
             candidates = index.query_limit("", candidate_limit);
         }
 
-        self.match_query(keyword, candidates)
+        if let Some(c) = cancel {
+            if c.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+        }
+
+        self.match_query(keyword, candidates, cancel)
             .into_iter()
             .take(limit)
             .map(|(meta, _)| meta)
@@ -342,7 +392,7 @@ mod tests {
         ];
 
         // Search for "中文" should match the first and third
-        let results = fzf.match_query("中文", entries.clone());
+        let results = fzf.match_query("中文", entries.clone(), None);
         assert_eq!(
             results.len(),
             2,
@@ -353,7 +403,7 @@ mod tests {
         assert!(paths.contains(&PathBuf::from("/tmp/中文文件.txt")));
 
         // Search for "文档" should match the first and second
-        let results2 = fzf.match_query("文档", entries.clone());
+        let results2 = fzf.match_query("文档", entries.clone(), None);
         assert_eq!(
             results2.len(),
             2,
