@@ -153,8 +153,16 @@ fn fast_sync_reconciles_add_and_delete() {
 
     // 离线变更：不经过事件管道直接修改文件系统
     std::fs::remove_file(&b).unwrap();
+    // 强制同步目录，确保删除操作已反映到文件系统（CI 文件系统可能有延迟）
+    let dir = std::fs::File::open(&root).unwrap();
+    dir.sync_all().unwrap();
+    drop(dir);
     let c = root.join("c_match.txt");
     std::fs::write(&c, b"c").unwrap();
+
+    let b_exists = std::fs::symlink_metadata(&b).is_ok();
+    let file_count = std::fs::read_dir(&root).unwrap().count();
+    eprintln!("[fast_sync debug] before fast_sync: b_exists={}, file_count={}", b_exists, file_count);
 
     let r = idx.fast_sync(
         DirtyScope::Dirs {
@@ -163,6 +171,17 @@ fn fast_sync_reconciles_add_and_delete() {
         },
         &[],
     );
+    eprintln!(
+        "[fast_sync debug] after fast_sync: dirs_scanned={}, upsert_events={}, delete_events={}",
+        r.dirs_scanned, r.upsert_events, r.delete_events
+    );
+    if r.delete_events == 0 {
+        eprintln!("[fast_sync debug] delete_events is 0, listing files in root:");
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let entry = entry.unwrap();
+            eprintln!("  {:?}", entry.path());
+        }
+    }
     assert!(r.dirs_scanned >= 1);
     assert!(r.upsert_events >= 1);
     assert!(r.delete_events >= 1);
