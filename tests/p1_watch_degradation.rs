@@ -38,6 +38,9 @@ fn watch_nonexistent_root_reports_failure() {
         "Should report failure for non-existent directory"
     );
     assert_eq!(failed[0], root);
+
+    drop(watcher);
+    std::thread::sleep(std::time::Duration::from_millis(200));
 }
 
 /// Watch existing directory succeeds
@@ -56,4 +59,6 @@ fn watch_existing_root_succeeds() {
     assert!(failed.is_empty(), "Should succeed for existing directory");
 
     let _ = std::fs::remove_dir_all(&root);
+    drop(watcher);
+    std::thread::sleep(std::time::Duration::from_millis(200));
 }
