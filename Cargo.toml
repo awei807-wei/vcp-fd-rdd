@@ -1,6 +1,6 @@
 [package]
 name = "fd-rdd"
-version = "0.5.8"
+version = "0.6.0"
 edition = "2021"
 authors = ["Piko & Aegis"]
 description = "Event-driven elastic file indexer with RDD lineage"
@@ -66,6 +66,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # 路径处理
 dirs = "5.0"
+
+# Unicode 规范化（NFC 强制去重）
+unicode-normalization = "0.1"
 
 # 全局分配器：默认使用 mimalloc（降低多线程 ptmalloc arena 导致的碎片与 RSS 回吐问题）
 # 如需回退到系统分配器：`cargo build --release --no-default-features`

@@ -4,29 +4,62 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 文件身份：Linux 上用 (dev, ino) 做主键，rename 时 ino 不变。
+/// 文件身份：Linux 上用 (dev, ino, generation) 做主键，rename 时 ino 不变，
+/// generation 用于区分 inode 复用（ext4 i_generation）。
 ///
 /// 说明：阶段 A 引入 `DocId(u32)` 作为 L2 内部的紧凑主键；
 /// `FileKey` 仍用于扫描/事件输入与“同 inode 去重”。
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "rkyv", derive(Archive, RkyvSerialize, RkyvDeserialize))]
 #[cfg_attr(feature = "rkyv", archive(check_bytes))]
 pub struct FileKey {
     pub dev: u64,
     pub ino: u64,
+    #[serde(default)]
+    pub generation: u32,
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_file_generation(path: &std::path::Path) -> u32 {
+    use std::ffi::CString;
+
+    let c_path = match CString::new(path.as_os_str().as_encoded_bytes()) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC, 0) };
+    if fd < 0 {
+        return 0;
+    }
+    let mut generation: i32 = 0;
+    const FS_IOC_GETVERSION: libc::c_ulong = 0x8008_7601;
+    let ret = unsafe { libc::ioctl(fd, FS_IOC_GETVERSION, &mut generation) };
+    unsafe { libc::close(fd) };
+    if ret == 0 {
+        generation as u32
+    } else {
+        0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_file_generation(_path: &std::path::Path) -> u32 {
+    0
 }
 
 impl FileKey {
     pub fn from_path_and_metadata(
-        _path: &std::path::Path,
+        path: &std::path::Path,
         meta: &std::fs::Metadata,
     ) -> Option<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let generation = get_file_generation(path);
             return Some(Self {
                 dev: meta.dev(),
                 ino: meta.ino(),
+                generation,
             });
         }
 
@@ -39,9 +72,9 @@ impl FileKey {
             // rename semantics to delete+create (still correct for query results).
             let _ = meta;
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            _path.as_os_str().as_encoded_bytes().hash(&mut hasher);
+            path.as_os_str().as_encoded_bytes().hash(&mut hasher);
             let h = hasher.finish();
-            return Some(Self { dev: 0, ino: h });
+            return Some(Self { dev: 0, ino: h, generation: 0 });
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -191,7 +224,7 @@ impl BuildRDD<FileMeta> for FsScanRDD {
     fn compute(&self, part: &Partition) -> Box<dyn Iterator<Item = FileMeta> + Send> {
         use ignore::WalkBuilder;
 
-        let mut visited: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+        let mut visited: std::collections::HashSet<FileKey> = std::collections::HashSet::new();
 
         let mut builder = WalkBuilder::new(&part.root);
         builder
@@ -223,7 +256,7 @@ impl BuildRDD<FileMeta> for FsScanRDD {
                 };
                 let file_key = FileKey::from_path_and_metadata(e.path(), &meta)?;
                 // ino+dev 去重：同一文件可能通过多条符号链接路径到达
-                if !visited.insert((file_key.dev, file_key.ino)) {
+                if !visited.insert(file_key) {
                     return None;
                 }
                 Some(FileMeta {
@@ -250,7 +283,7 @@ fn scan_partition_parallel(
 ) {
     use ignore::{WalkBuilder, WalkState};
 
-    let visited: Arc<dashmap::DashSet<(u64, u64)>> = Arc::new(dashmap::DashSet::new());
+    let visited: Arc<dashmap::DashSet<FileKey>> = Arc::new(dashmap::DashSet::new());
 
     let mut builder = WalkBuilder::new(&part.root);
     builder
@@ -289,7 +322,7 @@ fn scan_partition_parallel(
                 return WalkState::Continue;
             };
             // ino+dev 去重：避免符号链接导致同一文件被多次索引
-            if !visited.insert((file_key.dev, file_key.ino)) {
+            if !visited.insert(file_key) {
                 return WalkState::Continue;
             }
 

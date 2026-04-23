@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::event::ignore_filter::IgnoreFilter;
@@ -68,8 +69,8 @@ impl EventPipeline {
     pub fn new(index: Arc<TieredIndex>) -> Self {
         Self {
             index,
-            debounce_ms: 100,
-            channel_size: 4096,
+            debounce_ms: 50,
+            channel_size: 262_144,
             ignore_paths: Vec::new(),
             ignore_filter: None,
             total_events: Arc::new(AtomicU64::new(0)),
@@ -159,7 +160,7 @@ impl EventPipeline {
         let rescan_signals = self.rescan_signals.clone();
         let dirty = DirtyTracker::new(self.channel_size.saturating_mul(4).max(1024), roots.clone());
         let keep_cap = self.channel_size.max(256);
-        let (mut rx, mut watcher) = EventWatcher::start(
+        let (mut priority_rx, mut normal_rx, mut watcher) = EventWatcher::start(
             &roots,
             self.channel_size,
             overflow_drops.clone(),
@@ -178,6 +179,7 @@ impl EventPipeline {
 
         let index = self.index.clone();
         let debounce_ms = self.debounce_ms;
+        let priority_debounce_ms = debounce_ms.min(5);
         let total_events = self.total_events.clone();
         let last_batch_size = self.last_batch_size.clone();
         let ignore_paths = self.ignore_paths.clone();
@@ -186,6 +188,27 @@ impl EventPipeline {
         let merged_map_capacity = self.merged_map_capacity.clone();
         let records_capacity = self.records_capacity.clone();
         let dirty_activity = dirty.clone();
+        let pending_moves: Arc<tokio::sync::Mutex<PendingMoveMap>> =
+            Arc::new(tokio::sync::Mutex::new(PendingMoveMap::new()));
+        let pending_moves_cleaner = pending_moves.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PENDING_MOVE_TIMEOUT).await;
+                let mut pm = pending_moves_cleaner.lock().await;
+                let before = pm.len();
+                cleanup_pending_moves(&mut *pm);
+                let after = pm.len();
+                drop(pm);
+                if before != after {
+                    tracing::debug!(
+                        "PendingMoveMap cleanup: {} expired, {} remaining",
+                        before - after,
+                        after
+                    );
+                }
+            }
+        });
 
         tokio::spawn(async move {
             // 保持 watcher 存活
@@ -194,14 +217,26 @@ impl EventPipeline {
             let mut raw_events: Vec<notify::Event> = Vec::with_capacity(256);
             let mut merge_scratch = MergeScratch::default();
             let mut last_idle_trim = tokio::time::Instant::now();
+            let pending_moves = pending_moves;
 
             loop {
                 // 收集一批事件（debounce 窗口）
                 raw_events.clear();
 
                 // 等待第一个事件；若长期空闲，则回收事件缓冲的高水位 capacity（避免 plateau 被高水位"粘住"）。
-                let first = tokio::select! {
-                    ev = rx.recv() => ev,
+                // biased 模式下优先检查 priority_rx，Create 事件优先处理。
+                let (first_ev, is_priority) = tokio::select! {
+                    biased;
+                    ev = priority_rx.recv() => match ev {
+                        Some(e) => (e, true),
+                        None if normal_rx.is_closed() => break, // both closed
+                        None => continue, // priority closed but normal still open, re-select
+                    },
+                    ev = normal_rx.recv() => match ev {
+                        Some(e) => (e, false),
+                        None if priority_rx.is_closed() => break, // both closed
+                        None => continue, // normal closed but priority still open, re-select
+                    },
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                         // idle maintenance：每 5s 最多触发一次 shrink+trim，避免频繁抖动。
                         if last_idle_trim.elapsed() >= std::time::Duration::from_secs(5) {
@@ -222,12 +257,16 @@ impl EventPipeline {
                     }
                 };
 
-                match first {
-                    Some(ev) => raw_events.push(ev),
-                    None => break, // channel closed
-                }
+                raw_events.push(first_ev);
                 // 活动信号：用于 cooldown/max-staleness 兜底调度。
                 dirty_activity.record_activity();
+
+                // debounce：Create 事件使用更短窗口，优先快速索引
+                let debounce_ms = if is_priority {
+                    priority_debounce_ms
+                } else {
+                    debounce_ms
+                };
 
                 // debounce：在窗口内继续收集
                 let deadline =
@@ -238,10 +277,42 @@ impl EventPipeline {
                     if timeout.is_zero() {
                         break;
                     }
-                    match tokio::time::timeout(timeout, rx.recv()).await {
-                        Ok(Some(ev)) => raw_events.push(ev),
+                    match tokio::time::timeout(timeout, async {
+                        tokio::select! {
+                            biased;
+                            ev = priority_rx.recv() => ev.map(|e| (e, true)),
+                            ev = normal_rx.recv() => ev.map(|e| (e, false)),
+                        }
+                    }).await {
+                        Ok(Some((ev, _))) => raw_events.push(ev),
                         _ => break,
                     }
+                }
+
+                // Fast path: if all events are Create for distinct paths, apply immediately.
+                let all_create = raw_events.iter().all(|ev| {
+                    matches!(ev.kind, notify::EventKind::Create(_))
+                });
+                if all_create && raw_events.len() <= 10 {
+                    let mut fast_records: Vec<EventRecord> = Vec::with_capacity(raw_events.len());
+                    for ev in raw_events.drain(..) {
+                        if let Some(path) = ev.paths.into_iter().next() {
+                            seq = seq.wrapping_add(1);
+                            fast_records.push(EventRecord {
+                                seq,
+                                timestamp: std::time::SystemTime::now(),
+                                event_type: EventType::Create,
+                                id: FileIdentifier::Path(path),
+                                path_hint: None,
+                            });
+                        }
+                    }
+                    if !fast_records.is_empty() {
+                        index.apply_events(&fast_records);
+                        total_events.fetch_add(fast_records.len() as u64, Ordering::Relaxed);
+                        last_batch_size.store(fast_records.len() as u64, Ordering::Relaxed);
+                    }
+                    continue;
                 }
 
                 let raw_count = raw_events.len();
@@ -257,8 +328,63 @@ impl EventPipeline {
                 }
 
                 // 合并去重
-                merge_events_in_place(&mut seq, &mut raw_events, &mut merge_scratch);
+                // 跨批次 Rename 配对：将 inotify 拆分的 From/To 事件合并为完整 Rename
+                {
+                    let mut pm = pending_moves.lock().await;
+                    let mut paired = Vec::new();
+                    let mut to_remove = Vec::new();
 
+                    for (idx, ev) in raw_events.iter().enumerate() {
+                        if let notify::EventKind::Modify(notify::event::ModifyKind::Name(mode)) =
+                            ev.kind
+                        {
+                            if let Some(tracker) = ev.tracker() {
+                                match mode {
+                                    notify::event::RenameMode::From => {
+                                        pm.insert(tracker, (Instant::now(), ev.clone()));
+                                        to_remove.push(idx);
+                                    }
+                                    notify::event::RenameMode::To => {
+                                        if let Some((_, from_ev)) = pm.remove(&tracker) {
+                                            if let (Some(from), Some(to)) =
+                                                (from_ev.paths.first(), ev.paths.first())
+                                            {
+                                                let mut combined = notify::Event {
+                                                    kind: notify::EventKind::Modify(
+                                                        notify::event::ModifyKind::Name(
+                                                            notify::event::RenameMode::Any,
+                                                        ),
+                                                    ),
+                                                    paths: vec![from.clone(), to.clone()],
+                                                    attrs: Default::default(),
+                                                };
+                                                combined
+                                                    .attrs
+                                                    .set_tracker(tracker);
+                                                paired.push((idx, combined));
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    // 替换已配对的 To 事件，并移除已存储的 From 事件
+                    for (idx, ev) in paired {
+                        if idx < raw_events.len() {
+                            raw_events[idx] = ev;
+                        }
+                    }
+                    for idx in to_remove.into_iter().rev() {
+                        if idx < raw_events.len() {
+                            raw_events.swap_remove(idx);
+                        }
+                    }
+                }
+
+                merge_events_in_place(&mut seq, &mut raw_events, &mut merge_scratch);
                 raw_events_capacity.store(raw_events.capacity() as u64, Ordering::Relaxed);
                 merged_map_capacity
                     .store(merge_scratch.merged.capacity() as u64, Ordering::Relaxed);
@@ -287,10 +413,10 @@ impl EventPipeline {
             let dirty = dirty.clone();
             let ignores = self.ignore_paths.clone();
             tokio::spawn(async move {
-                // 经验值：静默 5s 触发；持续风暴 30s 强制触发一次（避免饿死）。
-                let cooldown_ns: u64 = 5_000_000_000;
-                let max_staleness_ns: u64 = 30_000_000_000;
-                let min_interval_ns: u64 = 15_000_000_000;
+                // 经验值：静默 1s 触发；持续风暴 5s 强制触发一次（避免饿死）。
+                let cooldown_ns: u64 = 1_000_000_000;
+                let max_staleness_ns: u64 = 5_000_000_000;
+                let min_interval_ns: u64 = 5_000_000_000;
 
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -361,6 +487,18 @@ struct MergedEvent {
     timestamp: std::time::SystemTime,
     event_type: EventType,
     path_hint: Option<PathBuf>,
+}
+
+/// 跨批次 Rename 事件配对表：cookie → (插入时间, From 事件)
+/// 用于处理 inotify 将一次 rename 拆分为两个独立事件的情况。
+type PendingMoveMap = HashMap<usize, (Instant, notify::Event)>;
+
+const PENDING_MOVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 清理超时的 pending rename 记录
+fn cleanup_pending_moves(pending: &mut PendingMoveMap) {
+    let now = Instant::now();
+    pending.retain(|_, (t, _)| now.duration_since(*t) < PENDING_MOVE_TIMEOUT);
 }
 
 /// 合并事件：同一路径的多个事件合并为最终状态

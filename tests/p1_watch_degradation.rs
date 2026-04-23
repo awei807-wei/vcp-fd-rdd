@@ -28,7 +28,7 @@ fn watch_nonexistent_root_reports_failure() {
     let drops = Arc::new(AtomicU64::new(0));
     let rescans = Arc::new(AtomicU64::new(0));
 
-    let (mut _rx, mut watcher) =
+    let (mut _priority_rx, mut _normal_rx, mut watcher) =
         EventWatcher::start(&[root.clone()], 64, drops, rescans, None).unwrap();
 
     // watch_roots should report the non-existent root as failed
@@ -49,7 +49,7 @@ fn watch_existing_root_succeeds() {
     let drops = Arc::new(AtomicU64::new(0));
     let rescans = Arc::new(AtomicU64::new(0));
 
-    let (_rx, mut watcher) =
+    let (_priority_rx, _normal_rx, mut watcher) =
         EventWatcher::start(&[root.clone()], 64, drops, rescans, None).unwrap();
 
     let failed = watch_roots(&mut watcher, &[root.clone()]);

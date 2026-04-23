@@ -871,13 +871,13 @@ impl SnapshotStore {
 
         // 组装 segments（顺序固定，便于调试）
         let seg_list: Vec<(V6SegKind, u32, Vec<u8>)> = vec![
-            (V6SegKind::Roots, 1, segs.roots_bytes.clone()),
-            (V6SegKind::PathArena, 1, segs.path_arena_bytes.clone()),
-            (V6SegKind::Metas, 1, segs.metas_bytes.clone()),
-            (V6SegKind::TrigramTable, 1, segs.trigram_table_bytes.clone()),
-            (V6SegKind::PostingsBlob, 1, segs.postings_blob_bytes.clone()),
-            (V6SegKind::Tombstones, 1, segs.tombstones_bytes.clone()),
-            (V6SegKind::FileKeyMap, 1, segs.filekey_map_bytes.clone()),
+            (V6SegKind::Roots, 1, segs.roots_bytes.to_vec()),
+            (V6SegKind::PathArena, 1, segs.path_arena_bytes.to_vec()),
+            (V6SegKind::Metas, 1, segs.metas_bytes.to_vec()),
+            (V6SegKind::TrigramTable, 1, segs.trigram_table_bytes.to_vec()),
+            (V6SegKind::PostingsBlob, 1, segs.postings_blob_bytes.to_vec()),
+            (V6SegKind::Tombstones, 1, segs.tombstones_bytes.to_vec()),
+            (V6SegKind::FileKeyMap, 1, segs.filekey_map_bytes.to_vec()),
         ];
 
         // 先计算 offsets/len/checksum，得到 manifest
@@ -1558,7 +1558,7 @@ mod tests {
         std::fs::write(&p2, b"b").unwrap();
 
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: p1.clone(),
             size: 1,
             mtime: None,
@@ -1566,7 +1566,7 @@ mod tests {
             atime: None,
         });
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 2 },
+            file_key: FileKey { dev: 1, ino: 2, generation: 0 },
             path: p2.clone(),
             size: 1,
             mtime: None,
@@ -1592,7 +1592,7 @@ mod tests {
         assert!(r[0].path.to_string_lossy().contains("alpha_test"));
 
         let m2 = mmap_idx
-            .get_meta_by_key(FileKey { dev: 1, ino: 1 })
+            .get_meta_by_key(FileKey { dev: 1, ino: 1, generation: 0 })
             .expect("get_meta_by_key");
         assert!(m2.path.to_string_lossy().contains("alpha_test"));
     }
@@ -1607,7 +1607,7 @@ mod tests {
         let p1 = root.join("alpha_test.txt");
         std::fs::write(&p1, b"a").unwrap();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: p1.clone(),
             size: 1,
             mtime: None,
@@ -1620,7 +1620,8 @@ mod tests {
 
         // 模拟旧段：FileKeyMap 为裸 20B 定长表（无 magic/header）
         if segs.filekey_map_bytes.len() >= 8 {
-            segs.filekey_map_bytes = segs.filekey_map_bytes[8..].to_vec();
+            let stripped = segs.filekey_map_bytes[8..].to_vec();
+            segs.filekey_map_bytes = std::sync::Arc::new(stripped);
         }
 
         store.write_atomic_v6(&segs).await.unwrap();
@@ -1632,7 +1633,7 @@ mod tests {
 
         let mmap_idx = MmapIndex::new(snap);
         let m2 = mmap_idx
-            .get_meta_by_key(FileKey { dev: 1, ino: 1 })
+            .get_meta_by_key(FileKey { dev: 1, ino: 1, generation: 0 })
             .expect("get_meta_by_key");
         assert!(m2.path.to_string_lossy().contains("alpha_test"));
     }
@@ -1644,7 +1645,7 @@ mod tests {
 
         let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: root.join("alpha_test.txt"),
             size: 1,
             mtime: None,
@@ -1670,7 +1671,7 @@ mod tests {
         let p1 = root.join("alpha_test.txt");
         std::fs::write(&p1, b"a").unwrap();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: p1.clone(),
             size: 1,
             mtime: None,
@@ -1744,7 +1745,7 @@ mod tests {
         let p1 = root.join("a.txt");
         std::fs::write(&p1, b"a").unwrap();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: p1,
             size: 1,
             mtime: None,
@@ -1761,7 +1762,7 @@ mod tests {
         let p2 = root.join("b.txt");
         std::fs::write(&p2, b"b").unwrap();
         delta_idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 2 },
+            file_key: FileKey { dev: 1, ino: 2, generation: 0 },
             path: p2,
             size: 1,
             mtime: None,
@@ -1789,7 +1790,7 @@ mod tests {
         let p1 = root.join("a.txt");
         std::fs::write(&p1, b"a").unwrap();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: p1,
             size: 1,
             mtime: None,

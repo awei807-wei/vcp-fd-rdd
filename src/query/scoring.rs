@@ -578,7 +578,7 @@ mod tests {
 
     fn meta(path: &str, size: u64, mtime: Option<SystemTime>) -> FileMeta {
         FileMeta {
-            file_key: FileKey { dev: 0, ino: 0 },
+            file_key: FileKey { dev: 0, ino: 0, generation: 0 },
             path: PathBuf::from(path),
             size,
             mtime,

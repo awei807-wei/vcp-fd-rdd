@@ -1,0 +1,1073 @@
+name: fd-rdd Stress Tests
+# 针对 fd-rdd 已知 Bug 与架构边界的系统性 CI 压力测试
+# 覆盖：Overlay 可见性、Rename 雪崩、并发中间状态、Mmap 安全、
+#       Trigram 倾斜、编码陷阱、超短查询、硬链接、跨挂载点、
+#       Compaction 竞态、事件风暴、Crash 恢复
+
+on:
+  push:
+    branches: [main, tests]
+  pull_request:
+    branches: [main, tests]
+  schedule:
+    # 每日凌晨跑一次全量压力测试
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Stress test duration (minutes)'
+        required: false
+        default: '5'
+      file_count:
+        description: 'File count for rename avalanche test'
+        required: false
+        default: '5000'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FD_RDD_PORT: 16060
+  FD_RDD_SNAPSHOT: /tmp/fd-rdd-ci-snapshot
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 1: 编译与基础环境准备
+  # ───────────────────────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: target/release/fd-rdd
+          retention-days: 1
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 2: L2/L3 Overlay 可见性 + 超短查询 + 编码陷阱
+  # ───────────────────────────────────────────────────────────────────────────
+  test-visibility-and-query-edge:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup test directory
+        run: |
+          mkdir -p /tmp/fd-rdd-ci-test/overlay-test
+          # 预先创建一些文件
+          for i in $(seq 1 100); do
+            echo "content $i" > "/tmp/fd-rdd-ci-test/overlay-test/file_${i}.txt"
+          done
+
+      - name: Start fd-rdd (short debounce for fast overlay flush)
+        run: |
+          ./bin/fd-rdd \
+            --root /tmp/fd-rdd-ci-test/overlay-test \
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }} \
+            --http-port ${{ env.FD_RDD_PORT }} \
+            --debounce-ms 50 \
+            --snapshot-interval-secs 3600 \
+            --no-build &
+          echo $! > /tmp/fd-rdd.pid
+          sleep 3
+
+      - name: Wait for service ready
+        run: |
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+            sleep 1
+          done
+
+      - name: "Test 2a: Create file → immediate query (overlay visibility)"
+        run: |
+          set -e
+          echo "=== Test 2a: Overlay upserted_paths visibility ==="
+          NEWFILE="/tmp/fd-rdd-ci-test/overlay-test/newly_created_file.txt"
+          echo "brand new content" > "$NEWFILE"
+          # 等待 debounce + apply（debounce=50ms，apply 通常 <100ms）
+          sleep 0.3
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=newly_created&limit=10")
+          echo "Query result: $RESULT"
+          if echo "$RESULT" | grep -q "newly_created_file.txt"; then
+            echo "✅ PASS: New file visible in overlay/L2"
+          else
+            echo "❌ FAIL: New file NOT visible (overlay upserted_paths bug?)"
+            exit 1
+          fi
+
+      - name: "Test 2b: Delete file → immediate query (tombstone visibility)"
+        run: |
+          set -e
+          echo "=== Test 2b: Tombstone overlay visibility ==="
+          rm "/tmp/fd-rdd-ci-test/overlay-test/file_1.txt"
+          sleep 0.3
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file_1&limit=10")
+          echo "Query result: $RESULT"
+          if echo "$RESULT" | grep -q "file_1.txt"; then
+            echo "❌ FAIL: Deleted file still visible (tombstone bug?)"
+            exit 1
+          else
+            echo "✅ PASS: Deleted file correctly hidden"
+          fi
+
+      - name: "Test 2c: Single-char query (short_component_index path)"
+        run: |
+          set -e
+          echo "=== Test 2c: Single-char query degradation ==="
+          # Create files with 'a' in name
+          echo "a" > "/tmp/fd-rdd-ci-test/overlay-test/a_file.txt"
+          sleep 0.3
+          # Query single char 'a' — should NOT full-scan
+          START=$(date +%s%N)
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=a&limit=50")
+          END=$(date +%s%N)
+          ELAPSED_MS=$(( (END - START) / 1000000 ))
+          echo "Query 'a' took ${ELAPSED_MS}ms"
+          echo "Result: $RESULT"
+          if [ "$ELAPSED_MS" -gt 500 ]; then
+            echo "⚠️ WARNING: Single-char query took >500ms, possible full-scan degradation"
+          fi
+          if echo "$RESULT" | grep -q "a_file.txt"; then
+            echo "✅ PASS: Single-char query works"
+          else
+            echo "❌ FAIL: Single-char query missing expected file"
+            exit 1
+          fi
+
+      - name: "Test 2d: Unicode NFC/NFD encoding trap"
+        run: |
+          set -e
+          echo "=== Test 2d: NFC/NFD encoding ==="
+          # Create file with NFC-encoded name (U+00E9 = é)
+          NFC_FILE="/tmp/fd-rdd-ci-test/overlay-test/café_nfc.txt"
+          echo "nfc" > "$NFC_FILE"
+          # Create file with NFD-encoded name (e + U+0301)
+          NFD_FILE=$(echo -e "/tmp/fd-rdd-ci-test/overlay-test/cafe\u0301_nfd.txt")
+          echo "nfd" > "$NFD_FILE"
+          sleep 0.5
+          # Query using NFC form
+          RESULT_NFC=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=café&limit=10")
+          echo "NFC query result: $RESULT_NFC"
+          # Query using NFD form
+          RESULT_NFD=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=cafe%CC%81&limit=10")
+          echo "NFD query result: $RESULT_NFD"
+          NFC_OK=0
+          NFD_OK=0
+          if echo "$RESULT_NFC" | grep -q "café_nfc.txt"; then NFC_OK=1; fi
+          if echo "$RESULT_NFD" | grep -q "café_nfd.txt"; then NFD_OK=1; fi
+          if [ "$NFC_OK" -eq 1 ] && [ "$NFD_OK" -eq 1 ]; then
+            echo "✅ PASS: Both NFC and NFD queries work"
+          else
+            echo "❌ FAIL: Encoding trap — NFC_OK=$NFC_OK NFD_OK=$NFD_OK"
+            exit 1
+          fi
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== fd-rdd process status ==="
+          cat /tmp/fd-rdd.pid 2>/dev/null && ps aux | grep fd-rdd || true
+          echo "=== Snapshot dir ==="
+          ls -laR ${{ env.FD_RDD_SNAPSHOT }}* 2>/dev/null || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 3: 子目录 Rename 雪崩效应（P0 Bug 核心测试）
+  # ───────────────────────────────────────────────────────────────────────────
+  test-rename-avalanche:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup deep directory tree
+        run: |
+          ROOT="/tmp/fd-rdd-ci-test/rename-test"
+          mkdir -p "$ROOT/old_project/src/components"
+          mkdir -p "$ROOT/old_project/node_modules/libA/dist"
+          # Create files at various depths
+          for i in $(seq 1 100); do
+            echo "module $i" > "$ROOT/old_project/src/app_${i}.js"
+            echo "component $i" > "$ROOT/old_project/src/components/widget_${i}.tsx"
+            echo "lib $i" > "$ROOT/old_project/node_modules/libA/dist/bundle_${i}.js"
+          done
+          echo "Created $(find $ROOT -type f | wc -l) files"
+
+      - name: Start fd-rdd
+        run: |
+          ./bin/fd-rdd \
+            --root /tmp/fd-rdd-ci-test/rename-test \
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_rename \
+            --http-port ${{ env.FD_RDD_PORT }} \
+            --debounce-ms 10 \
+            --snapshot-interval-secs 3600 \
+            --no-build &
+          echo $! > /tmp/fd-rdd.pid
+          sleep 3
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+            sleep 1
+          done
+
+      - name: "Test 3a: Verify pre-rename visibility"
+        run: |
+          set -e
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=old_project&limit=200")
+          COUNT=$(echo "$RESULT" | grep -c "old_project" || true)
+          echo "Pre-rename: found $COUNT files under old_project"
+          if [ "$COUNT" -lt 150 ]; then
+            echo "⚠️ Pre-rename count low ($COUNT), waiting for indexing..."
+            sleep 2
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=old_project&limit=200")
+            COUNT=$(echo "$RESULT" | grep -c "old_project" || true)
+          fi
+          if [ "$COUNT" -lt 100 ]; then
+            echo "❌ FAIL: Pre-rename indexing incomplete ($COUNT files)"
+            exit 1
+          fi
+          echo "✅ Pre-rename: $COUNT files indexed"
+
+      - name: "Test 3b: Rename directory (the avalanche trigger)"
+        run: |
+          set -e
+          echo "=== Test 3b: Rename avalanche ==="
+          ROOT="/tmp/fd-rdd-ci-test/rename-test"
+          mv "$ROOT/old_project" "$ROOT/new_project"
+          # Wait for debounce + apply + fast-sync cooldown
+          sleep 1
+
+      - name: "Test 3c: Query new_project immediately (should fail if P0 bug present)"
+        run: |
+          set -e
+          echo "=== Test 3c: Immediate post-rename query ==="
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=new_project&limit=200")
+          COUNT=$(echo "$RESULT" | grep -c "new_project" || true)
+          echo "Immediate post-rename: found $COUNT files under new_project"
+          if [ "$COUNT" -lt 50 ]; then
+            echo "❌ P0 BUG CONFIRMED: Rename avalanche — only $COUNT files visible after rename"
+            echo "Expected ~300 files, got $COUNT. Trigrams of sub-files not updated."
+            # 注意：这里我们仍然让 CI 失败，因为这是 P0 bug
+            exit 1
+          fi
+          echo "✅ PASS: $COUNT files visible after rename"
+
+      - name: "Test 3d: Deep file query (node_modules boundary)"
+        run: |
+          set -e
+          echo "=== Test 3d: Deep file query post-rename ==="
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=bundle_1&limit=20")
+          echo "Deep query result: $RESULT"
+          if echo "$RESULT" | grep -q "new_project/node_modules"; then
+            echo "✅ PASS: Deep nested files visible after rename"
+          else
+            echo "❌ FAIL: Deep nested files not visible (fast-sync max_depth:1 limit)"
+            exit 1
+          fi
+
+      - name: "Test 3e: Query old_project (should be empty)"
+        run: |
+          set -e
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=old_project&limit=200")
+          COUNT=$(echo "$RESULT" | grep -c "old_project" || true)
+          if [ "$COUNT" -gt 5 ]; then
+            echo "❌ FAIL: old_project still has $COUNT results (stale data)"
+            exit 1
+          fi
+          echo "✅ PASS: old_project correctly empty ($COUNT stale refs acceptable)"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 4: 并发中间状态 + 物理删除原子性 + 事件风暴
+  # ───────────────────────────────────────────────────────────────────────────
+  test-concurrent-chaos:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup test directory
+        run: |
+          mkdir -p /tmp/fd-rdd-ci-test/chaos-test/subdir_{a,b,c,d,e}
+          for d in a b c d e; do
+            for i in $(seq 1 200); do
+              echo "data $i" > "/tmp/fd-rdd-ci-test/chaos-test/subdir_${d}/file_${i}.txt"
+            done
+          done
+
+      - name: Start fd-rdd with tight debounce
+        run: |
+          ./bin/fd-rdd \
+            --root /tmp/fd-rdd-ci-test/chaos-test \
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_chaos \
+            --http-port ${{ env.FD_RDD_PORT }} \
+            --debounce-ms 5 \
+            --snapshot-interval-secs 3600 \
+            --event-channel-size 262144 \
+            --no-build &
+          echo $! > /tmp/fd-rdd.pid
+          sleep 3
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+            sleep 1
+          done
+
+      - name: "Test 4a: Concurrent chaos (writers + readers)"
+        run: |
+          set -e
+          echo "=== Test 4a: Concurrent chaos ==="
+          ROOT="/tmp/fd-rdd-ci-test/chaos-test"
+
+          # Background writer: continuous create/rename/delete
+          (
+            for round in $(seq 1 50); do
+              # Batch create
+              for i in $(seq 1 20); do
+                echo "round $round" > "$ROOT/chaos_${round}_${i}.tmp"
+              done
+              sleep 0.05
+              # Batch rename
+              for i in $(seq 1 20); do
+                mv "$ROOT/chaos_${round}_${i}.tmp" "$ROOT/chaos_${round}_${i}.txt" 2>/dev/null || true
+              done
+              sleep 0.05
+              # Batch delete
+              for i in $(seq 1 10); do
+                rm -f "$ROOT/chaos_${round}_${i}.txt"
+              done
+              sleep 0.05
+            done
+          ) &
+          WRITER_PID=$!
+
+          # Concurrent reader: query every 20ms
+          touch /tmp/query_results.log
+          (
+            for i in $(seq 1 100); do
+              curl -s -o /dev/null -w "%{http_code}" \
+                "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=chaos&limit=50" \
+                >> /tmp/query_results.log 2>&1 || true
+              echo " " >> /tmp/query_results.log
+              sleep 0.02
+            done
+          ) &
+          READER_PID=$!
+
+          wait $WRITER_PID
+          wait $READER_PID
+
+          # Check results
+          HTTP_200=$(grep -o "200" /tmp/query_results.log | wc -l)
+          TOTAL=$(wc -w < /tmp/query_results.log)
+          echo "Queries: $TOTAL total, $HTTP_200 HTTP 200"
+          if [ "$HTTP_200" -lt 80 ]; then
+            echo "❌ FAIL: Too many query failures ($HTTP_200/100 OK)"
+            exit 1
+          fi
+          echo "✅ PASS: Concurrent chaos survived ($HTTP_200/100 queries OK)"
+
+      - name: "Test 4b: Health check after chaos"
+        run: |
+          HEALTH=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health)
+          echo "Health: $HEALTH"
+          if echo "$HEALTH" | grep -q '"status":"ok"'; then
+            echo "✅ Health OK after chaos"
+          else
+            echo "❌ Health degraded after chaos"
+            exit 1
+          fi
+
+      - name: "Test 4c: Verify no phantom reads (deleted files should not appear)"
+        run: |
+          set -e
+          sleep 1  # let final events settle
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=chaos_1_1&limit=10")
+          echo "Query for chaos_1_1: $RESULT"
+          # chaos_1_1 should have been deleted in round 1
+          if echo "$RESULT" | grep -q "chaos_1_1"; then
+            echo "⚠️ WARNING: chaos_1_1 still visible (possible tombstone lag)"
+            # 这里放宽要求，因为 debounce 可能导致延迟
+          else
+            echo "✅ Deleted file correctly absent"
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* /tmp/query_results.log
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 5: Mmap 安全 + Compaction 竞态 + I/O 停顿
+  # ───────────────────────────────────────────────────────────────────────────
+  test-mmap-and-compaction:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup large dataset for compaction pressure
+        run: |
+          ROOT="/tmp/fd-rdd-ci-test/compaction-test"
+          mkdir -p "$ROOT"
+          for batch in $(seq 1 10); do
+            mkdir -p "$ROOT/batch_${batch}"
+            for i in $(seq 1 500); do
+              echo "batch $batch file $i" > "$ROOT/batch_${batch}/data_${i}.txt"
+            done
+          done
+          echo "Created $(find $ROOT -type f | wc -l) files"
+
+      - name: Start fd-rdd (short snapshot interval to force compaction)
+        run: |
+          ./bin/fd-rdd \
+            --root /tmp/fd-rdd-ci-test/compaction-test \
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_compaction \
+            --http-port ${{ env.FD_RDD_PORT }} \
+            --debounce-ms 50 \
+            --snapshot-interval-secs 10 \
+            --no-build &
+          echo $! > /tmp/fd-rdd.pid
+          sleep 5
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+            sleep 1
+          done
+
+      - name: "Test 5a: Query during initial indexing"
+        run: |
+          set -e
+          for i in $(seq 1 20); do
+            START=$(date +%s%N)
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=data_100&limit=10")
+            END=$(date +%s%N)
+            ELAPSED_MS=$(( (END - START) / 1000000 ))
+            echo "Query $i: ${ELAPSED_MS}ms"
+            if [ "$ELAPSED_MS" -gt 2000 ]; then
+              echo "⚠️ Query $i took ${ELAPSED_MS}ms (>2s)"
+            fi
+            sleep 0.5
+          done
+          echo "✅ Queries during indexing completed without crash"
+
+      - name: "Test 5b: Trigger compaction via file mutations during snapshot"
+        run: |
+          set -e
+          ROOT="/tmp/fd-rdd-ci-test/compaction-test"
+          echo "=== Test 5b: Mutation during compaction ==="
+          # Wait for first snapshot to happen
+          sleep 15
+
+          # Now mutate files while snapshots are ongoing (every 10s)
+          for round in $(seq 1 5); do
+            # Create new files
+            for i in $(seq 1 50); do
+              echo "new round $round" > "$ROOT/new_round_${round}_${i}.txt"
+            done
+            # Delete old files
+            for i in $(seq 1 25); do
+              rm -f "$ROOT/batch_${round}/data_${i}.txt"
+            done
+            # Query immediately (potential SIGBUS risk during compaction)
+            START=$(date +%s%N)
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=new_round_${round}&limit=10")
+            END=$(date +%s%N)
+            ELAPSED_MS=$(( (END - START) / 1000000 ))
+            echo "Round $round query: ${ELAPSED_MS}ms"
+            if [ "$ELAPSED_MS" -gt 5000 ]; then
+              echo "❌ FAIL: Query timeout during compaction (${ELAPSED_MS}ms)"
+              exit 1
+            fi
+            sleep 8
+          done
+          echo "✅ PASS: No SIGBUS/timeout during compaction cycles"
+
+      - name: "Test 5c: Verify fd-rdd process still alive"
+        run: |
+          if kill -0 $(cat /tmp/fd-rdd.pid) 2>/dev/null; then
+            echo "✅ fd-rdd process still alive after compaction stress"
+          else
+            echo "❌ FAIL: fd-rdd process died (possible SIGBUS/panic)"
+            exit 1
+          fi
+
+      - name: Collect dmesg for SIGBUS evidence
+        if: failure()
+        run: |
+          dmesg | tail -50 || true
+          journalctl -xe | tail -30 || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 6: Trigram 倾斜 + 长路径爆炸
+  # ───────────────────────────────────────────────────────────────────────────
+  test-trigram-skew:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup skewed dataset (common trigrams)
+        run: |
+          ROOT="/tmp/fd-rdd-ci-test/skew-test"
+          mkdir -p "$ROOT"
+          # Create files with common trigrams: .log, src, node_modules
+          for i in $(seq 1 2000); do
+            echo "log $i" > "$ROOT/app_${i}.log"
+          done
+          # Deep nested paths
+          for depth in $(seq 1 20); do
+            DIR="$ROOT"
+            for d in $(seq 1 $depth); do
+              DIR="$DIR/level_${d}"
+            done
+            mkdir -p "$DIR"
+            echo "deep $depth" > "$DIR/deep_file.txt"
+          done
+          # node_modules explosion
+          for pkg in $(seq 1 100); do
+            mkdir -p "$ROOT/node_modules/pkg_${pkg}/dist"
+            echo "pkg $pkg" > "$ROOT/node_modules/pkg_${pkg}/dist/index.js"
+          done
+          echo "Created $(find $ROOT -type f | wc -l) files"
+
+      - name: Start fd-rdd
+        run: |
+          ./bin/fd-rdd \
+            --root /tmp/fd-rdd-ci-test/skew-test \
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_skew \
+            --http-port ${{ env.FD_RDD_PORT }} \
+            --debounce-ms 50 \
+            --snapshot-interval-secs 3600 \
+            --no-build &
+          echo $! > /tmp/fd-rdd.pid
+          sleep 5
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+            sleep 1
+          done
+
+      - name: "Test 6a: Skewed trigram query (.log)"
+        run: |
+          set -e
+          echo "=== Test 6a: Skewed query '.log' ==="
+          START=$(date +%s%N)
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=.log&limit=100")
+          END=$(date +%s%N)
+          ELAPSED_MS=$(( (END - START) / 1000000 ))
+          COUNT=$(echo "$RESULT" | grep -c '\.log' || true)
+          echo "Query '.log' took ${ELAPSED_MS}ms, found $COUNT results"
+          if [ "$ELAPSED_MS" -gt 3000 ]; then
+            echo "❌ FAIL: Skewed query took ${ELAPSED_MS}ms (>3s) — possible posting list explosion"
+            exit 1
+          fi
+          if [ "$COUNT" -lt 100 ]; then
+            echo "❌ FAIL: Expected 100+ .log results, got $COUNT"
+            exit 1
+          fi
+          echo "✅ PASS: Skewed query handled in ${ELAPSED_MS}ms"
+
+      - name: "Test 6b: Deep path query"
+        run: |
+          set -e
+          echo "=== Test 6b: Deep path query ==="
+          START=$(date +%s%N)
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=level_20&limit=10")
+          END=$(date +%s%N)
+          ELAPSED_MS=$(( (END - START) / 1000000 ))
+          echo "Deep query took ${ELAPSED_MS}ms"
+          if echo "$RESULT" | grep -q "deep_file.txt"; then
+            echo "✅ PASS: Deep path file found"
+          else
+            echo "❌ FAIL: Deep path file not found"
+            exit 1
+          fi
+
+      - name: "Test 6c: node_modules explosion query"
+        run: |
+          set -e
+          START=$(date +%s%N)
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=node_modules&limit=100")
+          END=$(date +%s%N)
+          ELAPSED_MS=$(( (END - START) / 1000000 ))
+          COUNT=$(echo "$RESULT" | grep -c "node_modules" || true)
+          echo "node_modules query took ${ELAPSED_MS}ms, found $COUNT results"
+          if [ "$ELAPSED_MS" -gt 3000 ]; then
+            echo "❌ FAIL: node_modules query took ${ELAPSED_MS}ms"
+            exit 1
+          fi
+          echo "✅ PASS: node_modules explosion handled"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 7: 硬链接 + 跨挂载点移动
+  # ───────────────────────────────────────────────────────────────────────────
+  test-hardlink-crossmount:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup cross-mountpoint environment (tmpfs)
+        run: |
+          mkdir -p /tmp/fd-rdd-ci-test/crossmount-main
+          mkdir -p /tmp/fd-rdd-ci-test/crossmount-tmpfs
+          sudo mount -t tmpfs -o size=100M tmpfs /tmp/fd-rdd-ci-test/crossmount-tmpfs
+          echo "tmpfs mounted"
+
+      - name: Setup files and hard links
+        run: |
+          # Original file
+          echo "original content" > /tmp/fd-rdd-ci-test/crossmount-main/original.txt
+          # Hard link (same inode)
+          ln /tmp/fd-rdd-ci-test/crossmount-main/original.txt /tmp/fd-rdd-ci-test/crossmount-main/hardlink.txt
+          # File on tmpfs
+          echo "tmpfs content" > /tmp/fd-rdd-ci-test/crossmount-tmpfs/from_tmpfs.txt
+
+      - name: Start fd-rdd watching both mounts
+        run: |
+          ./bin/fd-rdd \
+            --root /tmp/fd-rdd-ci-test/crossmount-main \
+            --root /tmp/fd-rdd-ci-test/crossmount-tmpfs \
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_crossmount \
+            --http-port ${{ env.FD_RDD_PORT }} \
+            --debounce-ms 50 \
+            --snapshot-interval-secs 3600 \
+            --no-build &
+          echo $! > /tmp/fd-rdd.pid
+          sleep 3
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+            sleep 1
+          done
+
+      - name: "Test 7a: Hard link query"
+        run: |
+          set -e
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=original&limit=10")
+          echo "Original query: $RESULT"
+          if echo "$RESULT" | grep -q "original.txt"; then
+            echo "✅ Original file found"
+          else
+            echo "❌ FAIL: Original file not found"
+            exit 1
+          fi
+          RESULT2=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=hardlink&limit=10")
+          echo "Hardlink query: $RESULT2"
+          if echo "$RESULT2" | grep -q "hardlink.txt"; then
+            echo "✅ Hard link found"
+          else
+            echo "❌ FAIL: Hard link not found"
+            exit 1
+          fi
+
+      - name: "Test 7b: Modify through hard link → query both paths"
+        run: |
+          set -e
+          echo "modified through hardlink" >> /tmp/fd-rdd-ci-test/crossmount-main/hardlink.txt
+          sleep 0.5
+          # Both paths should reflect the modification (same inode)
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=hardlink&limit=10")
+          echo "Post-modify: $RESULT"
+          # 由于索引只存储路径，不是内容，修改内容不会影响搜索结果
+          # 但 FileKey 相同，所以两个路径都应该存在
+          if echo "$RESULT" | grep -q "hardlink.txt"; then
+            echo "✅ Hard link still indexed after modify"
+          else
+            echo "❌ FAIL: Hard link lost after modify"
+            exit 1
+          fi
+
+      - name: "Test 7c: Cross-mountpoint move (Copy+Delete semantics)"
+        run: |
+          set -e
+          # Move from tmpfs to main (cross-device = Copy+Delete)
+          mv /tmp/fd-rdd-ci-test/crossmount-tmpfs/from_tmpfs.txt /tmp/fd-rdd-ci-test/crossmount-main/moved_from_tmpfs.txt
+          sleep 1
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=moved_from_tmpfs&limit=10")
+          echo "Cross-mount query: $RESULT"
+          if echo "$RESULT" | grep -q "moved_from_tmpfs.txt"; then
+            echo "✅ PASS: Cross-mount move correctly tracked"
+          else
+            echo "❌ FAIL: Cross-mount move not tracked"
+            exit 1
+          fi
+          # Old path should be gone
+          RESULT_OLD=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=from_tmpfs&limit=10")
+          if echo "$RESULT_OLD" | grep -q "from_tmpfs.txt"; then
+            echo "❌ FAIL: Old path still visible after cross-mount move"
+            exit 1
+          else
+            echo "✅ Old path correctly removed"
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          sudo umount /tmp/fd-rdd-ci-test/crossmount-tmpfs 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 8: Crash 恢复 + WAL Replay 一致性
+  # ───────────────────────────────────────────────────────────────────────────
+  test-crash-recovery:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup test directory
+        run: |
+          mkdir -p /tmp/fd-rdd-ci-test/recovery-test
+          for i in $(seq 1 100); do
+            echo "data $i" > "/tmp/fd-rdd-ci-test/recovery-test/file_${i}.txt"
+          done
+
+      - name: Start fd-rdd and let it index
+        run: |
+          ./bin/fd-rdd \
+            --root /tmp/fd-rdd-ci-test/recovery-test \
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_recovery \
+            --http-port ${{ env.FD_RDD_PORT }} \
+            --debounce-ms 50 \
+            --snapshot-interval-secs 5 \
+            --no-build &
+          echo $! > /tmp/fd-rdd.pid
+          sleep 8  # let it index and write at least one snapshot
+
+      - name: Create files while running
+        run: |
+          for i in $(seq 101 150); do
+            echo "new $i" > "/tmp/fd-rdd-ci-test/recovery-test/post_${i}.txt"
+          done
+          sleep 2
+
+      - name: Simulate crash (kill -9)
+        run: |
+          echo "=== Simulating crash ==="
+          kill -9 $(cat /tmp/fd-rdd.pid)
+          sleep 1
+          # Verify process is gone
+          if kill -0 $(cat /tmp/fd-rdd.pid) 2>/dev/null; then
+            echo "Process still alive after kill -9?"
+            exit 1
+          fi
+          echo "Process killed"
+
+      - name: Create more files while crashed (offline changes)
+        run: |
+          for i in $(seq 151 200); do
+            echo "offline $i" > "/tmp/fd-rdd-ci-test/recovery-test/offline_${i}.txt"
+          done
+          # Delete some files
+          for i in $(seq 1 20); do
+            rm -f "/tmp/fd-rdd-ci-test/recovery-test/file_${i}.txt"
+          done
+
+      - name: Restart fd-rdd (should replay WAL + detect offline changes)
+        run: |
+          ./bin/fd-rdd \
+            --root /tmp/fd-rdd-ci-test/recovery-test \
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_recovery \
+            --http-port ${{ env.FD_RDD_PORT }} \
+            --debounce-ms 50 \
+            --snapshot-interval-secs 3600 \
+            --no-build &
+          echo $! > /tmp/fd-rdd.pid
+          sleep 5
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+            sleep 1
+          done
+
+      - name: "Test 8a: Verify offline-created files visible"
+        run: |
+          set -e
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=offline_180&limit=10")
+          echo "Offline file query: $RESULT"
+          if echo "$RESULT" | grep -q "offline_180.txt"; then
+            echo "✅ PASS: Offline-created file visible after recovery"
+          else
+            echo "❌ FAIL: Offline-created file not visible (WAL replay / fast-sync issue)"
+            exit 1
+          fi
+
+      - name: "Test 8b: Verify deleted files are gone"
+        run: |
+          set -e
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file_10&limit=10")
+          echo "Deleted file query: $RESULT"
+          if echo "$RESULT" | grep -q "file_10.txt"; then
+            echo "❌ FAIL: Deleted file still visible after recovery"
+            exit 1
+          else
+            echo "✅ PASS: Deleted file correctly absent after recovery"
+          fi
+
+      - name: "Test 8c: Verify crash-survived files still present"
+        run: |
+          set -e
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file_50&limit=10")
+          if echo "$RESULT" | grep -q "file_50.txt"; then
+            echo "✅ PASS: Survived file still present"
+          else
+            echo "❌ FAIL: Survived file missing after recovery"
+            exit 1
+          fi
+
+      - name: "Test 8d: Status shows correct count"
+        run: |
+          STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status)
+          echo "Status: $STATUS"
+          # Should have ~180 files (200 created - 20 deleted, minus some pre-crash)
+          # Just verify it's a reasonable number > 100
+          COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | cut -d: -f2)
+          if [ -z "$COUNT" ]; then COUNT=0; fi
+          if [ "$COUNT" -lt 100 ]; then
+            echo "❌ FAIL: Index count too low after recovery ($COUNT)"
+            exit 1
+          fi
+          echo "✅ PASS: Index count $COUNT after recovery"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 9: 长时压力 soak test（工作流调度触发）
+  # ───────────────────────────────────────────────────────────────────────────
+  test-soak:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event.inputs.duration_minutes
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup soak test environment
+        run: |
+          ROOT="/tmp/fd-rdd-ci-test/soak"
+          mkdir -p "$ROOT"
+          # Initial 1000 files
+          for i in $(seq 1 1000); do
+            echo "initial $i" > "$ROOT/file_${i}.txt"
+          done
+
+      - name: Start fd-rdd for soak
+        run: |
+          ./bin/fd-rdd \
+            --root /tmp/fd-rdd-ci-test/soak \
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_soak \
+            --http-port ${{ env.FD_RDD_PORT }} \
+            --debounce-ms 10 \
+            --snapshot-interval-secs 30 \
+            --event-channel-size 524288 \
+            --no-build &
+          echo $! > /tmp/fd-rdd.pid
+          sleep 5
+
+      - name: Run soak test
+        run: |
+          DURATION=${{ github.event.inputs.duration_minutes || '5' }}
+          ROOT="/tmp/fd-rdd-ci-test/soak"
+          echo "=== Soak test: ${DURATION} minutes ==="
+          END_TIME=$(($(date +%s) + DURATION * 60))
+          OP_COUNT=0
+          QUERY_COUNT=0
+          QUERY_OK=0
+          MAX_QUERY_MS=0
+
+          while [ $(date +%s) -lt $END_TIME ]; do
+            # Random operation
+            OP=$((RANDOM % 4))
+            case $OP in
+              0) # Create
+                i=$((RANDOM % 10000))
+                echo "new $OP_COUNT" > "$ROOT/soak_new_${i}.txt"
+                ;;
+              1) # Delete
+                i=$((RANDOM % 1000))
+                rm -f "$ROOT/file_${i}.txt"
+                ;;
+              2) # Rename
+                i=$((RANDOM % 1000))
+                j=$((RANDOM % 1000))
+                mv "$ROOT/file_${i}.txt" "$ROOT/file_renamed_${j}.txt" 2>/dev/null || true
+                ;;
+              3) # Modify
+                i=$((RANDOM % 1000))
+                echo "modified $OP_COUNT" >> "$ROOT/file_${i}.txt" 2>/dev/null || true
+                ;;
+            esac
+            OP_COUNT=$((OP_COUNT + 1))
+
+            # Query every 10 ops
+            if [ $((OP_COUNT % 10)) -eq 0 ]; then
+              START=$(date +%s%N)
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file&limit=20" || echo "000")
+              END=$(date +%s%N)
+              ELAPSED_MS=$(( (END - START) / 1000000 ))
+              QUERY_COUNT=$((QUERY_COUNT + 1))
+              if [ "$HTTP_CODE" = "200" ]; then
+                QUERY_OK=$((QUERY_OK + 1))
+              fi
+              if [ "$ELAPSED_MS" -gt "$MAX_QUERY_MS" ]; then
+                MAX_QUERY_MS=$ELAPSED_MS
+              fi
+            fi
+
+            # Throttle
+            sleep 0.05
+          done
+
+          echo "=== Soak results ==="
+          echo "Operations: $OP_COUNT"
+          echo "Queries: $QUERY_COUNT (OK: $QUERY_OK)"
+          echo "Max query latency: ${MAX_QUERY_MS}ms"
+
+          if [ "$QUERY_OK" -lt $((QUERY_COUNT * 95 / 100)) ]; then
+            echo "❌ FAIL: Query success rate too low ($QUERY_OK/$QUERY_COUNT)"
+            exit 1
+          fi
+          if [ "$MAX_QUERY_MS" -gt 5000 ]; then
+            echo "❌ FAIL: Max query latency ${MAX_QUERY_MS}ms > 5s"
+            exit 1
+          fi
+          echo "✅ PASS: Soak test completed successfully"
+
+      - name: Final health check
+        run: |
+          HEALTH=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health)
+          echo "Final health: $HEALTH"
+          if echo "$HEALTH" | grep -q '"status":"ok"'; then
+            echo "✅ Final health OK"
+          else
+            echo "❌ Final health degraded"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*

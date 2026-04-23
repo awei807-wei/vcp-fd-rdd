@@ -1,14 +1,16 @@
 use notify::{Config, RecursiveMode, Watcher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::event::recovery::DirtyTracker;
 
 fn handle_notify_result(
-    tx: &mpsc::Sender<notify::Event>,
+    priority_tx: &mpsc::Sender<notify::Event>,
+    normal_tx: &mpsc::Sender<notify::Event>,
+    channel_size: usize,
     dirty: Option<&DirtyTracker>,
-    overflow_drops: &AtomicU64,
     rescan_signals: &AtomicU64,
     res: notify::Result<notify::Event>,
 ) {
@@ -21,23 +23,23 @@ fn handle_notify_result(
             }
         }
 
-        // 非阻塞发送：队列满时丢弃并计数
-        match tx.try_send(event) {
-            Ok(_) => {}
-            Err(err) => {
-                let event = err.into_inner();
-                if let Some(d) = dirty {
-                    // best-effort：在 overload 场景尽量记录 dirty dirs；上限触发时降级为 dirty_all。
-                    d.record_overflow_paths(&event.paths);
-                }
-                let drops = overflow_drops.fetch_add(1, Ordering::Relaxed);
-                if drops % 1000 == 0 {
-                    eprintln!(
-                        "[fd-rdd] event channel overflow, total drops: {}",
-                        drops + 1
-                    );
-                }
-            }
+        // 分级队列：Create 事件走快速路径
+        let is_create = matches!(event.kind, notify::EventKind::Create(_));
+        let tx = if is_create { priority_tx } else { normal_tx };
+
+        // 动态背压：channel 水位 >80% 时主动 sleep，避免事件堆积压垮下游
+        let remaining = tx.capacity();
+        if remaining < channel_size.saturating_mul(2) / 10 {
+            let delay_ms = 10u64.saturating_add(
+                (channel_size - remaining) as u64 % 41
+            );
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+
+        // 阻塞发送：利用 bounded channel 做背压，满时阻塞 watcher 线程而非丢弃
+        if let Err(e) = tx.blocking_send(event) {
+            // 只有 channel 已关闭时才会失败
+            tracing::warn!("event channel closed, dropping event: {:?}", e);
         }
     }
 }
@@ -48,25 +50,32 @@ pub struct EventWatcher;
 
 impl EventWatcher {
     /// 启动监听，返回事件接收端
+    /// 返回 (priority_rx, normal_rx, watcher)：Create 事件走 priority channel
     pub fn start(
         _roots: &[std::path::PathBuf],
         channel_size: usize,
-        overflow_drops: Arc<AtomicU64>,
+        _overflow_drops: Arc<AtomicU64>,
         rescan_signals: Arc<AtomicU64>,
         dirty: Option<Arc<DirtyTracker>>,
-    ) -> anyhow::Result<(mpsc::Receiver<notify::Event>, notify::RecommendedWatcher)> {
+    ) -> anyhow::Result<(
+        mpsc::Receiver<notify::Event>,
+        mpsc::Receiver<notify::Event>,
+        notify::RecommendedWatcher,
+    )> {
         if channel_size == 0 {
             anyhow::bail!("event channel_size must be >= 1");
         }
-        let (tx, rx) = mpsc::channel(channel_size);
+        let (priority_tx, priority_rx) = mpsc::channel(channel_size);
+        let (normal_tx, normal_rx) = mpsc::channel(channel_size);
         let dirty = dirty.clone();
 
         let watcher = notify::RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
                 handle_notify_result(
-                    &tx,
+                    &priority_tx,
+                    &normal_tx,
+                    channel_size,
                     dirty.as_deref(),
-                    overflow_drops.as_ref(),
                     rescan_signals.as_ref(),
                     res,
                 );
@@ -75,7 +84,7 @@ impl EventWatcher {
         )?;
 
         // 注意：watcher 必须由调用方持有，否则会被 drop
-        Ok((rx, watcher))
+        Ok((priority_rx, normal_rx, watcher))
     }
 }
 
@@ -95,13 +104,14 @@ mod tests {
 
     #[test]
     fn rescan_event_marks_dirty_all() {
-        let drops = AtomicU64::new(0);
+        let _drops = AtomicU64::new(0);
         let rescans = AtomicU64::new(0);
-        let (tx, _rx) = mpsc::channel(16);
+        let (priority_tx, _priority_rx) = mpsc::channel(16);
+        let (normal_tx, _normal_rx) = mpsc::channel(16);
         let dirty = DirtyTracker::new(16, vec![]);
 
         let ev = notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
-        handle_notify_result(&tx, Some(dirty.as_ref()), &drops, &rescans, Ok(ev));
+        handle_notify_result(&priority_tx, &normal_tx, 16, Some(dirty.as_ref()), &rescans, Ok(ev));
         assert_eq!(rescans.load(Ordering::Relaxed), 1);
 
         let scope = dirty.try_begin_sync(0, 0, 0);

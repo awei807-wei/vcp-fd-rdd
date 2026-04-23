@@ -316,8 +316,18 @@ impl TieredIndex {
         ignore_prefixes: Vec<PathBuf>,
         tracker: Arc<DirtyTracker>,
     ) {
+        let permit = match self.fast_sync_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::debug!("Fast-sync already in progress, skipping duplicate spawn");
+                tracker.finish_sync();
+                return;
+            }
+        };
+
         let idx = self.clone();
         std::thread::spawn(move || {
+            let _permit = permit;
             let report = idx.fast_sync(scope, &ignore_prefixes);
             tracing::warn!(
                 "Fast-sync complete: dirs={} upserts={} deletes={}",
@@ -420,7 +430,7 @@ impl TieredIndex {
                     continue;
                 }
 
-                let path = ent.path().to_path_buf();
+                let path = super::normalize_path(ent.path());
                 let meta = match ent.metadata() {
                     Ok(meta) => meta,
                     Err(err) => {
@@ -463,17 +473,10 @@ impl TieredIndex {
         let dirty_dirs: HashSet<PathBuf> = dirs.into_iter().collect();
 
         // 3) 删除对齐：只对齐"被标记 dirty 的目录"下的条目（但对文件做轻量存在性检查，避免构建巨大的 names set）。
-        // 注意：for_each_live_meta 内部持有读锁，期间不能调用 apply_events（会死锁）。
+        // 注意：for_each_live_meta_in_dirs 内部持有读锁，期间不能调用 apply_events（会死锁）。
         let l2 = self.l2.load_full();
         let mut delete_events: Vec<EventRecord> = Vec::new();
-        l2.for_each_live_meta(|m| {
-            let Some(parent) = m.path.parent() else {
-                return;
-            };
-            if !dirty_dirs.contains(parent) {
-                return;
-            };
-
+        l2.for_each_live_meta_in_dirs(&dirty_dirs, |m| {
             match std::fs::symlink_metadata(&m.path) {
                 Ok(_) => return,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -497,13 +500,13 @@ impl TieredIndex {
         report
     }
 
-    /// 即时扫描指定目录并更新索引（同步执行，不走 debounce/channel）。
-    ///
-    /// 限制：最多 10 个目录，每目录最多 10000 条目。
-    /// 返回 (scanned_files, elapsed_ms)。
-    pub fn scan_dirs_immediate(&self, dirs: &[PathBuf]) -> (usize, u64) {
+    fn scan_dirs_with_depth(
+        &self,
+        dirs: &[&PathBuf],
+        max_depth: Option<usize>,
+        max_entries_per_dir: usize,
+    ) -> (usize, u64) {
         let start = Instant::now();
-        let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
 
         let mut upsert_events: Vec<EventRecord> = Vec::new();
         let mut upsert_metas: Vec<FileMeta> = Vec::new();
@@ -513,8 +516,10 @@ impl TieredIndex {
         for dir in dirs {
             let mut dir_count = 0;
             let mut builder = ignore::WalkBuilder::new(dir);
+            if let Some(d) = max_depth {
+                builder.max_depth(Some(d));
+            }
             builder
-                .max_depth(Some(1))
                 .hidden(!self.include_hidden)
                 .follow_links(false)
                 .ignore(self.ignore_enabled)
@@ -539,12 +544,12 @@ impl TieredIndex {
                 if ft.is_dir() {
                     continue;
                 }
-                if dir_count >= 10_000 {
+                if dir_count >= max_entries_per_dir {
                     break;
                 }
                 dir_count += 1;
 
-                let path = ent.path().to_path_buf();
+                let path = super::normalize_path(ent.path());
                 let meta = match ent.metadata() {
                     Ok(m) => m,
                     Err(err) => {
@@ -585,5 +590,23 @@ impl TieredIndex {
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
         (scanned, elapsed_ms)
+    }
+
+    /// 即时扫描指定目录并更新索引（同步执行，不走 debounce/channel）。
+    ///
+    /// 限制：最多 10 个目录，每目录最多 10000 条目。
+    /// 返回 (scanned_files, elapsed_ms)。
+    pub fn scan_dirs_immediate(&self, dirs: &[PathBuf]) -> (usize, u64) {
+        let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
+        self.scan_dirs_with_depth(&dirs, Some(1), 10_000)
+    }
+
+    /// 深度即时扫描指定目录并更新索引（递归，不走 debounce/channel）。
+    ///
+    /// 限制：最多 10 个目录，每目录最多 50000 条目。
+    /// 返回 (scanned_files, elapsed_ms)。
+    pub fn scan_dirs_immediate_deep(&self, dirs: &[PathBuf]) -> (usize, u64) {
+        let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
+        self.scan_dirs_with_depth(&dirs, None, 50_000)
     }
 }

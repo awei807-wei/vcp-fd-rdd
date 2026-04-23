@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::mmap_index::MmapIndex;
@@ -12,6 +12,8 @@ use super::disk_layer::DiskLayer;
 use super::pathbuf_from_bytes;
 use super::TieredIndex;
 
+const MIN_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
+
 impl TieredIndex {
     /// 原子快照
     pub async fn snapshot_now<S>(self: &Arc<Self>, store: Arc<S>) -> anyhow::Result<()>
@@ -19,7 +21,7 @@ impl TieredIndex {
         S: StorageBackend + 'static,
     {
         // Flush：把当前内存 Delta 刷盘为新 Segment；必要时触发后台 compaction。
-        let (old_delta, deleted_paths, layers_snapshot, wal_seal_id) = {
+        let (segs, old_delta, deleted_paths, layers_snapshot, wal_seal_id) = {
             let _wg = self.apply_gate.write();
 
             let delta = self.l2.load_full();
@@ -47,6 +49,9 @@ impl TieredIndex {
                 None => 0,
             };
 
+            // FIX: export BEFORE swap, while data is still in L2
+            let segs = delta.export_segments_v6();
+
             let old = self.l2.swap(Arc::new(PersistentIndex::new_with_roots(
                 self.roots.clone(),
             )));
@@ -64,7 +69,7 @@ impl TieredIndex {
             Arc::make_mut(&mut ov.upserted_paths).maybe_shrink_after_clear();
             self.flush_requested.store(false, Ordering::Release);
 
-            (old, deleted, self.disk_layers.read().clone(), wal_seal_id)
+            (segs, old, deleted, self.disk_layers.read().clone(), wal_seal_id)
         };
 
         // 判断是否已有 LSM manifest：无则先 bootstrap 为 base（避免 legacy base 被"遗忘"）。
@@ -132,7 +137,6 @@ impl TieredIndex {
         }
 
         drop(layers_snapshot);
-        let segs = old_delta.export_segments_v6();
         drop(old_delta);
         let seg = store
             .append_delta_v6(&segs, &deleted_paths, &roots, wal_seal_id)
@@ -181,9 +185,19 @@ impl TieredIndex {
         loop {
             // flush 请求优先：避免 overlay 长期积压。
             if self.flush_requested.load(Ordering::Acquire) {
+                // Enforce minimum interval to prevent back-to-back snapshot storms
+                let last = self.last_snapshot_time.load(Ordering::Relaxed);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if last != 0 && now.saturating_sub(last) < MIN_SNAPSHOT_INTERVAL.as_secs() {
+                    let wait_secs = MIN_SNAPSHOT_INTERVAL.as_secs() - (now - last);
+                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                    continue;
+                }
                 if let Err(e) = self.snapshot_now(store.clone()).await {
                     tracing::error!("Snapshot failed (flush requested): {}", e);
-                    // 避免失败后自旋
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
                 continue;

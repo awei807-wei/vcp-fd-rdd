@@ -54,10 +54,12 @@ impl TieredIndex {
             pending_flush_events: AtomicU64::new(0),
             pending_flush_bytes: AtomicU64::new(0),
             last_snapshot_time: AtomicU64::new(0),
+            pending_events: Mutex::new(Vec::new()),
             roots,
             include_hidden,
             ignore_enabled,
             follow_symlinks,
+            fast_sync_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 

@@ -10,7 +10,31 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-> 当前 tests 分支发布版本为 v0.5.8（平台清理、安全加固、配置全量接线、竞态修复、配置化启动、持久化路径、中文搜索修复、存储层健壮性加固、WAL 去重、事件溢出增量恢复、版本兼容重构）。
+当前 tests 分支发布版本为 v0.6.0（内存尖峰治理、compaction 降频、事件管道延迟优化、snapshot 一致性加固）。
+
+## v0.6.0 更新（内存与事件管道 P0 治理）
+
+- **修复** `snapshot_now` 数据不可见窗口：将 `export_segments_v6()` 前置到 L2 swap 之前，在 `apply_gate.write()` 锁内完成序列化，消除 swap 后、disk_layers push 前的查询漏数据窗口。
+- **修复** compaction 过于频繁导致的 CPU/RAM 尖峰：阈值由 `2 delta / 30s 冷却` 上调为 `8 delta / 4 max_deltas / 300s 冷却`，显著降低百万级文件场景下的 compaction 触发频率与临时分配。
+- **修复** watcher channel 批量事件溢出：默认 `event_channel_size` 由 4096 提高到 262144，降低 git clone / 解压等批量操作场景下的事件静默丢弃概率。
+- **修复** fast-sync 兜底延迟过长：cooldown 由 5s 缩短到 1s，max-staleness 由 30s 缩短到 5s，事件溢出后更快完成增量补扫，减少"新文件搜不到"的感知延迟。
+- **新增** `snapshot_loop` 最小间隔保护（10s）：防止 overlay 高频 flush 请求导致 snapshot 连环触发，避免临时内存分配叠加。
+- **新增** PendingMoveMap Rename 撮合：解决跨批次 Rename 导致的文件消失问题。
+- **新增** 动态延迟背压：监控 channel 水位，>80% 时注入 sleep，防止 npm install 等事件风暴导致 OOM。
+- **新增** i_generation 断代校验：使用 `FS_IOC_GETVERSION` 获取 inode generation，彻底解决 inode 复用导致的幽灵文件。
+- **修复** `execute_query_plan` overlay 可见性：合并 `overlay.upserted_paths`，确保新创建文件在 L2/L3 查询中可见。
+- **新增** 目录 Rename 深度同步：检测到目录 Rename 后触发 Deep Fast-Sync，递归更新子文件索引。
+- **新增** Unicode NFC 规范化：集成 `unicode-normalization`，全量路径强制 NFC，消除编码陷阱。
+- **修复** tombstones/trigrams 原子性：确保删除时先 `tombstones.insert` 后 `remove_trigrams`，消除查询落空窗口。
+- **新增** fd-rdd Stress CI：系统性压力测试覆盖 Overlay 可见性、Rename 雪崩、并发中间状态、Mmap 安全、Trigram 倾斜等。
+
+## v0.5.9 更新
+
+- **新增** `Config::load()` 自动创建默认配置：首次启动时若 `~/.config/fd-rdd/config.toml` 不存在，自动创建并写入默认配置（`roots = ["~"]` 等），创建失败则回退到内存默认值。
+- **新增** `~` / `~/` 路径展开：配置文件中 `roots`、`socket_path`、`snapshot_path` 均支持 tilde 展开，无需硬编码绝对路径。
+- **新增** `snapshot_path` 配置字段：用户可通过 `config.toml` 指定快照数据库路径。
+- **新增** `--show-config` 诊断命令：启动时打印每个配置项的最终生效值及其来源（`CLI`、`config.toml` 或 `default`），解决配置混用时的可审计性问题。
+- **修复** clippy `manual_strip` 警告。
 
 ## v0.5.8 更新（平台清理、安全加固与配置全量接线）
 

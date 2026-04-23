@@ -20,8 +20,10 @@ use std::sync::OnceLock;
 const META_REC_SIZE: usize = 40;
 // TrigramEntryV6：3 + 1 + 4 + 4 = 12B
 const TRI_REC_SIZE: usize = 12;
-// FileKeyMap：dev(8) + ino(8) + docid(4) = 20B（v6 兼容；运行时读作 u64）
-const FILEKEY_MAP_REC_SIZE: usize = 20;
+// FileKeyMap：dev(8) + ino(8) + generation(4) + docid(4) = 24B（v6+ 兼容）
+const FILEKEY_MAP_REC_SIZE: usize = 24;
+// 旧格式（v6 早期）：dev(8) + ino(8) + docid(4) = 20B，无 generation
+const FILEKEY_MAP_REC_SIZE_OLD: usize = 20;
 
 const FKM_MAGIC: [u8; 4] = *b"FKM\0";
 const FKM_HDR_SIZE: usize = 8;
@@ -133,7 +135,7 @@ impl MmapIndex {
         };
 
         Some((
-            FileKey { dev, ino },
+            FileKey { dev, ino, generation: 0 },
             root_id,
             path_off,
             path_len,
@@ -143,7 +145,29 @@ impl MmapIndex {
     }
 
     fn lookup_docid_in_legacy_map(bytes: &[u8], key: FileKey) -> Option<u64> {
-        let n = bytes.len() / FILEKEY_MAP_REC_SIZE;
+        // 优先尝试新格式（24B），若长度不匹配则回退旧格式（20B）
+        if bytes.len() % FILEKEY_MAP_REC_SIZE == 0 {
+            if let Some(r) = Self::lookup_docid_in_legacy_map_with_stride(bytes, key, FILEKEY_MAP_REC_SIZE) {
+                return Some(r);
+            }
+        }
+        if bytes.len() % FILEKEY_MAP_REC_SIZE_OLD == 0 {
+            // 旧格式无 generation：用 generation=0 再查一次
+            let mut key_fallback = key;
+            key_fallback.generation = 0;
+            if let Some(r) = Self::lookup_docid_in_legacy_map_with_stride(bytes, key_fallback, FILEKEY_MAP_REC_SIZE_OLD) {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    fn lookup_docid_in_legacy_map_with_stride(
+        bytes: &[u8],
+        key: FileKey,
+        stride: usize,
+    ) -> Option<u64> {
+        let n = bytes.len() / stride;
         if n == 0 {
             return None;
         }
@@ -152,11 +176,18 @@ impl MmapIndex {
         let mut hi = n;
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let off = mid * FILEKEY_MAP_REC_SIZE;
-            let rec = &bytes[off..off + FILEKEY_MAP_REC_SIZE];
+            let off = mid * stride;
+            let rec = &bytes[off..off + stride];
             let dev = u64::from_le_bytes(rec[0..8].try_into().ok()?);
             let ino = u64::from_le_bytes(rec[8..16].try_into().ok()?);
-            if (dev, ino) < (key.dev, key.ino) {
+            let generation = if stride >= FILEKEY_MAP_REC_SIZE {
+                u32::from_le_bytes(rec[16..20].try_into().ok()?)
+            } else {
+                0
+            };
+            let cmp_key = (dev, ino, generation);
+            let target = (key.dev, key.ino, key.generation);
+            if cmp_key < target {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -165,14 +196,20 @@ impl MmapIndex {
         if lo >= n {
             return None;
         }
-        let off = lo * FILEKEY_MAP_REC_SIZE;
-        let rec = &bytes[off..off + FILEKEY_MAP_REC_SIZE];
+        let off = lo * stride;
+        let rec = &bytes[off..off + stride];
         let dev = u64::from_le_bytes(rec[0..8].try_into().ok()?);
         let ino = u64::from_le_bytes(rec[8..16].try_into().ok()?);
-        if (dev, ino) != (key.dev, key.ino) {
+        let generation = if stride >= FILEKEY_MAP_REC_SIZE {
+            u32::from_le_bytes(rec[16..20].try_into().ok()?)
+        } else {
+            0
+        };
+        if (dev, ino, generation) != (key.dev, key.ino, key.generation) {
             return None;
         }
-        let docid = u32::from_le_bytes(rec[16..20].try_into().ok()?);
+        let docid_off = if stride >= FILEKEY_MAP_REC_SIZE { 20 } else { 16 };
+        let docid = u32::from_le_bytes(rec[docid_off..docid_off + 4].try_into().ok()?);
         Some(docid as u64)
     }
 
@@ -201,7 +238,8 @@ impl MmapIndex {
             let e = &slice[mid];
             let dev = e.key.dev;
             let ino = e.key.ino;
-            if (dev, ino) < (key.dev, key.ino) {
+            let generation = e.key.generation;
+            if (dev, ino, generation) < (key.dev, key.ino, key.generation) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -211,10 +249,32 @@ impl MmapIndex {
             return None;
         }
         let e = &slice[lo];
-        if (e.key.dev, e.key.ino) != (key.dev, key.ino) {
-            return None;
+        if (e.key.dev, e.key.ino, e.key.generation) == (key.dev, key.ino, key.generation) {
+            return Some(e.doc_id);
         }
-        Some(e.doc_id)
+        // 兼容：旧数据可能 generation=0，尝试降级匹配
+        if key.generation != 0 {
+            let mut key_fallback = key;
+            key_fallback.generation = 0;
+            let mut lo2 = 0usize;
+            let mut hi2 = slice.len();
+            while lo2 < hi2 {
+                let mid = (lo2 + hi2) / 2;
+                let e = &slice[mid];
+                if (e.key.dev, e.key.ino) < (key_fallback.dev, key_fallback.ino) {
+                    lo2 = mid + 1;
+                } else {
+                    hi2 = mid;
+                }
+            }
+            if lo2 < slice.len() {
+                let e = &slice[lo2];
+                if (e.key.dev, e.key.ino) == (key_fallback.dev, key_fallback.ino) {
+                    return Some(e.doc_id);
+                }
+            }
+        }
+        None
     }
 
     fn lookup_docid_by_filekey(&self, key: FileKey) -> Option<u64> {
@@ -295,12 +355,13 @@ impl MmapIndex {
             };
             pairs.push((file_key, docid));
         }
-        pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino));
+        pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino, k.generation));
         let mut bytes = Vec::with_capacity(pairs.len() * FILEKEY_MAP_REC_SIZE);
         for (k, docid) in pairs {
             bytes.extend_from_slice(&k.dev.to_le_bytes());
             bytes.extend_from_slice(&k.ino.to_le_bytes());
-            bytes.extend_from_slice(&docid.to_le_bytes());
+            bytes.extend_from_slice(&k.generation.to_le_bytes());
+            bytes.extend_from_slice(&(docid as u32).to_le_bytes());
         }
         let arc = Arc::new(bytes);
         *self.filekey_map_cache.lock() = Some(arc.clone());
@@ -693,6 +754,43 @@ impl MmapIndex {
         };
         self.snap.roots == encoded
     }
+
+    pub fn for_each_trigram<F>(&self, mut callback: F)
+    where
+        F: FnMut([u8; 3], &roaring::RoaringTreemap),
+    {
+        let table = self.snap.trigram_table_bytes();
+        let n = table.len() / TRI_REC_SIZE;
+        for i in 0..n {
+            let off = i * TRI_REC_SIZE;
+            let rec = &table[off..off + TRI_REC_SIZE];
+            let tri = [rec[0], rec[1], rec[2]];
+            if tri == [0, 0, 0] {
+                continue;
+            }
+            let Some(posting_off_bytes) = rec.get(4..8).and_then(|b| b.try_into().ok()) else {
+                continue;
+            };
+            let posting_off = u32::from_le_bytes(posting_off_bytes) as usize;
+            let Some(posting_len_bytes) = rec.get(8..12).and_then(|b| b.try_into().ok()) else {
+                continue;
+            };
+            let posting_len = u32::from_le_bytes(posting_len_bytes) as usize;
+            let blob = self.snap.postings_blob_bytes();
+            let Some(bytes) = blob.get(posting_off..posting_off + posting_len) else {
+                continue;
+            };
+            let mut cur = Cursor::new(bytes);
+            if let Ok(bm) = roaring::RoaringBitmap::deserialize_from(&mut cur) {
+                let treemap: RoaringTreemap = bm.iter().map(|v| v as u64).collect();
+                callback(tri, &treemap);
+            }
+        }
+    }
+
+    pub fn live_meta_count(&self) -> u64 {
+        (self.file_count_estimate() as u64).saturating_sub(self.tombstones().len())
+    }
 }
 
 impl IndexLayer for MmapIndex {
@@ -731,7 +829,7 @@ mod tests {
         let p = root.join("alpha_test.txt");
         std::fs::write(&p, b"a").unwrap();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: p.clone(),
             size: 1,
             mtime: None,
@@ -755,7 +853,7 @@ mod tests {
 
         // 预期：触发 lookup_docid_by_filekey 的 fallback 路径，并返回正确 meta。
         let meta = mmap_idx
-            .get_meta_by_key(FileKey { dev: 1, ino: 1 })
+            .get_meta_by_key(FileKey { dev: 1, ino: 1, generation: 0 })
             .expect("get_meta_by_key");
         assert!(meta.path.to_string_lossy().contains("alpha_test"));
     }
@@ -821,7 +919,7 @@ mod tests {
         // 构建索引：两个 doc，docid 依插入顺序为 0/1。
         let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: p_dir_hit.clone(),
             size: 1,
             mtime: None,
@@ -829,7 +927,7 @@ mod tests {
             atime: None,
         });
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 2 },
+            file_key: FileKey { dev: 1, ino: 2, generation: 0 },
             path: p_base_hit.clone(),
             size: 1,
             mtime: None,
@@ -841,8 +939,8 @@ mod tests {
         let mut segs = idx.export_segments_v6();
         let (tri_table, postings_blob) =
             build_basename_only_trigram_segments(&[(0, &p_dir_hit), (1, &p_base_hit)]);
-        segs.trigram_table_bytes = tri_table;
-        segs.postings_blob_bytes = postings_blob;
+        segs.trigram_table_bytes = std::sync::Arc::new(tri_table);
+        segs.postings_blob_bytes = std::sync::Arc::new(postings_blob);
 
         let store = SnapshotStore::new(root.join("index.db"));
         store.write_atomic_v6(&segs).await.unwrap();
@@ -880,7 +978,7 @@ mod tests {
             let path = root.join(name);
             std::fs::write(&path, b"x").unwrap();
             idx.upsert(FileMeta {
-                file_key: FileKey { dev: 1, ino },
+                file_key: FileKey { dev: 1, ino, generation: 0 },
                 path,
                 size: 1,
                 mtime: None,

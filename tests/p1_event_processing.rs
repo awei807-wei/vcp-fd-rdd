@@ -62,7 +62,7 @@ fn rename_event_updates_index() {
     use fd_rdd::core::{FileKey, FileMeta};
     let l2 = index.l2.load_full();
     l2.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 100 },
+        file_key: FileKey { dev: 1, ino: 100, generation: 0 },
         path: old_path.clone(),
         size: 42,
         mtime: None,

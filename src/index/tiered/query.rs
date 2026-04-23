@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::core::{FileKey, FileMeta};
+use crate::core::{EventType, FileKey, FileMeta};
 use crate::index::IndexLayer;
 use crate::query::dsl::compile_query;
 use crate::query::matcher::create_matcher;
@@ -41,9 +41,50 @@ impl TieredIndex {
             }
         };
 
-        let results = self.execute_query_plan(&plan, limit);
+        let mut results = self.execute_query_plan(&plan, limit);
         if !results.is_empty() {
             tracing::debug!("Query hit: {} results", results.len());
+            for meta in results.iter().take(10) {
+                self.l1.insert(meta.clone());
+            }
+            return results;
+        }
+
+        // 搜索 pending_events 中尚未被应用到 L2 的事件
+        let pending = self.pending_events.lock();
+        for ev in pending.iter() {
+            let path = match &ev.event_type {
+                EventType::Create | EventType::Modify | EventType::Rename { .. } => ev.best_path(),
+                EventType::Delete => continue,
+            };
+            let Some(path) = path else { continue };
+            let path = super::normalize_path(path);
+            let path_str = path.to_string_lossy();
+
+            let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
+            if !matches_anchor {
+                continue;
+            }
+
+            let meta = FileMeta {
+                file_key: FileKey { dev: 0, ino: 0, generation: 0 },
+                path: path.to_path_buf(),
+                size: 0,
+                mtime: None,
+                ctime: None,
+                atime: None,
+            };
+
+            if plan.matches(&meta) {
+                results.push(meta);
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        if !results.is_empty() {
+            tracing::debug!("Pending events hit: {} results", results.len());
             for meta in results.iter().take(10) {
                 self.l1.insert(meta.clone());
             }
@@ -57,7 +98,10 @@ impl TieredIndex {
     fn execute_query_plan(&self, plan: &QueryPlan, limit: usize) -> Vec<FileMeta> {
         let l2 = self.l2.load_full();
         let layers = self.disk_layers.read().clone();
-        let overlay_deleted = { self.overlay_state.lock().deleted_paths.clone() };
+        let (overlay_deleted, overlay_upserted) = {
+            let ov = self.overlay_state.lock();
+            (ov.deleted_paths.clone(), ov.upserted_paths.clone())
+        };
         let mut blocked_paths = PathArenaSet::default();
         let mut deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
         let mut seen: std::collections::HashSet<FileKey> =
@@ -91,6 +135,48 @@ impl TieredIndex {
                 return results;
             }
             deleted_sources.push(layer.deleted_paths.clone());
+        }
+
+        // Supplement results from overlay upserted paths (e.g., during rebuild)
+        if results.len() < limit {
+            overlay_upserted.for_each_bytes(|bytes| {
+                if results.len() >= limit {
+                    return;
+                }
+                let path = super::pathbuf_from_bytes(bytes);
+                let path = super::normalize_path(&path);
+                let path_str = path.to_string_lossy();
+                let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
+                if !matches_anchor {
+                    return;
+                }
+                let meta = match std::fs::metadata(&path) {
+                    Ok(m) => {
+                        let file_key = match FileKey::from_path_and_metadata(&path, &m) {
+                            Some(fk) => fk,
+                            None => return,
+                        };
+                        if !seen.insert(file_key) {
+                            return;
+                        }
+                        FileMeta {
+                            file_key,
+                            path: path.clone(),
+                            size: m.len(),
+                            mtime: m.modified().ok(),
+                            ctime: m.created().ok(),
+                            atime: m.accessed().ok(),
+                        }
+                    }
+                    Err(_) => {
+                        // File may have been deleted after upsert; skip.
+                        return;
+                    }
+                };
+                if plan.matches(&meta) {
+                    results.push(meta);
+                }
+            });
         }
 
         results

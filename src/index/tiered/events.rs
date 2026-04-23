@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLockReadGuard;
 
-use crate::core::{EventRecord, EventType, FileMeta};
+use crate::core::{EventRecord, EventType, FileIdentifier, FileMeta};
 use crate::index::l2_partition::PersistentIndex;
 
 use super::arena::PathArenaSet;
@@ -29,7 +29,11 @@ pub(super) struct OverlayState {
 impl TieredIndex {
     /// 批量应用事件到索引
     pub fn apply_events(&self, events: &[EventRecord]) {
-        self.apply_events_inner(events, true);
+        let mut normalized: Vec<EventRecord> = events.to_vec();
+        for ev in &mut normalized {
+            Self::normalize_event_paths(ev);
+        }
+        self.apply_events_inner(&normalized, true);
     }
 
     /// 批量应用事件到索引（drain 版本）：消费 `Vec<EventRecord>`，用于减少 PathBuf 克隆带来的非索引 PD 高水位。
@@ -38,6 +42,9 @@ impl TieredIndex {
     /// - 仅用于"事件生产者本就不需要保留 EventRecord"的路径（EventPipeline / fast-sync）。
     /// - 内部会清空 `events`，但保留 capacity 以便复用。
     pub fn apply_events_drain(&self, events: &mut Vec<EventRecord>) {
+        for ev in events.iter_mut() {
+            Self::normalize_event_paths(ev);
+        }
         self.apply_events_inner_drain(events, true);
     }
 
@@ -258,6 +265,21 @@ impl TieredIndex {
         self.note_pending_flush_batch(events);
         self.invalidate_l1_for_events(events);
 
+        // 将非 Delete 事件加入 pending_events，使 debounce 期间的新文件可被查询到。
+        {
+            let mut pending = self.pending_events.lock();
+            for ev in events {
+                match &ev.event_type {
+                    EventType::Delete => {}
+                    _ => {
+                        if pending.len() < 4096 {
+                            pending.push(ev.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         Some(ApplyBatchState {
             _gate: gate,
             l2,
@@ -266,19 +288,64 @@ impl TieredIndex {
         })
     }
 
+    fn normalize_event_paths(ev: &mut EventRecord) {
+        use super::normalize_path;
+        if let Some(ref mut p) = ev.path_hint {
+            *p = normalize_path(p);
+        }
+        if let FileIdentifier::Path(ref mut p) = ev.id {
+            *p = normalize_path(p);
+        }
+        if let EventType::Rename { ref mut from, ref mut from_path_hint } = &mut ev.event_type {
+            if let FileIdentifier::Path(ref mut p) = from {
+                *p = normalize_path(p);
+            }
+            if let Some(ref mut p) = from_path_hint {
+                *p = normalize_path(p);
+            }
+        }
+    }
+
     pub(super) fn apply_events_inner(&self, events: &[EventRecord], log_to_wal: bool) {
         let Some(batch) = self.begin_apply_batch(events, log_to_wal) else {
             return;
         };
+        self.remove_from_pending(events);
         batch.l2.apply_events(events);
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
+
+        // Deep sync for directory renames
+        for ev in events {
+            if let EventType::Rename { .. } = &ev.event_type {
+                if let Some(path) = ev.best_path() {
+                    if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
+                        let _ = self.scan_dirs_immediate_deep(&[path.to_path_buf()]);
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn apply_events_inner_drain(&self, events: &mut Vec<EventRecord>, log_to_wal: bool) {
+        // Capture rename dir paths before drain
+        let rename_dirs: Vec<std::path::PathBuf> = events
+            .iter()
+            .filter_map(|ev| {
+                if let EventType::Rename { .. } = &ev.event_type {
+                    ev.best_path().filter(|p| {
+                        std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
+                    }).map(|p| p.to_path_buf())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal) else {
             return;
         };
+        self.remove_from_pending(events.as_slice());
         if batch.rebuild_in_progress {
             batch.l2.apply_events(events.as_slice());
             events.clear();
@@ -287,6 +354,32 @@ impl TieredIndex {
         }
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
+
+        for dir in rename_dirs {
+            let _ = self.scan_dirs_immediate_deep(&[dir]);
+        }
+    }
+
+    fn remove_from_pending(&self, events: &[EventRecord]) {
+        let mut pending = self.pending_events.lock();
+        for ev in events {
+            match &ev.event_type {
+                EventType::Rename { from, from_path_hint } => {
+                    let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
+                    if let Some(from_path) = from_best {
+                        pending.retain(|p| p.best_path().map(|bp| bp != from_path).unwrap_or(true));
+                    }
+                    if let Some(path) = ev.best_path() {
+                        pending.retain(|p| p.best_path().map(|bp| bp != path).unwrap_or(true));
+                    }
+                }
+                _ => {
+                    if let Some(path) = ev.best_path() {
+                        pending.retain(|p| p.best_path().map(|bp| bp != path).unwrap_or(true));
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn apply_upserted_metas_inner(
@@ -307,5 +400,6 @@ impl TieredIndex {
         }
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
+        self.remove_from_pending(events);
     }
 }

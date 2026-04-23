@@ -26,6 +26,7 @@ fn build_index_with_files(root: &PathBuf, files: &[(&str, u64)]) -> Arc<TieredIn
             file_key: FileKey {
                 dev: 1,
                 ino: (i + 1) as u64,
+                generation: 0,
             },
             path,
             size: *size,
@@ -103,7 +104,7 @@ fn large_result_set_query_does_not_oom() {
     for i in 0..10_000u64 {
         let path = root.join(format!("data_{:05}.txt", i));
         l2.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: i + 1 },
+            file_key: FileKey { dev: 1, ino: i + 1, generation: 0 },
             path,
             size: 100,
             mtime: None,

@@ -27,6 +27,7 @@ impl FileIdentifier {
             FileIdentifier::Fid { dev, ino } => Some(FileKey {
                 dev: *dev,
                 ino: *ino,
+                generation: 0,
             }),
         }
     }

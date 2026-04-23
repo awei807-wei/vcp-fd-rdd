@@ -335,7 +335,7 @@ async fn lsm_layering_delete_blocks_base() {
     // base: alpha
     let base_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
     base_idx.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 1 },
+        file_key: FileKey { dev: 1, ino: 1, generation: 0 },
         path: alpha.clone(),
         size: 1,
         mtime: None,
@@ -351,7 +351,7 @@ async fn lsm_layering_delete_blocks_base() {
     // delta seg: gamma + delete(alpha)
     let delta_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
     delta_idx.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 2 },
+        file_key: FileKey { dev: 1, ino: 2, generation: 0 },
         path: gamma.clone(),
         size: 1,
         mtime: None,
@@ -391,7 +391,7 @@ async fn lsm_delete_then_recreate_prefers_newest() {
     // base: alpha
     let base_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
     base_idx.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 1 },
+        file_key: FileKey { dev: 1, ino: 1, generation: 0 },
         path: alpha.clone(),
         size: 1,
         mtime: None,
@@ -415,7 +415,7 @@ async fn lsm_delete_then_recreate_prefers_newest() {
     // delta2: recreate(alpha)
     let d2 = PersistentIndex::new_with_roots(vec![root.clone()]);
     d2.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 42 },
+        file_key: FileKey { dev: 1, ino: 42, generation: 0 },
         path: alpha.clone(),
         size: 2,
         mtime: None,
@@ -452,7 +452,7 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
     // seg1 (older): (dev=1, ino=100, path=/a.txt)
     let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
     seg1.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 100 },
+        file_key: FileKey { dev: 1, ino: 100, generation: 0 },
         path: a.clone(),
         size: 1,
         mtime: None,
@@ -467,7 +467,7 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
     // seg2 (newer): (dev=1, ino=200, path=/a.txt) -- no delete sidecar
     let seg2 = PersistentIndex::new_with_roots(vec![root.clone()]);
     seg2.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 200 },
+        file_key: FileKey { dev: 1, ino: 200, generation: 0 },
         path: a.clone(),
         size: 2,
         mtime: None,
@@ -506,7 +506,7 @@ async fn query_rename_from_tombstone_blocks_old_path() {
     // seg1 (older): /old.txt
     let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
     seg1.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 10 },
+        file_key: FileKey { dev: 1, ino: 10, generation: 0 },
         path: old.clone(),
         size: 1,
         mtime: None,
@@ -521,7 +521,7 @@ async fn query_rename_from_tombstone_blocks_old_path() {
     // seg2 (newer): /new.txt + tombstone(/old.txt)
     let seg2 = PersistentIndex::new_with_roots(vec![root.clone()]);
     seg2.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 11 },
+        file_key: FileKey { dev: 1, ino: 11, generation: 0 },
         path: newp.clone(),
         size: 1,
         mtime: None,
@@ -564,7 +564,7 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
 
     let store = SnapshotStore::new(root.join("index.db"));
 
-    let k = FileKey { dev: 1, ino: 999 };
+    let k = FileKey { dev: 1, ino: 999, generation: 0 };
 
     // seg1 (older): k -> p1
     let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
@@ -645,7 +645,7 @@ async fn lsm_offline_dir_mtime_change_skips_disk_segments() {
     // base: alpha（写入 LSM，生成 last_build_ns）
     let base_idx = PersistentIndex::new_with_roots(vec![content_root.clone()]);
     base_idx.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 1 },
+        file_key: FileKey { dev: 1, ino: 1, generation: 0 },
         path: alpha.clone(),
         size: 1,
         mtime: None,
@@ -686,7 +686,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
     let mk_seg = |ino: u64, name: &str| {
         let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino },
+            file_key: FileKey { dev: 1, ino, generation: 0 },
             path: root.join(name),
             size: ino,
             mtime: None,

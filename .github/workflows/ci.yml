@@ -3,7 +3,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, tests]
   pull_request:
 
 env:
@@ -190,3 +190,47 @@ jobs:
             tail -40 /tmp/fd-rdd-daemon.log
           fi
           exit $SMOKE_EXIT
+
+  compaction-correctness:
+    name: Fast compaction correctness
+    runs-on: ubuntu-latest
+    env:
+      FAST_COMPACTION: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test p1_compaction_fast
+        run: cargo test --test p1_compaction_fast -- --test-threads=1
+
+  streaming-export-check:
+    name: Streaming export byte-identical
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test p1_streaming_export
+        run: cargo test --test p1_streaming_export -- --test-threads=1
+
+  visibility-latency:
+    name: Visibility latency placeholder
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test p1_visibility_latency
+        run: cargo test --test p1_visibility_latency -- --test-threads=1

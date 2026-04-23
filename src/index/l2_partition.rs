@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(feature = "rkyv")]
 use crate::core::FileKeyEntry;
@@ -100,14 +101,33 @@ fn for_each_short_component(path: &Path, mut f: impl FnMut(&[u8])) {
 }
 
 /// Path blob arena：所有路径的连续字节存储
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct PathArena {
-    pub data: Vec<u8>,
+    pub data: Arc<Vec<u8>>,
+}
+
+impl serde::Serialize for PathArena {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.data.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PathArena {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let data = Vec::<u8>::deserialize(deserializer)?;
+        Ok(PathArena { data: Arc::new(data) })
+    }
 }
 
 impl PathArena {
     pub fn new() -> Self {
-        Self { data: Vec::new() }
+        Self { data: Arc::new(Vec::new()) }
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Option<(u32, u16)> {
@@ -122,8 +142,9 @@ impl PathArena {
                 return None;
             }
         };
-        let off: u32 = self.data.len().try_into().ok()?;
-        self.data.extend_from_slice(bytes);
+        let data = Arc::make_mut(&mut self.data);
+        let off: u32 = data.len().try_into().ok()?;
+        data.extend_from_slice(bytes);
         Some((off, len))
     }
 
@@ -248,13 +269,13 @@ impl IndexSnapshotV5 {
 /// - 这里仅导出段的 raw bytes；物理布局/校验与原子替换由 storage 层负责
 #[derive(Clone, Debug)]
 pub struct V6Segments {
-    pub roots_bytes: Vec<u8>,
-    pub path_arena_bytes: Vec<u8>,
-    pub metas_bytes: Vec<u8>,
-    pub trigram_table_bytes: Vec<u8>,
-    pub postings_blob_bytes: Vec<u8>,
-    pub tombstones_bytes: Vec<u8>,
-    pub filekey_map_bytes: Vec<u8>,
+    pub roots_bytes: Arc<Vec<u8>>,
+    pub path_arena_bytes: Arc<Vec<u8>>,
+    pub metas_bytes: Arc<Vec<u8>>,
+    pub trigram_table_bytes: Arc<Vec<u8>>,
+    pub postings_blob_bytes: Arc<Vec<u8>>,
+    pub tombstones_bytes: Arc<Vec<u8>>,
+    pub filekey_map_bytes: Arc<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -524,7 +545,8 @@ impl PersistentIndex {
         self.upsert_inner(meta, true);
     }
 
-    fn upsert_inner(&self, meta: FileMeta, force_path_update: bool) {
+    fn upsert_inner(&self, mut meta: FileMeta, force_path_update: bool) {
+        meta.path = crate::index::tiered::normalize_path(&meta.path);
         let fkey = meta.file_key;
         let (new_root_id, new_rel_bytes) = self.split_root_relative_bytes(meta.path.as_path());
 
@@ -665,15 +687,15 @@ impl PersistentIndex {
                 .and_then(|m| self.absolute_path_buf(m.root_id, m.path_off, m.path_len))
         };
 
+        // Atomicity: mark tombstone first so queries see deleted before trigrams are removed.
+        self.filekey_to_docid.write().remove(&file_key);
+        self.tombstones.write().insert(docid);
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
+
         if let Some(p) = path {
             self.remove_trigrams(docid, &p);
             self.remove_path_hash(docid, &p);
         }
-
-        // 保留 doc 槽位，但移除 filekey 映射，避免 inode 复用/重新扫描复用 docid
-        self.filekey_to_docid.write().remove(&file_key);
-        self.tombstones.write().insert(docid);
-        self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// 按路径删除
@@ -773,7 +795,7 @@ impl PersistentIndex {
         }
     }
 
-    /// 遍历所有”活跃”文档（跳过 tombstone），用于 Flush/Compaction/重建等离线流程。
+    /// 遍历所有"活跃"文档（跳过 tombstone），用于 Flush/Compaction/重建等离线流程。
     pub fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
         let metas = self.metas.read();
         let arena = self.arena.read();
@@ -796,6 +818,44 @@ impl PersistentIndex {
                 ctime: None,
                 atime: None,
             });
+        }
+    }
+
+    /// Iterate live metas whose path's parent is in `dirs`.
+    pub fn for_each_live_meta_in_dirs<F>(
+        &self,
+        dirs: &std::collections::HashSet<PathBuf>,
+        mut callback: F,
+    )
+    where
+        F: FnMut(FileMeta),
+    {
+        let metas = self.metas.read();
+        let arena = self.arena.read();
+        let tombstones = self.tombstones.read();
+        for (i, m) in metas.iter().enumerate() {
+            let docid = i as DocId;
+            if tombstones.contains(docid) {
+                continue;
+            }
+            let rel = match arena.get_bytes(m.path_off, m.path_len) {
+                Some(r) => r,
+                None => continue,
+            };
+            let abs = compose_abs_path_bytes(root_bytes_for_id(&self.roots_bytes, m.root_id), rel);
+            let path = pathbuf_from_encoded_vec(abs.to_vec());
+            if let Some(parent) = path.parent() {
+                if dirs.contains(parent) {
+                    callback(FileMeta {
+                        file_key: m.file_key,
+                        path,
+                        size: m.size,
+                        mtime: m.mtime,
+                        ctime: None,
+                        atime: None,
+                    });
+                }
+            }
         }
     }
 
@@ -884,12 +944,12 @@ impl PersistentIndex {
                     self.handle_create_or_modify(Some(Cow::Owned(path)), None)
                 }
                 (None, FileIdentifier::Fid { dev, ino }) => {
-                    self.handle_create_or_modify(None, Some(FileKey { dev, ino }))
+                    self.handle_create_or_modify(None, Some(FileKey { dev, ino, generation: 0 }))
                 }
             },
             EventType::Delete => match (path_hint, id) {
                 (_, FileIdentifier::Fid { dev, ino }) => {
-                    self.handle_delete(None, Some(FileKey { dev, ino }));
+                    self.handle_delete(None, Some(FileKey { dev, ino, generation: 0 }));
                 }
                 (Some(path), _) => {
                     self.handle_delete(Some(path.as_path()), None);
@@ -967,9 +1027,11 @@ impl PersistentIndex {
         from_fid: Option<FileKey>,
         to_path: Option<Cow<'_, Path>>,
     ) {
+        let to_path = to_path.map(|p| Cow::Owned(crate::index::tiered::normalize_path(p.as_ref())));
+        let from_best_path = from_best_path.map(|p| crate::index::tiered::normalize_path(p));
         let to_meta = to_path.as_deref().and_then(Self::resolve_path_meta);
         let fallback_meta = if to_meta.is_none() {
-            from_best_path.and_then(Self::resolve_path_meta)
+            from_best_path.as_deref().and_then(Self::resolve_path_meta)
         } else {
             None
         };
@@ -977,7 +1039,7 @@ impl PersistentIndex {
         let docid_opt = if let Some(fk) = from_fid {
             self.filekey_to_docid.read().get(&fk).copied()
         } else {
-            from_best_path.and_then(|p| self.lookup_docid_by_path(p))
+            from_best_path.as_deref().and_then(|p| self.lookup_docid_by_path(p))
         };
 
         if let Some(docid) = docid_opt {
@@ -990,7 +1052,7 @@ impl PersistentIndex {
                 if let Some(old_path) = self.absolute_path_buf(m.root_id, m.path_off, m.path_len) {
                     self.remove_trigrams(docid, &old_path);
                     self.remove_path_hash(docid, &old_path);
-                } else if let Some(path) = from_best_path {
+                } else if let Some(ref path) = from_best_path {
                     self.remove_trigrams(docid, path);
                     self.remove_path_hash(docid, path);
                 }
@@ -1023,7 +1085,7 @@ impl PersistentIndex {
             return;
         }
 
-        self.handle_delete(from_best_path, from_fid);
+        self.handle_delete(from_best_path.as_deref(), from_fid);
         if let (Some(to_path), Some(meta)) = (to_path, to_meta) {
             self.upsert(FileMeta {
                 file_key: meta.file_key,
@@ -1061,7 +1123,6 @@ impl PersistentIndex {
     }
 
     pub fn export_segments_v6(&self) -> V6Segments {
-        use std::io::Write;
 
         // roots 段：u16 count + (u16 len + bytes)...
         let mut roots_bytes = Vec::new();
@@ -1074,7 +1135,7 @@ impl PersistentIndex {
         }
 
         // PathArena 段：raw bytes（root-relative）
-        let path_arena_bytes = self.arena.read().data.clone();
+        let path_arena_bytes = Arc::clone(&self.arena.read().data);
 
         // Metas 段：按 DocId 顺序顺排，固定记录大小（little-endian）
         //
@@ -1122,12 +1183,10 @@ impl PersistentIndex {
         let mut entries: Vec<([u8; 3], u32, u32)> = Vec::with_capacity(tri_idx.len());
         let mut postings_blob_bytes = Vec::new();
         for (tri, posting) in tri_idx.iter() {
-            let mut buf = Vec::new();
-            let posting_bitmap: roaring::RoaringBitmap = posting.iter().map(|v| v as u32).collect();
-            posting_bitmap.serialize_into(&mut buf).expect("write to vec");
             let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
-            let len: u32 = buf.len().try_into().unwrap_or(u32::MAX);
-            postings_blob_bytes.write_all(&buf).expect("write to vec");
+            let posting_bitmap: roaring::RoaringBitmap = posting.iter().map(|v| v as u32).collect();
+            posting_bitmap.serialize_into(&mut postings_blob_bytes).expect("write to vec");
+            let len: u32 = postings_blob_bytes.len().saturating_sub(off as usize).try_into().unwrap_or(u32::MAX);
             entries.push((*tri, off, len));
         }
 
@@ -1136,13 +1195,11 @@ impl PersistentIndex {
         // - posting 置空即可（只用 key 存在性探测）。
         const TRIGRAM_SENTINEL: [u8; 3] = [0, 0, 0];
         if !tri_idx.contains_key(&TRIGRAM_SENTINEL) {
-            let mut buf = Vec::new();
-            roaring::RoaringBitmap::new()
-                .serialize_into(&mut buf)
-                .expect("write to vec");
             let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
-            let len: u32 = buf.len().try_into().unwrap_or(u32::MAX);
-            postings_blob_bytes.write_all(&buf).expect("write to vec");
+            roaring::RoaringBitmap::new()
+                .serialize_into(&mut postings_blob_bytes)
+                .expect("write to vec");
+            let len: u32 = postings_blob_bytes.len().saturating_sub(off as usize).try_into().unwrap_or(u32::MAX);
             entries.push((TRIGRAM_SENTINEL, off, len));
         }
         entries.sort_by_key(|(tri, _, _)| *tri);
@@ -1162,9 +1219,10 @@ impl PersistentIndex {
         //   version u16  = 1
         //   flags u16    = 0 legacy table | 1 rkyv bytes
         //
-        // legacy payload：固定记录 20B（LE）：
+        // legacy payload：固定记录 24B（LE）：
         //   dev u64
         //   ino u64
+        //   generation u32
         //   docid u32
         //
         // 注意：来源为 filekey_to_docid（天然排除 tombstone）。
@@ -1172,7 +1230,7 @@ impl PersistentIndex {
             let m = self.filekey_to_docid.read();
             m.iter().map(|(k, v)| (*k, *v)).collect()
         };
-        pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino));
+        pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino, k.generation));
         const FKM_MAGIC: [u8; 4] = *b"FKM\0";
         const FKM_VERSION: u16 = 1;
         #[cfg(not(feature = "rkyv"))]
@@ -1200,23 +1258,167 @@ impl PersistentIndex {
         {
             // 默认：仍写 legacy 定长表（极致性能），但带 header 便于未来平滑切换。
             filekey_map_bytes.extend_from_slice(&FKM_FLAG_LEGACY.to_le_bytes());
-            filekey_map_bytes.reserve(pairs.len() * 20);
+            filekey_map_bytes.reserve(pairs.len() * 24);
             for (k, docid) in pairs {
                 filekey_map_bytes.extend_from_slice(&k.dev.to_le_bytes());
                 filekey_map_bytes.extend_from_slice(&k.ino.to_le_bytes());
+                filekey_map_bytes.extend_from_slice(&k.generation.to_le_bytes());
                 filekey_map_bytes.extend_from_slice(&(docid as u32).to_le_bytes());
             }
         }
 
         V6Segments {
-            roots_bytes,
+            roots_bytes: Arc::new(roots_bytes),
             path_arena_bytes,
-            metas_bytes,
-            trigram_table_bytes,
-            postings_blob_bytes,
-            tombstones_bytes,
-            filekey_map_bytes,
+            metas_bytes: Arc::new(metas_bytes),
+            trigram_table_bytes: Arc::new(trigram_table_bytes),
+            postings_blob_bytes: Arc::new(postings_blob_bytes),
+            tombstones_bytes: Arc::new(tombstones_bytes),
+            filekey_map_bytes: Arc::new(filekey_map_bytes),
         }
+    }
+
+    fn write_segment(writer: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+        writer.write_all(&(bytes.len() as u64).to_le_bytes())?;
+        writer.write_all(bytes)?;
+        Ok(())
+    }
+
+    /// 将 v6 段按固定顺序流式写入 writer，每段带 u64 LE 长度前缀。
+    /// 顺序：roots → path_arena → metas → tombstones → trigram_table → postings_blob → filekey_map。
+    pub fn export_segments_v6_to_writer(&self, writer: &mut impl std::io::Write) -> std::io::Result<()> {
+        // roots 段：u16 count + (u16 len + bytes)...
+        let mut roots_bytes = Vec::new();
+        let roots_count: u16 = self.roots_bytes.len().try_into().unwrap_or(u16::MAX);
+        roots_bytes.extend_from_slice(&roots_count.to_le_bytes());
+        for rb in self.roots_bytes.iter().take(roots_count as usize) {
+            let len: u16 = rb.len().try_into().unwrap_or(u16::MAX);
+            roots_bytes.extend_from_slice(&len.to_le_bytes());
+            roots_bytes.extend_from_slice(&rb[..len as usize]);
+        }
+        Self::write_segment(writer, &roots_bytes)?;
+
+        // PathArena 段：raw bytes（root-relative）
+        let arena_guard = self.arena.read();
+        let path_arena_bytes = arena_guard.data.as_ref();
+        Self::write_segment(writer, path_arena_bytes)?;
+
+        // Metas 段：按 DocId 顺序顺排，固定记录大小（little-endian）
+        let metas = self.metas.read();
+        let mut metas_bytes = Vec::with_capacity(metas.len() * 40);
+        for m in metas.iter() {
+            metas_bytes.extend_from_slice(&m.file_key.dev.to_le_bytes());
+            metas_bytes.extend_from_slice(&m.file_key.ino.to_le_bytes());
+            metas_bytes.extend_from_slice(&m.root_id.to_le_bytes());
+            metas_bytes.extend_from_slice(&m.path_off.to_le_bytes());
+            metas_bytes.extend_from_slice(&m.path_len.to_le_bytes());
+            metas_bytes.extend_from_slice(&m.size.to_le_bytes());
+            let ns: i64 = m
+                .mtime
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|d| i64::try_from(d.as_nanos()).ok())
+                .unwrap_or(-1);
+            metas_bytes.extend_from_slice(&ns.to_le_bytes());
+        }
+        drop(metas);
+        Self::write_segment(writer, &metas_bytes)?;
+
+        // Tombstones 段：RoaringBitmap serialized bytes
+        let tombstones = self.tombstones.read();
+        let mut tombstones_bytes = Vec::new();
+        let tomb_bitmap: roaring::RoaringBitmap = tombstones.iter().map(|v| v as u32).collect();
+        tomb_bitmap
+            .serialize_into(&mut tombstones_bytes)
+            .expect("write to vec");
+        drop(tombstones);
+        Self::write_segment(writer, &tombstones_bytes)?;
+
+        // TrigramTable + PostingsBlob 段
+        let tri_idx = self.trigram_index.read();
+        let mut entries: Vec<([u8; 3], u32, u32)> = Vec::with_capacity(tri_idx.len());
+        let mut postings_blob_bytes = Vec::new();
+        for (tri, posting) in tri_idx.iter() {
+            let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
+            let posting_bitmap: roaring::RoaringBitmap = posting.iter().map(|v| v as u32).collect();
+            posting_bitmap.serialize_into(&mut postings_blob_bytes).expect("write to vec");
+            let len: u32 = postings_blob_bytes.len().saturating_sub(off as usize).try_into().unwrap_or(u32::MAX);
+            entries.push((*tri, off, len));
+        }
+
+        const TRIGRAM_SENTINEL: [u8; 3] = [0, 0, 0];
+        if !tri_idx.contains_key(&TRIGRAM_SENTINEL) {
+            let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
+            roaring::RoaringBitmap::new()
+                .serialize_into(&mut postings_blob_bytes)
+                .expect("write to vec");
+            let len: u32 = postings_blob_bytes.len().saturating_sub(off as usize).try_into().unwrap_or(u32::MAX);
+            entries.push((TRIGRAM_SENTINEL, off, len));
+        }
+        drop(tri_idx);
+        entries.sort_by_key(|(tri, _, _)| *tri);
+
+        let mut trigram_table_bytes = Vec::with_capacity(entries.len() * 12);
+        for (tri, off, len) in entries {
+            trigram_table_bytes.extend_from_slice(&tri);
+            trigram_table_bytes.push(0); // pad
+            trigram_table_bytes.extend_from_slice(&off.to_le_bytes());
+            trigram_table_bytes.extend_from_slice(&len.to_le_bytes());
+        }
+        Self::write_segment(writer, &trigram_table_bytes)?;
+        Self::write_segment(writer, &postings_blob_bytes)?;
+
+        // FileKeyMap 段
+        let mut pairs: Vec<(FileKey, DocId)> = {
+            let m = self.filekey_to_docid.read();
+            m.iter().map(|(k, v)| (*k, *v)).collect()
+        };
+        pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino, k.generation));
+        const FKM_MAGIC: [u8; 4] = *b"FKM\0";
+        const FKM_VERSION: u16 = 1;
+        #[cfg(not(feature = "rkyv"))]
+        const FKM_FLAG_LEGACY: u16 = 0;
+        #[cfg(feature = "rkyv")]
+        const FKM_FLAG_RKYV: u16 = 1;
+
+        let mut filekey_map_bytes = Vec::new();
+        filekey_map_bytes.extend_from_slice(&FKM_MAGIC);
+        filekey_map_bytes.extend_from_slice(&FKM_VERSION.to_le_bytes());
+
+        #[cfg(feature = "rkyv")]
+        {
+            filekey_map_bytes.extend_from_slice(&FKM_FLAG_RKYV.to_le_bytes());
+            let entries: Vec<FileKeyEntry> = pairs
+                .into_iter()
+                .map(|(key, doc_id)| FileKeyEntry { key, doc_id })
+                .collect();
+            let bytes = rkyv::to_bytes::<_, 1024>(&entries).expect("rkyv to_bytes");
+            filekey_map_bytes.extend_from_slice(bytes.as_ref());
+        }
+
+        #[cfg(not(feature = "rkyv"))]
+        {
+            filekey_map_bytes.extend_from_slice(&FKM_FLAG_LEGACY.to_le_bytes());
+            filekey_map_bytes.reserve(pairs.len() * 24);
+            for (k, docid) in pairs {
+                filekey_map_bytes.extend_from_slice(&k.dev.to_le_bytes());
+                filekey_map_bytes.extend_from_slice(&k.ino.to_le_bytes());
+                filekey_map_bytes.extend_from_slice(&k.generation.to_le_bytes());
+                filekey_map_bytes.extend_from_slice(&(docid as u32).to_le_bytes());
+            }
+        }
+        Self::write_segment(writer, &filekey_map_bytes)?;
+
+        Ok(())
+    }
+
+    /// 导出 v6 段（物理 compaction 版）并流式写入 writer。
+    pub fn export_segments_v6_compacted_to_writer(
+        &self,
+        writer: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
+        let compact = PersistentIndex::new_with_roots(self.roots.clone());
+        self.for_each_live_meta(|m| compact.upsert_rename(m));
+        compact.export_segments_v6_to_writer(writer)
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -1353,7 +1555,7 @@ impl PersistentIndex {
         self.path_hash_to_id.write().clear();
         self.filekey_to_docid.write().clear();
         self.metas.write().clear();
-        self.arena.write().data.clear();
+        Arc::make_mut(&mut self.arena.write().data).clear();
         self.tombstones.write().clear();
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -1643,7 +1845,13 @@ fn path_hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 fn normalize_roots_with_fallback(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    // 去重 + 排序，保证 root_id 的解释在“同一组 roots”下稳定。
+    use unicode_normalization::UnicodeNormalization;
+    for r in &mut roots {
+        let s = r.to_string_lossy();
+        *r = PathBuf::from(s.nfc().collect::<String>());
+    }
+
+    // 去重 + 排序，保证 root_id 的解释在"同一组 roots"下稳定。
     roots.sort_by(|a, b| {
         a.as_os_str()
             .as_encoded_bytes()
@@ -1660,6 +1868,80 @@ fn normalize_roots_with_fallback(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
+impl PersistentIndex {
+    /// Fast-path bulk fill used by compaction dimension reduction.
+    /// Directly replaces metas, arena, trigram_index, and derived maps.
+    /// Paths are taken from `metas` (full FileMeta with absolute paths).
+    /// `trigrams` contains pre-merged DocId posting lists (DocId matches index in `metas`).
+    pub(crate) fn fill_from_compaction(
+        &self,
+        _roots: Vec<PathBuf>,
+        metas: Vec<FileMeta>,
+        trigrams: std::collections::HashMap<[u8; 3], roaring::RoaringTreemap>,
+    ) {
+        // Reset internal state
+        {
+            *self.metas.write() = Vec::new();
+            *self.arena.write() = PathArena::new();
+            *self.filekey_to_docid.write() = HashMap::new();
+            *self.path_hash_to_id.write() = HashMap::new();
+            *self.trigram_index.write() = HashMap::new();
+            *self.short_component_index.write() = HashMap::new();
+            *self.tombstones.write() = RoaringTreemap::new();
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        let mut new_metas = Vec::with_capacity(metas.len());
+        let mut new_arena = PathArena::new();
+        let mut new_filekey_to_docid = HashMap::with_capacity(metas.len());
+        let mut new_path_hash_to_id = HashMap::with_capacity(metas.len());
+        let mut new_short_component_index = HashMap::new();
+
+        for (docid, meta) in metas.into_iter().enumerate() {
+            let docid = docid as DocId;
+            let (root_id, rel_bytes) = self.split_root_relative_bytes(&meta.path);
+
+            let Some((off, len)) = new_arena.push_bytes(&rel_bytes) else {
+                continue;
+            };
+
+            new_metas.push(CompactMeta {
+                file_key: meta.file_key,
+                root_id,
+                path_off: off,
+                path_len: len,
+                size: meta.size,
+                mtime: meta.mtime,
+            });
+
+            new_filekey_to_docid.insert(meta.file_key, docid);
+
+            let bytes = meta.path.as_os_str().as_encoded_bytes();
+            let h = path_hash_bytes(bytes);
+            new_path_hash_to_id
+                .entry(h)
+                .and_modify(|v: &mut OneOrManyDocId| v.insert(docid))
+                .or_insert(OneOrManyDocId::One(docid));
+
+            for_each_short_component(meta.path.as_path(), |component| {
+                new_short_component_index
+                    .entry(Box::<[u8]>::from(component))
+                    .or_insert_with(RoaringTreemap::new)
+                    .insert(docid);
+            });
+        }
+
+        {
+            *self.metas.write() = new_metas;
+            *self.arena.write() = new_arena;
+            *self.filekey_to_docid.write() = new_filekey_to_docid;
+            *self.path_hash_to_id.write() = new_path_hash_to_id;
+            *self.trigram_index.write() = trigrams;
+            *self.short_component_index.write() = new_short_component_index;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1669,7 +1951,7 @@ mod tests {
     fn roaring_posting_basic_query() {
         let idx = PersistentIndex::new();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: PathBuf::from("/tmp/alpha_test.txt"),
             size: 1,
             mtime: None,
@@ -1677,7 +1959,7 @@ mod tests {
             atime: None,
         });
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 2 },
+            file_key: FileKey { dev: 1, ino: 2, generation: 0 },
             path: PathBuf::from("/tmp/beta_test.txt"),
             size: 1,
             mtime: None,
@@ -1695,7 +1977,7 @@ mod tests {
     fn short_literal_query_uses_short_component_candidates() {
         let idx = PersistentIndex::new();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: PathBuf::from("/tmp/ab"),
             size: 1,
             mtime: None,
@@ -1703,7 +1985,7 @@ mod tests {
             atime: None,
         });
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 2 },
+            file_key: FileKey { dev: 1, ino: 2, generation: 0 },
             path: PathBuf::from("/tmp/cabd.txt"),
             size: 1,
             mtime: None,
@@ -1725,7 +2007,7 @@ mod tests {
         let idx = PersistentIndex::new();
         let path = PathBuf::from(format!("/tmp/{}", "a".repeat(u16::MAX as usize + 1)));
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path,
             size: 1,
             mtime: None,
@@ -1742,7 +2024,7 @@ mod tests {
     fn rename_to_overlong_path_tombstones_old_entry() {
         let idx = PersistentIndex::new();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: PathBuf::from("/tmp/short-name.txt"),
             size: 1,
             mtime: None,
@@ -1752,7 +2034,7 @@ mod tests {
 
         let long_path = PathBuf::from(format!("/tmp/{}", "b".repeat(u16::MAX as usize + 1)));
         idx.upsert_rename(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
             path: long_path,
             size: 2,
             mtime: None,
