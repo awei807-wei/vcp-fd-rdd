@@ -1,7 +1,7 @@
 use std::collections::HashSet;
+use std::ops::BitOrAssign;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::ops::BitOrAssign;
 use std::time::Instant;
 
 use crate::core::{FileKey, FileMeta};
@@ -14,7 +14,7 @@ use super::arena::{deleted_paths_stats, path_arena_set_from_paths};
 use super::disk_layer::DiskLayer;
 use super::pathbuf_from_bytes;
 use super::{
-    COMPACTION_COOLDOWN, COMPACTION_DELTA_THRESHOLD, COMPACTION_MAX_DELTAS_PER_RUN, TieredIndex,
+    TieredIndex, COMPACTION_COOLDOWN, COMPACTION_DELTA_THRESHOLD, COMPACTION_MAX_DELTAS_PER_RUN,
 };
 
 impl TieredIndex {
@@ -60,7 +60,10 @@ impl TieredIndex {
                 }
             }
             let _guard = CompactionInProgressGuard(idx.clone());
-            let use_fast = std::env::var("FAST_COMPACTION").ok().map(|v| v == "1").unwrap_or(false);
+            let use_fast = std::env::var("FAST_COMPACTION")
+                .ok()
+                .map(|v| v == "1")
+                .unwrap_or(false);
             let result = if use_fast {
                 idx.compact_layers_fast(store, layers).await
             } else {
@@ -277,7 +280,7 @@ impl TieredIndex {
                 if !shifted.is_empty() {
                     merged_trigrams
                         .entry(tri)
-                        .or_insert_with(roaring::RoaringTreemap::new)
+                        .or_default()
                         .bitor_assign(&shifted);
                 }
             });

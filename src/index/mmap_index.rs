@@ -28,6 +28,8 @@ const FILEKEY_MAP_REC_SIZE_OLD: usize = 20;
 const FKM_MAGIC: [u8; 4] = *b"FKM\0";
 const FKM_HDR_SIZE: usize = 8;
 const FKM_FLAG_LEGACY: u16 = 0;
+
+type ShortComponentCache = parking_lot::Mutex<Option<Arc<HashMap<Box<[u8]>, RoaringTreemap>>>>;
 const FKM_FLAG_RKYV: u16 = 1;
 
 fn normalize_short_hint(hint: &[u8]) -> Option<Vec<u8>> {
@@ -72,7 +74,7 @@ pub struct MmapIndex {
     tomb_cache: parking_lot::Mutex<Option<RoaringTreemap>>,
     // 兼容旧段：若缺少 mmap 内的 file_key_map 段，则按需构建一次排序 map（以 bytes 形式存储，便于二分查找）。
     filekey_map_cache: parking_lot::Mutex<Option<Arc<Vec<u8>>>>,
-    short_component_cache: parking_lot::Mutex<Option<Arc<HashMap<Box<[u8]>, RoaringTreemap>>>>,
+    short_component_cache: ShortComponentCache,
     #[cfg(feature = "rkyv")]
     validated_rkyv: OnceLock<anyhow::Result<()>>,
 }
@@ -135,7 +137,11 @@ impl MmapIndex {
         };
 
         Some((
-            FileKey { dev, ino, generation: 0 },
+            FileKey {
+                dev,
+                ino,
+                generation: 0,
+            },
             root_id,
             path_off,
             path_len,
@@ -146,16 +152,22 @@ impl MmapIndex {
 
     fn lookup_docid_in_legacy_map(bytes: &[u8], key: FileKey) -> Option<u64> {
         // 优先尝试新格式（24B），若长度不匹配则回退旧格式（20B）
-        if bytes.len() % FILEKEY_MAP_REC_SIZE == 0 {
-            if let Some(r) = Self::lookup_docid_in_legacy_map_with_stride(bytes, key, FILEKEY_MAP_REC_SIZE) {
+        if bytes.len().is_multiple_of(FILEKEY_MAP_REC_SIZE) {
+            if let Some(r) =
+                Self::lookup_docid_in_legacy_map_with_stride(bytes, key, FILEKEY_MAP_REC_SIZE)
+            {
                 return Some(r);
             }
         }
-        if bytes.len() % FILEKEY_MAP_REC_SIZE_OLD == 0 {
+        if bytes.len().is_multiple_of(FILEKEY_MAP_REC_SIZE_OLD) {
             // 旧格式无 generation：用 generation=0 再查一次
             let mut key_fallback = key;
             key_fallback.generation = 0;
-            if let Some(r) = Self::lookup_docid_in_legacy_map_with_stride(bytes, key_fallback, FILEKEY_MAP_REC_SIZE_OLD) {
+            if let Some(r) = Self::lookup_docid_in_legacy_map_with_stride(
+                bytes,
+                key_fallback,
+                FILEKEY_MAP_REC_SIZE_OLD,
+            ) {
                 return Some(r);
             }
         }
@@ -208,7 +220,11 @@ impl MmapIndex {
         if (dev, ino, generation) != (key.dev, key.ino, key.generation) {
             return None;
         }
-        let docid_off = if stride >= FILEKEY_MAP_REC_SIZE { 20 } else { 16 };
+        let docid_off = if stride >= FILEKEY_MAP_REC_SIZE {
+            20
+        } else {
+            16
+        };
         let docid = u32::from_le_bytes(rec[docid_off..docid_off + 4].try_into().ok()?);
         Some(docid as u64)
     }
@@ -464,7 +480,7 @@ impl MmapIndex {
         }
         bitmaps.sort_by_key(|b| b.len());
         let mut iter = bitmaps.into_iter();
-        let mut acc = iter.next().unwrap_or_else(RoaringTreemap::new);
+        let mut acc = iter.next().unwrap_or_default();
         for b in iter {
             acc &= &b;
             if acc.is_empty() {
@@ -499,7 +515,7 @@ impl MmapIndex {
             for_each_short_component(path.as_path(), |component| {
                 cache
                     .entry(Box::<[u8]>::from(component))
-                    .or_insert_with(RoaringTreemap::new)
+                    .or_default()
                     .insert(docid);
             });
         }
@@ -609,9 +625,7 @@ impl MmapIndex {
         }
 
         let arena = self.snap.path_arena_bytes();
-        let Some((file_key, root_id, path_off, path_len, size, mtime)) = self.meta_at(docid) else {
-            return None;
-        };
+        let (file_key, root_id, path_off, path_len, size, mtime) = self.meta_at(docid)?;
         let start = path_off as usize;
         let end = start.saturating_add(path_len as usize);
         let rel = arena.get(start..end)?;
@@ -809,8 +823,8 @@ mod tests {
     use crate::index::PersistentIndex;
     use crate::query::matcher::create_matcher;
     use crate::storage::snapshot::SnapshotStore;
-    use std::collections::HashMap;
     use roaring::RoaringBitmap;
+    use std::collections::HashMap;
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -829,7 +843,11 @@ mod tests {
         let p = root.join("alpha_test.txt");
         std::fs::write(&p, b"a").unwrap();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: p.clone(),
             size: 1,
             mtime: None,
@@ -842,7 +860,7 @@ mod tests {
         store.write_atomic_v6(&segs).await.unwrap();
 
         let mut snap = store
-            .load_v6_mmap_if_valid(&[root.clone()])
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
             .unwrap()
             .expect("load v6");
 
@@ -853,7 +871,11 @@ mod tests {
 
         // 预期：触发 lookup_docid_by_filekey 的 fallback 路径，并返回正确 meta。
         let meta = mmap_idx
-            .get_meta_by_key(FileKey { dev: 1, ino: 1, generation: 0 })
+            .get_meta_by_key(FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            })
             .expect("get_meta_by_key");
         assert!(meta.path.to_string_lossy().contains("alpha_test"));
     }
@@ -873,10 +895,7 @@ mod tests {
             }
             for w in bytes.windows(3) {
                 let tri = [w[0], w[1], w[2]];
-                tri_idx
-                    .entry(tri)
-                    .or_insert_with(RoaringBitmap::new)
-                    .insert(*docid);
+                tri_idx.entry(tri).or_default().insert(*docid);
             }
         }
 
@@ -919,7 +938,11 @@ mod tests {
         // 构建索引：两个 doc，docid 依插入顺序为 0/1。
         let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: p_dir_hit.clone(),
             size: 1,
             mtime: None,
@@ -927,7 +950,11 @@ mod tests {
             atime: None,
         });
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 2, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 2,
+                generation: 0,
+            },
             path: p_base_hit.clone(),
             size: 1,
             mtime: None,
@@ -946,7 +973,7 @@ mod tests {
         store.write_atomic_v6(&segs).await.unwrap();
 
         let snap = store
-            .load_v6_mmap_if_valid(&[root.clone()])
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
             .unwrap()
             .expect("load v6");
         let mmap_idx = MmapIndex::new(snap);
@@ -978,7 +1005,11 @@ mod tests {
             let path = root.join(name);
             std::fs::write(&path, b"x").unwrap();
             idx.upsert(FileMeta {
-                file_key: FileKey { dev: 1, ino, generation: 0 },
+                file_key: FileKey {
+                    dev: 1,
+                    ino,
+                    generation: 0,
+                },
                 path,
                 size: 1,
                 mtime: None,
@@ -992,7 +1023,7 @@ mod tests {
         store.write_atomic_v6(&segs).await.unwrap();
 
         let snap = store
-            .load_v6_mmap_if_valid(&[root.clone()])
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
             .unwrap()
             .expect("load v6");
         let mmap_idx = MmapIndex::new(snap);

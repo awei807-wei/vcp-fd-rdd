@@ -13,6 +13,7 @@ use super::sync::dir_tree_changed_since;
 use super::TieredIndex;
 
 impl TieredIndex {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         l1: L1Cache,
         l2: Arc<PersistentIndex>,
@@ -23,14 +24,14 @@ impl TieredIndex {
         follow_symlinks: bool,
         disk_layers: Vec<DiskLayer>,
     ) -> Self {
-        use std::sync::atomic::{AtomicBool, AtomicU64};
         use arc_swap::ArcSwap;
         use parking_lot::{Mutex, RwLock};
+        use std::sync::atomic::{AtomicBool, AtomicU64};
         use tokio::sync::Notify;
 
-        use crate::core::AdaptiveScheduler;
         use super::events::OverlayState;
         use super::rebuild::RebuildState;
+        use crate::core::AdaptiveScheduler;
 
         Self {
             l1,

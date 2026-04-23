@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use fd_rdd::event::watcher::{EventWatcher, watch_roots};
+use fd_rdd::event::watcher::{watch_roots, EventWatcher};
 
 fn unique_tmp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -29,10 +29,10 @@ fn watch_nonexistent_root_reports_failure() {
     let rescans = Arc::new(AtomicU64::new(0));
 
     let (mut _priority_rx, mut _normal_rx, mut watcher) =
-        EventWatcher::start(&[root.clone()], 64, drops, rescans, None).unwrap();
+        EventWatcher::start(std::slice::from_ref(&root), 64, drops, rescans, None).unwrap();
 
     // watch_roots should report the non-existent root as failed
-    let failed = watch_roots(&mut watcher, &[root.clone()]);
+    let failed = watch_roots(&mut watcher, std::slice::from_ref(&root));
     assert!(
         !failed.is_empty(),
         "Should report failure for non-existent directory"
@@ -50,13 +50,10 @@ fn watch_existing_root_succeeds() {
     let rescans = Arc::new(AtomicU64::new(0));
 
     let (_priority_rx, _normal_rx, mut watcher) =
-        EventWatcher::start(&[root.clone()], 64, drops, rescans, None).unwrap();
+        EventWatcher::start(std::slice::from_ref(&root), 64, drops, rescans, None).unwrap();
 
-    let failed = watch_roots(&mut watcher, &[root.clone()]);
-    assert!(
-        failed.is_empty(),
-        "Should succeed for existing directory"
-    );
+    let failed = watch_roots(&mut watcher, std::slice::from_ref(&root));
+    assert!(failed.is_empty(), "Should succeed for existing directory");
 
     let _ = std::fs::remove_dir_all(&root);
 }

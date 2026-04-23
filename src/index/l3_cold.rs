@@ -42,7 +42,7 @@ impl IndexBuilder {
         rdd.for_each(|meta: FileMeta| {
             index.upsert(meta);
             count += 1;
-            if count % 10000 == 0 {
+            if count.is_multiple_of(10000) {
                 tracing::info!("IndexBuilder: scanned {} files...", count);
             }
         });
@@ -75,7 +75,7 @@ impl IndexBuilder {
         rdd.for_each_meta(move |meta: FileMeta| {
             idx.upsert(meta);
             let n = c.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 10000 == 0 {
+            if n.is_multiple_of(10000) {
                 tracing::info!("IndexBuilder: scanned {} files...", n);
             }
         });

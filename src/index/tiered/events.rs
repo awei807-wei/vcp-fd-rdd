@@ -135,7 +135,10 @@ impl TieredIndex {
         }
     }
 
-    pub(super) fn capture_l2_for_apply(&self, events: &[EventRecord]) -> (Arc<PersistentIndex>, bool) {
+    pub(super) fn capture_l2_for_apply(
+        &self,
+        events: &[EventRecord],
+    ) -> (Arc<PersistentIndex>, bool) {
         let mut st = self.rebuild_state.lock();
         if !st.in_progress {
             drop(st);
@@ -296,7 +299,11 @@ impl TieredIndex {
         if let FileIdentifier::Path(ref mut p) = ev.id {
             *p = normalize_path(p);
         }
-        if let EventType::Rename { ref mut from, ref mut from_path_hint } = &mut ev.event_type {
+        if let EventType::Rename {
+            ref mut from,
+            ref mut from_path_hint,
+        } = &mut ev.event_type
+        {
             if let FileIdentifier::Path(ref mut p) = from {
                 *p = normalize_path(p);
             }
@@ -333,9 +340,9 @@ impl TieredIndex {
             .iter()
             .filter_map(|ev| {
                 if let EventType::Rename { .. } = &ev.event_type {
-                    ev.best_path().filter(|p| {
-                        std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
-                    }).map(|p| p.to_path_buf())
+                    ev.best_path()
+                        .filter(|p| std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false))
+                        .map(|p| p.to_path_buf())
                 } else {
                     None
                 }
@@ -364,7 +371,10 @@ impl TieredIndex {
         let mut pending = self.pending_events.lock();
         for ev in events {
             match &ev.event_type {
-                EventType::Rename { from, from_path_hint } => {
+                EventType::Rename {
+                    from,
+                    from_path_hint,
+                } => {
                     let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
                     if let Some(from_path) = from_best {
                         pending.retain(|p| p.best_path().map(|bp| bp != from_path).unwrap_or(true));

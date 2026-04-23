@@ -81,7 +81,11 @@ impl IgnoreFilter {
             let global_root = self.global.path();
             if path.starts_with(global_root) {
                 let rel = path.strip_prefix(global_root).unwrap_or(path);
-                if self.global.matched_path_or_any_parents(rel, is_dir).is_ignore() {
+                if self
+                    .global
+                    .matched_path_or_any_parents(rel, is_dir)
+                    .is_ignore()
+                {
                     return true;
                 }
             }
@@ -120,7 +124,7 @@ mod tests {
         fs::write(root.join(".gitignore"), "*.log\ntarget/\n").unwrap();
         fs::write(root.join("app.log"), "log").unwrap();
 
-        let filter = IgnoreFilter::from_roots(&[root.clone()]);
+        let filter = IgnoreFilter::from_roots(std::slice::from_ref(&root));
         assert!(filter.is_ignored(&root.join("app.log")));
         assert!(!filter.is_ignored(&root.join("main.rs")));
 
@@ -132,7 +136,7 @@ mod tests {
         let root = unique_tmp_dir("ignore-none");
         fs::create_dir_all(&root).unwrap();
 
-        let filter = IgnoreFilter::from_roots(&[root.clone()]);
+        let filter = IgnoreFilter::from_roots(std::slice::from_ref(&root));
         assert!(!filter.is_ignored(&root.join("anything.txt")));
 
         let _ = fs::remove_dir_all(root);
@@ -144,7 +148,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(".gitignore"), "*.log\n").unwrap();
 
-        let filter = IgnoreFilter::from_roots(&[root.clone()]);
+        let filter = IgnoreFilter::from_roots(std::slice::from_ref(&root));
         // Path outside the root should not be ignored
         assert!(!filter.is_ignored(Path::new("/some/other/path/app.log")));
 
@@ -158,7 +162,7 @@ mod tests {
         fs::write(root.join(".ignore"), "*.tmp\n").unwrap();
         fs::write(root.join(".git").join("info").join("exclude"), "cache/\n").unwrap();
 
-        let filter = IgnoreFilter::from_roots(&[root.clone()]);
+        let filter = IgnoreFilter::from_roots(std::slice::from_ref(&root));
         assert!(filter.is_ignored(&root.join("foo.tmp")));
         assert!(filter.is_ignored(&root.join("cache").join("x.txt")));
         assert!(!filter.is_ignored(&root.join("keep.rs")));

@@ -33,7 +33,7 @@ pub fn get_file_generation(path: &std::path::Path) -> u32 {
     }
     let mut generation: i32 = 0;
     const FS_IOC_GETVERSION: libc::c_ulong = 0x8008_7601;
-    let ret = unsafe { libc::ioctl(fd, FS_IOC_GETVERSION, &mut generation) };
+    let ret = unsafe { libc::ioctl(fd, FS_IOC_GETVERSION as _, &mut generation) };
     unsafe { libc::close(fd) };
     if ret == 0 {
         generation as u32
@@ -56,11 +56,11 @@ impl FileKey {
         {
             use std::os::unix::fs::MetadataExt;
             let generation = get_file_generation(path);
-            return Some(Self {
+            Some(Self {
                 dev: meta.dev(),
                 ino: meta.ino(),
                 generation,
-            });
+            })
         }
 
         #[cfg(windows)]
@@ -74,7 +74,11 @@ impl FileKey {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             path.as_os_str().as_encoded_bytes().hash(&mut hasher);
             let h = hasher.finish();
-            return Some(Self { dev: 0, ino: h, generation: 0 });
+            Some(Self {
+                dev: 0,
+                ino: h,
+                generation: 0,
+            })
         }
 
         #[cfg(not(any(unix, windows)))]

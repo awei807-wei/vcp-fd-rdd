@@ -113,7 +113,7 @@ impl ScoreConfig {
         let query_has_node = query_lower.contains("node");
 
         let query_basename = query_lower
-            .rsplit(|c: char| c == '/' || c == '\\')
+            .rsplit(['/', '\\'])
             .next()
             .unwrap_or(&query_lower)
             .to_string();
@@ -133,7 +133,7 @@ impl ScoreConfig {
 /// 隐藏**目录**（.开头的目录段，不含文件名本身）是否出现在路径中。
 /// 注意：文件名本身以 `.` 开头不惩罚（如 `.config.json`、`.eslintrc` 是常用文件）。
 fn path_has_hidden_dir(path: &str) -> bool {
-    let segments: Vec<&str> = path.split(|c: char| c == '/' || c == '\\').collect();
+    let segments: Vec<&str> = path.split(['/', '\\']).collect();
     // 最后一段是文件名，不检查
     for seg in segments.iter().take(segments.len().saturating_sub(1)) {
         if seg.starts_with('.') && seg.len() > 1 {
@@ -146,7 +146,7 @@ fn path_has_hidden_dir(path: &str) -> bool {
 /// 路径是否经过"噪声目录"。
 fn path_in_junk_dir(path: &str) -> bool {
     let lower = path.to_lowercase();
-    for seg in lower.split(|c: char| c == '/' || c == '\\') {
+    for seg in lower.split(['/', '\\']) {
         if seg.is_empty() {
             continue;
         }
@@ -162,7 +162,7 @@ fn path_in_junk_dir(path: &str) -> bool {
 /// 路径是否经过 node_modules 等 "Low Priority Zone"。
 fn path_in_node_zone(path: &str) -> bool {
     let lower = path.to_lowercase();
-    for seg in lower.split(|c: char| c == '/' || c == '\\') {
+    for seg in lower.split(['/', '\\']) {
         if seg.is_empty() {
             continue;
         }
@@ -423,8 +423,7 @@ pub fn score_result(meta: &FileMeta, config: &ScoreConfig) -> i64 {
         }
 
         // 4d) 深度仅作为"最后的仲裁"（Tie-breaker）
-        let depth =
-            path_str.matches('/').count() + path_str.matches('\\').count();
+        let depth = path_str.matches('/').count() + path_str.matches('\\').count();
         score -= (depth as f64) * DEPTH_TIEBREAKER_FACTOR;
     }
 
@@ -485,10 +484,7 @@ fn compute_path_initials_highlights(path: &str, query: &str) -> Vec<[usize; 2]> 
     let mut highlights = Vec::new();
 
     // Split query by separators
-    let query_segments: Vec<&str> = query
-        .split(|c: char| c == '/' || c == '\\')
-        .filter(|s| !s.is_empty())
-        .collect();
+    let query_segments: Vec<&str> = query.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
 
     if query_segments.is_empty() {
         return highlights;
@@ -578,7 +574,11 @@ mod tests {
 
     fn meta(path: &str, size: u64, mtime: Option<SystemTime>) -> FileMeta {
         FileMeta {
-            file_key: FileKey { dev: 0, ino: 0, generation: 0 },
+            file_key: FileKey {
+                dev: 0,
+                ino: 0,
+                generation: 0,
+            },
             path: PathBuf::from(path),
             size,
             mtime,
@@ -664,7 +664,10 @@ mod tests {
         let nm_file = meta("/home/project/node_modules/express/index.js", 100, None);
         let s = score_result(&nm_file, &config);
         // 不应被压缩到极低分
-        assert!(s > 50, "node_modules file with node query should not be suppressed, got {s}");
+        assert!(
+            s > 50,
+            "node_modules file with node query should not be suppressed, got {s}"
+        );
     }
 
     // ── 其他噪声目录惩罚 ──
@@ -748,10 +751,7 @@ mod tests {
         let s3 = score_result(&depth3, &config);
         let s8 = score_result(&depth8, &config);
         // 深度差 5 层，每层 -0.5，差值约 2-3 分（而非旧方案的 50+ 分）
-        assert!(
-            s3 > s8,
-            "depth3={s3} should be > depth8={s8} (tiebreaker)"
-        );
+        assert!(s3 > s8, "depth3={s3} should be > depth8={s8} (tiebreaker)");
         // 差距不应太大——证明深度是 tiebreaker 而非主因
         let gap = s3 - s8;
         assert!(

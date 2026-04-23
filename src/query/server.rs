@@ -112,7 +112,7 @@ impl QueryServer {
         Self {
             index,
             config: QueryServerConfig::default(),
-            health_provider: Arc::new(|| HealthTelemetry::default()),
+            health_provider: Arc::new(HealthTelemetry::default),
         }
     }
 

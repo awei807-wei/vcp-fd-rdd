@@ -44,7 +44,7 @@ fn pathbuf_from_encoded_bytes(bytes: &[u8]) -> PathBuf {
     {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
-        return PathBuf::from(OsString::from_vec(bytes.to_vec()));
+        PathBuf::from(OsString::from_vec(bytes.to_vec()))
     }
     #[cfg(not(unix))]
     {
@@ -276,7 +276,6 @@ impl WalStore {
             e.seq = i as u64 + 1;
         }
 
-
         Ok(WalReplayResult {
             events,
             sealed_used: sealed.len(),
@@ -308,113 +307,6 @@ impl crate::storage::traits::WriteAheadLog for WalStore {
 
     fn replay_since_seal(&self, checkpoint_seal_id: u64) -> anyhow::Result<WalReplayResult> {
         self.replay_since_seal(checkpoint_seal_id)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn unique_tmp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("fd-rdd-wal-{}-{}", tag, nanos))
-    }
-
-    #[test]
-    fn wal_append_seal_replay_respects_checkpoint() {
-        let dir = unique_tmp_dir("basic");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let wal = WalStore::open_in_dir(dir.clone()).unwrap();
-
-        let p1 = dir.join("a.txt");
-        let p2 = dir.join("b.txt");
-
-        wal.append(&[EventRecord {
-            seq: 1,
-            timestamp: std::time::SystemTime::now(),
-            event_type: EventType::Create,
-            id: FileIdentifier::Path(p1.clone()),
-            path_hint: Some(p1.clone()),
-        }])
-        .unwrap();
-
-        let seal1 = wal.seal().unwrap();
-
-        wal.append(&[EventRecord {
-            seq: 2,
-            timestamp: std::time::SystemTime::now(),
-            event_type: EventType::Delete,
-            id: FileIdentifier::Path(p2.clone()),
-            path_hint: Some(p2.clone()),
-        }])
-        .unwrap();
-
-        // checkpoint=0：回放 sealed+current
-        let r = wal.replay_since_seal(0).unwrap();
-        assert_eq!(r.events.len(), 2);
-
-        // checkpoint=seal1：只回放 current
-        let r2 = wal.replay_since_seal(seal1).unwrap();
-        assert_eq!(r2.events.len(), 1);
-    }
-
-    #[test]
-    fn wal_v1_file_is_sealed_and_replayed_after_upgrade_to_v3() {
-        let dir = unique_tmp_dir("upgrade");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let wal_path = dir.join("events.wal");
-
-        // 手工构造一个 v1 WAL（header ver=1 + 1 条记录）
-        {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&wal_path)
-                .unwrap();
-            f.write_all(&WAL_MAGIC.to_le_bytes()).unwrap();
-            f.write_all(&1u32.to_le_bytes()).unwrap();
-
-            let p = dir.join("legacy.txt");
-            let ev = EventRecord {
-                seq: 1,
-                timestamp: std::time::SystemTime::now(),
-                event_type: EventType::Create,
-                id: FileIdentifier::Path(p.clone()),
-                path_hint: Some(p),
-            };
-            let payload = encode_event_v1(&ev);
-            let len: u32 = payload.len().try_into().unwrap();
-            let crc = crc32_simple(&payload);
-            f.write_all(&len.to_le_bytes()).unwrap();
-            f.write_all(&crc.to_le_bytes()).unwrap();
-            f.write_all(&payload).unwrap();
-            f.flush().unwrap();
-        }
-
-        // 打开时应触发 v1 -> v3 非破坏性升级（rename 为 sealed-*.v1）
-        let wal = WalStore::open_in_dir(dir.clone()).unwrap();
-
-        let sealed_v1 = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.starts_with("events.wal.seal-") && s.contains(".v1"))
-                    .unwrap_or(false)
-            });
-        assert!(sealed_v1.is_some());
-
-        // 回放应能读到 v1 sealed 中的事件
-        let r = wal.replay_since_seal(0).unwrap();
-        assert_eq!(r.events.len(), 1);
     }
 }
 
@@ -763,4 +655,110 @@ fn decode_event_v2(buf: &[u8]) -> Option<EventRecord> {
         id,
         path_hint,
     })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("fd-rdd-wal-{}-{}", tag, nanos))
+    }
+
+    #[test]
+    fn wal_append_seal_replay_respects_checkpoint() {
+        let dir = unique_tmp_dir("basic");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wal = WalStore::open_in_dir(dir.clone()).unwrap();
+
+        let p1 = dir.join("a.txt");
+        let p2 = dir.join("b.txt");
+
+        wal.append(&[EventRecord {
+            seq: 1,
+            timestamp: std::time::SystemTime::now(),
+            event_type: EventType::Create,
+            id: FileIdentifier::Path(p1.clone()),
+            path_hint: Some(p1.clone()),
+        }])
+        .unwrap();
+
+        let seal1 = wal.seal().unwrap();
+
+        wal.append(&[EventRecord {
+            seq: 2,
+            timestamp: std::time::SystemTime::now(),
+            event_type: EventType::Delete,
+            id: FileIdentifier::Path(p2.clone()),
+            path_hint: Some(p2.clone()),
+        }])
+        .unwrap();
+
+        // checkpoint=0：回放 sealed+current
+        let r = wal.replay_since_seal(0).unwrap();
+        assert_eq!(r.events.len(), 2);
+
+        // checkpoint=seal1：只回放 current
+        let r2 = wal.replay_since_seal(seal1).unwrap();
+        assert_eq!(r2.events.len(), 1);
+    }
+
+    #[test]
+    fn wal_v1_file_is_sealed_and_replayed_after_upgrade_to_v3() {
+        let dir = unique_tmp_dir("upgrade");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wal_path = dir.join("events.wal");
+
+        // 手工构造一个 v1 WAL（header ver=1 + 1 条记录）
+        {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&wal_path)
+                .unwrap();
+            f.write_all(&WAL_MAGIC.to_le_bytes()).unwrap();
+            f.write_all(&1u32.to_le_bytes()).unwrap();
+
+            let p = dir.join("legacy.txt");
+            let ev = EventRecord {
+                seq: 1,
+                timestamp: std::time::SystemTime::now(),
+                event_type: EventType::Create,
+                id: FileIdentifier::Path(p.clone()),
+                path_hint: Some(p),
+            };
+            let payload = encode_event_v1(&ev);
+            let len: u32 = payload.len().try_into().unwrap();
+            let crc = crc32_simple(&payload);
+            f.write_all(&len.to_le_bytes()).unwrap();
+            f.write_all(&crc.to_le_bytes()).unwrap();
+            f.write_all(&payload).unwrap();
+            f.flush().unwrap();
+        }
+
+        // 打开时应触发 v1 -> v3 非破坏性升级（rename 为 sealed-*.v1）
+        let wal = WalStore::open_in_dir(dir.clone()).unwrap();
+
+        let sealed_v1 = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.starts_with("events.wal.seal-") && s.contains(".v1"))
+                    .unwrap_or(false)
+            });
+        assert!(sealed_v1.is_some());
+
+        // 回放应能读到 v1 sealed 中的事件
+        let r = wal.replay_since_seal(0).unwrap();
+        assert_eq!(r.events.len(), 1);
+    }
 }

@@ -11,17 +11,17 @@ on:
     branches: [main, tests]
   schedule:
     # 每日凌晨跑一次全量压力测试
-    - cron: '0 2 * * *'
+    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: 'Stress test duration (minutes)'
+        description: "Stress test duration (minutes)"
         required: false
-        default: '5'
+        default: "5"
       file_count:
-        description: 'File count for rename avalanche test'
+        description: "File count for rename avalanche test"
         required: false
-        default: '5000'
+        default: "5000"
 
 env:
   CARGO_TERM_COLOR: always
@@ -89,20 +89,23 @@ jobs:
 
       - name: Start fd-rdd (short debounce for fast overlay flush)
         run: |
-          ./bin/fd-rdd \
-            --root /tmp/fd-rdd-ci-test/overlay-test \
-            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }} \
-            --http-port ${{ env.FD_RDD_PORT }} \
-            --debounce-ms 50 \
-            --snapshot-interval-secs 3600 \
-            --no-build &
+          ./bin/fd-rdd \\
+            --root /tmp/fd-rdd-ci-test/overlay-test \\
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }} \\
+            --http-port ${{ env.FD_RDD_PORT }} \\
+            --debounce-ms 50 \\
+            --snapshot-interval-secs 3600 >/tmp/fd-rdd-daemon.log 2>&1 &
           echo $! > /tmp/fd-rdd.pid
-          sleep 3
-
-      - name: Wait for service ready
-        run: |
-          for i in $(seq 1 30); do
-            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+          # 等待 HTTP 就绪 + 初始索引完成
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
             sleep 1
           done
 
@@ -238,17 +241,23 @@ jobs:
 
       - name: Start fd-rdd
         run: |
-          ./bin/fd-rdd \
-            --root /tmp/fd-rdd-ci-test/rename-test \
-            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_rename \
-            --http-port ${{ env.FD_RDD_PORT }} \
-            --debounce-ms 10 \
-            --snapshot-interval-secs 3600 \
-            --no-build &
+          ./bin/fd-rdd \\
+            --root /tmp/fd-rdd-ci-test/rename-test \\
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_rename \\
+            --http-port ${{ env.FD_RDD_PORT }} \\
+            --debounce-ms 10 \\
+            --snapshot-interval-secs 3600 >/tmp/fd-rdd-daemon.log 2>&1 &
           echo $! > /tmp/fd-rdd.pid
-          sleep 3
-          for i in $(seq 1 30); do
-            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+          # 等待 HTTP 就绪 + 初始索引完成
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
             sleep 1
           done
 
@@ -318,6 +327,14 @@ jobs:
           fi
           echo "✅ PASS: old_project correctly empty ($COUNT stale refs acceptable)"
 
+      - name: Collect daemon logs
+        if: failure()
+        run: |
+          echo "=== Daemon stdout/stderr ==="
+          cat /tmp/fd-rdd-daemon.log 2>/dev/null || true
+          echo "=== Daemon PID status ==="
+          cat /tmp/fd-rdd.pid 2>/dev/null && ps aux | grep fd-rdd || true
+
       - name: Cleanup
         if: always()
         run: |
@@ -354,18 +371,24 @@ jobs:
 
       - name: Start fd-rdd with tight debounce
         run: |
-          ./bin/fd-rdd \
-            --root /tmp/fd-rdd-ci-test/chaos-test \
-            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_chaos \
-            --http-port ${{ env.FD_RDD_PORT }} \
-            --debounce-ms 5 \
-            --snapshot-interval-secs 3600 \
-            --event-channel-size 262144 \
-            --no-build &
+          ./bin/fd-rdd \\
+            --root /tmp/fd-rdd-ci-test/chaos-test \\
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_chaos \\
+            --http-port ${{ env.FD_RDD_PORT }} \\
+            --debounce-ms 5 \\
+            --event-channel-size 262144 \\
+            --snapshot-interval-secs 3600 >/tmp/fd-rdd-daemon.log 2>&1 &
           echo $! > /tmp/fd-rdd.pid
-          sleep 3
-          for i in $(seq 1 30); do
-            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+          # 等待 HTTP 就绪 + 初始索引完成
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
             sleep 1
           done
 
@@ -448,6 +471,14 @@ jobs:
             echo "✅ Deleted file correctly absent"
           fi
 
+      - name: Collect daemon logs
+        if: failure()
+        run: |
+          echo "=== Daemon stdout/stderr ==="
+          cat /tmp/fd-rdd-daemon.log 2>/dev/null || true
+          echo "=== Daemon PID status ==="
+          cat /tmp/fd-rdd.pid 2>/dev/null && ps aux | grep fd-rdd || true
+
       - name: Cleanup
         if: always()
         run: |
@@ -487,17 +518,23 @@ jobs:
 
       - name: Start fd-rdd (short snapshot interval to force compaction)
         run: |
-          ./bin/fd-rdd \
-            --root /tmp/fd-rdd-ci-test/compaction-test \
-            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_compaction \
-            --http-port ${{ env.FD_RDD_PORT }} \
-            --debounce-ms 50 \
-            --snapshot-interval-secs 10 \
-            --no-build &
+          ./bin/fd-rdd \\
+            --root /tmp/fd-rdd-ci-test/compaction-test \\
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_compaction \\
+            --http-port ${{ env.FD_RDD_PORT }} \\
+            --debounce-ms 50 \\
+            --snapshot-interval-secs 10 >/tmp/fd-rdd-daemon.log 2>&1 &
           echo $! > /tmp/fd-rdd.pid
-          sleep 5
-          for i in $(seq 1 30); do
-            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+          # 等待 HTTP 就绪 + 初始索引完成
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
             sleep 1
           done
 
@@ -564,6 +601,14 @@ jobs:
           dmesg | tail -50 || true
           journalctl -xe | tail -30 || true
 
+      - name: Collect daemon logs
+        if: failure()
+        run: |
+          echo "=== Daemon stdout/stderr ==="
+          cat /tmp/fd-rdd-daemon.log 2>/dev/null || true
+          echo "=== Daemon PID status ==="
+          cat /tmp/fd-rdd.pid 2>/dev/null && ps aux | grep fd-rdd || true
+
       - name: Cleanup
         if: always()
         run: |
@@ -615,17 +660,23 @@ jobs:
 
       - name: Start fd-rdd
         run: |
-          ./bin/fd-rdd \
-            --root /tmp/fd-rdd-ci-test/skew-test \
-            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_skew \
-            --http-port ${{ env.FD_RDD_PORT }} \
-            --debounce-ms 50 \
-            --snapshot-interval-secs 3600 \
-            --no-build &
+          ./bin/fd-rdd \\
+            --root /tmp/fd-rdd-ci-test/skew-test \\
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_skew \\
+            --http-port ${{ env.FD_RDD_PORT }} \\
+            --debounce-ms 50 \\
+            --snapshot-interval-secs 3600 >/tmp/fd-rdd-daemon.log 2>&1 &
           echo $! > /tmp/fd-rdd.pid
-          sleep 5
-          for i in $(seq 1 30); do
-            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+          # 等待 HTTP 就绪 + 初始索引完成
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
             sleep 1
           done
 
@@ -680,6 +731,14 @@ jobs:
           fi
           echo "✅ PASS: node_modules explosion handled"
 
+      - name: Collect daemon logs
+        if: failure()
+        run: |
+          echo "=== Daemon stdout/stderr ==="
+          cat /tmp/fd-rdd-daemon.log 2>/dev/null || true
+          echo "=== Daemon PID status ==="
+          cat /tmp/fd-rdd.pid 2>/dev/null && ps aux | grep fd-rdd || true
+
       - name: Cleanup
         if: always()
         run: |
@@ -723,18 +782,24 @@ jobs:
 
       - name: Start fd-rdd watching both mounts
         run: |
-          ./bin/fd-rdd \
-            --root /tmp/fd-rdd-ci-test/crossmount-main \
-            --root /tmp/fd-rdd-ci-test/crossmount-tmpfs \
-            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_crossmount \
-            --http-port ${{ env.FD_RDD_PORT }} \
-            --debounce-ms 50 \
-            --snapshot-interval-secs 3600 \
-            --no-build &
+          ./bin/fd-rdd \\
+            --root /tmp/fd-rdd-ci-test/crossmount-main \\
+            --root /tmp/fd-rdd-ci-test/crossmount-tmpfs \\
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_crossmount \\
+            --http-port ${{ env.FD_RDD_PORT }} \\
+            --debounce-ms 50 \\
+            --snapshot-interval-secs 3600 >/tmp/fd-rdd-daemon.log 2>&1 &
           echo $! > /tmp/fd-rdd.pid
-          sleep 3
-          for i in $(seq 1 30); do
-            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+          # 等待 HTTP 就绪 + 初始索引完成
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
             sleep 1
           done
 
@@ -798,6 +863,14 @@ jobs:
             echo "✅ Old path correctly removed"
           fi
 
+      - name: Collect daemon logs
+        if: failure()
+        run: |
+          echo "=== Daemon stdout/stderr ==="
+          cat /tmp/fd-rdd-daemon.log 2>/dev/null || true
+          echo "=== Daemon PID status ==="
+          cat /tmp/fd-rdd.pid 2>/dev/null && ps aux | grep fd-rdd || true
+
       - name: Cleanup
         if: always()
         run: |
@@ -833,15 +906,25 @@ jobs:
 
       - name: Start fd-rdd and let it index
         run: |
-          ./bin/fd-rdd \
-            --root /tmp/fd-rdd-ci-test/recovery-test \
-            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_recovery \
-            --http-port ${{ env.FD_RDD_PORT }} \
-            --debounce-ms 50 \
-            --snapshot-interval-secs 5 \
-            --no-build &
+          ./bin/fd-rdd \\
+            --root /tmp/fd-rdd-ci-test/recovery-test \\
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_recovery \\
+            --http-port ${{ env.FD_RDD_PORT }} \\
+            --debounce-ms 50 \\
+            --snapshot-interval-secs 5 >/tmp/fd-rdd-daemon.log 2>&1 &
           echo $! > /tmp/fd-rdd.pid
-          sleep 8  # let it index and write at least one snapshot
+          # 等待 HTTP 就绪 + 初始索引完成
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
+            sleep 1
+          done
 
       - name: Create files while running
         run: |
@@ -874,17 +957,23 @@ jobs:
 
       - name: Restart fd-rdd (should replay WAL + detect offline changes)
         run: |
-          ./bin/fd-rdd \
-            --root /tmp/fd-rdd-ci-test/recovery-test \
-            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_recovery \
-            --http-port ${{ env.FD_RDD_PORT }} \
-            --debounce-ms 50 \
-            --snapshot-interval-secs 3600 \
-            --no-build &
+          ./bin/fd-rdd \\
+            --root /tmp/fd-rdd-ci-test/recovery-test \\
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_recovery \\
+            --http-port ${{ env.FD_RDD_PORT }} \\
+            --debounce-ms 50 \\
+            --snapshot-interval-secs 3600 >/tmp/fd-rdd-daemon.log 2>&1 &
           echo $! > /tmp/fd-rdd.pid
-          sleep 5
-          for i in $(seq 1 30); do
-            curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health && break
+          # 等待 HTTP 就绪 + 初始索引完成
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
             sleep 1
           done
 
@@ -937,6 +1026,14 @@ jobs:
           fi
           echo "✅ PASS: Index count $COUNT after recovery"
 
+      - name: Collect daemon logs
+        if: failure()
+        run: |
+          echo "=== Daemon stdout/stderr ==="
+          cat /tmp/fd-rdd-daemon.log 2>/dev/null || true
+          echo "=== Daemon PID status ==="
+          cat /tmp/fd-rdd.pid 2>/dev/null && ps aux | grep fd-rdd || true
+
       - name: Cleanup
         if: always()
         run: |
@@ -974,16 +1071,26 @@ jobs:
 
       - name: Start fd-rdd for soak
         run: |
-          ./bin/fd-rdd \
-            --root /tmp/fd-rdd-ci-test/soak \
-            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_soak \
-            --http-port ${{ env.FD_RDD_PORT }} \
-            --debounce-ms 10 \
-            --snapshot-interval-secs 30 \
-            --event-channel-size 524288 \
-            --no-build &
+          ./bin/fd-rdd \\
+            --root /tmp/fd-rdd-ci-test/soak \\
+            --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_soak \\
+            --http-port ${{ env.FD_RDD_PORT }} \\
+            --debounce-ms 10 \\
+            --event-channel-size 524288 \\
+            --snapshot-interval-secs 30 >/tmp/fd-rdd-daemon.log 2>&1 &
           echo $! > /tmp/fd-rdd.pid
-          sleep 5
+          # 等待 HTTP 就绪 + 初始索引完成
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
+            sleep 1
+          done
 
       - name: Run soak test
         run: |
@@ -1065,6 +1172,14 @@ jobs:
             echo "❌ Final health degraded"
             exit 1
           fi
+
+      - name: Collect daemon logs
+        if: failure()
+        run: |
+          echo "=== Daemon stdout/stderr ==="
+          cat /tmp/fd-rdd-daemon.log 2>/dev/null || true
+          echo "=== Daemon PID status ==="
+          cat /tmp/fd-rdd.pid 2>/dev/null && ps aux | grep fd-rdd || true
 
       - name: Cleanup
         if: always()

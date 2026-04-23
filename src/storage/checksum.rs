@@ -5,7 +5,6 @@
 /// - `Crc32c`: CRC32C (Castagnoli). Standard, stronger collision resistance.
 ///
 /// New writes always use CRC32C; readers fall back to SimpleChecksum for old data.
-
 /// Dual-mode checksum: selects algorithm at construction time.
 pub enum Checksum32 {
     Simple(SimpleChecksum),
@@ -33,6 +32,12 @@ pub struct SimpleChecksum {
     hash: u32,
     pending: [u8; 4],
     pending_len: usize,
+}
+
+impl Default for SimpleChecksum {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SimpleChecksum {
@@ -92,6 +97,12 @@ impl SimpleChecksum {
 /// - Uses reflected polynomial 0x82F63B78.
 pub struct Crc32c {
     state: u32,
+}
+
+impl Default for Crc32c {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Crc32c {

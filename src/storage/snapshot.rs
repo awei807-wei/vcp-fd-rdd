@@ -2,8 +2,8 @@ use crate::index::l2_partition::IndexSnapshotV2;
 use crate::index::l2_partition::IndexSnapshotV3;
 use crate::index::l2_partition::IndexSnapshotV4;
 use crate::index::l2_partition::IndexSnapshotV5;
-use crate::index::l2_partition::V6Segments;
 use crate::index::l2_partition::PersistentIndex;
+use crate::index::l2_partition::V6Segments;
 use memmap2::Mmap;
 use std::collections::HashSet;
 use std::io::Seek;
@@ -83,16 +83,24 @@ impl_legacy_snapshot!(IndexSnapshotV4, "v4");
 impl_legacy_snapshot!(IndexSnapshotV5, "v5");
 
 impl From<IndexSnapshotV2> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV2) -> Self { LoadedSnapshot::V2(v) }
+    fn from(v: IndexSnapshotV2) -> Self {
+        LoadedSnapshot::V2(v)
+    }
 }
 impl From<IndexSnapshotV3> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV3) -> Self { LoadedSnapshot::V3(v) }
+    fn from(v: IndexSnapshotV3) -> Self {
+        LoadedSnapshot::V3(v)
+    }
 }
 impl From<IndexSnapshotV4> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV4) -> Self { LoadedSnapshot::V4(v) }
+    fn from(v: IndexSnapshotV4) -> Self {
+        LoadedSnapshot::V4(v)
+    }
 }
 impl From<IndexSnapshotV5> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV5) -> Self { LoadedSnapshot::V5(v) }
+    fn from(v: IndexSnapshotV5) -> Self {
+        LoadedSnapshot::V5(v)
+    }
 }
 
 fn load_legacy_snapshot<T: LegacySnapshot>(body: &[u8]) -> anyhow::Result<Option<LoadedSnapshot>> {
@@ -305,7 +313,7 @@ fn compute_file_checksum_with(
     Ok(hasher.finalize())
 }
 
-use crate::storage::checksum::{Checksum32, Crc32c, SimpleChecksum, simple_checksum};
+use crate::storage::checksum::{simple_checksum, Checksum32, Crc32c, SimpleChecksum};
 
 struct ChecksumWriter<'a, W: Write> {
     inner: &'a mut W,
@@ -874,8 +882,16 @@ impl SnapshotStore {
             (V6SegKind::Roots, 1, segs.roots_bytes.to_vec()),
             (V6SegKind::PathArena, 1, segs.path_arena_bytes.to_vec()),
             (V6SegKind::Metas, 1, segs.metas_bytes.to_vec()),
-            (V6SegKind::TrigramTable, 1, segs.trigram_table_bytes.to_vec()),
-            (V6SegKind::PostingsBlob, 1, segs.postings_blob_bytes.to_vec()),
+            (
+                V6SegKind::TrigramTable,
+                1,
+                segs.trigram_table_bytes.to_vec(),
+            ),
+            (
+                V6SegKind::PostingsBlob,
+                1,
+                segs.postings_blob_bytes.to_vec(),
+            ),
             (V6SegKind::Tombstones, 1, segs.tombstones_bytes.to_vec()),
             (V6SegKind::FileKeyMap, 1, segs.filekey_map_bytes.to_vec()),
         ];
@@ -1107,7 +1123,9 @@ fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
     let ver = u32::from_le_bytes(hdr[4..8].try_into()?);
     let body_len = u32::from_le_bytes(hdr[8..12].try_into()?) as usize;
     let checksum = u32::from_le_bytes(hdr[12..16].try_into()?);
-    if magic != LSM_MANIFEST_MAGIC || !(ver == 1 || ver == 2 || ver == 3 || ver == LSM_MANIFEST_VERSION) {
+    if magic != LSM_MANIFEST_MAGIC
+        || !(ver == 1 || ver == 2 || ver == 3 || ver == LSM_MANIFEST_VERSION)
+    {
         anyhow::bail!("LSM manifest magic/version mismatch");
     }
     if body_len > MAX_LSM_MANIFEST_BODY_BYTES {
@@ -1124,18 +1142,16 @@ fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
     // v4+ uses CRC32C; v1-v3 use legacy SimpleChecksum
     let checksum_ok = if ver >= 4 {
         crc32c_checksum(&body) == checksum
+    } else if simple_checksum(&body) == checksum {
+        tracing::warn!(
+            "Loading legacy LSM manifest v{} from {}; consider upgrading to v{} (CRC32C)",
+            ver,
+            path.display(),
+            LSM_MANIFEST_VERSION
+        );
+        true
     } else {
-        if simple_checksum(&body) == checksum {
-            tracing::warn!(
-                "Loading legacy LSM manifest v{} from {}; consider upgrading to v{} (CRC32C)",
-                ver,
-                path.display(),
-                LSM_MANIFEST_VERSION
-            );
-            true
-        } else {
-            false
-        }
+        false
     };
     if !checksum_ok {
         anyhow::bail!("LSM manifest checksum mismatch");
@@ -1558,7 +1574,11 @@ mod tests {
         std::fs::write(&p2, b"b").unwrap();
 
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: p1.clone(),
             size: 1,
             mtime: None,
@@ -1566,7 +1586,11 @@ mod tests {
             atime: None,
         });
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 2, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 2,
+                generation: 0,
+            },
             path: p2.clone(),
             size: 1,
             mtime: None,
@@ -1579,7 +1603,7 @@ mod tests {
         store.write_atomic_v6(&segs).await.unwrap();
 
         let snap = store
-            .load_v6_mmap_if_valid(&[root.clone()])
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
             .unwrap()
             .expect("load v6");
 
@@ -1592,7 +1616,11 @@ mod tests {
         assert!(r[0].path.to_string_lossy().contains("alpha_test"));
 
         let m2 = mmap_idx
-            .get_meta_by_key(FileKey { dev: 1, ino: 1, generation: 0 })
+            .get_meta_by_key(FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            })
             .expect("get_meta_by_key");
         assert!(m2.path.to_string_lossy().contains("alpha_test"));
     }
@@ -1607,7 +1635,11 @@ mod tests {
         let p1 = root.join("alpha_test.txt");
         std::fs::write(&p1, b"a").unwrap();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: p1.clone(),
             size: 1,
             mtime: None,
@@ -1627,13 +1659,17 @@ mod tests {
         store.write_atomic_v6(&segs).await.unwrap();
 
         let snap = store
-            .load_v6_mmap_if_valid(&[root.clone()])
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
             .unwrap()
             .expect("load v6");
 
         let mmap_idx = MmapIndex::new(snap);
         let m2 = mmap_idx
-            .get_meta_by_key(FileKey { dev: 1, ino: 1, generation: 0 })
+            .get_meta_by_key(FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            })
             .expect("get_meta_by_key");
         assert!(m2.path.to_string_lossy().contains("alpha_test"));
     }
@@ -1645,7 +1681,11 @@ mod tests {
 
         let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: root.join("alpha_test.txt"),
             size: 1,
             mtime: None,
@@ -1671,7 +1711,11 @@ mod tests {
         let p1 = root.join("alpha_test.txt");
         std::fs::write(&p1, b"a").unwrap();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: p1.clone(),
             size: 1,
             mtime: None,
@@ -1731,7 +1775,9 @@ mod tests {
         f.write_all(&b).unwrap();
         f.sync_all().unwrap();
 
-        let snap = store.load_v6_mmap_if_valid(&[root.clone()]).unwrap();
+        let snap = store
+            .load_v6_mmap_if_valid(std::slice::from_ref(&root))
+            .unwrap();
         assert!(snap.is_none());
     }
 
@@ -1745,7 +1791,11 @@ mod tests {
         let p1 = root.join("a.txt");
         std::fs::write(&p1, b"a").unwrap();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: p1,
             size: 1,
             mtime: None,
@@ -1754,7 +1804,7 @@ mod tests {
         });
         let base = idx.export_segments_v6();
         store
-            .lsm_replace_base_v6(&base, None, &[root.clone()], 0)
+            .lsm_replace_base_v6(&base, None, std::slice::from_ref(&root), 0)
             .await
             .unwrap();
 
@@ -1762,7 +1812,11 @@ mod tests {
         let p2 = root.join("b.txt");
         std::fs::write(&p2, b"b").unwrap();
         delta_idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 2, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 2,
+                generation: 0,
+            },
             path: p2,
             size: 1,
             mtime: None,
@@ -1771,12 +1825,14 @@ mod tests {
         });
         let delta = delta_idx.export_segments_v6();
         let appended = store
-            .lsm_append_delta_v6(&delta, &[], &[root.clone()], 0)
+            .lsm_append_delta_v6(&delta, &[], std::slice::from_ref(&root), 0)
             .await
             .unwrap();
 
         std::fs::remove_file(store.lsm_seg_db_path(appended.id)).unwrap();
-        let loaded = store.load_lsm_if_valid(&[root.clone()]).unwrap();
+        let loaded = store
+            .load_lsm_if_valid(std::slice::from_ref(&root))
+            .unwrap();
         assert!(loaded.is_none());
     }
 
@@ -1790,7 +1846,11 @@ mod tests {
         let p1 = root.join("a.txt");
         std::fs::write(&p1, b"a").unwrap();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: p1,
             size: 1,
             mtime: None,
@@ -1799,12 +1859,14 @@ mod tests {
         });
         let segs = idx.export_segments_v6();
         let appended = store
-            .lsm_append_delta_v6(&segs, &[], &[root.clone()], 0)
+            .lsm_append_delta_v6(&segs, &[], std::slice::from_ref(&root), 0)
             .await
             .unwrap();
 
         std::fs::write(store.lsm_seg_del_path(appended.id), b"bad-sidecar").unwrap();
-        let loaded = store.load_lsm_if_valid(&[root.clone()]).unwrap();
+        let loaded = store
+            .load_lsm_if_valid(std::slice::from_ref(&root))
+            .unwrap();
         assert!(loaded.is_none());
     }
 

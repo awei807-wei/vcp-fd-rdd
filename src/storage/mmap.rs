@@ -10,6 +10,7 @@ impl MmapStorage {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(path)?;
         file.set_len(size)?;
         // SAFETY: The file is opened exclusively by this process for read/write.

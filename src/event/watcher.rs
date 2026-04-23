@@ -30,9 +30,7 @@ fn handle_notify_result(
         // 动态背压：channel 水位 >80% 时主动 sleep，避免事件堆积压垮下游
         let remaining = tx.capacity();
         if remaining < channel_size.saturating_mul(2) / 10 {
-            let delay_ms = 10u64.saturating_add(
-                (channel_size - remaining) as u64 % 41
-            );
+            let delay_ms = 10u64.saturating_add((channel_size - remaining) as u64 % 41);
             std::thread::sleep(Duration::from_millis(delay_ms));
         }
 
@@ -88,37 +86,6 @@ impl EventWatcher {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::event::recovery::DirtyScope;
-
-    #[test]
-    fn reject_zero_channel_size() {
-        let drops = Arc::new(AtomicU64::new(0));
-        let rescans = Arc::new(AtomicU64::new(0));
-        let roots: Vec<std::path::PathBuf> = Vec::new();
-        let res = EventWatcher::start(&roots, 0, drops, rescans, None);
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn rescan_event_marks_dirty_all() {
-        let _drops = AtomicU64::new(0);
-        let rescans = AtomicU64::new(0);
-        let (priority_tx, _priority_rx) = mpsc::channel(16);
-        let (normal_tx, _normal_rx) = mpsc::channel(16);
-        let dirty = DirtyTracker::new(16, vec![]);
-
-        let ev = notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
-        handle_notify_result(&priority_tx, &normal_tx, 16, Some(dirty.as_ref()), &rescans, Ok(ev));
-        assert_eq!(rescans.load(Ordering::Relaxed), 1);
-
-        let scope = dirty.try_begin_sync(0, 0, 0);
-        assert!(matches!(scope, Some(DirtyScope::All { .. })));
-    }
-}
-
 /// 检查 Linux inotify watch 上限，不够时发出警告。
 /// 非 Linux 平台直接返回 None。
 pub fn check_inotify_limit(root_count: usize) -> Option<u64> {
@@ -160,4 +127,41 @@ pub fn watch_roots(
         }
     }
     failed
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::recovery::DirtyScope;
+
+    #[test]
+    fn reject_zero_channel_size() {
+        let drops = Arc::new(AtomicU64::new(0));
+        let rescans = Arc::new(AtomicU64::new(0));
+        let roots: Vec<std::path::PathBuf> = Vec::new();
+        let res = EventWatcher::start(&roots, 0, drops, rescans, None);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn rescan_event_marks_dirty_all() {
+        let _drops = AtomicU64::new(0);
+        let rescans = AtomicU64::new(0);
+        let (priority_tx, _priority_rx) = mpsc::channel(16);
+        let (normal_tx, _normal_rx) = mpsc::channel(16);
+        let dirty = DirtyTracker::new(16, vec![]);
+
+        let ev = notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        handle_notify_result(
+            &priority_tx,
+            &normal_tx,
+            16,
+            Some(dirty.as_ref()),
+            &rescans,
+            Ok(ev),
+        );
+        assert_eq!(rescans.load(Ordering::Relaxed), 1);
+
+        let scope = dirty.try_begin_sync(0, 0, 0);
+        assert!(matches!(scope, Some(DirtyScope::All { .. })));
+    }
 }

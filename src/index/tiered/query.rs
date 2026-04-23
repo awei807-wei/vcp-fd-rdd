@@ -67,7 +67,11 @@ impl TieredIndex {
             }
 
             let meta = FileMeta {
-                file_key: FileKey { dev: 0, ino: 0, generation: 0 },
+                file_key: FileKey {
+                    dev: 0,
+                    ino: 0,
+                    generation: 0,
+                },
                 path: path.to_path_buf(),
                 size: 0,
                 mtime: None,
@@ -182,6 +186,7 @@ impl TieredIndex {
         results
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn query_layer(
         &self,
         plan: &QueryPlan,

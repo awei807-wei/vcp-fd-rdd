@@ -1,10 +1,10 @@
 use super::*;
-use std::sync::Arc;
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::event::recovery::DirtyScope;
 use crate::stats::EventPipelineStats;
 use crate::storage::snapshot::SnapshotStore;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn mk_event(seq: u64, event_type: EventType, path: PathBuf) -> EventRecord {
     EventRecord {
@@ -335,7 +335,11 @@ async fn lsm_layering_delete_blocks_base() {
     // base: alpha
     let base_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
     base_idx.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+        file_key: FileKey {
+            dev: 1,
+            ino: 1,
+            generation: 0,
+        },
         path: alpha.clone(),
         size: 1,
         mtime: None,
@@ -343,7 +347,12 @@ async fn lsm_layering_delete_blocks_base() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&base_idx.export_segments_v6(), None, &[root.clone()], 0)
+        .lsm_replace_base_v6(
+            &base_idx.export_segments_v6(),
+            None,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
     store.gc_stale_segments().unwrap();
@@ -351,7 +360,11 @@ async fn lsm_layering_delete_blocks_base() {
     // delta seg: gamma + delete(alpha)
     let delta_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
     delta_idx.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 2, generation: 0 },
+        file_key: FileKey {
+            dev: 1,
+            ino: 2,
+            generation: 0,
+        },
         path: gamma.clone(),
         size: 1,
         mtime: None,
@@ -363,7 +376,7 @@ async fn lsm_layering_delete_blocks_base() {
         .lsm_append_delta_v6(
             &delta_idx.export_segments_v6(),
             &deleted,
-            &[root.clone()],
+            std::slice::from_ref(&root),
             0,
         )
         .await
@@ -391,7 +404,11 @@ async fn lsm_delete_then_recreate_prefers_newest() {
     // base: alpha
     let base_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
     base_idx.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+        file_key: FileKey {
+            dev: 1,
+            ino: 1,
+            generation: 0,
+        },
         path: alpha.clone(),
         size: 1,
         mtime: None,
@@ -399,7 +416,12 @@ async fn lsm_delete_then_recreate_prefers_newest() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&base_idx.export_segments_v6(), None, &[root.clone()], 0)
+        .lsm_replace_base_v6(
+            &base_idx.export_segments_v6(),
+            None,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
     store.gc_stale_segments().unwrap();
@@ -408,14 +430,23 @@ async fn lsm_delete_then_recreate_prefers_newest() {
     let d1 = PersistentIndex::new_with_roots(vec![root.clone()]);
     let deleted = vec![alpha.as_os_str().as_encoded_bytes().to_vec()];
     store
-        .lsm_append_delta_v6(&d1.export_segments_v6(), &deleted, &[root.clone()], 0)
+        .lsm_append_delta_v6(
+            &d1.export_segments_v6(),
+            &deleted,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
     // delta2: recreate(alpha)
     let d2 = PersistentIndex::new_with_roots(vec![root.clone()]);
     d2.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 42, generation: 0 },
+        file_key: FileKey {
+            dev: 1,
+            ino: 42,
+            generation: 0,
+        },
         path: alpha.clone(),
         size: 2,
         mtime: None,
@@ -423,7 +454,12 @@ async fn lsm_delete_then_recreate_prefers_newest() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&d2.export_segments_v6(), &[], &[root.clone()], 0)
+        .lsm_append_delta_v6(
+            &d2.export_segments_v6(),
+            &[],
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -452,7 +488,11 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
     // seg1 (older): (dev=1, ino=100, path=/a.txt)
     let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
     seg1.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 100, generation: 0 },
+        file_key: FileKey {
+            dev: 1,
+            ino: 100,
+            generation: 0,
+        },
         path: a.clone(),
         size: 1,
         mtime: None,
@@ -460,14 +500,23 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
+        .lsm_replace_base_v6(
+            &seg1.export_segments_v6(),
+            None,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
     // seg2 (newer): (dev=1, ino=200, path=/a.txt) -- no delete sidecar
     let seg2 = PersistentIndex::new_with_roots(vec![root.clone()]);
     seg2.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 200, generation: 0 },
+        file_key: FileKey {
+            dev: 1,
+            ino: 200,
+            generation: 0,
+        },
         path: a.clone(),
         size: 2,
         mtime: None,
@@ -475,7 +524,12 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], &[root.clone()], 0)
+        .lsm_append_delta_v6(
+            &seg2.export_segments_v6(),
+            &[],
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -506,7 +560,11 @@ async fn query_rename_from_tombstone_blocks_old_path() {
     // seg1 (older): /old.txt
     let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
     seg1.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 10, generation: 0 },
+        file_key: FileKey {
+            dev: 1,
+            ino: 10,
+            generation: 0,
+        },
         path: old.clone(),
         size: 1,
         mtime: None,
@@ -514,14 +572,23 @@ async fn query_rename_from_tombstone_blocks_old_path() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
+        .lsm_replace_base_v6(
+            &seg1.export_segments_v6(),
+            None,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
     // seg2 (newer): /new.txt + tombstone(/old.txt)
     let seg2 = PersistentIndex::new_with_roots(vec![root.clone()]);
     seg2.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 11, generation: 0 },
+        file_key: FileKey {
+            dev: 1,
+            ino: 11,
+            generation: 0,
+        },
         path: newp.clone(),
         size: 1,
         mtime: None,
@@ -530,7 +597,12 @@ async fn query_rename_from_tombstone_blocks_old_path() {
     });
     let deleted = vec![old.as_os_str().as_encoded_bytes().to_vec()];
     store
-        .lsm_append_delta_v6(&seg2.export_segments_v6(), &deleted, &[root.clone()], 0)
+        .lsm_append_delta_v6(
+            &seg2.export_segments_v6(),
+            &deleted,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -564,7 +636,11 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
 
     let store = SnapshotStore::new(root.join("index.db"));
 
-    let k = FileKey { dev: 1, ino: 999, generation: 0 };
+    let k = FileKey {
+        dev: 1,
+        ino: 999,
+        generation: 0,
+    };
 
     // seg1 (older): k -> p1
     let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
@@ -577,7 +653,12 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
         atime: None,
     });
     store
-        .lsm_replace_base_v6(&seg1.export_segments_v6(), None, &[root.clone()], 0)
+        .lsm_replace_base_v6(
+            &seg1.export_segments_v6(),
+            None,
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -592,7 +673,12 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&seg2.export_segments_v6(), &[], &[root.clone()], 0)
+        .lsm_append_delta_v6(
+            &seg2.export_segments_v6(),
+            &[],
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -607,7 +693,12 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
         atime: None,
     });
     store
-        .lsm_append_delta_v6(&seg3.export_segments_v6(), &[], &[root.clone()], 0)
+        .lsm_append_delta_v6(
+            &seg3.export_segments_v6(),
+            &[],
+            std::slice::from_ref(&root),
+            0,
+        )
         .await
         .unwrap();
 
@@ -645,7 +736,11 @@ async fn lsm_offline_dir_mtime_change_skips_disk_segments() {
     // base: alpha（写入 LSM，生成 last_build_ns）
     let base_idx = PersistentIndex::new_with_roots(vec![content_root.clone()]);
     base_idx.upsert(FileMeta {
-        file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+        file_key: FileKey {
+            dev: 1,
+            ino: 1,
+            generation: 0,
+        },
         path: alpha.clone(),
         size: 1,
         mtime: None,
@@ -656,7 +751,7 @@ async fn lsm_offline_dir_mtime_change_skips_disk_segments() {
         .lsm_replace_base_v6(
             &base_idx.export_segments_v6(),
             None,
-            &[content_root.clone()],
+            std::slice::from_ref(&content_root),
             0,
         )
         .await
@@ -686,7 +781,11 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
     let mk_seg = |ino: u64, name: &str| {
         let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino,
+                generation: 0,
+            },
             path: root.join(name),
             size: ino,
             mtime: None,
@@ -700,7 +799,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
         .lsm_replace_base_v6(
             &mk_seg(1, "base.txt").export_segments_v6(),
             None,
-            &[root.clone()],
+            std::slice::from_ref(&root),
             10,
         )
         .await
@@ -709,7 +808,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
         .lsm_append_delta_v6(
             &mk_seg(2, "delta-1.txt").export_segments_v6(),
             &[],
-            &[root.clone()],
+            std::slice::from_ref(&root),
             11,
         )
         .await
@@ -718,7 +817,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
         .lsm_append_delta_v6(
             &mk_seg(3, "delta-2.txt").export_segments_v6(),
             &[],
-            &[root.clone()],
+            std::slice::from_ref(&root),
             12,
         )
         .await
@@ -727,7 +826,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
         .lsm_append_delta_v6(
             &mk_seg(4, "delta-3.txt").export_segments_v6(),
             &[],
-            &[root.clone()],
+            std::slice::from_ref(&root),
             13,
         )
         .await
@@ -736,7 +835,7 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
         .lsm_append_delta_v6(
             &mk_seg(5, "delta-4.txt").export_segments_v6(),
             &[],
-            &[root.clone()],
+            std::slice::from_ref(&root),
             14,
         )
         .await
@@ -773,7 +872,10 @@ async fn compaction_prefix_replaces_base_and_keeps_suffix_deltas() {
     assert_eq!(layer_ids[1..], [4, 5]);
     assert!(layer_ids[0] > 5);
 
-    let loaded = store.load_lsm_if_valid(&[root.clone()]).unwrap().unwrap();
+    let loaded = store
+        .load_lsm_if_valid(std::slice::from_ref(&root))
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.base.as_ref().map(|b| b.id), Some(layer_ids[0]));
     assert_eq!(
         loaded.deltas.iter().map(|d| d.id).collect::<Vec<_>>(),

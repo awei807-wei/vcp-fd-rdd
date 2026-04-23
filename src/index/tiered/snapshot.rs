@@ -69,7 +69,13 @@ impl TieredIndex {
             Arc::make_mut(&mut ov.upserted_paths).maybe_shrink_after_clear();
             self.flush_requested.store(false, Ordering::Release);
 
-            (segs, old, deleted, self.disk_layers.read().clone(), wal_seal_id)
+            (
+                segs,
+                old,
+                deleted,
+                self.disk_layers.read().clone(),
+                wal_seal_id,
+            )
         };
 
         // 判断是否已有 LSM manifest：无则先 bootstrap 为 base（避免 legacy base 被"遗忘"）。

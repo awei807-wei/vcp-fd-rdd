@@ -25,7 +25,11 @@ fn streaming_export_byte_identical() {
     // Insert a few FileMeta entries with varied paths
     for i in 0..5u64 {
         let meta = FileMeta {
-            file_key: FileKey { dev: 1, ino: i + 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: i + 1,
+                generation: 0,
+            },
             path: root.join(format!("file_{}.txt", i)),
             size: 100 + i,
             mtime: None,

@@ -121,13 +121,17 @@ impl<'de> serde::Deserialize<'de> for PathArena {
         D: serde::Deserializer<'de>,
     {
         let data = Vec::<u8>::deserialize(deserializer)?;
-        Ok(PathArena { data: Arc::new(data) })
+        Ok(PathArena {
+            data: Arc::new(data),
+        })
     }
 }
 
 impl PathArena {
     pub fn new() -> Self {
-        Self { data: Arc::new(Vec::new()) }
+        Self {
+            data: Arc::new(Vec::new()),
+        }
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Option<(u32, u16)> {
@@ -190,7 +194,7 @@ pub struct CompactMeta {
 }
 
 /// 旧快照格式 v2（兼容读取）
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IndexSnapshotV2 {
     pub files: HashMap<FileKey, FileMeta>,
     pub path_to_id: HashMap<PathBuf, FileKey>,
@@ -208,7 +212,7 @@ impl IndexSnapshotV2 {
 }
 
 /// 旧快照格式 v3（兼容读取）：不落盘 path_to_id（可从 files 重建）
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IndexSnapshotV3 {
     pub files: HashMap<FileKey, FileMeta>,
     pub tombstones: HashSet<FileKey>,
@@ -224,7 +228,7 @@ impl IndexSnapshotV3 {
 }
 
 /// 新快照格式 v4：落盘紧凑布局（arena + metas + tombstones）
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IndexSnapshotV4 {
     pub arena: PathArena,
     pub metas: Vec<CompactMetaV4>,
@@ -363,6 +367,12 @@ pub struct PersistentIndex {
 
     /// 脏标记（自上次快照后是否有变更）
     dirty: std::sync::atomic::AtomicBool,
+}
+
+impl Default for PersistentIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PersistentIndex {
@@ -515,15 +525,12 @@ impl PersistentIndex {
                     rel_bytes,
                 );
                 for_each_component_trigram(abs_path.as_path(), |tri| {
-                    trigram_index
-                        .entry(tri)
-                        .or_insert_with(RoaringTreemap::new)
-                        .insert(docid);
+                    trigram_index.entry(tri).or_default().insert(docid);
                 });
                 for_each_short_component(abs_path.as_path(), |component| {
                     short_component_index
                         .entry(Box::<[u8]>::from(component))
-                        .or_insert_with(RoaringTreemap::new)
+                        .or_default()
                         .insert(docid);
                 });
             }
@@ -826,8 +833,7 @@ impl PersistentIndex {
         &self,
         dirs: &std::collections::HashSet<PathBuf>,
         mut callback: F,
-    )
-    where
+    ) where
         F: FnMut(FileMeta),
     {
         let metas = self.metas.read();
@@ -943,13 +949,25 @@ impl PersistentIndex {
                 (None, FileIdentifier::Path(path)) => {
                     self.handle_create_or_modify(Some(Cow::Owned(path)), None)
                 }
-                (None, FileIdentifier::Fid { dev, ino }) => {
-                    self.handle_create_or_modify(None, Some(FileKey { dev, ino, generation: 0 }))
-                }
+                (None, FileIdentifier::Fid { dev, ino }) => self.handle_create_or_modify(
+                    None,
+                    Some(FileKey {
+                        dev,
+                        ino,
+                        generation: 0,
+                    }),
+                ),
             },
             EventType::Delete => match (path_hint, id) {
                 (_, FileIdentifier::Fid { dev, ino }) => {
-                    self.handle_delete(None, Some(FileKey { dev, ino, generation: 0 }));
+                    self.handle_delete(
+                        None,
+                        Some(FileKey {
+                            dev,
+                            ino,
+                            generation: 0,
+                        }),
+                    );
                 }
                 (Some(path), _) => {
                     self.handle_delete(Some(path.as_path()), None);
@@ -1028,7 +1046,7 @@ impl PersistentIndex {
         to_path: Option<Cow<'_, Path>>,
     ) {
         let to_path = to_path.map(|p| Cow::Owned(crate::index::tiered::normalize_path(p.as_ref())));
-        let from_best_path = from_best_path.map(|p| crate::index::tiered::normalize_path(p));
+        let from_best_path = from_best_path.map(crate::index::tiered::normalize_path);
         let to_meta = to_path.as_deref().and_then(Self::resolve_path_meta);
         let fallback_meta = if to_meta.is_none() {
             from_best_path.as_deref().and_then(Self::resolve_path_meta)
@@ -1039,7 +1057,9 @@ impl PersistentIndex {
         let docid_opt = if let Some(fk) = from_fid {
             self.filekey_to_docid.read().get(&fk).copied()
         } else {
-            from_best_path.as_deref().and_then(|p| self.lookup_docid_by_path(p))
+            from_best_path
+                .as_deref()
+                .and_then(|p| self.lookup_docid_by_path(p))
         };
 
         if let Some(docid) = docid_opt {
@@ -1102,7 +1122,12 @@ impl PersistentIndex {
     pub fn export_snapshot_v5(&self) -> IndexSnapshotV5 {
         let arena = self.arena.read().clone();
         let metas = self.metas.read().clone();
-        let tombstones = self.tombstones.read().iter().map(|v| v as u32).collect::<Vec<u32>>();
+        let tombstones = self
+            .tombstones
+            .read()
+            .iter()
+            .map(|v| v as u32)
+            .collect::<Vec<u32>>();
         self.dirty
             .store(false, std::sync::atomic::Ordering::Release);
         IndexSnapshotV5 {
@@ -1123,7 +1148,6 @@ impl PersistentIndex {
     }
 
     pub fn export_segments_v6(&self) -> V6Segments {
-
         // roots 段：u16 count + (u16 len + bytes)...
         let mut roots_bytes = Vec::new();
         let roots_count: u16 = self.roots_bytes.len().try_into().unwrap_or(u16::MAX);
@@ -1185,8 +1209,14 @@ impl PersistentIndex {
         for (tri, posting) in tri_idx.iter() {
             let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
             let posting_bitmap: roaring::RoaringBitmap = posting.iter().map(|v| v as u32).collect();
-            posting_bitmap.serialize_into(&mut postings_blob_bytes).expect("write to vec");
-            let len: u32 = postings_blob_bytes.len().saturating_sub(off as usize).try_into().unwrap_or(u32::MAX);
+            posting_bitmap
+                .serialize_into(&mut postings_blob_bytes)
+                .expect("write to vec");
+            let len: u32 = postings_blob_bytes
+                .len()
+                .saturating_sub(off as usize)
+                .try_into()
+                .unwrap_or(u32::MAX);
             entries.push((*tri, off, len));
         }
 
@@ -1199,7 +1229,11 @@ impl PersistentIndex {
             roaring::RoaringBitmap::new()
                 .serialize_into(&mut postings_blob_bytes)
                 .expect("write to vec");
-            let len: u32 = postings_blob_bytes.len().saturating_sub(off as usize).try_into().unwrap_or(u32::MAX);
+            let len: u32 = postings_blob_bytes
+                .len()
+                .saturating_sub(off as usize)
+                .try_into()
+                .unwrap_or(u32::MAX);
             entries.push((TRIGRAM_SENTINEL, off, len));
         }
         entries.sort_by_key(|(tri, _, _)| *tri);
@@ -1286,7 +1320,10 @@ impl PersistentIndex {
 
     /// 将 v6 段按固定顺序流式写入 writer，每段带 u64 LE 长度前缀。
     /// 顺序：roots → path_arena → metas → tombstones → trigram_table → postings_blob → filekey_map。
-    pub fn export_segments_v6_to_writer(&self, writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    pub fn export_segments_v6_to_writer(
+        &self,
+        writer: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
         // roots 段：u16 count + (u16 len + bytes)...
         let mut roots_bytes = Vec::new();
         let roots_count: u16 = self.roots_bytes.len().try_into().unwrap_or(u16::MAX);
@@ -1340,8 +1377,14 @@ impl PersistentIndex {
         for (tri, posting) in tri_idx.iter() {
             let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
             let posting_bitmap: roaring::RoaringBitmap = posting.iter().map(|v| v as u32).collect();
-            posting_bitmap.serialize_into(&mut postings_blob_bytes).expect("write to vec");
-            let len: u32 = postings_blob_bytes.len().saturating_sub(off as usize).try_into().unwrap_or(u32::MAX);
+            posting_bitmap
+                .serialize_into(&mut postings_blob_bytes)
+                .expect("write to vec");
+            let len: u32 = postings_blob_bytes
+                .len()
+                .saturating_sub(off as usize)
+                .try_into()
+                .unwrap_or(u32::MAX);
             entries.push((*tri, off, len));
         }
 
@@ -1351,7 +1394,11 @@ impl PersistentIndex {
             roaring::RoaringBitmap::new()
                 .serialize_into(&mut postings_blob_bytes)
                 .expect("write to vec");
-            let len: u32 = postings_blob_bytes.len().saturating_sub(off as usize).try_into().unwrap_or(u32::MAX);
+            let len: u32 = postings_blob_bytes
+                .len()
+                .saturating_sub(off as usize)
+                .try_into()
+                .unwrap_or(u32::MAX);
             entries.push((TRIGRAM_SENTINEL, off, len));
         }
         drop(tri_idx);
@@ -1639,15 +1686,12 @@ impl PersistentIndex {
         let mut tri_idx = self.trigram_index.write();
         let mut short_idx = self.short_component_index.write();
         for_each_component_trigram(path, |tri| {
-            tri_idx
-                .entry(tri)
-                .or_insert_with(RoaringTreemap::new)
-                .insert(docid);
+            tri_idx.entry(tri).or_default().insert(docid);
         });
         for_each_short_component(path, |component| {
             short_idx
                 .entry(Box::<[u8]>::from(component))
-                .or_insert_with(RoaringTreemap::new)
+                .or_default()
                 .insert(docid);
         });
     }
@@ -1895,7 +1939,7 @@ impl PersistentIndex {
         let mut new_arena = PathArena::new();
         let mut new_filekey_to_docid = HashMap::with_capacity(metas.len());
         let mut new_path_hash_to_id = HashMap::with_capacity(metas.len());
-        let mut new_short_component_index = HashMap::new();
+        let mut new_short_component_index: HashMap<Box<[u8]>, RoaringTreemap> = HashMap::new();
 
         for (docid, meta) in metas.into_iter().enumerate() {
             let docid = docid as DocId;
@@ -1926,7 +1970,7 @@ impl PersistentIndex {
             for_each_short_component(meta.path.as_path(), |component| {
                 new_short_component_index
                     .entry(Box::<[u8]>::from(component))
-                    .or_insert_with(RoaringTreemap::new)
+                    .or_default()
                     .insert(docid);
             });
         }
@@ -1951,7 +1995,11 @@ mod tests {
     fn roaring_posting_basic_query() {
         let idx = PersistentIndex::new();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: PathBuf::from("/tmp/alpha_test.txt"),
             size: 1,
             mtime: None,
@@ -1959,7 +2007,11 @@ mod tests {
             atime: None,
         });
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 2, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 2,
+                generation: 0,
+            },
             path: PathBuf::from("/tmp/beta_test.txt"),
             size: 1,
             mtime: None,
@@ -1977,7 +2029,11 @@ mod tests {
     fn short_literal_query_uses_short_component_candidates() {
         let idx = PersistentIndex::new();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: PathBuf::from("/tmp/ab"),
             size: 1,
             mtime: None,
@@ -1985,7 +2041,11 @@ mod tests {
             atime: None,
         });
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 2, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 2,
+                generation: 0,
+            },
             path: PathBuf::from("/tmp/cabd.txt"),
             size: 1,
             mtime: None,
@@ -2007,7 +2067,11 @@ mod tests {
         let idx = PersistentIndex::new();
         let path = PathBuf::from(format!("/tmp/{}", "a".repeat(u16::MAX as usize + 1)));
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path,
             size: 1,
             mtime: None,
@@ -2024,7 +2088,11 @@ mod tests {
     fn rename_to_overlong_path_tombstones_old_entry() {
         let idx = PersistentIndex::new();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: PathBuf::from("/tmp/short-name.txt"),
             size: 1,
             mtime: None,
@@ -2034,7 +2102,11 @@ mod tests {
 
         let long_path = PathBuf::from(format!("/tmp/{}", "b".repeat(u16::MAX as usize + 1)));
         idx.upsert_rename(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: long_path,
             size: 2,
             mtime: None,

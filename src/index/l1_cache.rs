@@ -277,7 +277,11 @@ mod tests {
 
     fn meta(ino: u64, name: &str) -> FileMeta {
         FileMeta {
-            file_key: FileKey { dev: 1, ino, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino,
+                generation: 0,
+            },
             path: PathBuf::from(format!("/tmp/{name}")),
             size: ino,
             mtime: None,
@@ -300,8 +304,20 @@ mod tests {
         cache.insert(meta(3, "gamma.txt"));
 
         let inner = cache.inner.read();
-        assert!(inner.contains_key(&FileKey { dev: 1, ino: 1, generation: 0 }));
-        assert!(!inner.contains_key(&FileKey { dev: 1, ino: 2, generation: 0 }));
-        assert!(inner.contains_key(&FileKey { dev: 1, ino: 3, generation: 0 }));
+        assert!(inner.contains_key(&FileKey {
+            dev: 1,
+            ino: 1,
+            generation: 0
+        }));
+        assert!(!inner.contains_key(&FileKey {
+            dev: 1,
+            ino: 2,
+            generation: 0
+        }));
+        assert!(inner.contains_key(&FileKey {
+            dev: 1,
+            ino: 3,
+            generation: 0
+        }));
     }
 }

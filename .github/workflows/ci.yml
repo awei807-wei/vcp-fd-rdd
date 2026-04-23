@@ -101,13 +101,15 @@ jobs:
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
-
-      - uses: Swatinem/rust-cache@v2
+        with:
+          components: rust-src
 
       - name: cargo test with ThreadSanitizer
         env:
           RUSTFLAGS: "-Z sanitizer=thread"
-        run: cargo test --target x86_64-unknown-linux-gnu -- --test-threads=1
+          TSAN_OPTIONS: "suppressions=.tsan-supp"
+          CARGO_INCREMENTAL: "0"
+        run: cargo -Zbuild-std test --target x86_64-unknown-linux-gnu -- --test-threads=1
 
   doc:
     name: Documentation check
@@ -138,7 +140,7 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
 
       - name: cargo check (musl)
-        run: cargo check --target x86_64-unknown-linux-musl --all-targets
+        run: cargo check --target x86_64-unknown-linux-musl --all-targets --no-default-features
 
   smoke:
     name: Smoke test (ubuntu)

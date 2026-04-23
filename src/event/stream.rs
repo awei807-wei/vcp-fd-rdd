@@ -197,7 +197,7 @@ impl EventPipeline {
                 tokio::time::sleep(PENDING_MOVE_TIMEOUT).await;
                 let mut pm = pending_moves_cleaner.lock().await;
                 let before = pm.len();
-                cleanup_pending_moves(&mut *pm);
+                cleanup_pending_moves(&mut pm);
                 let after = pm.len();
                 drop(pm);
                 if before != after {
@@ -283,16 +283,18 @@ impl EventPipeline {
                             ev = priority_rx.recv() => ev.map(|e| (e, true)),
                             ev = normal_rx.recv() => ev.map(|e| (e, false)),
                         }
-                    }).await {
+                    })
+                    .await
+                    {
                         Ok(Some((ev, _))) => raw_events.push(ev),
                         _ => break,
                     }
                 }
 
                 // Fast path: if all events are Create for distinct paths, apply immediately.
-                let all_create = raw_events.iter().all(|ev| {
-                    matches!(ev.kind, notify::EventKind::Create(_))
-                });
+                let all_create = raw_events
+                    .iter()
+                    .all(|ev| matches!(ev.kind, notify::EventKind::Create(_)));
                 if all_create && raw_events.len() <= 10 {
                     let mut fast_records: Vec<EventRecord> = Vec::with_capacity(raw_events.len());
                     for ev in raw_events.drain(..) {
@@ -358,9 +360,7 @@ impl EventPipeline {
                                                     paths: vec![from.clone(), to.clone()],
                                                     attrs: Default::default(),
                                                 };
-                                                combined
-                                                    .attrs
-                                                    .set_tracker(tracker);
+                                                combined.attrs.set_tracker(tracker);
                                                 paired.push((idx, combined));
                                             }
                                         }

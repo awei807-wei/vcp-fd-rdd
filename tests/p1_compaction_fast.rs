@@ -25,7 +25,11 @@ fn fast_compaction_equivalence() {
     // Populate index normally
     for i in 0..5u64 {
         let meta = FileMeta {
-            file_key: FileKey { dev: 1, ino: i + 1, generation: 0 },
+            file_key: FileKey {
+                dev: 1,
+                ino: i + 1,
+                generation: 0,
+            },
             path: root.join(format!("file_{}.txt", i)),
             size: 100 + i,
             mtime: None,
@@ -71,10 +75,9 @@ fn fast_compaction_equivalence() {
     );
 
     // Compacted version should have no tombstones
-    let compacted_tombstones = roaring::RoaringBitmap::deserialize_from(
-        &segs_compacted.tombstones_bytes[..],
-    )
-    .expect("valid roaring bitmap in compacted tombstones_bytes");
+    let compacted_tombstones =
+        roaring::RoaringBitmap::deserialize_from(&segs_compacted.tombstones_bytes[..])
+            .expect("valid roaring bitmap in compacted tombstones_bytes");
     assert!(
         compacted_tombstones.is_empty(),
         "compacted tombstones_bytes must represent an empty set"
@@ -82,12 +85,7 @@ fn fast_compaction_equivalence() {
 }
 
 /// Parse trigram table + postings blob and compare logical equivalence.
-fn assert_trigram_equivalence(
-    tri_a: &[u8],
-    blob_a: &[u8],
-    tri_b: &[u8],
-    blob_b: &[u8],
-) {
+fn assert_trigram_equivalence(tri_a: &[u8], blob_a: &[u8], tri_b: &[u8], blob_b: &[u8]) {
     assert_eq!(
         tri_a.len() % 12,
         0,
@@ -121,5 +119,8 @@ fn assert_trigram_equivalence(
         map_b.insert(tri, bitmap);
     }
 
-    assert_eq!(map_a, map_b, "trigram postings must be logically equivalent");
+    assert_eq!(
+        map_a, map_b,
+        "trigram postings must be logically equivalent"
+    );
 }

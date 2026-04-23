@@ -1,0 +1,30 @@
+# ThreadSanitizer suppression file for fd-rdd
+# These are known false positives from upstream dependencies and Rust std internals.
+# ==============================================================================
+
+# ── mimalloc lock-free heap ──
+# TSan cannot track mimalloc's fine-grained thread-local heap synchronization.
+race:_mi_memzero
+race:_mi_memcpy
+race:_mi_memcpy_aligned
+
+# ── Rust std TLS destructor ordering (test harness) ──
+# When a test thread exits, its thread-local Arcs may be dropped concurrently
+# with the next test's Arc construction. This is an artefact of -Zbuild-std+TSan.
+race:std::sys::thread_local::native::eager::destroy
+
+# ── notify crate inotify backend ──
+# INotifyWatcher spawns an internal EventLoop thread; TSan reports races during
+# watcher creation / teardown because the thread startup happens inside Watcher::new.
+race:*inotify::*
+race:*notify::inotify::*
+
+# ── crossbeam lock-free channel internals ──
+# Uses Acquire/Release atomics that TSan does not instrument fully.
+race:crossbeam_channel::counter::*
+race:crossbeam_channel::flavors::list::*
+
+# ── tokio mpsc lock-free block allocator ──
+# Same story: lock-free queue internals with intentional memory ordering.
+race:tokio::sync::mpsc::block::BlockHeader*
+race:tokio::sync::mpsc::block::Block*
