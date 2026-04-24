@@ -129,6 +129,33 @@ pub(crate) struct FastSyncReport {
 }
 
 impl TieredIndex {
+    /// 启动阶段对 roots 做一次 best-effort 离线变更补偿。
+    ///
+    /// 用途：
+    /// - 守护进程停机期间新增/删除的文件不会经过 watcher/WAL；
+    /// - 对已有索引做一次全 roots fast-sync，可在不清空索引的前提下补齐新增并对齐删除。
+    pub fn startup_reconcile(&self, ignore_prefixes: &[PathBuf]) -> (usize, usize, usize) {
+        let report = self.fast_sync(
+            DirtyScope::Dirs {
+                cutoff_ns: 0,
+                dirs: self.roots.clone(),
+            },
+            ignore_prefixes,
+        );
+        maybe_trim_rss();
+        tracing::info!(
+            "Startup reconcile complete: dirs={} upserts={} deletes={}",
+            report.dirs_scanned,
+            report.upsert_events,
+            report.delete_events
+        );
+        (
+            report.dirs_scanned,
+            report.upsert_events,
+            report.delete_events,
+        )
+    }
+
     pub(super) fn try_start_rebuild_force(&self) -> bool {
         let mut st = self.rebuild_state.lock();
         if st.in_progress {

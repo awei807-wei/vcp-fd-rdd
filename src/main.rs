@@ -168,6 +168,9 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let mut startup_ignore_paths = args.ignore_paths.clone();
+    startup_ignore_paths.push(store.path().to_path_buf());
+    startup_ignore_paths.push(store.derived_lsm_dir_path());
 
     // 5) 启动事件管道（bounded + debounce）
     let pipeline = if args.no_watch {
@@ -175,22 +178,24 @@ async fn main() -> anyhow::Result<()> {
     } else {
         // 默认忽略索引自身的 snapshot/segment 写入路径，避免 watcher 反馈循环。
         // 额外忽略项可通过 --ignore-path 传入（例如将日志重定向到了被 watch 的目录下）。
-        let mut ignores = args.ignore_paths.clone();
-        ignores.push(store.path().to_path_buf());
-        ignores.push(store.derived_lsm_dir_path());
-
         let pipeline = Arc::new(
             EventPipeline::new_with_config_and_ignores(
                 index.clone(),
                 args.debounce_ms,
                 args.event_channel_size,
-                ignores,
+                startup_ignore_paths.clone(),
             )
             .with_ignore_filter(ignore_filter.clone()),
         );
         pipeline.start().await?;
         Some(pipeline)
     };
+
+    // 5.5) 启动阶段 best-effort 补偿停机期间的离线变更。
+    // 仅在已有索引内容时执行，避免与空索引冷启动 full_build 重复做全量工作。
+    if index.file_count() > 0 {
+        let _ = index.startup_reconcile(&startup_ignore_paths);
+    }
 
     // 6) 启动 HTTP 查询服务
     let health_provider = {

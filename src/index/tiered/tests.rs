@@ -165,7 +165,12 @@ fn fast_sync_reconciles_add_and_delete() {
     );
     assert!(r.dirs_scanned >= 1);
     assert!(r.upsert_events >= 1);
-    assert!(r.delete_events >= 1);
+    // Linux 上删除后立即新建文件时可能复用 inode，当前实现会把它视为
+    // same-FileKey reconcile；此时最终状态正确，但 delete_events 可能为 0。
+    assert!(
+        r.delete_events >= 1 || r.upsert_events >= 2,
+        "expected a delete event or a same-FileKey reconcile: {r:?}"
+    );
 
     assert!(!idx.query("a_match").is_empty());
     assert!(idx.query("b_match").is_empty());
@@ -182,6 +187,68 @@ fn fast_sync_reconciles_add_and_delete() {
     }
     assert!(c_found, "c_match should appear after fast_sync");
     assert!(!idx.query("c_match").is_empty());
+}
+
+#[test]
+fn nfd_query_matches_nfc_normalized_path() {
+    let root = unique_tmp_dir("unicode-query");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let nfc_path = root.join("café_nfc.txt");
+    std::fs::write(&nfc_path, b"nfc").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let (scanned, _) = idx.scan_dirs_immediate_deep(std::slice::from_ref(&root));
+    assert!(scanned >= 1);
+
+    let results = idx.query("cafe\u{301}");
+    assert!(
+        results
+            .iter()
+            .any(|meta| meta.path.to_string_lossy().contains("café_nfc.txt")),
+        "nfd query should match nfc-normalized indexed path: {results:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn deep_scan_reconciles_directory_rename_when_old_path_is_gone() {
+    let root = unique_tmp_dir("deep-rename-reconcile");
+    let old_project = root.join("old_project");
+    let deep_dir = old_project.join("node_modules/libA/dist");
+    std::fs::create_dir_all(&deep_dir).unwrap();
+
+    let old_file = deep_dir.join("bundle_1.js");
+    std::fs::write(&old_file, b"bundle").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let (scanned, _) = idx.scan_dirs_immediate_deep(std::slice::from_ref(&root));
+    assert!(scanned >= 1);
+
+    let new_project = root.join("new_project");
+    std::fs::rename(&old_project, &new_project).unwrap();
+
+    let (rescanned, _) = idx.scan_dirs_immediate_deep(std::slice::from_ref(&new_project));
+    assert!(rescanned >= 1);
+
+    let results = idx.query("bundle_1");
+    assert!(
+        results.iter().any(|meta| meta
+            .path
+            .to_string_lossy()
+            .contains("new_project/node_modules/libA/dist/bundle_1.js")),
+        "renamed deep path should be visible after reconcile: {results:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .all(|meta| !meta.path.to_string_lossy().contains("old_project/")),
+        "old renamed path should be removed after reconcile: {results:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
@@ -767,6 +834,43 @@ async fn lsm_offline_dir_mtime_change_skips_disk_segments() {
         .await
         .unwrap();
     assert_eq!(idx.disk_layers.read().len(), 0);
+}
+
+#[tokio::test]
+async fn startup_reconcile_recovers_offline_add_and_delete() {
+    let root = unique_tmp_dir("startup-reconcile");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let a = root.join("online_keep.txt");
+    let b = root.join("online_delete.txt");
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"b").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, a.clone()),
+        mk_event(2, EventType::Create, b.clone()),
+    ]);
+    assert!(!idx.query("online_keep").is_empty());
+    assert!(!idx.query("online_delete").is_empty());
+
+    // 模拟停机期间的离线变化
+    std::fs::remove_file(&b).unwrap();
+    let c = root.join("offline_new.txt");
+    std::fs::write(&c, b"c").unwrap();
+
+    let (dirs, upserts, deletes) = idx.startup_reconcile(&[]);
+    assert!(dirs >= 1);
+    assert!(upserts >= 1);
+    // 同上：inode 复用时 offline add/delete 可能收敛为一次路径 reconcile。
+    assert!(
+        deletes >= 1 || upserts >= 2,
+        "expected a delete event or a same-FileKey reconcile: dirs={dirs} upserts={upserts} deletes={deletes}"
+    );
+
+    assert!(!idx.query("online_keep").is_empty());
+    assert!(idx.query("online_delete").is_empty());
+    assert!(!idx.query("offline_new").is_empty());
 }
 
 #[tokio::test]

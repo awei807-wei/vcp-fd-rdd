@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use unicode_normalization::UnicodeNormalization;
 
 /// Glob 匹配模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,10 @@ pub trait Matcher: Send + Sync {
     }
 }
 
+fn normalize_match_input(input: &str) -> String {
+    input.nfc().collect()
+}
+
 /// 精确包含匹配 (contains)
 pub struct ExactMatcher {
     pattern: String,
@@ -45,7 +50,7 @@ pub struct ExactMatcher {
 impl ExactMatcher {
     pub fn new(pattern: &str, case_sensitive: bool) -> Self {
         Self {
-            pattern: pattern.to_string(),
+            pattern: normalize_match_input(pattern),
             case_sensitive,
         }
     }
@@ -84,6 +89,7 @@ pub struct GlobMatcher {
 
 impl GlobMatcher {
     pub fn new(pattern: &str, mode: GlobMode, case_sensitive: bool) -> Self {
+        let pattern = normalize_match_input(pattern);
         // 提取通配符前的固定前缀
         let prefix = pattern
             .split(['*', '?'])
@@ -91,10 +97,10 @@ impl GlobMatcher {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        let literal_hint = extract_longest_literal_hint(pattern);
+        let literal_hint = extract_longest_literal_hint(&pattern);
 
         Self {
-            pattern: simplify_glob_pattern(pattern),
+            pattern: simplify_glob_pattern(&pattern),
             prefix,
             mode,
             literal_hint,
@@ -286,15 +292,16 @@ fn extract_longest_literal_hint(pattern: &str) -> Option<Vec<u8>> {
 
 /// 匹配器工厂与自动识别
 pub fn create_matcher(pattern: &str, case_sensitive: bool) -> Arc<dyn Matcher> {
+    let pattern = normalize_match_input(pattern);
     if pattern.contains('*') || pattern.contains('?') {
-        let mode = if contains_path_separator(pattern) {
+        let mode = if contains_path_separator(&pattern) {
             GlobMode::FullPath
         } else {
             GlobMode::Segment
         };
-        Arc::new(GlobMatcher::new(pattern, mode, case_sensitive))
+        Arc::new(GlobMatcher::new(&pattern, mode, case_sensitive))
     } else {
-        Arc::new(ExactMatcher::new(pattern, case_sensitive))
+        Arc::new(ExactMatcher::new(&pattern, case_sensitive))
     }
 }
 
@@ -315,7 +322,7 @@ pub struct WfnMatcher {
 impl WfnMatcher {
     pub fn new(pattern: &str, scope: PathScope, case_sensitive: bool) -> Self {
         Self {
-            pattern: pattern.to_string(),
+            pattern: normalize_match_input(pattern),
             scope,
             case_sensitive,
         }
@@ -450,7 +457,8 @@ pub struct PathInitialsMatcher {
 
 impl PathInitialsMatcher {
     pub fn new(input: &str) -> Self {
-        let segments = input
+        let normalized = normalize_match_input(input);
+        let segments = normalized
             .split(['/', '\\'])
             .filter(|s| !s.is_empty())
             .map(|s| s.to_lowercase())
@@ -692,5 +700,11 @@ mod tests {
     fn path_initials_empty_segments() {
         let m = PathInitialsMatcher::new("");
         assert!(m.matches("/any/path"));
+    }
+
+    #[test]
+    fn nfd_query_matches_nfc_path() {
+        let m = create_matcher("cafe\u{301}", false);
+        assert!(m.matches("/tmp/café_nfc.txt"));
     }
 }

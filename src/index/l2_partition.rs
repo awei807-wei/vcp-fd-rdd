@@ -542,7 +542,7 @@ impl PersistentIndex {
     /// ## 单路径策略 (first-seen wins)
     /// 如果该 FileKey 已存在且路径不同（hardlink 场景），
     /// 保留最先发现的路径，仅更新 size/mtime 等元数据。
-    /// 只有显式 rename 事件才会更新路径。
+    /// 只有显式 rename 事件，或补扫时检测到旧路径已消失的 reconcile 场景，才会更新路径。
     pub fn upsert(&self, meta: FileMeta) {
         self.upsert_inner(meta, false);
     }
@@ -590,8 +590,20 @@ impl PersistentIndex {
                 return;
             }
 
-            // 路径不同：hardlink 或 rename
-            if !force_path_update {
+            let old_path_missing = if force_path_update || old_len == 0 {
+                false
+            } else {
+                self.absolute_path_buf(old_root_id, old_off, old_len)
+                    .map(|old_path| match std::fs::symlink_metadata(&old_path) {
+                        Ok(_) => false,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(_) => false,
+                    })
+                    .unwrap_or(false)
+            };
+
+            // 路径不同：hardlink、rename，或旧路径已消失后的 reconcile
+            if !force_path_update && !old_path_missing {
                 // hardlink/重复发现：保留旧路径，仅更新元数据
                 let mut metas = self.metas.write();
                 if let Some(existing) = metas.get_mut(docid as usize) {
@@ -2117,5 +2129,67 @@ mod tests {
         assert_eq!(idx.file_count(), 0);
         let m = create_matcher("short-name", true);
         assert!(idx.query(m.as_ref(), 100).is_empty());
+    }
+
+    #[test]
+    fn same_filekey_updates_to_new_path_when_old_path_is_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-reconcile-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let old_project = root.join("old_project");
+        let old_dir = old_project.join("node_modules/libA/dist");
+        std::fs::create_dir_all(&old_dir).unwrap();
+
+        let old_path = old_dir.join("bundle_1.js");
+        std::fs::write(&old_path, b"bundle").unwrap();
+
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        let file_key = FileKey {
+            dev: 1,
+            ino: 42,
+            generation: 0,
+        };
+
+        idx.upsert(FileMeta {
+            file_key,
+            path: old_path.clone(),
+            size: 6,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        let new_project = root.join("new_project");
+        std::fs::rename(&old_project, &new_project).unwrap();
+        let new_path = new_project.join("node_modules/libA/dist/bundle_1.js");
+
+        idx.upsert(FileMeta {
+            file_key,
+            path: new_path.clone(),
+            size: 6,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        let meta = idx.get_meta(file_key).expect("file should remain indexed");
+        assert_eq!(meta.path, new_path);
+
+        let matcher = create_matcher("bundle_1", false);
+        let results = idx.query(matcher.as_ref(), 10);
+        assert!(
+            results.iter().any(|m| m.path == new_path),
+            "new path should be queryable after reconcile: {results:?}"
+        );
+        assert!(
+            results.iter().all(|m| m.path != old_path),
+            "old path should be removed after reconcile: {results:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
