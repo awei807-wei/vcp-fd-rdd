@@ -99,6 +99,110 @@ impl TieredIndex {
         Vec::new()
     }
 
+    pub(crate) fn collect_all_live_metas(&self) -> Vec<FileMeta> {
+        let l2 = self.l2.load_full();
+        let layers = self.disk_layers.read().clone();
+        let (overlay_deleted, overlay_upserted) = {
+            let ov = self.overlay_state.lock();
+            (ov.deleted_paths.clone(), ov.upserted_paths.clone())
+        };
+        let mut blocked_paths = PathArenaSet::default();
+        let mut deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
+        let mut seen: std::collections::HashSet<FileKey> =
+            std::collections::HashSet::with_capacity(l2.file_count().saturating_add(256));
+        let mut results: Vec<FileMeta> = Vec::with_capacity(l2.file_count().saturating_add(256));
+
+        l2.for_each_live_meta(|meta| {
+            collect_live_meta(
+                meta,
+                None,
+                deleted_sources.as_slice(),
+                &mut seen,
+                &mut blocked_paths,
+                &mut results,
+            );
+        });
+
+        for layer in layers.iter().rev() {
+            layer.idx.for_each_live_meta(|meta| {
+                collect_live_meta(
+                    meta,
+                    Some(layer.deleted_paths.as_ref()),
+                    deleted_sources.as_slice(),
+                    &mut seen,
+                    &mut blocked_paths,
+                    &mut results,
+                );
+            });
+            deleted_sources.push(layer.deleted_paths.clone());
+        }
+
+        overlay_upserted.for_each_bytes(|bytes| {
+            let path = super::pathbuf_from_bytes(bytes);
+            let path = super::normalize_path(&path);
+            let path_bytes = path.as_os_str().as_encoded_bytes();
+            if blocked_paths.contains(path_bytes)
+                || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
+            {
+                return;
+            }
+
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => {
+                    let file_key = match FileKey::from_path_and_metadata(&path, &m) {
+                        Some(fk) => fk,
+                        None => return,
+                    };
+                    if !seen.insert(file_key) {
+                        return;
+                    }
+                    FileMeta {
+                        file_key,
+                        path: path.clone(),
+                        size: m.len(),
+                        mtime: m.modified().ok(),
+                        ctime: m.created().ok(),
+                        atime: m.accessed().ok(),
+                    }
+                }
+                Err(_) => return,
+            };
+            let _ = blocked_paths.insert(path_bytes);
+            results.push(meta);
+        });
+
+        let pending = self.pending_events.lock();
+        for ev in pending.iter() {
+            let path = match &ev.event_type {
+                EventType::Create | EventType::Modify | EventType::Rename { .. } => ev.best_path(),
+                EventType::Delete => continue,
+            };
+            let Some(path) = path else { continue };
+            let path = super::normalize_path(path);
+            let path_bytes = path.as_os_str().as_encoded_bytes();
+            if blocked_paths.contains(path_bytes)
+                || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
+            {
+                continue;
+            }
+            let _ = blocked_paths.insert(path_bytes);
+            results.push(FileMeta {
+                file_key: FileKey {
+                    dev: 0,
+                    ino: 0,
+                    generation: 0,
+                },
+                path,
+                size: 0,
+                mtime: None,
+                ctime: None,
+                atime: None,
+            });
+        }
+
+        results
+    }
+
     fn execute_query_plan(&self, plan: &QueryPlan, limit: usize) -> Vec<FileMeta> {
         let l2 = self.l2.load_full();
         let layers = self.disk_layers.read().clone();
@@ -227,4 +331,28 @@ impl TieredIndex {
 
         false
     }
+}
+
+fn collect_live_meta(
+    meta: FileMeta,
+    layer_deleted: Option<&PathArenaSet>,
+    deleted_sources: &[Arc<PathArenaSet>],
+    seen: &mut std::collections::HashSet<FileKey>,
+    blocked_paths: &mut PathArenaSet,
+    results: &mut Vec<FileMeta>,
+) {
+    if !seen.insert(meta.file_key) {
+        return;
+    }
+
+    let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+    if blocked_paths.contains(path_bytes)
+        || layer_deleted.is_some_and(|paths| paths.contains(path_bytes))
+        || path_deleted_by_any(path_bytes, deleted_sources)
+    {
+        return;
+    }
+
+    let _ = blocked_paths.insert(path_bytes);
+    results.push(meta);
 }

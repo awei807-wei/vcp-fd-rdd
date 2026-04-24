@@ -212,7 +212,7 @@ impl FzfIntegration {
         let candidate_limit = fuzzy_candidate_limit(index.file_count(), limit);
         let mut candidates = index.query_limit(keyword, candidate_limit);
         if candidates.is_empty() {
-            candidates = index.query_limit("", candidate_limit);
+            candidates = index.collect_all_live_metas();
         }
 
         self.match_query(keyword, candidates)
@@ -301,6 +301,46 @@ mod tests {
         let fuzzy = execute_query(
             &index,
             "mdt",
+            1,
+            QueryMode::Fuzzy,
+            SortColumn::default(),
+            SortOrder::default(),
+        );
+        assert_eq!(fuzzy.len(), 1);
+        assert_eq!(fuzzy[0].path, wanted);
+        Ok(())
+    }
+
+    #[test]
+    fn fuzzy_fallback_scans_beyond_truncated_match_all_candidates() -> anyhow::Result<()> {
+        let root = unique_tmp_dir("fallback-wide");
+        let wanted = root.join("main_document_target.txt");
+        fs::create_dir_all(&root)?;
+
+        let index = TieredIndex::empty(vec![root.clone()]);
+        let mut events = Vec::new();
+        for i in 0..700u64 {
+            let noise = root.join(format!("noise_{:04}.txt", i));
+            fs::write(&noise, b"x")?;
+            events.push(ev(i + 1, noise));
+        }
+        fs::write(&wanted, b"wanted")?;
+        events.push(ev(10_000, wanted.clone()));
+        index.apply_events(&events);
+
+        let exact = execute_query(
+            &index,
+            "maindoctarget",
+            10,
+            QueryMode::Exact,
+            SortColumn::default(),
+            SortOrder::default(),
+        );
+        assert!(exact.is_empty());
+
+        let fuzzy = execute_query(
+            &index,
+            "maindoctarget",
             1,
             QueryMode::Fuzzy,
             SortColumn::default(),

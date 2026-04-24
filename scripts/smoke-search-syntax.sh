@@ -60,6 +60,20 @@ api_search_paths() {
     | jq -r '.[].path'
 }
 
+api_search_json() {
+  local q="$1"
+  shift
+  curl -fsS -G "${BASE_URL%/}/search" --data-urlencode "q=$q" "$@"
+}
+
+api_scan_json() {
+  local path="$1"
+  jq -nc --arg path "$path" '{paths:[$path]}' \
+    | curl -fsS -X POST "${BASE_URL%/}/scan" \
+        -H 'Content-Type: application/json' \
+        --data-binary @-
+}
+
 wait_until_indexed() {
   local q="$1"
   local expect="$2"
@@ -75,6 +89,12 @@ wait_until_indexed() {
   echo "等待索引超时（${TIMEOUT_SECS}s）：未命中 $expect" >&2
   echo "提示：请确认 daemon 的 --root 覆盖了该目录，且未使用 --no-watch。" >&2
   return 1
+}
+
+path_depth() {
+  local path="$1"
+  local trimmed="${path//[^\/]/}"
+  echo "${#trimmed}"
 }
 
 mkdir -p "$BASE_DIR"
@@ -123,6 +143,39 @@ mkdir -p "$BASE_DIR/regex"
 printf 'console.log(\"plugin\");\n' > "$BASE_DIR/regex/VCP${RUN_ID}Plugin.js"
 printf 'console.log(\"tool\");\n' > "$BASE_DIR/regex/VCP${RUN_ID}Tool.ts"
 
+# 9) additional coverage: parent/infolder/depth/len/type/fuzzy/sort/highlights/initials/CJK
+mkdir -p "$BASE_DIR/filter_parent/target_parent" "$BASE_DIR/filter_parent/other_parent"
+printf 'parent match\n' > "$BASE_DIR/filter_parent/target_parent/parent_probe_${RUN_ID}.txt"
+printf 'other parent\n' > "$BASE_DIR/filter_parent/other_parent/parent_probe_${RUN_ID}.txt"
+
+mkdir -p "$BASE_DIR/filter_depth"
+printf 'depth shallow\n' > "$BASE_DIR/filter_depth/depthprobe_${RUN_ID}_shallow.txt"
+mkdir -p "$BASE_DIR/filter_depth/alpha/beta/gamma"
+printf 'depth deep\n' > "$BASE_DIR/filter_depth/alpha/beta/gamma/depthprobe_${RUN_ID}_deep.txt"
+
+mkdir -p "$BASE_DIR/filter_len"
+printf 'len short\n' > "$BASE_DIR/filter_len/lenprobe_${RUN_ID}.txt"
+printf 'len long\n' > "$BASE_DIR/filter_len/lenprobe_filename_with_significantly_long_name_${RUN_ID}.txt"
+
+mkdir -p "$BASE_DIR/filter_type"
+printf 'type file\n' > "$BASE_DIR/filter_type/typeprobe_${RUN_ID}.txt"
+
+mkdir -p "$BASE_DIR/segment/client/user/search"
+printf 'initials\n' > "$BASE_DIR/segment/client/user/search/initials_probe_${RUN_ID}.txt"
+
+mkdir -p "$BASE_DIR/fuzzy"
+printf 'fuzzy target\n' > "$BASE_DIR/fuzzy/main_document_target_${RUN_ID}.txt"
+
+mkdir -p "$BASE_DIR/sort"
+printf '123456789' > "$BASE_DIR/sort/sortprobe_small_${RUN_ID}.txt"
+printf '12345678901234567890' > "$BASE_DIR/sort/sortprobe_large_${RUN_ID}.txt"
+
+mkdir -p "$BASE_DIR/highlight"
+printf 'highlight\n' > "$BASE_DIR/highlight/highlightprobe_${RUN_ID}.txt"
+
+mkdir -p "$BASE_DIR/cjk"
+printf '中文\n' > "$BASE_DIR/cjk/中文检索_${RUN_ID}.txt"
+
 # ready marker（避免用 wfn/regex/glob 做等待条件）
 READY="READY_smoke_${RUN_ID}.txt"
 printf 'ready\n' > "$BASE_DIR/${READY}"
@@ -141,6 +194,20 @@ assert_not_has() {
     fail "$msg (unexpected: $bad)"
   fi
 }
+assert_json_expr() {
+  local json="$1" expr="$2" msg="$3"
+  if ! printf '%s' "$json" | jq -e "$expr" >/dev/null; then
+    fail "$msg (jq: $expr)"
+  fi
+}
+
+# Force a full directory refresh before assertions. Waiting for READY alone only
+# proves one file is visible; the rest of the sample tree may still be settling
+# on slower CI runners while the first smart-case query starts.
+json="$(api_scan_json "$BASE_DIR")"
+assert_json_expr "$json" ".scanned >= 1" "POST /scan 应至少扫描样本目录"
+wait_until_indexed "vcp_${RUN_ID}" "VCP_${RUN_ID}.txt"
+wait_until_indexed "vcp_${RUN_ID}" "vcp_${RUN_ID}.txt"
 
 echo "== fd-rdd search DSL smoke test =="
 echo "base_url=${BASE_URL%/}"
@@ -202,5 +269,48 @@ assert_has "$out" "$server_path" "wfn: fullpath 应命中精确路径"
 out="$(api_search_paths "regex:\"^VCP${RUN_ID}.*\\\\.(js|ts)$\"")"
 assert_has "$out" "regex/VCP${RUN_ID}Plugin.js" "regex: 应命中 js"
 assert_has "$out" "regex/VCP${RUN_ID}Tool.ts" "regex: 应命中 ts"
+
+parent_dir="${BASE_DIR}/filter_parent/target_parent"
+out="$(api_search_paths "parent:${parent_dir} parent_probe_${RUN_ID}")"
+assert_has "$out" "filter_parent/target_parent/parent_probe_${RUN_ID}.txt" "parent: 应命中目标父目录"
+assert_not_has "$out" "filter_parent/other_parent/parent_probe_${RUN_ID}.txt" "parent: 不应命中其他父目录"
+
+out="$(api_search_paths "infolder:${parent_dir} parent_probe_${RUN_ID}")"
+assert_has "$out" "filter_parent/target_parent/parent_probe_${RUN_ID}.txt" "infolder: 应作为 parent: 别名生效"
+assert_not_has "$out" "filter_parent/other_parent/parent_probe_${RUN_ID}.txt" "infolder: 不应命中其他父目录"
+
+depth_shallow_path="${BASE_DIR}/filter_depth/depthprobe_${RUN_ID}_shallow.txt"
+depth_limit="$(path_depth "$depth_shallow_path")"
+out="$(api_search_paths "depthprobe_${RUN_ID} depth:<=${depth_limit}")"
+assert_has "$out" "filter_depth/depthprobe_${RUN_ID}_shallow.txt" "depth:<= 应命中浅层文件"
+assert_not_has "$out" "filter_depth/alpha/beta/gamma/depthprobe_${RUN_ID}_deep.txt" "depth:<= 不应命中更深层文件"
+
+out="$(api_search_paths "lenprobe len:>40")"
+assert_has "$out" "filter_len/lenprobe_filename_with_significantly_long_name_${RUN_ID}.txt" "len:>40 应命中长文件名"
+assert_not_has "$out" "filter_len/lenprobe_${RUN_ID}.txt" "len:>40 不应命中短文件名"
+
+out="$(api_search_paths "type:file typeprobe_${RUN_ID}")"
+assert_has "$out" "filter_type/typeprobe_${RUN_ID}.txt" "type:file 应命中文件"
+
+out="$(api_search_paths "c/u/s/initials_probe_${RUN_ID}")"
+assert_has "$out" "segment/client/user/search/initials_probe_${RUN_ID}.txt" "路径段首匹配应命中 c/u/s/initials_probe"
+
+json="$(api_search_json "maindoctarget" --data-urlencode "mode=fuzzy" --data-urlencode "limit=200")"
+assert_json_expr "$json" ". | map(.path) | any(contains(\"main_document_target_${RUN_ID}.txt\"))" "mode=fuzzy 应命中文件"
+
+json="$(api_search_json "sortprobe" --data-urlencode "sort=size" --data-urlencode "order=desc" --data-urlencode "limit=20")"
+assert_json_expr "$json" ".[0].path | contains(\"sortprobe_large_${RUN_ID}.txt\")" "sort=size&order=desc 首项应为大文件"
+
+json="$(api_search_json "highlightprobe_${RUN_ID}" --data-urlencode "limit=20")"
+assert_json_expr "$json" ".[0].highlights | length > 0" "搜索结果应返回 highlights"
+
+out="$(api_search_paths "中文检索_${RUN_ID}")"
+assert_has "$out" "cjk/中文检索_${RUN_ID}.txt" "中文查询应命中文件"
+
+mkdir -p "$BASE_DIR/scan/on_demand"
+printf 'scan now\n' > "$BASE_DIR/scan/on_demand/scan_trigger_${RUN_ID}.txt"
+json="$(api_scan_json "$BASE_DIR/scan/on_demand")"
+assert_json_expr "$json" ".scanned >= 1" "POST /scan 应返回扫描条目数"
+wait_until_indexed "scan_trigger_${RUN_ID}" "scan_trigger_${RUN_ID}.txt"
 
 echo "PASS"

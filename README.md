@@ -27,6 +27,8 @@
 - **新增** Unicode NFC 规范化：集成 `unicode-normalization`，全量路径强制 NFC，消除编码陷阱。
 - **修复** tombstones/trigrams 原子性：确保删除时先 `tombstones.insert` 后 `remove_trigrams`，消除查询落空窗口。
 - **新增** fd-rdd Stress CI：系统性压力测试覆盖 Overlay 可见性、Rename 雪崩、并发中间状态、Mmap 安全、Trigram 倾斜等。
+- **修复** GitHub Actions 中 `fd-rdd` 启动命令的续行脆弱性：压力工作流与 smoke 节点改为单行启动，避免 `\` 被误传给 clap 导致测试在 daemon 启动前失败。
+- **修复** nightly ThreadSanitizer ABI mismatch：sanitizer job 改为使用 job 级 `RUSTFLAGS=-Z sanitizer=thread`，确保当前 crate、依赖与标准库使用同一 sanitizer ABI。
 
 ## v0.5.9 更新
 

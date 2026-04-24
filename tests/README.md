@@ -18,7 +18,7 @@
 - `p1_watch_degradation.rs` — watcher 降级轮询
 - `p1_streaming_export.rs` — 流式导出字节一致性
 - `p1_compaction_fast.rs` — fast/legacy compaction 等价性
-- `p1_visibility_latency.rs` — 文件可见性延迟（占位）
+- `p1_visibility_latency.rs` — 文件可见性延迟
 
 ## v0.6.0 测试相关变更
 
@@ -43,4 +43,4 @@
 
 - `tests/p1_streaming_export.rs`：流式导出字节一致性
 - `tests/p1_compaction_fast.rs`：fast/legacy compaction 等价性
-- `tests/p1_visibility_latency.rs`：文件可见性延迟（占位）
+- `tests/p1_visibility_latency.rs`：文件可见性延迟回归
