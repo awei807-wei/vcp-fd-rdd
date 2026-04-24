@@ -21,24 +21,25 @@ impl TieredIndex {
         S: StorageBackend + 'static,
     {
         // Flush：把当前内存 Delta 刷盘为新 Segment；必要时触发后台 compaction。
-        let (segs, old_delta, deleted_paths, layers_snapshot, wal_seal_id) = {
-            let _wg = self.apply_gate.write();
+        let idx = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _wg = idx.apply_gate.write();
 
-            let delta = self.l2.load_full();
+            let delta = idx.l2.load_full();
             let delta_dirty = delta.is_dirty();
 
-            let mut ov = self.overlay_state.lock();
+            let mut ov = idx.overlay_state.lock();
             let overlay_dirty =
                 ov.deleted_paths.len_paths() != 0 || ov.upserted_paths.len_paths() != 0;
             if !delta_dirty && !overlay_dirty {
                 tracing::debug!("No delta/overlay changes, skipping flush");
-                self.flush_requested.store(false, Ordering::Release);
-                self.reset_pending_flush_batch();
-                return Ok(());
+                idx.flush_requested.store(false, Ordering::Release);
+                idx.reset_pending_flush_batch();
+                return None;
             }
 
             // WAL：在 snapshot 边界 seal，确保新事件进入新 WAL（并可由 manifest checkpoint 判定回放范围）。
-            let wal_seal_id = match self.wal.lock().clone() {
+            let wal_seal_id = match idx.wal.lock().clone() {
                 Some(w) => match w.seal() {
                     Ok(id) => id,
                     Err(e) => {
@@ -52,8 +53,8 @@ impl TieredIndex {
             // FIX: export BEFORE swap, while data is still in L2
             let segs = delta.export_segments_v6();
 
-            let old = self.l2.swap(Arc::new(PersistentIndex::new_with_roots(
-                self.roots.clone(),
+            let old = idx.l2.swap(Arc::new(PersistentIndex::new_with_roots(
+                idx.roots.clone(),
             )));
 
             // 只保留"仍然有效"的 delete：若本轮 delta 又 upsert 了同一路径，则认为 delete 被抵消。
@@ -67,15 +68,22 @@ impl TieredIndex {
             Arc::make_mut(&mut ov.upserted_paths).clear();
             Arc::make_mut(&mut ov.deleted_paths).maybe_shrink_after_clear();
             Arc::make_mut(&mut ov.upserted_paths).maybe_shrink_after_clear();
-            self.flush_requested.store(false, Ordering::Release);
+            idx.flush_requested.store(false, Ordering::Release);
 
-            (
+            Some((
                 segs,
                 old,
                 deleted,
-                self.disk_layers.read().clone(),
+                idx.disk_layers.read().clone(),
                 wal_seal_id,
-            )
+            ))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("snapshot sync phase panicked: {}", e))?;
+
+        let (segs, old_delta, deleted_paths, layers_snapshot, wal_seal_id) = match result {
+            Some(v) => v,
+            None => return Ok(()),
         };
 
         // 判断是否已有 LSM manifest：无则先 bootstrap 为 base（避免 legacy base 被"遗忘"）。
@@ -218,6 +226,16 @@ impl TieredIndex {
                 }
                 None => {
                     self.flush_notify.notified().await;
+                    let last = self.last_snapshot_time.load(Ordering::Relaxed);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if last != 0 && now.saturating_sub(last) < MIN_SNAPSHOT_INTERVAL.as_secs() {
+                        let wait_secs = MIN_SNAPSHOT_INTERVAL.as_secs() - (now - last);
+                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                        continue;
+                    }
                     false
                 }
             };
