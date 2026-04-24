@@ -2197,7 +2197,11 @@ mod tests {
     fn chinese_exact_query_via_trigram() {
         let idx = PersistentIndex::new();
         idx.upsert(FileMeta {
-            file_key: FileKey { dev: 1, ino: 1 },
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
             path: PathBuf::from("/tmp/中文文件.txt"),
             size: 1,
             mtime: None,
@@ -2212,6 +2216,11 @@ mod tests {
 
         let m2 = create_matcher("文件", true);
         let r2 = idx.query(m2.as_ref(), 100);
-        assert_eq!(r2.len(), 1, "expected 1 result for '文件', got {}", r2.len());
+        assert_eq!(
+            r2.len(),
+            1,
+            "expected 1 result for '文件', got {}",
+            r2.len()
+        );
     }
 }

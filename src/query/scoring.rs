@@ -911,7 +911,6 @@ mod tests {
         assert_eq!(h, vec![[11, 17]], "文档 should highlight at [11,17]");
     }
 
-
     #[test]
     fn highlight_chinese_multiple_occurrences() {
         let h = compute_highlights("/tmp/中文中文.txt", "中文");
