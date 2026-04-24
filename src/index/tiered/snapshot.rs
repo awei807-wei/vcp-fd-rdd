@@ -23,7 +23,13 @@ impl TieredIndex {
         // Flush：把当前内存 Delta 刷盘为新 Segment；必要时触发后台 compaction。
         let idx = self.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let _wg = idx.apply_gate.write();
+            let _wg = match idx.apply_gate.try_write() {
+                Some(guard) => guard,
+                None => {
+                    tracing::debug!("apply_gate busy, deferring snapshot");
+                    return None;
+                }
+            };
 
             let delta = idx.l2.load_full();
             let delta_dirty = delta.is_dirty();
@@ -53,9 +59,9 @@ impl TieredIndex {
             // FIX: export BEFORE swap, while data is still in L2
             let segs = delta.export_segments_v6();
 
-            let old = idx.l2.swap(Arc::new(PersistentIndex::new_with_roots(
-                idx.roots.clone(),
-            )));
+            let old = idx
+                .l2
+                .swap(Arc::new(PersistentIndex::new_with_roots(idx.roots.clone())));
 
             // 只保留"仍然有效"的 delete：若本轮 delta 又 upsert 了同一路径，则认为 delete 被抵消。
             let mut deleted: Vec<Vec<u8>> = Vec::new();
@@ -83,7 +89,10 @@ impl TieredIndex {
 
         let (segs, old_delta, deleted_paths, layers_snapshot, wal_seal_id) = match result {
             Some(v) => v,
-            None => return Ok(()),
+            None => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                return Ok(());
+            }
         };
 
         // 判断是否已有 LSM manifest：无则先 bootstrap 为 base（避免 legacy base 被"遗忘"）。
