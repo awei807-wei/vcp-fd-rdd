@@ -101,8 +101,8 @@ mkdir -p "$BASE_DIR"
 
 # 1) Smart-Case / case:
 mkdir -p "$BASE_DIR/case"
-printf '0123456789abcdef\n' > "$BASE_DIR/case/VCP_${RUN_ID}.txt"
-printf '0123456789abcdef\n' > "$BASE_DIR/case/vcp_${RUN_ID}.txt"
+printf '0123456789abcdef\n' > "$BASE_DIR/case/VCPsmoke_${RUN_ID}_upper.txt"
+printf '0123456789abcdef\n' > "$BASE_DIR/case/vcpsmoke_${RUN_ID}_lower.txt"
 
 # 2) phrase + NOT
 mkdir -p "$BASE_DIR/phrase/VCP_server/New Folder"
@@ -206,25 +206,25 @@ assert_json_expr() {
 # on slower CI runners while the first smart-case query starts.
 json="$(api_scan_json "$BASE_DIR")"
 assert_json_expr "$json" ".scanned >= 1" "POST /scan 应至少扫描样本目录"
-wait_until_indexed "vcp_${RUN_ID}" "VCP_${RUN_ID}.txt"
-wait_until_indexed "vcp_${RUN_ID}" "vcp_${RUN_ID}.txt"
+wait_until_indexed "vcpsmoke_${RUN_ID}" "VCPsmoke_${RUN_ID}_upper.txt"
+wait_until_indexed "vcpsmoke_${RUN_ID}" "vcpsmoke_${RUN_ID}_lower.txt"
 
 echo "== fd-rdd search DSL smoke test =="
 echo "base_url=${BASE_URL%/}"
 echo "root=$ROOT"
 echo "sample_dir=$BASE_DIR"
 
-out="$(api_search_paths "vcp_${RUN_ID}")"
-assert_has "$out" "VCP_${RUN_ID}.txt" "smart-case: vcp 应命中 VCP"
-assert_has "$out" "vcp_${RUN_ID}.txt" "smart-case: vcp 应命中 vcp"
+out="$(api_search_paths "vcpsmoke_${RUN_ID}")"
+assert_has "$out" "VCPsmoke_${RUN_ID}_upper.txt" "smart-case: 小写查询应命中大写前缀文件"
+assert_has "$out" "vcpsmoke_${RUN_ID}_lower.txt" "smart-case: 小写查询应命中小写前缀文件"
 
-out="$(api_search_paths "VCP_${RUN_ID}")"
-assert_has "$out" "VCP_${RUN_ID}.txt" "smart-case: VCP 应命中 VCP"
-assert_not_has "$out" "vcp_${RUN_ID}.txt" "smart-case: VCP 不应命中 vcp"
+out="$(api_search_paths "VCPsmoke_${RUN_ID}")"
+assert_has "$out" "VCPsmoke_${RUN_ID}_upper.txt" "smart-case: 大写查询应命中大写前缀文件"
+assert_not_has "$out" "vcpsmoke_${RUN_ID}_lower.txt" "smart-case: 大写查询不应命中小写前缀文件"
 
-out="$(api_search_paths "case: vcp_${RUN_ID}")"
-assert_has "$out" "vcp_${RUN_ID}.txt" "case:: vcp 应命中 vcp"
-assert_not_has "$out" "VCP_${RUN_ID}.txt" "case:: vcp 不应命中 VCP"
+out="$(api_search_paths "case: vcpsmoke_${RUN_ID}")"
+assert_has "$out" "vcpsmoke_${RUN_ID}_lower.txt" "case:: 小写查询应命中小写前缀文件"
+assert_not_has "$out" "VCPsmoke_${RUN_ID}_upper.txt" "case:: 小写查询不应命中大写前缀文件"
 
 out="$(api_search_paths "VCP server \"New Folder\" readme_${RUN_ID} !${EXCLUDE_DIR}")"
 assert_has "$out" "phrase/VCP_server/New Folder/readme_${RUN_ID}.md" "phrase+NOT: include 应命中"
