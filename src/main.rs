@@ -115,11 +115,47 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    // Load config file (~/.config/fd-rdd/config.toml); fall back to defaults on missing file.
-    let cfg = Config::load().unwrap_or_else(|e| {
-        tracing::warn!("Failed to load config file, using defaults: {}", e);
-        Config::default()
-    });
+    // 检测首次启动：配置文件不存在视为首次启动
+    let config_path = Config::config_path();
+    let is_first_run = config_path.as_ref().map(|p| !p.exists()).unwrap_or(true);
+
+    let cfg = if is_first_run {
+        // 首次启动：必须提供 --root
+        if args.roots.is_empty() {
+            eprintln!("错误: 首次启动必须通过 --root <PATH> 指定至少一个索引根目录");
+            eprintln!("示例: fd-rdd --root $HOME");
+            std::process::exit(1);
+        }
+
+        // 用 CLI 参数构建配置，覆盖默认值
+        let mut cfg = Config {
+            roots: args.roots.clone(),
+            http_port: args.http_port,
+            snapshot_interval_secs: args.snapshot_interval_secs,
+            include_hidden: args.include_hidden,
+            follow_symlinks: args.follow_symlinks,
+            ignore_enabled: !args.no_ignore,
+            ..Config::default()
+        };
+        if let Some(socket) = &args.uds_socket {
+            cfg.socket_path = Some(socket.clone());
+        }
+
+        // 保存默认配置到文件
+        if let Err(e) = cfg.save() {
+            tracing::warn!("无法保存默认配置文件: {}", e);
+        } else {
+            tracing::info!("已创建默认配置文件");
+        }
+
+        cfg
+    } else {
+        // 非首次启动：正常加载配置文件
+        Config::load().unwrap_or_else(|e| {
+            tracing::warn!("配置文件加载失败，使用默认值: {}", e);
+            Config::default()
+        })
+    };
 
     info!(
         "Starting fd-rdd v{}: atomic-snapshot file indexer",
@@ -132,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
         roots = cfg.roots.clone();
     }
     if roots.is_empty() {
-        eprintln!("错误: 必须通过 --root <PATH> 指定至少一个索引根目录（例如 --root $HOME）");
+        eprintln!("错误: 配置文件中没有配置索引根目录，请通过 --root <PATH> 指定");
         std::process::exit(1);
     }
 

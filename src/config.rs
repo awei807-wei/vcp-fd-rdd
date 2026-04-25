@@ -3,7 +3,7 @@
 //! Priority: CLI args > config file > defaults.
 //! Config path: `~/.config/fd-rdd/config.toml`
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Returns the platform-appropriate default socket path (user-isolated).
@@ -52,7 +52,7 @@ pub fn default_socket_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let username = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
-        return PathBuf::from(format!(r"\\.\pipe\fd-rdd-{}", username));
+        PathBuf::from(format!(r"\\.\pipe\fd-rdd-{}", username))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -116,7 +116,7 @@ pub fn default_snapshot_path() -> PathBuf {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!("Failed to create snapshot dir {}: {e}", dir.display());
         }
-        return dir.join("index.db");
+        dir.join("index.db")
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -130,7 +130,7 @@ pub fn default_snapshot_path() -> PathBuf {
 }
 
 /// Top-level configuration loaded from `~/.config/fd-rdd/config.toml`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     /// UDS socket path override.
@@ -184,5 +184,19 @@ impl Config {
         let text = std::fs::read_to_string(&path)?;
         let cfg: Config = toml::from_str(&text)?;
         Ok(cfg)
+    }
+
+    /// Save config to the default path (`~/.config/fd-rdd/config.toml`).
+    /// Creates parent directories if needed.
+    pub fn save(&self) -> anyhow::Result<()> {
+        let Some(path) = Self::config_path() else {
+            anyhow::bail!("Could not determine config directory");
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(self)?;
+        std::fs::write(&path, text)?;
+        Ok(())
     }
 }

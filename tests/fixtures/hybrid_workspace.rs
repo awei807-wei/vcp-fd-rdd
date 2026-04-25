@@ -270,8 +270,8 @@ fn generate_dep_specs(root: &Path) -> Vec<FileSpec> {
     let target_root = root.join("target");
     for (target_name, base_seed) in [("debug", 40_000), ("release", 50_000)] {
         let target_dir = target_root.join(target_name).join("deps");
-        for i in 0..50_000 {
-            let hash = format!("{:016x}", i * 0x9E37_79B9_7F4A_7C15);
+        for i in 0usize..50_000 {
+            let hash = format!("{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let stem = format!("lib{i}-{hash}");
             specs.push(FileSpec {
                 path: target_dir.join(format!("{stem}.rlib")),

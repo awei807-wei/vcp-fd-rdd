@@ -10,7 +10,16 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-当前 tests 分支发布版本为 v0.6.0（内存尖峰治理、compaction 降频、事件管道延迟优化、snapshot 一致性加固）。
+当前 tests 分支发布版本为 v0.6.1（CI 修复与开箱即用体验改进）。
+
+## v0.6.1 更新（CI 修复与开箱即用体验）
+
+- **修复** musl 目标构建失败：`reqwest` dev-dependency 改用 `rustls-tls`，消除 musl 交叉编译对系统 OpenSSL 的依赖。
+- **修复** CI workflow：`musl-build` job 新增 `musl-tools` 安装步骤，确保 musl 交叉编译环境完整。
+- **修复** `cargo fmt` 格式化检查：格式化全部 Rust 源码，使 `cargo fmt --all -- --check` 通过。
+- **修复** Clippy `dead_code` / `unused` 警告：测试辅助模块（`tests/common/`、`tests/fixtures/`）添加模块级 `#![allow(dead_code, unused)]`，使 `cargo clippy --all-targets -- -D warnings` 通过。
+- **新增** `Config::save()` 方法：`Config` 结构体新增 `serde::Serialize` 支持，可将配置以 TOML 格式写入 `~/.config/fd-rdd/config.toml`。
+- **新增** 首次启动自动创建配置：首次启动时若 `~/.config/fd-rdd/config.toml` 不存在，必须传入 `--root`；成功启动后自动保存默认配置。后续启动无需任何参数，直接执行 `fd-rdd` 即可。
 
 ## v0.6.0 更新（内存与事件管道 P0 治理）
 
