@@ -171,7 +171,7 @@ fn large_scale_hybrid_workspace_correctness() {
     // -----------------------------------------------------------------------
     let port = 17060;
     let snapshot = root.join("snapshot");
-    let process = FdRddProcess::spawn(&root, port, &snapshot, &["--debounce-ms", "10"]);
+    let process = FdRddProcess::spawn(&root, port, &snapshot, &["--debounce-ms", "10", "--event-channel-size", "524288"]);
     let pid = process.pid();
 
     let mut all_metrics: Vec<PhaseMetrics> = Vec::new();

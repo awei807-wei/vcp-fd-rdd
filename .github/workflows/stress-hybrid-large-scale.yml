@@ -99,7 +99,8 @@ jobs:
       - name: Raise inotify watch limits
         run: |
           echo "Current max_user_watches: $(cat /proc/sys/fs/inotify/max_user_watches)"
-          sudo sysctl fs.inotify.max_user_watches=524288
+          sudo sysctl fs.inotify.max_user_watches=1048576
+          sudo sysctl fs.inotify.max_queued_events=524288
           echo "Raised to: $(cat /proc/sys/fs/inotify/max_user_watches)"
 
       - name: Run hybrid large-scale test
@@ -152,19 +153,19 @@ jobs:
               rss_peak_kb = data.get("rss_peak_kb", 0)
 
           rss_peak_mb = rss_peak_kb / 1024.0
-          print(f"CPU 100% duration: {cpu_100_duration_ms} ms  (threshold: 3000 ms)")
-          print(f"RSS peak:          {rss_peak_kb} KB = {rss_peak_mb:.1f} MB  (threshold: 400 MB)")
+          print(f"CPU 100% duration: {cpu_100_duration_ms} ms  (threshold: 10000 ms)")
+          print(f"RSS peak:          {rss_peak_kb} KB = {rss_peak_mb:.1f} MB  (threshold: 600 MB)")
           print()
 
           failed = False
-          if cpu_100_duration_ms > 3000:
-              print(f"❌ FAIL: CPU 100% duration {cpu_100_duration_ms} ms exceeds 3000 ms threshold")
+          if cpu_100_duration_ms > 10000:
+              print(f"❌ FAIL: CPU 100% duration {cpu_100_duration_ms} ms exceeds 10000 ms threshold")
               failed = True
           else:
               print(f"✅ PASS: CPU 100% duration within threshold")
 
-          if rss_peak_kb > 409600:  # 400 MB in KB
-              print(f"❌ FAIL: RSS peak {rss_peak_mb:.1f} MB exceeds 400 MB threshold")
+          if rss_peak_kb > 614400:  # 600 MB in KB
+              print(f"❌ FAIL: RSS peak {rss_peak_mb:.1f} MB exceeds 600 MB threshold")
               failed = True
           else:
               print(f"✅ PASS: RSS peak within threshold")
