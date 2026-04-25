@@ -41,54 +41,9 @@ impl TieredIndex {
             }
         };
 
-        let mut results = self.execute_query_plan(&plan, limit);
+        let results = self.execute_query_plan(&plan, limit);
         if !results.is_empty() {
             tracing::debug!("Query hit: {} results", results.len());
-            for meta in results.iter().take(10) {
-                self.l1.insert(meta.clone());
-            }
-            return results;
-        }
-
-        // 搜索 pending_events 中尚未被应用到 L2 的事件
-        let pending = self.pending_events.lock();
-        for ev in pending.iter() {
-            let path = match &ev.event_type {
-                EventType::Create | EventType::Modify | EventType::Rename { .. } => ev.best_path(),
-                EventType::Delete => continue,
-            };
-            let Some(path) = path else { continue };
-            let path = super::normalize_path(path);
-            let path_str = path.to_string_lossy();
-
-            let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
-            if !matches_anchor {
-                continue;
-            }
-
-            let meta = FileMeta {
-                file_key: FileKey {
-                    dev: 0,
-                    ino: 0,
-                    generation: 0,
-                },
-                path: path.to_path_buf(),
-                size: 0,
-                mtime: None,
-                ctime: None,
-                atime: None,
-            };
-
-            if plan.matches(&meta) {
-                results.push(meta);
-                if results.len() >= limit {
-                    break;
-                }
-            }
-        }
-
-        if !results.is_empty() {
-            tracing::debug!("Pending events hit: {} results", results.len());
             for meta in results.iter().take(10) {
                 self.l1.insert(meta.clone());
             }
@@ -285,6 +240,49 @@ impl TieredIndex {
                     results.push(meta);
                 }
             });
+        }
+
+        // Scan pending_events for files not yet applied to L2
+        if results.len() < limit {
+            let pending = self.pending_events.lock();
+            for ev in pending.iter() {
+                if results.len() >= limit {
+                    break;
+                }
+                let path = match &ev.event_type {
+                    EventType::Create | EventType::Modify | EventType::Rename { .. } => {
+                        ev.best_path()
+                    }
+                    EventType::Delete => continue,
+                };
+                let Some(path) = path else { continue };
+                let path = super::normalize_path(path);
+                let path_bytes = path.as_os_str().as_encoded_bytes();
+                if blocked_paths.contains(path_bytes) {
+                    continue;
+                }
+                let path_str = path.to_string_lossy();
+                let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
+                if !matches_anchor {
+                    continue;
+                }
+                let meta = FileMeta {
+                    file_key: FileKey {
+                        dev: 0,
+                        ino: 0,
+                        generation: 0,
+                    },
+                    path: path.to_path_buf(),
+                    size: 0,
+                    mtime: None,
+                    ctime: None,
+                    atime: None,
+                };
+                if plan.matches(&meta) {
+                    let _ = blocked_paths.insert(path_bytes);
+                    results.push(meta);
+                }
+            }
         }
 
         results

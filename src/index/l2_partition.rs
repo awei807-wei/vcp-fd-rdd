@@ -365,6 +365,10 @@ pub struct PersistentIndex {
     /// 墓碑标记（DocId）
     tombstones: RwLock<RoaringTreemap>,
 
+    /// upsert 写锁：保护 alloc_docid → insert_trigrams / insert_path_hash 的原子性，
+    /// 防止写入-查询竞态导致 trigram 索引与 metas 不一致。
+    upsert_lock: RwLock<()>,
+
     /// 脏标记（自上次快照后是否有变更）
     dirty: std::sync::atomic::AtomicBool,
 }
@@ -397,6 +401,7 @@ impl PersistentIndex {
             trigram_index: RwLock::new(HashMap::new()),
             short_component_index: RwLock::new(HashMap::new()),
             tombstones: RwLock::new(RoaringTreemap::new()),
+            upsert_lock: RwLock::new(()),
             dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -615,6 +620,7 @@ impl PersistentIndex {
             }
 
             // rename：先移除旧路径关联
+            let _guard = self.upsert_lock.write();
             if old_len != 0 {
                 if let Some(old_path) = self.absolute_path_buf(old_root_id, old_off, old_len) {
                     self.remove_trigrams(docid, &old_path);
@@ -656,6 +662,7 @@ impl PersistentIndex {
         }
 
         // 新文件：分配 docid 并写入
+        let _guard = self.upsert_lock.write();
         let Some(docid) =
             self.alloc_docid(fkey, new_root_id, &new_rel_bytes, meta.size, meta.mtime)
         else {
@@ -1777,14 +1784,14 @@ impl PersistentIndex {
         let mut acc: Option<RoaringTreemap> = None;
         for tri in &sorted_tris {
             let Some(posting) = tri_idx.get(tri) else {
-                return Some(RoaringTreemap::new());
+                return None;
             };
             match acc {
                 None => acc = Some(posting.clone()),
                 Some(ref mut a) => {
                     *a &= posting;
                     if a.is_empty() {
-                        return Some(RoaringTreemap::new());
+                        return None;
                     }
                 }
             }

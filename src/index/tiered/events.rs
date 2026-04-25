@@ -317,8 +317,8 @@ impl TieredIndex {
         let Some(batch) = self.begin_apply_batch(events, log_to_wal) else {
             return;
         };
-        self.remove_from_pending(events);
         batch.l2.apply_events(events);
+        self.remove_from_pending(events);
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
 
@@ -352,13 +352,9 @@ impl TieredIndex {
         let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal) else {
             return;
         };
+        batch.l2.apply_events(events.as_slice());
         self.remove_from_pending(events.as_slice());
-        if batch.rebuild_in_progress {
-            batch.l2.apply_events(events.as_slice());
-            events.clear();
-        } else {
-            batch.l2.apply_events_drain(events);
-        }
+        events.clear();
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
 

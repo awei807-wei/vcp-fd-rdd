@@ -11,15 +11,21 @@ use super::TieredIndex;
 
 impl TieredIndex {
     pub fn file_count(&self) -> usize {
+        // Hold apply_gate read lock to prevent reading inconsistent state
+        // during snapshot (when L2 is swapped empty but disk_layers not yet updated).
+        let _gate = self.apply_gate.read();
         let l2 = self.l2.load_full().file_count();
-        if l2 > 0 {
-            return l2;
-        }
-        self.disk_layers
+        let disk = self
+            .disk_layers
             .read()
-            .first()
-            .map(|b| b.idx.file_count_estimate())
-            .unwrap_or(0)
+            .iter()
+            .map(|l| l.idx.file_count_estimate())
+            .sum::<usize>();
+        let overlay = {
+            let ov = self.overlay_state.lock();
+            ov.upserted_paths.len_paths()
+        };
+        l2 + disk + overlay
     }
 
     /// 生成完整内存报告

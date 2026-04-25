@@ -54,10 +54,10 @@ pub struct ScanResponse {
     pub scanned: usize,
     pub elapsed_ms: u64,
 }
-
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub indexed_count: usize,
+    pub is_rebuilding: bool,
 }
 
 #[derive(Serialize)]
@@ -220,6 +220,7 @@ async fn search_handler(
 async fn status_handler(State(state): State<QueryServerState>) -> Json<StatusResponse> {
     Json(StatusResponse {
         indexed_count: state.index.file_count(),
+        is_rebuilding: state.index.rebuild_in_progress(),
     })
 }
 

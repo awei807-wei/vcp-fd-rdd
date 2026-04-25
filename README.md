@@ -10,7 +10,18 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-当前 tests 分支发布版本为 v0.6.1（CI 修复与开箱即用体验改进）。
+当前 tests 分支发布版本为 v0.6.2（索引查询正确性与稳定性修复）。
+
+## v0.6.2 更新（索引查询正确性与稳定性修复）
+
+- **修复** `trigram_candidates` 空 bitmap 短路：当查询词的任一 trigram 在索引中不存在，或 trigram 交集为空时，旧逻辑返回 `Some(空 bitmap)`，阻断 `short_hint_candidates` 和全量扫描回退，导致假阴性（文件明明存在却搜不到）。已统一改为返回 `None`，正确触发回退路径。
+- **修复** `mmap_index.rs` 中同名空 bitmap 短路：`MmapIndex::trigram_candidates` 在交集为空时 `break` 并返回 `Some(空 bitmap)`，同样阻断回退，已改为返回 `None`。
+- **新增** `upsert_lock` 写锁保护：`PersistentIndex` 新增 `RwLock<()>`，在 rename 路径的 `remove_trigrams → alloc_docid → insert_trigrams → insert_path_hash` 以及 new-file 路径的 `alloc_docid → insert_trigrams → insert_path_hash` 全程持有写锁，消除 upsert 与查询之间的竞态窗口。
+- **修复** `remove_from_pending` 与 `apply_events` 顺序：`apply_events_inner` / `apply_events_inner_drain` 中旧逻辑先 `remove_from_pending` 再 `batch.l2.apply_events`，导致事件在极短窗口内既不在 `pending_events` 也不在 L2，查询不可见。已交换顺序，先 apply 到 L2 再移出 pending。
+- **修复** `query_limit` 跳过 `pending_events`：旧逻辑在 `execute_query_plan` 返回非空结果时直接 `return`，完全跳过 `pending_events` 扫描，导致 debounce 期间的新文件不可见。已将 `pending_events` 扫描整合进 `execute_query_plan`，确保无论 L2/DiskLayers 结果如何都补充 pending 结果，实现"所见即所得"。
+- **修复** `file_count()` 统计口径：`file_count()` 旧逻辑仅返回 L2 计数（L2>0 时）或第一个 disk_layer 估计值，snapshot 期间 L2 被 swap 为空后总数骤降。已改为汇总 L2 + 全部 disk_layers + overlay_upserted，反映真实文件总数。
+- **修复** `file_count()` snapshot 期间不一致读取：`snapshot_now` 在 `apply_gate.write()` 锁内执行 L2 swap 后再更新 `disk_layers`，旧 `file_count()` 无锁读取会读到 L2=0 且 disk_layers 尚未更新的中间态。已添加 `apply_gate.read()` 锁，强制与 snapshot 互斥，确保读到一致状态。
+- **扩展** `/status` 接口：新增 `is_rebuilding` 字段，使测试和外部监控可以判断后台 rebuild 任务是否在进行中。
 
 ## v0.6.1 更新（CI 修复与开箱即用体验）
 

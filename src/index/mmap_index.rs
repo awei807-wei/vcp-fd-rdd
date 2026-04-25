@@ -484,7 +484,7 @@ impl MmapIndex {
         for b in iter {
             acc &= &b;
             if acc.is_empty() {
-                break;
+                return None;
             }
         }
         Some(acc)

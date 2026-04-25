@@ -84,8 +84,7 @@ pub struct TieredIndex {
 }
 
 impl TieredIndex {
-    #[cfg(test)]
-    fn rebuild_in_progress(&self) -> bool {
+    pub fn rebuild_in_progress(&self) -> bool {
         self.rebuild_state.lock().in_progress
     }
 }
