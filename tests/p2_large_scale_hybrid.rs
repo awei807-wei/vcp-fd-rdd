@@ -206,7 +206,7 @@ fn large_scale_hybrid_workspace_correctness() {
         )
         .unwrap();
 
-    wait_for_indexed_count(port, ws.total_file_count(), 60)
+    wait_for_indexed_count(port, ws.indexable_files().len(), 60)
         .expect("initial probe indexing timeout");
     verify_file_searchable(port, &initial_marker, &initial_probe, 30);
 
@@ -225,7 +225,8 @@ fn large_scale_hybrid_workspace_correctness() {
     });
     all_metrics.push(m);
 
-    wait_for_indexed_count(port, ws.total_file_count(), 60).expect("git clone indexing timeout");
+    wait_for_indexed_count(port, ws.indexable_files().len(), 60)
+        .expect("git clone indexing timeout");
 
     // git clone 中应包含一个可搜索的 probe 文件（非忽略）
     let cloned_dir = root.join(&git_repo_name);
@@ -242,7 +243,8 @@ fn large_scale_hybrid_workspace_correctness() {
     });
     all_metrics.push(m);
 
-    wait_for_indexed_count(port, ws.total_file_count(), 60).expect("npm install indexing timeout");
+    wait_for_indexed_count(port, ws.indexable_files().len(), 60)
+        .expect("npm install indexing timeout");
 
     // npm install 中应包含一个可搜索的 probe 文件（非忽略）
     let npm_dir = root.join("node_modules").join(&npm_pkg_name);
@@ -262,7 +264,7 @@ fn large_scale_hybrid_workspace_correctness() {
         )
         .unwrap();
 
-    let after_create_count = ws.total_file_count();
+    let after_create_count = ws.indexable_files().len();
     let create_start = Instant::now();
     wait_for_indexed_count(port, after_create_count, 30).expect("create file indexing timeout");
     let create_latency = create_start.elapsed();
@@ -278,11 +280,11 @@ fn large_scale_hybrid_workspace_correctness() {
             &format!("to be deleted {}", delete_marker),
         )
         .unwrap();
-    wait_for_indexed_count(port, ws.total_file_count(), 30).unwrap();
+    wait_for_indexed_count(port, ws.indexable_files().len(), 30).unwrap();
     verify_file_searchable(port, &delete_marker, &file_to_delete, 30);
 
     ws.user_delete_file(&file_to_delete).unwrap();
-    let after_delete_count = ws.total_file_count();
+    let after_delete_count = ws.indexable_files().len();
     let delete_start = Instant::now();
     wait_for_indexed_count(port, after_delete_count, 30).expect("delete file indexing timeout");
     let delete_latency = delete_start.elapsed();
@@ -298,7 +300,7 @@ fn large_scale_hybrid_workspace_correctness() {
             &format!("fn old() {{ /* {} */ }}", rename_marker),
         )
         .unwrap();
-    wait_for_indexed_count(port, ws.total_file_count(), 30).unwrap();
+    wait_for_indexed_count(port, ws.indexable_files().len(), 30).unwrap();
     verify_file_searchable(port, &rename_marker, &file_to_rename, 30);
 
     let renamed_path = root.join(format!("src/renamed-{}.rs", rename_marker));
@@ -321,8 +323,8 @@ fn large_scale_hybrid_workspace_correctness() {
     // 9. 最终一致性验证
     // -----------------------------------------------------------------------
 
-    // 9a. 数量一致性：索引总数应与工作区当前总数一致
-    let final_count = ws.total_file_count();
+    // 9a. 数量一致性：索引总数应与可索引文件数一致
+    let final_count = ws.indexable_files().len();
     wait_for_indexed_count(port, final_count, 60).expect("final consistency count timeout");
 
     // 9b. 抽样验证所有非忽略文件可搜索
