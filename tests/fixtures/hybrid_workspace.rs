@@ -11,8 +11,6 @@
 //! - Directories are deduplicated and created in parallel before file writes.
 //! - File contents are small (tens to hundreds of bytes) to minimize I/O.
 
-#![allow(dead_code, unused)]
-
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -103,15 +101,6 @@ fn ignored_content(seed: usize) -> Vec<u8> {
     pseudo_random_bytes(seed ^ 0xDEAD_BEEF, len)
 }
 
-/// Content for a generic user file.
-fn user_content(id: usize) -> Vec<u8> {
-    format!(
-        "// HYBRID_USER_FILE_ID_{id:08}\n// search_marker_{id:08}\n// This file is part of the CI stress test workspace.\n",
-    )
-    .into_bytes()
-}
-
-/// Content for a user file with language-appropriate syntax.
 fn user_content_for(id: usize, ext: &str) -> Vec<u8> {
     let text = match ext {
         "rs" => format!(
@@ -786,21 +775,11 @@ impl HybridWorkspace {
         Ok(())
     }
 
-    /// Total number of tracked files.
-    pub fn total_tracked(&self) -> usize {
-        self.user_files.len() + self.ignored_files.len() + self.dep_files.len()
-    }
-
     /// Return only the user files that should be indexed by fd-rdd.
     ///
     /// (Ignored and dependency files are excluded.)
     pub fn indexable_files(&self) -> &[PathBuf] {
         &self.user_files
-    }
-
-    /// Alias for `total_tracked` to match expected test API.
-    pub fn total_file_count(&self) -> usize {
-        self.total_tracked()
     }
 
     /// Sample up to `n` ignored file paths.

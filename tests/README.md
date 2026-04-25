@@ -25,6 +25,11 @@
 - compaction 阈值调整（8 delta / 300s 冷却）相关测试在 `p1_lsm_compaction.rs` 中覆盖。
 - 事件管道 fast-sync 参数调整相关测试在 `p1_event_processing.rs` / `p1_watch_degradation.rs` 中覆盖。
 
+## v0.6.1 测试相关变更
+
+- CI 格式化与 Clippy 警告修复相关变更已使全部测试辅助模块通过 `cargo fmt --all -- --check` 与 `cargo clippy --all-targets -- -D warnings`。
+- 新增大规模混合工作区测试 `tests/p2_large_scale_hybrid.rs`，覆盖 80 万文件冷扫、git clone、npm install、单文件 CRUD 与最终一致性验证，带性能阈值断言（CPU 100% 持续时间 ≤3000ms，峰值 RSS ≤400MB）。
+
 ## v0.6.0 更新（零拷贝序列化 P1 + Compaction 降维 P2）
 
 ### P1 — 零拷贝序列化
@@ -44,3 +49,4 @@
 - `tests/p1_streaming_export.rs`：流式导出字节一致性
 - `tests/p1_compaction_fast.rs`：fast/legacy compaction 等价性
 - `tests/p1_visibility_latency.rs`：文件可见性延迟回归
+- `tests/p2_large_scale_hybrid.rs`：80 万文件大规模混合工作区正确性（git clone、npm install、CRUD）

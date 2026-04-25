@@ -1,7 +1,7 @@
 [Unit]
 Description=fd-rdd: RDD-based elastic file indexer (user service)
 After=local-fs.target
-Documentation=https://github.com/AegisCompute/fd-rdd
+Documentation=https://github.com/awei807-wei/vcp-fd-rdd
 
 [Service]
 Type=simple

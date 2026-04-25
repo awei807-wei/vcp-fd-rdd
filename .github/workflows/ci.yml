@@ -45,10 +45,10 @@ jobs:
         run: cargo update -w --locked
 
       - name: cargo check
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
 
       - name: cargo test
-        run: cargo test -- --test-threads=1 --nocapture
+        run: cargo test --locked -- --test-threads=1 --nocapture
 
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -65,7 +65,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test --release
-        run: cargo test --release -- --test-threads=1
+        run: cargo test --release --locked -- --test-threads=1
 
   test-no-default-features:
     name: Test without default features
@@ -79,7 +79,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test --no-default-features
-        run: cargo test --no-default-features -- --test-threads=1
+        run: cargo test --no-default-features --locked -- --test-threads=1
 
   test-multi-thread:
     name: Test multi-threaded (may expose flaky concurrency bugs)
@@ -94,7 +94,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test (multi-threaded)
-        run: cargo test -- --test-threads=$(nproc)
+        run: cargo test --locked -- --test-threads=$(nproc)
 
   sanitizer:
     name: ThreadSanitizer (nightly)
@@ -114,7 +114,7 @@ jobs:
           RUSTDOCFLAGS: "-Z sanitizer=thread"
           TSAN_OPTIONS: "suppressions=.tsan-supp"
           CARGO_INCREMENTAL: "0"
-        run: cargo -Zbuild-std test --target x86_64-unknown-linux-gnu --no-default-features --lib --tests -- --test-threads=1 --nocapture
+        run: cargo -Zbuild-std test --locked --target x86_64-unknown-linux-gnu --no-default-features --lib --tests -- --test-threads=1 --nocapture
 
   doc:
     name: Documentation check
@@ -148,7 +148,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: cargo check (musl)
-        run: cargo check --target x86_64-unknown-linux-musl --all-targets --no-default-features
+        run: cargo check --locked --target x86_64-unknown-linux-musl --all-targets --no-default-features
 
   smoke:
     name: Smoke test (ubuntu)
@@ -165,7 +165,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Run smoke-search-syntax.sh
         run: |
@@ -234,7 +234,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test --test p1_compaction_fast
-        run: cargo test --test p1_compaction_fast -- --test-threads=1
+        run: cargo test --locked --test p1_compaction_fast -- --test-threads=1
 
   streaming-export-check:
     name: Streaming export byte-identical
@@ -248,7 +248,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test --test p1_streaming_export
-        run: cargo test --test p1_streaming_export -- --test-threads=1
+        run: cargo test --locked --test p1_streaming_export -- --test-threads=1
 
   visibility-latency:
     name: Visibility latency placeholder
@@ -262,4 +262,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test --test p1_visibility_latency
-        run: cargo test --test p1_visibility_latency -- --test-threads=1
+        run: cargo test --locked --test p1_visibility_latency -- --test-threads=1

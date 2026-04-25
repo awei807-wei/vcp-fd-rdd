@@ -10,6 +10,7 @@ use serde::Deserialize;
 const BASE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A single search result returned by the HTTP `/search` endpoint.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchResult {
     pub path: PathBuf,
@@ -31,6 +32,7 @@ fn client() -> reqwest::blocking::Client {
 }
 
 /// Perform a lightweight health check against `/health`.
+#[allow(dead_code)]
 pub fn health_check(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{}/health", port);
     match client().get(&url).send() {
@@ -62,6 +64,7 @@ pub fn search(port: u16, q: &str, limit: usize) -> Vec<SearchResult> {
 }
 
 /// Query `/search` and return the raw JSON body as a `String`.
+#[allow(dead_code)]
 pub fn search_raw(port: u16, q: &str, limit: usize) -> String {
     let url = format!("http://127.0.0.1:{}/search", port);
     match client()

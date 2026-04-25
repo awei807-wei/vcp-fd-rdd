@@ -52,7 +52,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
@@ -105,7 +105,7 @@ jobs:
       - name: Run hybrid large-scale test
         run: |
           echo "=== Running p2_large_scale_hybrid (ignored test) ==="
-          cargo test --test p2_large_scale_hybrid -- --ignored --nocapture
+          cargo test --locked --test p2_large_scale_hybrid -- --ignored --nocapture
 
       - name: Output performance metrics
         if: always()

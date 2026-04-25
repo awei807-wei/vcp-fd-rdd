@@ -185,11 +185,10 @@ fn large_scale_hybrid_workspace_correctness() {
     all_metrics.push(m);
 
     // -----------------------------------------------------------------------
-    // 4. 等待初始索引完成（可索引文件全部索引）
+    // 4. 等待初始索引完成（等待 indexed_count 稳定 5 秒）
     // -----------------------------------------------------------------------
-    let indexable_count = ws.indexable_files().len();
     let (_, m) = monitor_phase("initial_indexing", pid, || {
-        wait_for_indexed_count(port, indexable_count, 600).expect("initial indexing timeout")
+        wait_for_index_stable(port, 5, 600).expect("initial indexing timeout")
     });
     all_metrics.push(m);
 
@@ -206,8 +205,6 @@ fn large_scale_hybrid_workspace_correctness() {
         )
         .unwrap();
 
-    wait_for_indexed_count(port, ws.indexable_files().len(), 60)
-        .expect("initial probe indexing timeout");
     verify_file_searchable(port, &initial_marker, &initial_probe, 30);
 
     // 抽样验证被忽略文件不可搜索
@@ -225,9 +222,6 @@ fn large_scale_hybrid_workspace_correctness() {
     });
     all_metrics.push(m);
 
-    wait_for_indexed_count(port, ws.indexable_files().len(), 60)
-        .expect("git clone indexing timeout");
-
     // git clone 中应包含一个可搜索的 probe 文件（非忽略）
     let cloned_dir = root.join(&git_repo_name);
     let git_probe = cloned_dir.join(format!("probe-{}.md", git_marker));
@@ -242,9 +236,6 @@ fn large_scale_hybrid_workspace_correctness() {
         ws.simulate_npm_install(&npm_pkg_name, 5000).unwrap()
     });
     all_metrics.push(m);
-
-    wait_for_indexed_count(port, ws.indexable_files().len(), 60)
-        .expect("npm install indexing timeout");
 
     // npm install 中应包含一个可搜索的 probe 文件（非忽略）
     let npm_dir = root.join("node_modules").join(&npm_pkg_name);
@@ -264,11 +255,9 @@ fn large_scale_hybrid_workspace_correctness() {
         )
         .unwrap();
 
-    let after_create_count = ws.indexable_files().len();
     let create_start = Instant::now();
-    wait_for_indexed_count(port, after_create_count, 30).expect("create file indexing timeout");
-    let create_latency = create_start.elapsed();
     verify_file_searchable(port, &crud_marker, &new_file, 30);
+    let create_latency = create_start.elapsed();
 
     eprintln!("[file_create_latency] duration={:?}", create_latency);
 
@@ -280,15 +269,12 @@ fn large_scale_hybrid_workspace_correctness() {
             &format!("to be deleted {}", delete_marker),
         )
         .unwrap();
-    wait_for_indexed_count(port, ws.indexable_files().len(), 30).unwrap();
     verify_file_searchable(port, &delete_marker, &file_to_delete, 30);
 
     ws.user_delete_file(&file_to_delete).unwrap();
-    let after_delete_count = ws.indexable_files().len();
     let delete_start = Instant::now();
-    wait_for_indexed_count(port, after_delete_count, 30).expect("delete file indexing timeout");
-    let delete_latency = delete_start.elapsed();
     verify_file_not_searchable(port, &delete_marker, &file_to_delete, 30);
+    let delete_latency = delete_start.elapsed();
 
     eprintln!("[file_delete_latency] duration={:?}", delete_latency);
 

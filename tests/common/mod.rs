@@ -1,7 +1,5 @@
 //! Shared helpers for fd-rdd integration tests.
 
-#![allow(dead_code, unused)]
-
 pub mod fd_rdd_client;
 pub mod sys_monitor;
 
@@ -28,6 +26,7 @@ pub fn unique_tmp_dir(tag: &str) -> PathBuf {
 /// helpers to query its HTTP endpoints.
 pub struct FdRddProcess {
     pub child: Child,
+    #[allow(dead_code)]
     pub port: u16,
 }
 
@@ -59,21 +58,25 @@ impl FdRddProcess {
     }
 
     /// HTTP GET `/health` – returns `true` if the server responds with 2xx.
+    #[allow(dead_code)]
     pub fn health_check(&self) -> bool {
         fd_rdd_client::health_check(self.port)
     }
 
     /// HTTP GET `/status` – returns the parsed JSON value.
+    #[allow(dead_code)]
     pub fn status(&self) -> Option<serde_json::Value> {
         fd_rdd_client::status(self.port)
     }
 
     /// HTTP GET `/search` – returns typed search results.
+    #[allow(dead_code)]
     pub fn search(&self, q: &str, limit: usize) -> Vec<SearchResult> {
         fd_rdd_client::search(self.port, q, limit)
     }
 
     /// HTTP GET `/search` – returns the raw JSON body.
+    #[allow(dead_code)]
     pub fn search_raw(&self, q: &str, limit: usize) -> String {
         fd_rdd_client::search_raw(self.port, q, limit)
     }
@@ -103,6 +106,42 @@ fn fd_rdd_exe_path() -> PathBuf {
     target_dir
         .join("fd-rdd")
         .with_extension(std::env::consts::EXE_EXTENSION)
+}
+
+/// Poll `/status` until `indexed_count` stops changing for `stable_secs`.
+///
+/// Returns the stabilized count on success, or an error message on timeout.
+pub fn wait_for_index_stable(
+    port: u16,
+    stable_secs: u64,
+    timeout_secs: u64,
+) -> Result<usize, String> {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+    let stable_duration = Duration::from_secs(stable_secs);
+    let mut last_count = 0usize;
+    let mut last_change = start;
+
+    loop {
+        if let Some(count) = fd_rdd_client::indexed_count(port) {
+            if count != last_count {
+                last_count = count;
+                last_change = std::time::Instant::now();
+            } else if last_change.elapsed() >= stable_duration {
+                return Ok(last_count);
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "Timeout waiting for index to stabilize (last_count: {}, elapsed: {:?})",
+                last_count,
+                start.elapsed()
+            ));
+        }
+
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Poll `/status` until `indexed_count` reaches at least `expected`.

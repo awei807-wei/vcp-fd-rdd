@@ -344,7 +344,7 @@ cargo build --release --no-default-features
 
 说明：
 
-- `--root` 可重复传入，用于覆盖多个索引源。**v0.5.3 起 `--root` 为必传参数**，不传时程序报错退出。
+- `--root` 可重复传入，用于覆盖多个索引源。**v0.6.1 起**：首次启动若 `~/.config/fd-rdd/config.toml` 不存在，则必须传入 `--root`；成功启动后会自动保存配置，后续启动无需任何参数，直接执行 `fd-rdd` 即可。若配置已存在，`--root` 为可选参数，传入后会覆盖配置中的值。
 - 默认 `--snapshot-path` / `--uds-socket` 会优先落到 `$XDG_RUNTIME_DIR/fd-rdd/`，回退 `/run/user/$UID/fd-rdd/`，最后才使用 `/tmp/fd-rdd-$UID...`，避免多用户互相冲突。
 - 默认会跳过 `.` 开头的文件/目录；如需将 dotfiles / dotdirs 纳入冷启动全扫、后台重建与增量补扫，请显式加 `--include-hidden`。
 - 默认会读取 `.gitignore`、`.ignore`、`.git/info/exclude` 和全局 gitignore；如需关闭这套规则，可显式传入 `--no-ignore`。
