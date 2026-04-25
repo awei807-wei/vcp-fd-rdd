@@ -1,0 +1,264 @@
+name: fd-rdd Memory Pressure Stress Test
+# 内存压力测试：验证高频变更下内存增长是否受控，查询延迟是否稳定
+
+on:
+  push:
+    branches: [main, tests]
+  schedule:
+    # 每日凌晨 3 点运行内存压力测试
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FD_RDD_PORT: 16060
+  FD_RDD_SNAPSHOT: /tmp/fd-rdd-ci-snapshot
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 1: 编译与基础环境准备
+  # ───────────────────────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: target/release/fd-rdd
+          retention-days: 1
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 2: 内存压力测试
+  # ───────────────────────────────────────────────────────────────────────────
+  test-memory-pressure:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup memory test directory
+        run: |
+          ROOT="/tmp/fd-rdd-ci-test/memory-test"
+          mkdir -p "$ROOT"
+          for i in $(seq 1 10000); do
+            echo "data $i" > "$ROOT/file_${i}.txt"
+          done
+          echo "Created $(find "$ROOT" -type f | wc -l) files"
+
+      - name: Start fd-rdd
+        run: |
+          ./bin/fd-rdd --root /tmp/fd-rdd-ci-test/memory-test --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_memory --http-port ${{ env.FD_RDD_PORT }} --debounce-ms 10 --snapshot-interval-secs 30 >/tmp/fd-rdd-daemon.log 2>&1 &
+          echo $! > /tmp/fd-rdd.pid
+          # Wait for HTTP ready + initial indexing
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+      - name: "Phase 1: Baseline RSS sampling"
+        run: |
+          set -e
+          echo "=== Phase 1: Baseline RSS ==="
+          # Let indexing settle briefly
+          sleep 2
+          PID=$(cat /tmp/fd-rdd.pid)
+          SAMPLES=()
+          for i in $(seq 1 3); do
+            RSS=$(ps -o rss= -p "$PID" | tr -d ' ')
+            SAMPLES+=("$RSS")
+            echo "Baseline sample $i: ${RSS}KB"
+            sleep 1
+          done
+          # Average
+          SUM=$(echo "${SAMPLES[0]} + ${SAMPLES[1]} + ${SAMPLES[2]}" | bc)
+          BASELINE=$(echo "scale=0; $SUM / 3" | bc)
+          echo "$BASELINE" > /tmp/fd-rdd-baseline-rss
+          echo "Baseline RSS (avg): ${BASELINE}KB"
+
+      - name: "Phase 2: Stress mutations + RSS sampling"
+        run: |
+          set -e
+          echo "=== Phase 2: Stress mutations ==="
+          ROOT="/tmp/fd-rdd-ci-test/memory-test"
+          PID=$(cat /tmp/fd-rdd.pid)
+          END_TIME=$(($(date +%s) + 180))
+          OP_COUNT=0
+          MAX_QUERY_MS=0
+          # Initialize CSV
+          echo "timestamp_ms,operation_count,rss_kb,query_ms" > /tmp/memory-profile.csv
+
+          while [ $(date +%s) -lt $END_TIME ]; do
+            OP=$((RANDOM % 3))
+            case $OP in
+              0) # Create
+                i=$((RANDOM % 100000))
+                echo "new $OP_COUNT" > "$ROOT/mem_new_${i}.txt"
+                ;;
+              1) # Delete
+                i=$((RANDOM % 10000 + 1))
+                rm -f "$ROOT/file_${i}.txt"
+                ;;
+              2) # Rename
+                i=$((RANDOM % 10000 + 1))
+                j=$((RANDOM % 10000 + 1))
+                mv "$ROOT/file_${i}.txt" "$ROOT/file_renamed_${j}.txt" 2>/dev/null || true
+                ;;
+            esac
+            OP_COUNT=$((OP_COUNT + 1))
+
+            # Every 10 ops, sample RSS and run a query
+            if [ $((OP_COUNT % 10)) -eq 0 ]; then
+              RSS=$(ps -o rss= -p "$PID" | tr -d ' ')
+              START=$(date +%s%N)
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file&limit=20" || echo "000")
+              END=$(date +%s%N)
+              ELAPSED_MS=$(( (END - START) / 1000000 ))
+              TIMESTAMP_MS=$(($(date +%s%N) / 1000000))
+              echo "$TIMESTAMP_MS,$OP_COUNT,$RSS,$ELAPSED_MS" >> /tmp/memory-profile.csv
+              if [ "$ELAPSED_MS" -gt "$MAX_QUERY_MS" ]; then
+                MAX_QUERY_MS=$ELAPSED_MS
+              fi
+              if [ "$HTTP_CODE" != "200" ]; then
+                echo "⚠️ Query failed with HTTP $HTTP_CODE during stress"
+              fi
+            fi
+
+            # Throttle
+            sleep 0.05
+          done
+
+          echo "$MAX_QUERY_MS" > /tmp/fd-rdd-max-query-ms
+          echo "Stress completed. Operations: $OP_COUNT, Max query latency: ${MAX_QUERY_MS}ms"
+
+      - name: "Phase 3: Settle + final RSS sampling"
+        run: |
+          set -e
+          echo "=== Phase 3: Settle ==="
+          PID=$(cat /tmp/fd-rdd.pid)
+          # Wait 30s without mutations
+          sleep 30
+          SAMPLES=()
+          for i in $(seq 1 3); do
+            RSS=$(ps -o rss= -p "$PID" | tr -d ' ')
+            SAMPLES+=("$RSS")
+            echo "Settle sample $i: ${RSS}KB"
+            sleep 1
+          done
+          SUM=$(echo "${SAMPLES[0]} + ${SAMPLES[1]} + ${SAMPLES[2]}" | bc)
+          FINAL=$(echo "scale=0; $SUM / 3" | bc)
+          echo "$FINAL" > /tmp/fd-rdd-final-rss
+          echo "Final settled RSS (avg): ${FINAL}KB"
+
+      - name: "Assertion: Memory growth <= 2.5x baseline"
+        run: |
+          set -e
+          BASELINE=$(cat /tmp/fd-rdd-baseline-rss)
+          FINAL=$(cat /tmp/fd-rdd-final-rss)
+          LIMIT=$(echo "scale=0; $BASELINE * 2.5 / 1" | bc)
+          echo "Baseline: ${BASELINE}KB, Final: ${FINAL}KB, Limit: ${LIMIT}KB"
+          if [ "$FINAL" -gt "$LIMIT" ]; then
+            echo "❌ FAIL: Final RSS ${FINAL}KB exceeds 2.5x baseline limit ${LIMIT}KB"
+            exit 1
+          fi
+          echo "✅ PASS: Final RSS ${FINAL}KB within 2.5x baseline limit"
+
+      - name: "Assertion: Max query latency < 3000ms"
+        run: |
+          set -e
+          MAX_QUERY_MS=$(cat /tmp/fd-rdd-max-query-ms)
+          echo "Max query latency during stress: ${MAX_QUERY_MS}ms"
+          if [ "$MAX_QUERY_MS" -ge 3000 ]; then
+            echo "❌ FAIL: Max query latency ${MAX_QUERY_MS}ms >= 3000ms"
+            exit 1
+          fi
+          echo "✅ PASS: Max query latency ${MAX_QUERY_MS}ms < 3000ms"
+
+      - name: Final health check
+        run: |
+          HEALTH=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health)
+          echo "Final health: $HEALTH"
+          if echo "$HEALTH" | grep -q '"status":"ok"'; then
+            echo "✅ Final health OK"
+          else
+            echo "❌ Final health degraded"
+            exit 1
+          fi
+
+      - name: Collect debug bundle
+        if: failure()
+        run: |
+          bash ./scripts/ci-collect-debug.sh \
+            --output "${{ runner.temp }}/fd-rdd-debug/${{ github.job }}" \
+            --job "${{ github.job }}" \
+            --workflow "stress-memory" \
+            --port "${{ env.FD_RDD_PORT }}" \
+            --log /tmp/fd-rdd-daemon.log \
+            --log /tmp/fd-rdd.pid \
+            --log /tmp/fd-rdd-baseline-rss \
+            --log /tmp/fd-rdd-final-rss \
+            --log /tmp/fd-rdd-max-query-ms \
+            --log /tmp/memory-profile.csv \
+            --path /tmp/fd-rdd-ci-test \
+            --path "${{ env.FD_RDD_SNAPSHOT }}_memory*"
+
+      - name: Upload debug bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-debug-${{ github.job }}
+          path: ${{ runner.temp }}/fd-rdd-debug/${{ github.job }}
+          retention-days: 7
+
+      - name: Upload memory profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-profile
+          path: /tmp/memory-profile.csv
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*

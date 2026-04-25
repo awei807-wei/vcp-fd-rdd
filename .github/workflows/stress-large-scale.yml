@@ -1,0 +1,199 @@
+name: fd-rdd Large-Scale Stress Test
+# 大规模数据集压力测试：验证 100,000 文件索引性能与查询延迟
+
+on:
+  push:
+    branches: [main, tests]
+  pull_request:
+    branches: [main, tests]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FD_RDD_PORT: 16060
+  FD_RDD_SNAPSHOT: /tmp/fd-rdd-ci-snapshot
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 1: 编译与基础环境准备
+  # ───────────────────────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: target/release/fd-rdd
+          retention-days: 1
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 2: 大规模数据集压力测试（100,000 文件）
+  # ───────────────────────────────────────────────────────────────────────────
+  test-large-scale:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup large-scale test directory
+        run: |
+          ROOT="/tmp/fd-rdd-ci-test/large-scale"
+          mkdir -p "$ROOT"
+          # Create 100,000 files in a deep-ish directory tree
+          for batch in $(seq 1 100); do
+            mkdir -p "$ROOT/batch_${batch}/sub_a/sub_b/sub_c"
+            for i in $(seq 1 500); do
+              echo "content batch $batch item $i" > "$ROOT/batch_${batch}/file_${i}.txt"
+            done
+            for i in $(seq 1 500); do
+              echo "deep content batch $batch item $i" > "$ROOT/batch_${batch}/sub_a/sub_b/sub_c/deep_${i}.txt"
+            done
+          done
+          echo "Created $(find "$ROOT" -type f | wc -l) files"
+
+      - name: Start fd-rdd
+        run: |
+          ./bin/fd-rdd --root /tmp/fd-rdd-ci-test/large-scale --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_large --http-port ${{ env.FD_RDD_PORT }} --debounce-ms 50 --snapshot-interval-secs 3600 >/tmp/fd-rdd-daemon.log 2>&1 &
+          echo $! > /tmp/fd-rdd.pid
+          DAEMON_START_EPOCH=$(date +%s)
+          echo "$DAEMON_START_EPOCH" > /tmp/fd-rdd-start-epoch
+          # Wait for HTTP ready + initial indexing
+          for i in $(seq 1 180); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+      - name: "Test A: Initial indexing time within 120 seconds"
+        run: |
+          set -e
+          echo "=== Test A: Measure initial indexing time ==="
+          DAEMON_START_EPOCH=$(cat /tmp/fd-rdd-start-epoch)
+          INDEXED_AT_EPOCH=""
+          for i in $(seq 1 180); do
+            STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+            COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+            if [ -n "$COUNT" ] && [ "$COUNT" -ge 100000 ]; then
+              INDEXED_AT_EPOCH=$(date +%s)
+              echo "Indexed $COUNT files at epoch $INDEXED_AT_EPOCH"
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$INDEXED_AT_EPOCH" ]; then
+            echo "❌ FAIL: Did not reach indexed_count >= 100000 within 180 seconds"
+            exit 1
+          fi
+          ELAPSED=$((INDEXED_AT_EPOCH - DAEMON_START_EPOCH))
+          echo "Initial indexing took ${ELAPSED}s"
+          if [ "$ELAPSED" -gt 120 ]; then
+            echo "❌ FAIL: Initial indexing took ${ELAPSED}s (>120s)"
+            exit 1
+          fi
+          echo "✅ PASS: Initial indexing completed in ${ELAPSED}s"
+
+      - name: "Test B: Query latency < 2000ms"
+        run: |
+          set -e
+          echo "=== Test B: Query latency ==="
+          MAX_LATENCY=0
+          for i in $(seq 1 10); do
+            START=$(date +%s%N)
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file&limit=20")
+            END=$(date +%s%N)
+            ELAPSED_MS=$(( (END - START) / 1000000 ))
+            echo "Query $i: ${ELAPSED_MS}ms"
+            if [ "$ELAPSED_MS" -gt "$MAX_LATENCY" ]; then
+              MAX_LATENCY=$ELAPSED_MS
+            fi
+            if [ "$ELAPSED_MS" -ge 2000 ]; then
+              echo "❌ FAIL: Query $i took ${ELAPSED_MS}ms (>=2000ms)"
+              exit 1
+            fi
+            # Verify result is non-empty JSON array
+            if [ "$RESULT" = "[]" ]; then
+              echo "❌ FAIL: Query $i returned empty results"
+              exit 1
+            fi
+          done
+          echo "✅ PASS: All 10 queries completed, max latency ${MAX_LATENCY}ms"
+
+      - name: "Test C: Deep file query"
+        run: |
+          set -e
+          echo "=== Test C: Deep file query ==="
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=deep_42&limit=10")
+          echo "Deep query result: $RESULT"
+          if echo "$RESULT" | grep -q "sub_a/sub_b/sub_c/deep_42.txt"; then
+            echo "✅ PASS: Deep file found"
+          else
+            echo "❌ FAIL: Deep file not found"
+            exit 1
+          fi
+
+      - name: Collect debug bundle
+        if: failure()
+        run: |
+          bash ./scripts/ci-collect-debug.sh \
+            --output "${{ runner.temp }}/fd-rdd-debug/${{ github.job }}" \
+            --job "${{ github.job }}" \
+            --workflow "stress-large-scale" \
+            --port "${{ env.FD_RDD_PORT }}" \
+            --log /tmp/fd-rdd-daemon.log \
+            --log /tmp/fd-rdd.pid \
+            --log /tmp/fd-rdd-start-epoch \
+            --path /tmp/fd-rdd-ci-test \
+            --path "${{ env.FD_RDD_SNAPSHOT }}_large*"
+
+      - name: Upload debug bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-debug-${{ github.job }}
+          path: ${{ runner.temp }}/fd-rdd-debug/${{ github.job }}
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*

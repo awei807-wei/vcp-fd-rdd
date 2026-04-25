@@ -1,0 +1,368 @@
+name: fd-rdd musl Stress Tests
+# Run critical stress tests on the musl target to ensure static-link behavior matches glibc.
+
+on:
+  push:
+    branches: [main, tests]
+  schedule:
+    - cron: "0 5 * * 0"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FD_RDD_PORT: 16061
+  FD_RDD_SNAPSHOT: /tmp/fd-rdd-musl-snapshot
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release (musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl --no-default-features
+
+      - name: Upload musl binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fd-rdd-musl-binary
+          path: target/x86_64-unknown-linux-musl/release/fd-rdd
+          retention-days: 1
+
+  test-musl-rename:
+    needs: build-musl
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download musl binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-musl-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup deep directory tree
+        run: |
+          ROOT="/tmp/fd-rdd-musl-test/rename-test"
+          mkdir -p "$ROOT/old_project/src/components"
+          mkdir -p "$ROOT/old_project/node_modules/libA/dist"
+          for i in $(seq 1 100); do
+            echo "module $i" > "$ROOT/old_project/src/app_${i}.js"
+            echo "component $i" > "$ROOT/old_project/src/components/widget_${i}.tsx"
+            echo "lib $i" > "$ROOT/old_project/node_modules/libA/dist/bundle_${i}.js"
+          done
+          echo "Created $(find $ROOT -type f | wc -l) files"
+
+      - name: Start fd-rdd (musl)
+        run: |
+          ./bin/fd-rdd --root /tmp/fd-rdd-musl-test/rename-test --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_rename --http-port ${{ env.FD_RDD_PORT }} --debounce-ms 10 --snapshot-interval-secs 3600 >/tmp/fd-rdd-daemon.log 2>&1 &
+          echo $! > /tmp/fd-rdd.pid
+          # Wait for HTTP ready + initial indexing complete
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+      - name: "Test: Verify pre-rename visibility"
+        run: |
+          set -e
+          count_substr() {
+            local haystack="$1"
+            local needle="$2"
+            printf '%s' "$haystack" | awk -v RS="$needle" 'END { print NR - 1 }'
+          }
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=old_project&limit=200")
+          COUNT=$(count_substr "$RESULT" "old_project")
+          echo "Pre-rename: found $COUNT files under old_project"
+          if [ "$COUNT" -lt 100 ]; then
+            echo "❌ FAIL: Pre-rename indexing incomplete ($COUNT files)"
+            exit 1
+          fi
+          echo "✅ Pre-rename: $COUNT files indexed"
+
+      - name: "Test: Rename directory (avalanche trigger)"
+        run: |
+          set -e
+          echo "=== Rename avalanche ==="
+          ROOT="/tmp/fd-rdd-musl-test/rename-test"
+          mv "$ROOT/old_project" "$ROOT/new_project"
+          sleep 1
+
+      - name: "Test: Query new_project after rename"
+        run: |
+          set -e
+          count_substr() {
+            local haystack="$1"
+            local needle="$2"
+            printf '%s' "$haystack" | awk -v RS="$needle" 'END { print NR - 1 }'
+          }
+          echo "=== Post-rename query ==="
+          COUNT=0
+          for i in $(seq 1 10); do
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=new_project&limit=200")
+            COUNT=$(count_substr "$RESULT" "new_project")
+            echo "Post-rename attempt $i: found $COUNT files under new_project"
+            if [ "$COUNT" -ge 1 ]; then
+              break
+            fi
+            sleep 1
+          done
+          if [ "$COUNT" -lt 1 ]; then
+            echo "❌ FAIL: No new_project paths visible after rename"
+            exit 1
+          fi
+          echo "✅ PASS: $COUNT files visible after rename"
+
+      - name: "Test: Query old_project (should be empty)"
+        run: |
+          set -e
+          count_substr() {
+            local haystack="$1"
+            local needle="$2"
+            printf '%s' "$haystack" | awk -v RS="$needle" 'END { print NR - 1 }'
+          }
+          RESULT='[]'
+          COUNT=999999
+          for i in $(seq 1 10); do
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=old_project&limit=200")
+            COUNT=$(count_substr "$RESULT" "old_project")
+            echo "Old-path cleanup attempt $i: found $COUNT old_project refs"
+            if [ "$COUNT" -le 5 ]; then
+              break
+            fi
+            sleep 1
+          done
+          if [ "$COUNT" -gt 5 ]; then
+            echo "❌ FAIL: old_project still has $COUNT results (stale data)"
+            exit 1
+          fi
+          echo "✅ PASS: old_project correctly empty ($COUNT stale refs acceptable)"
+
+      - name: "Test: Deep file query (node_modules boundary)"
+        run: |
+          set -e
+          echo "=== Deep file query post-rename ==="
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=bundle_1&limit=20")
+          echo "Deep query result: $RESULT"
+          if echo "$RESULT" | grep -q "new_project/node_modules"; then
+            echo "✅ PASS: Deep nested files visible after rename"
+          else
+            echo "❌ FAIL: Deep nested files not visible"
+            exit 1
+          fi
+
+      - name: Collect debug bundle
+        if: failure()
+        run: |
+          bash ./scripts/ci-collect-debug.sh \
+            --output "${{ runner.temp }}/fd-rdd-debug/${{ github.job }}" \
+            --job "${{ github.job }}" \
+            --workflow "stress-musl" \
+            --port "${{ env.FD_RDD_PORT }}" \
+            --log /tmp/fd-rdd-daemon.log \
+            --log /tmp/fd-rdd.pid \
+            --path /tmp/fd-rdd-musl-test \
+            --path "${{ env.FD_RDD_SNAPSHOT }}_rename*"
+
+      - name: Upload debug bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-debug-musl-rename
+          path: ${{ runner.temp }}/fd-rdd-debug/${{ github.job }}
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-musl-test ${{ env.FD_RDD_SNAPSHOT }}*
+
+  test-musl-crash:
+    needs: build-musl
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download musl binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-musl-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup test directory
+        run: |
+          mkdir -p /tmp/fd-rdd-musl-test/recovery-test
+          for i in $(seq 1 100); do
+            echo "data $i" > "/tmp/fd-rdd-musl-test/recovery-test/file_${i}.txt"
+          done
+
+      - name: Start fd-rdd and let it index
+        run: |
+          ./bin/fd-rdd --root /tmp/fd-rdd-musl-test/recovery-test --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_recovery --http-port ${{ env.FD_RDD_PORT }} --debounce-ms 50 --snapshot-interval-secs 5 >/tmp/fd-rdd-daemon.log 2>&1 &
+          echo $! > /tmp/fd-rdd.pid
+          # Wait for HTTP ready + initial indexing complete
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+      - name: Create files while running
+        run: |
+          for i in $(seq 101 150); do
+            echo "new $i" > "/tmp/fd-rdd-musl-test/recovery-test/post_${i}.txt"
+          done
+          sleep 2
+
+      - name: Simulate crash (kill -9)
+        run: |
+          echo "=== Simulating crash ==="
+          kill -9 $(cat /tmp/fd-rdd.pid)
+          sleep 1
+          if kill -0 $(cat /tmp/fd-rdd.pid) 2>/dev/null; then
+            echo "Process still alive after kill -9?"
+            exit 1
+          fi
+          echo "Process killed"
+
+      - name: Create more files while crashed (offline changes)
+        run: |
+          for i in $(seq 151 200); do
+            echo "offline $i" > "/tmp/fd-rdd-musl-test/recovery-test/offline_${i}.txt"
+          done
+          # Delete some files
+          for i in $(seq 1 20); do
+            rm -f "/tmp/fd-rdd-musl-test/recovery-test/file_${i}.txt"
+          done
+
+      - name: Restart fd-rdd (should replay WAL + detect offline changes)
+        run: |
+          ./bin/fd-rdd --root /tmp/fd-rdd-musl-test/recovery-test --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_recovery --http-port ${{ env.FD_RDD_PORT }} --debounce-ms 50 --snapshot-interval-secs 3600 >/tmp/fd-rdd-daemon.log 2>&1 &
+          echo $! > /tmp/fd-rdd.pid
+          # Wait for HTTP ready + initial indexing complete
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+      - name: "Test: Verify offline-created files visible"
+        run: |
+          set -e
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=offline_180&limit=10")
+          echo "Offline file query: $RESULT"
+          if echo "$RESULT" | grep -q "offline_180.txt"; then
+            echo "✅ PASS: Offline-created file visible after recovery"
+          else
+            echo "❌ FAIL: Offline-created file not visible"
+            exit 1
+          fi
+
+      - name: "Test: Verify deleted files are gone"
+        run: |
+          set -e
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file_10&limit=10")
+          echo "Deleted file query: $RESULT"
+          if echo "$RESULT" | grep -q "file_10.txt"; then
+            echo "❌ FAIL: Deleted file still visible after recovery"
+            exit 1
+          else
+            echo "✅ PASS: Deleted file correctly absent after recovery"
+          fi
+
+      - name: "Test: Verify crash-survived files still present"
+        run: |
+          set -e
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file_50&limit=10")
+          if echo "$RESULT" | grep -q "file_50.txt"; then
+            echo "✅ PASS: Survived file still present"
+          else
+            echo "❌ FAIL: Survived file missing after recovery"
+            exit 1
+          fi
+
+      - name: "Test: Status shows correct count"
+        run: |
+          STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status)
+          echo "Status: $STATUS"
+          COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | cut -d: -f2)
+          if [ -z "$COUNT" ]; then COUNT=0; fi
+          if [ "$COUNT" -lt 100 ]; then
+            echo "❌ FAIL: Index count too low after recovery ($COUNT)"
+            exit 1
+          fi
+          echo "✅ PASS: Index count $COUNT after recovery"
+
+      - name: Collect debug bundle
+        if: failure()
+        run: |
+          bash ./scripts/ci-collect-debug.sh \
+            --output "${{ runner.temp }}/fd-rdd-debug/${{ github.job }}" \
+            --job "${{ github.job }}" \
+            --workflow "stress-musl" \
+            --port "${{ env.FD_RDD_PORT }}" \
+            --log /tmp/fd-rdd-daemon.log \
+            --log /tmp/fd-rdd.pid \
+            --path /tmp/fd-rdd-musl-test \
+            --path "${{ env.FD_RDD_SNAPSHOT }}_recovery*"
+
+      - name: Upload debug bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-debug-musl-crash
+          path: ${{ runner.temp }}/fd-rdd-debug/${{ github.job }}
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-musl-test ${{ env.FD_RDD_SNAPSHOT }}*

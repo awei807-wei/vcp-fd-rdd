@@ -1,0 +1,471 @@
+name: fd-rdd Boundary Stress Tests
+# Boundary-condition stress tests for fd-rdd
+# Covers: inotify watch exhaustion, extreme filenames, I/O pressure / disk-full
+
+on:
+  push:
+    branches: [main, tests]
+  pull_request:
+    branches: [main, tests]
+  schedule:
+    # Weekly Sunday 4am
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FD_RDD_PORT: 16060
+  FD_RDD_SNAPSHOT: /tmp/fd-rdd-ci-snapshot
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 1: Build release binary
+  # ───────────────────────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: target/release/fd-rdd
+          retention-days: 1
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 2: Inotify watch handle exhaustion
+  # ───────────────────────────────────────────────────────────────────────────
+  test-watch-limit:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Check and lower max_user_watches
+        run: |
+          echo "Current max_user_watches: $(cat /proc/sys/fs/inotify/max_user_watches)"
+          sudo sysctl fs.inotify.max_user_watches=64
+          echo "Lowered to: $(cat /proc/sys/fs/inotify/max_user_watches)"
+
+      - name: Setup test directories
+        run: |
+          ROOT="/tmp/fd-rdd-ci-test/watch-limit"
+          mkdir -p "$ROOT"
+          for i in $(seq 1 500); do
+            mkdir -p "$ROOT/dir_${i}"
+            echo "init $i" > "$ROOT/dir_${i}/init_file.txt"
+          done
+          echo "Created 500 directories with initial files"
+
+      - name: Start fd-rdd
+        run: |
+          ./bin/fd-rdd --root /tmp/fd-rdd-ci-test/watch-limit --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_watch --http-port ${{ env.FD_RDD_PORT }} --debounce-ms 50 --snapshot-interval-secs 3600 >/tmp/fd-rdd-daemon.log 2>&1 &
+          echo $! > /tmp/fd-rdd.pid
+          # Wait for HTTP ready + initial indexing (fallback polling may be slow)
+          READY=0
+          for i in $(seq 1 180); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -ge 500 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                READY=1
+                break
+              fi
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "❌ FAIL: Daemon failed to become ready within 180s under watch exhaustion"
+            exit 1
+          fi
+
+      - name: "Test: Query existing files under watch exhaustion"
+        run: |
+          set -e
+          echo "=== Test: Watch limit degradation ==="
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=init_file&limit=10")
+          echo "Query result: $RESULT"
+          if echo "$RESULT" | grep -q "init_file.txt"; then
+            echo "✅ PASS: Existing file queryable despite watch exhaustion"
+          else
+            echo "❌ FAIL: Existing file NOT found"
+            exit 1
+          fi
+
+      - name: "Test: Health endpoint remains ok"
+        run: |
+          set -e
+          HEALTH=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health)
+          echo "Health: $HEALTH"
+          if echo "$HEALTH" | grep -q '"status":"ok"'; then
+            echo "✅ PASS: Health ok under watch exhaustion"
+          else
+            echo "❌ FAIL: Health degraded"
+            exit 1
+          fi
+
+      - name: Collect debug bundle
+        if: failure()
+        run: |
+          bash ./scripts/ci-collect-debug.sh \
+            --output "${{ runner.temp }}/fd-rdd-debug/${{ github.job }}" \
+            --job "${{ github.job }}" \
+            --workflow "stress-boundary" \
+            --port "${{ env.FD_RDD_PORT }}" \
+            --log /tmp/fd-rdd-daemon.log \
+            --log /tmp/fd-rdd.pid \
+            --path /tmp/fd-rdd-ci-test \
+            --path "${{ env.FD_RDD_SNAPSHOT }}_watch*"
+
+      - name: Upload debug bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-debug-${{ github.job }}
+          path: ${{ runner.temp }}/fd-rdd-debug/${{ github.job }}
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+          sudo sysctl fs.inotify.max_user_watches=524288 || true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 3: Extreme / bizarre filenames
+  # ───────────────────────────────────────────────────────────────────────────
+  test-extreme-filenames:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup extreme filenames
+        run: |
+          ROOT="/tmp/fd-rdd-ci-test/extreme-names"
+          mkdir -p "$ROOT"
+
+          # 0-byte empty file
+          touch "$ROOT/empty_file"
+
+          # Very long name (251 chars + .txt = 255 bytes, ext4 filename limit)
+          LONGNAME=$(python3 -c "print('a'*251 + '.txt')")
+          touch "$ROOT/$LONGNAME"
+
+          # Name with newline (using printf)
+          printf 'file\nname.txt' | xargs -0 -I {} touch "$ROOT/{}"
+
+          # Name with tab
+          touch "$ROOT/file"$'\t'"name.txt"
+
+          # Name with only spaces
+          touch "$ROOT/   "
+
+          # Name with Unicode RTL override (U+202E) + evil.txt
+          RTL_NAME=$(python3 -c "import sys; sys.stdout.buffer.write(b'\xe2\x80\xae')")"evil.txt"
+          touch "$ROOT/$RTL_NAME"
+
+          # Name with mixed CJK + emoji
+          touch "$ROOT/报告_🚀_draft.md"
+
+          echo "Created extreme filenames:"
+          ls -1 "$ROOT" | cat -A
+
+      - name: Start fd-rdd
+        run: |
+          ./bin/fd-rdd --root /tmp/fd-rdd-ci-test/extreme-names --snapshot-path ${{ env.FD_RDD_SNAPSHOT }}_names --http-port ${{ env.FD_RDD_PORT }} --debounce-ms 50 --snapshot-interval-secs 3600 >/tmp/fd-rdd-daemon.log 2>&1 &
+          echo $! > /tmp/fd-rdd.pid
+          # Wait for HTTP ready + initial indexing
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+      - name: "Test: Query extreme filenames"
+        run: |
+          set -e
+          echo "=== Test: Extreme filename queries ==="
+
+          # empty_file
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=empty_file&limit=10")
+          if echo "$RESULT" | grep -q "empty_file"; then
+            echo "✅ empty_file found"
+          else
+            echo "❌ empty_file NOT found"
+            exit 1
+          fi
+
+          # long name (query by substring)
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=aaaaaaaaaa&limit=10")
+          if echo "$RESULT" | grep -q "aaaaaaaaaa"; then
+            echo "✅ long name found"
+          else
+            echo "❌ long name NOT found"
+            exit 1
+          fi
+
+          # RTL override name - query by "evil"
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=evil&limit=10")
+          if echo "$RESULT" | grep -q "evil"; then
+            echo "✅ RTL override name found"
+          else
+            echo "❌ RTL override name NOT found"
+            exit 1
+          fi
+
+          # CJK + emoji
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=%E6%8A%A5%E5%91%8A&limit=10")
+          if echo "$RESULT" | grep -q "报告"; then
+            echo "✅ CJK+emoji name found"
+          else
+            echo "❌ CJK+emoji name NOT found"
+            exit 1
+          fi
+
+          # space-only name - query by spaces (URL-encoded)
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=%20%20%20&limit=10")
+          # We just check the daemon doesn't crash; matching spaces is ambiguous
+          echo "Space-only query result: $RESULT"
+
+          # tab/newline files - query by common substring "name"
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=name&limit=10")
+          echo "name query result: $RESULT"
+          COUNT=$(echo "$RESULT" | grep -o '"path"' | wc -l | tr -d ' ')
+          if [ "$COUNT" -ge 2 ]; then
+            echo "✅ tab/newline filename found via partial query"
+          else
+            echo "❌ tab/newline filename NOT found"
+            exit 1
+          fi
+
+          echo "✅ PASS: All extreme filename queries handled"
+
+      - name: Collect debug bundle
+        if: failure()
+        run: |
+          bash ./scripts/ci-collect-debug.sh \
+            --output "${{ runner.temp }}/fd-rdd-debug/${{ github.job }}" \
+            --job "${{ github.job }}" \
+            --workflow "stress-boundary" \
+            --port "${{ env.FD_RDD_PORT }}" \
+            --log /tmp/fd-rdd-daemon.log \
+            --log /tmp/fd-rdd.pid \
+            --path /tmp/fd-rdd-ci-test \
+            --path "${{ env.FD_RDD_SNAPSHOT }}_names*"
+
+      - name: Upload debug bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-debug-${{ github.job }}
+          path: ${{ runner.temp }}/fd-rdd-debug/${{ github.job }}
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 4: I/O pressure (disk-full / slow I/O simulation)
+  # ───────────────────────────────────────────────────────────────────────────
+  test-io-pressure:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/fd-rdd
+
+      - name: Setup small tmpfs
+        run: |
+          ROOT="/tmp/fd-rdd-ci-test/io-pressure"
+          mkdir -p "$ROOT"
+          sudo mount -t tmpfs -o size=50M tmpfs "$ROOT"
+          echo "Mounted 50MB tmpfs at $ROOT"
+
+      - name: Pre-fill tmpfs with files
+        run: |
+          ROOT="/tmp/fd-rdd-ci-test/io-pressure"
+          for i in $(seq 1 1000); do
+            echo "data $i $(date +%s)" > "$ROOT/prefill_${i}.txt"
+          done
+          echo "Created $(find $ROOT -type f | wc -l) files"
+          df -h "$ROOT"
+
+      - name: Start fd-rdd with frequent snapshots
+        run: |
+          ./bin/fd-rdd --root /tmp/fd-rdd-ci-test/io-pressure --snapshot-path /tmp/fd-rdd-ci-test/io-pressure/snapshots --http-port ${{ env.FD_RDD_PORT }} --debounce-ms 50 --snapshot-interval-secs 5 >/tmp/fd-rdd-daemon.log 2>&1 &
+          echo $! > /tmp/fd-rdd.pid
+          # Wait for HTTP ready + initial indexing
+          for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
+              STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
+              COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+                echo "Daemon ready, indexed_count=$COUNT"
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+      - name: "Test: Fill tmpfs to >90% and verify daemon survives"
+        run: |
+          set -e
+          echo "=== Test: I/O pressure ==="
+          ROOT="/tmp/fd-rdd-ci-test/io-pressure"
+
+          # Rapidly create files to fill tmpfs
+          for i in $(seq 1 2000); do
+            echo "fill $i $(python3 -c "print('x'*4096)")" > "$ROOT/fill_${i}.txt" 2>/dev/null || break
+          done
+
+          USAGE_PCT=$(df "$ROOT" | tail -1 | awk '{print $5}' | tr -d '%')
+          echo "Tmpfs usage: ${USAGE_PCT}%"
+          if [ "$USAGE_PCT" -lt 90 ]; then
+            echo "⚠️ WARNING: Could not fill tmpfs above 90% (at ${USAGE_PCT}%)"
+          fi
+
+          # Wait for next snapshot cycle (5-10s)
+          sleep 8
+
+          # Query daemon - assert health ok and HTTP 200
+          HEALTH=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${{ env.FD_RDD_PORT }}/health")
+          echo "Health HTTP code: $HEALTH"
+          if [ "$HEALTH" != "200" ]; then
+            echo "❌ FAIL: Health endpoint returned HTTP $HEALTH under I/O pressure"
+            exit 1
+          fi
+
+          SEARCH_HTTP=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=prefill&limit=10")
+          echo "Search HTTP code: $SEARCH_HTTP"
+          if [ "$SEARCH_HTTP" != "200" ]; then
+            echo "❌ FAIL: Search endpoint returned HTTP $SEARCH_HTTP under I/O pressure"
+            exit 1
+          fi
+
+          echo "✅ PASS: Daemon survived snapshot under disk pressure"
+
+      - name: "Test: Daemon recovers after space is freed"
+        run: |
+          set -e
+          ROOT="/tmp/fd-rdd-ci-test/io-pressure"
+
+          # Remove fill files to free space
+          rm -f "$ROOT"/fill_*.txt
+          echo "Freed space:"
+          df -h "$ROOT"
+
+          # Create a new file
+          echo "recovery_test_file_content" > "$ROOT/recovery_test_file.txt"
+          sleep 2
+
+          # Query for it
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=recovery_test_file&limit=10")
+          echo "Recovery query result: $RESULT"
+          if echo "$RESULT" | grep -q "recovery_test_file.txt"; then
+            echo "✅ PASS: Daemon recovered and indexed new file after space freed"
+          else
+            echo "❌ FAIL: Recovery file not found"
+            exit 1
+          fi
+
+      - name: Collect dmesg for I/O evidence
+        if: failure()
+        run: |
+          {
+            echo "== dmesg tail =="
+            dmesg | tail -50 || true
+            echo
+            echo "== df =="
+            df -h /tmp/fd-rdd-ci-test/io-pressure || true
+          } > /tmp/fd-rdd-dmesg.log
+
+      - name: Collect debug bundle
+        if: failure()
+        run: |
+          bash ./scripts/ci-collect-debug.sh \
+            --output "${{ runner.temp }}/fd-rdd-debug/${{ github.job }}" \
+            --job "${{ github.job }}" \
+            --workflow "stress-boundary" \
+            --port "${{ env.FD_RDD_PORT }}" \
+            --log /tmp/fd-rdd-daemon.log \
+            --log /tmp/fd-rdd.pid \
+            --log /tmp/fd-rdd-dmesg.log \
+            --path /tmp/fd-rdd-ci-test \
+            --path "${{ env.FD_RDD_SNAPSHOT }}*"
+
+      - name: Upload debug bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-debug-${{ github.job }}
+          path: ${{ runner.temp }}/fd-rdd-debug/${{ github.job }}
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          sudo umount /tmp/fd-rdd-ci-test/io-pressure 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*

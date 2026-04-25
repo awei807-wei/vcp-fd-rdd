@@ -400,6 +400,7 @@ jobs:
   test-concurrent-chaos:
     needs: build
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -550,6 +551,7 @@ jobs:
   test-mmap-and-compaction:
     needs: build
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -694,6 +696,7 @@ jobs:
   test-trigram-skew:
     needs: build
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -832,6 +835,7 @@ jobs:
   test-hardlink-crossmount:
     needs: build
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -970,6 +974,7 @@ jobs:
   test-crash-recovery:
     needs: build
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -1135,7 +1140,7 @@ jobs:
   test-soak:
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event.inputs.duration_minutes
+    if: (github.event_name == 'schedule' || github.event.inputs.duration_minutes) && github.event_name != 'pull_request'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
