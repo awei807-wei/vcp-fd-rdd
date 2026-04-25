@@ -195,7 +195,7 @@ impl MmapSnapshotV6 {
     pub fn tombstones_bytes(&self) -> &[u8] {
         self.slice(self.tombstones.clone())
     }
-pub fn file_key_map_bytes(&self) -> Option<&[u8]> {
+    pub fn file_key_map_bytes(&self) -> Option<&[u8]> {
         self.file_key_map.clone().map(|r| self.slice(r))
     }
 

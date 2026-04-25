@@ -662,9 +662,13 @@ impl PersistentIndex {
                 existing.mtime_ns = mtime_to_ns(meta.mtime);
             } else {
                 // 极端情况：docid 槽位不存在，降级为 append
-                if let Some(docid_new) =
-                    self.alloc_docid(fkey, new_root_id, &new_rel_bytes, meta.size, mtime_to_ns(meta.mtime))
-                {
+                if let Some(docid_new) = self.alloc_docid(
+                    fkey,
+                    new_root_id,
+                    &new_rel_bytes,
+                    meta.size,
+                    mtime_to_ns(meta.mtime),
+                ) {
                     self.insert_trigrams(docid_new, meta.path.as_path());
                     self.insert_path_hash(docid_new, meta.path.as_path());
                 }
@@ -678,9 +682,13 @@ impl PersistentIndex {
 
         // 新文件：分配 docid 并写入
         let _guard = self.upsert_lock.write();
-        let Some(docid) =
-            self.alloc_docid(fkey, new_root_id, &new_rel_bytes, meta.size, mtime_to_ns(meta.mtime))
-        else {
+        let Some(docid) = self.alloc_docid(
+            fkey,
+            new_root_id,
+            &new_rel_bytes,
+            meta.size,
+            mtime_to_ns(meta.mtime),
+        ) else {
             return;
         };
         self.insert_trigrams(docid, meta.path.as_path());

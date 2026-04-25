@@ -9,7 +9,9 @@ use std::sync::Arc;
 ///
 /// 说明：阶段 A 引入 `DocId(u32)` 作为 L2 内部的紧凑主键；
 /// `FileKey` 仍用于扫描/事件输入与“同 inode 去重”。
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
+)]
 #[cfg_attr(feature = "rkyv", derive(Archive, RkyvSerialize, RkyvDeserialize))]
 #[cfg_attr(feature = "rkyv", archive(check_bytes))]
 pub struct FileKey {

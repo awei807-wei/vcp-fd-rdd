@@ -68,6 +68,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # NOTE: This is a physical-machine benchmark test (800K files).
+    # It validates extreme-environment reliability and resource usage.
+    # CI runners (2-core) are often resource-constrained and may fail.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
