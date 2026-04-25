@@ -29,6 +29,14 @@
 - **新增** fd-rdd Stress CI：系统性压力测试覆盖 Overlay 可见性、Rename 雪崩、并发中间状态、Mmap 安全、Trigram 倾斜等。
 - **修复** GitHub Actions 中 `fd-rdd` 启动命令的续行脆弱性：压力工作流与 smoke 节点改为单行启动，避免 `\` 被误传给 clap 导致测试在 daemon 启动前失败。
 - **修复** nightly ThreadSanitizer ABI mismatch：sanitizer job 改为使用 job 级 `RUSTFLAGS=-Z sanitizer=thread`，确保当前 crate、依赖与标准库使用同一 sanitizer ABI。
+- **修复** musl 目标构建与代码兼容性问题：解决 musl target 下的编译失败与运行时兼容问题。
+- **修复** 离线变更恢复与重命名路径协调：崩溃重启后正确恢复离线期间发生变更的文件，并协调重命名路径的一致性。
+- **修复** CI 工作流稳定性与搜索覆盖：整合并稳定化 CI 工作流，增强 smoke 搜索覆盖。
+- **修复** smoke smart-case 查询覆盖：稳定化 smart-case 查询的 smoke 测试覆盖。
+- **修复** snapshot_now 同步阶段阻塞：将 snapshot_now 的同步阶段移至 spawn_blocking，避免阻塞 tokio 运行时；并在 interval=0 时强制 MIN_SNAPSHOT_INTERVAL，防止高频 snapshot 连环触发。
+- **修复** apply_gate 写锁饥饿：使用 try_write 替代 write，避免写锁持续持有导致 tokio worker 的读优先饥饿。
+- **修复** compute_highlights 中文 UTF-8 越界 panic：cherry-pick 主分支修复，匹配后错误按 `+1` 推进 start，导致中文字符（多字节 UTF-8）下一轮切片落在字符中间，触发 panic；已改为按匹配子串实际字节长度推进。
+- **修复** 中文精确查询测试缺失 generation 字段：为 `chinese_exact_query_via_trigram` 测试补充 `FileKey` 中缺失的 `generation` 字段。
 
 ## v0.5.9 更新
 
