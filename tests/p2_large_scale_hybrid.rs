@@ -185,10 +185,11 @@ fn large_scale_hybrid_workspace_correctness() {
     all_metrics.push(m);
 
     // -----------------------------------------------------------------------
-    // 4. 等待初始索引完成（80 万文件全部索引）
+    // 4. 等待初始索引完成（可索引文件全部索引）
     // -----------------------------------------------------------------------
+    let indexable_count = ws.indexable_files().len();
     let (_, m) = monitor_phase("initial_indexing", pid, || {
-        wait_for_indexed_count(port, 800_000, 300).expect("initial indexing timeout")
+        wait_for_indexed_count(port, indexable_count, 600).expect("initial indexing timeout")
     });
     all_metrics.push(m);
 
