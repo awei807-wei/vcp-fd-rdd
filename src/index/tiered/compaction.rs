@@ -185,6 +185,11 @@ impl TieredIndex {
                 cur.clear();
                 cur.push(new_layer);
                 cur.extend(suffix);
+                // 驱逐旧段 mmap 的缓存页（Linux-only）
+                #[cfg(target_os = "linux")]
+                for layer in &layers_snapshot {
+                    layer.idx.evict_mmap_pages();
+                }
                 self.l1.clear();
             }
         }
@@ -348,6 +353,11 @@ impl TieredIndex {
                 cur.clear();
                 cur.push(new_layer);
                 cur.extend(suffix);
+                // 驱逐旧段 mmap 的缓存页（Linux-only）
+                #[cfg(target_os = "linux")]
+                for layer in &layers_snapshot {
+                    layer.idx.evict_mmap_pages();
+                }
                 self.l1.clear();
             }
         }

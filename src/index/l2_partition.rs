@@ -2,7 +2,7 @@ use parking_lot::RwLock;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -49,6 +49,21 @@ struct ResolvedFsMeta {
     file_key: FileKey,
     size: u64,
     mtime: Option<std::time::SystemTime>,
+}
+
+fn mtime_to_ns(mtime: Option<std::time::SystemTime>) -> i64 {
+    mtime
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
+        .unwrap_or(-1)
+}
+
+fn mtime_from_ns(ns: i64) -> Option<std::time::SystemTime> {
+    if ns < 0 {
+        None
+    } else {
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ns as u64))
+    }
 }
 
 /// DocId：L2 内部紧凑文档编号（posting 的元素类型）
@@ -190,7 +205,7 @@ pub struct CompactMeta {
     pub path_off: u32,
     pub path_len: u16,
     pub size: u64,
-    pub mtime: Option<std::time::SystemTime>,
+    pub mtime_ns: i64,
 }
 
 /// 旧快照格式 v2（兼容读取）
@@ -350,12 +365,12 @@ pub struct PersistentIndex {
     /// DocId -> CompactMeta
     metas: RwLock<Vec<CompactMeta>>,
     /// FileKey -> DocId
-    filekey_to_docid: RwLock<HashMap<FileKey, DocId>>,
+    filekey_to_docid: RwLock<BTreeMap<FileKey, DocId>>,
     /// 路径 blob
     arena: RwLock<PathArena>,
 
     /// 路径反查：hash(path_bytes) -> DocId（或少量冲突列表）
-    path_hash_to_id: RwLock<HashMap<u64, OneOrManyDocId>>,
+    path_hash_to_id: RwLock<BTreeMap<u64, OneOrManyDocId>>,
 
     /// Trigram 倒排索引：trigram -> RoaringTreemap(DocId)
     trigram_index: RwLock<HashMap<Trigram, RoaringTreemap>>,
@@ -395,9 +410,9 @@ impl PersistentIndex {
             roots,
             roots_bytes,
             metas: RwLock::new(Vec::new()),
-            filekey_to_docid: RwLock::new(HashMap::new()),
+            filekey_to_docid: RwLock::new(BTreeMap::new()),
             arena: RwLock::new(PathArena::new()),
-            path_hash_to_id: RwLock::new(HashMap::new()),
+            path_hash_to_id: RwLock::new(BTreeMap::new()),
             trigram_index: RwLock::new(HashMap::new()),
             short_component_index: RwLock::new(HashMap::new()),
             tombstones: RwLock::new(RoaringTreemap::new()),
@@ -458,7 +473,7 @@ impl PersistentIndex {
                 path_off: off,
                 path_len: len,
                 size: m.size,
-                mtime: m.mtime,
+                mtime_ns: mtime_to_ns(m.mtime),
             });
         }
 
@@ -589,7 +604,7 @@ impl PersistentIndex {
                 let mut metas = self.metas.write();
                 if let Some(existing) = metas.get_mut(docid as usize) {
                     existing.size = meta.size;
-                    existing.mtime = meta.mtime;
+                    existing.mtime_ns = mtime_to_ns(meta.mtime);
                 }
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
@@ -613,7 +628,7 @@ impl PersistentIndex {
                 let mut metas = self.metas.write();
                 if let Some(existing) = metas.get_mut(docid as usize) {
                     existing.size = meta.size;
-                    existing.mtime = meta.mtime;
+                    existing.mtime_ns = mtime_to_ns(meta.mtime);
                 }
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
@@ -644,11 +659,11 @@ impl PersistentIndex {
                 existing.path_off = new_off;
                 existing.path_len = new_len;
                 existing.size = meta.size;
-                existing.mtime = meta.mtime;
+                existing.mtime_ns = mtime_to_ns(meta.mtime);
             } else {
                 // 极端情况：docid 槽位不存在，降级为 append
                 if let Some(docid_new) =
-                    self.alloc_docid(fkey, new_root_id, &new_rel_bytes, meta.size, meta.mtime)
+                    self.alloc_docid(fkey, new_root_id, &new_rel_bytes, meta.size, mtime_to_ns(meta.mtime))
                 {
                     self.insert_trigrams(docid_new, meta.path.as_path());
                     self.insert_path_hash(docid_new, meta.path.as_path());
@@ -664,7 +679,7 @@ impl PersistentIndex {
         // 新文件：分配 docid 并写入
         let _guard = self.upsert_lock.write();
         let Some(docid) =
-            self.alloc_docid(fkey, new_root_id, &new_rel_bytes, meta.size, meta.mtime)
+            self.alloc_docid(fkey, new_root_id, &new_rel_bytes, meta.size, mtime_to_ns(meta.mtime))
         else {
             return;
         };
@@ -679,7 +694,7 @@ impl PersistentIndex {
         root_id: u16,
         rel_bytes: &[u8],
         size: u64,
-        mtime: Option<std::time::SystemTime>,
+        mtime_ns: i64,
     ) -> Option<DocId> {
         let (off, len) = self.arena.write().push_bytes(rel_bytes)?;
 
@@ -691,7 +706,7 @@ impl PersistentIndex {
             path_off: off,
             path_len: len,
             size,
-            mtime,
+            mtime_ns,
         });
 
         self.filekey_to_docid.write().insert(file_key, docid);
@@ -774,7 +789,7 @@ impl PersistentIndex {
                         file_key: m.file_key,
                         path,
                         size: m.size,
-                        mtime: m.mtime,
+                        mtime: mtime_from_ns(m.mtime_ns),
                         ctime: None,
                         atime: None,
                     })
@@ -807,7 +822,7 @@ impl PersistentIndex {
                                 file_key: m.file_key,
                                 path,
                                 size: m.size,
-                                mtime: m.mtime,
+                                mtime: mtime_from_ns(m.mtime_ns),
                                 ctime: None,
                                 atime: None,
                             })
@@ -840,7 +855,7 @@ impl PersistentIndex {
                 file_key: m.file_key,
                 path,
                 size: m.size,
-                mtime: m.mtime,
+                mtime: mtime_from_ns(m.mtime_ns),
                 ctime: None,
                 atime: None,
             });
@@ -875,7 +890,7 @@ impl PersistentIndex {
                         file_key: m.file_key,
                         path,
                         size: m.size,
-                        mtime: m.mtime,
+                        mtime: mtime_from_ns(m.mtime_ns),
                         ctime: None,
                         atime: None,
                     });
@@ -1106,13 +1121,13 @@ impl PersistentIndex {
                     }
                     if let Some(meta) = to_meta {
                         m.size = meta.size;
-                        m.mtime = meta.mtime;
+                        m.mtime_ns = mtime_to_ns(meta.mtime);
                     }
                     self.insert_trigrams(docid, to_path.as_path());
                     self.insert_path_hash(docid, to_path.as_path());
                 } else if let Some(meta) = fallback_meta {
                     m.size = meta.size;
-                    m.mtime = meta.mtime;
+                    m.mtime_ns = mtime_to_ns(meta.mtime);
                 }
 
                 if let Some(slot) = self.metas.write().get_mut(docid as usize) {
@@ -1199,12 +1214,7 @@ impl PersistentIndex {
             metas_bytes.extend_from_slice(&m.path_off.to_le_bytes());
             metas_bytes.extend_from_slice(&m.path_len.to_le_bytes());
             metas_bytes.extend_from_slice(&m.size.to_le_bytes());
-            let ns: i64 = m
-                .mtime
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|d| i64::try_from(d.as_nanos()).ok())
-                .unwrap_or(-1);
-            metas_bytes.extend_from_slice(&ns.to_le_bytes());
+            metas_bytes.extend_from_slice(&m.mtime_ns.to_le_bytes());
         }
 
         // Tombstones 段：RoaringBitmap serialized bytes（v6 兼容格式；v8 后再切 Treemap）
@@ -1369,12 +1379,7 @@ impl PersistentIndex {
             metas_bytes.extend_from_slice(&m.path_off.to_le_bytes());
             metas_bytes.extend_from_slice(&m.path_len.to_le_bytes());
             metas_bytes.extend_from_slice(&m.size.to_le_bytes());
-            let ns: i64 = m
-                .mtime
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|d| i64::try_from(d.as_nanos()).ok())
-                .unwrap_or(-1);
-            metas_bytes.extend_from_slice(&ns.to_le_bytes());
+            metas_bytes.extend_from_slice(&m.mtime_ns.to_le_bytes());
         }
         drop(metas);
         Self::write_segment(writer, &metas_bytes)?;
@@ -1534,10 +1539,10 @@ impl PersistentIndex {
         let metas_bytes = metas.capacity() as u64 * size_of::<CompactMeta>() as u64
             + size_of::<Vec<CompactMeta>>() as u64;
 
-        // mapping: HashMap<FileKey, DocId>
+        // mapping: BTreeMap<FileKey, DocId>
         let map_entry_bytes = size_of::<(FileKey, DocId)>() as u64;
-        let filekey_to_docid_bytes = filekey_to_docid.capacity() as u64 * (map_entry_bytes + 1)
-            + size_of::<HashMap<FileKey, DocId>>() as u64;
+        let filekey_to_docid_bytes = filekey_to_docid.len() as u64 * (map_entry_bytes + 1)
+            + size_of::<BTreeMap<FileKey, DocId>>() as u64;
 
         // arena：Vec<u8>
         let arena_bytes = arena.data.capacity() as u64 + size_of::<Vec<u8>>() as u64;
@@ -1551,8 +1556,8 @@ impl PersistentIndex {
                     + size_of::<Vec<DocId>>() as u64;
             }
         }
-        let path_to_id_bytes = path_hash_to_id.capacity() as u64 * (path_entry_bytes + 1)
-            + size_of::<HashMap<u64, OneOrManyDocId>>() as u64
+        let path_to_id_bytes = path_hash_to_id.len() as u64 * (path_entry_bytes + 1)
+            + size_of::<BTreeMap<u64, OneOrManyDocId>>() as u64
             + path_many_bytes;
 
         // trigram：HashMap<Trigram, RoaringTreemap> 的 entry + Roaring 的压缩存储量（serialized_size）
@@ -1586,8 +1591,8 @@ impl PersistentIndex {
             trigram_postings_total,
             tombstone_count,
             metas_capacity: metas.capacity(),
-            filekey_to_docid_capacity: filekey_to_docid.capacity(),
-            path_hash_to_id_capacity: path_hash_to_id.capacity(),
+            filekey_to_docid_capacity: filekey_to_docid.len(),
+            path_hash_to_id_capacity: path_hash_to_id.len(),
             trigram_index_capacity: trigram_index.capacity(),
             arena_capacity: arena.data.capacity(),
 
@@ -1783,9 +1788,7 @@ impl PersistentIndex {
 
         let mut acc: Option<RoaringTreemap> = None;
         for tri in &sorted_tris {
-            let Some(posting) = tri_idx.get(tri) else {
-                return None;
-            };
+            let posting = tri_idx.get(tri)?;
             match acc {
                 None => acc = Some(posting.clone()),
                 Some(ref mut a) => {
@@ -1894,7 +1897,7 @@ impl IndexLayer for PersistentIndex {
             file_key: m.file_key,
             path,
             size: m.size,
-            mtime: m.mtime,
+            mtime: mtime_from_ns(m.mtime_ns),
             ctime: None,
             atime: None,
         })
@@ -1946,8 +1949,8 @@ impl PersistentIndex {
         {
             *self.metas.write() = Vec::new();
             *self.arena.write() = PathArena::new();
-            *self.filekey_to_docid.write() = HashMap::new();
-            *self.path_hash_to_id.write() = HashMap::new();
+            *self.filekey_to_docid.write() = BTreeMap::new();
+            *self.path_hash_to_id.write() = BTreeMap::new();
             *self.trigram_index.write() = HashMap::new();
             *self.short_component_index.write() = HashMap::new();
             *self.tombstones.write() = RoaringTreemap::new();
@@ -1956,8 +1959,8 @@ impl PersistentIndex {
 
         let mut new_metas = Vec::with_capacity(metas.len());
         let mut new_arena = PathArena::new();
-        let mut new_filekey_to_docid = HashMap::with_capacity(metas.len());
-        let mut new_path_hash_to_id = HashMap::with_capacity(metas.len());
+        let mut new_filekey_to_docid = BTreeMap::new();
+        let mut new_path_hash_to_id = BTreeMap::new();
         let mut new_short_component_index: HashMap<Box<[u8]>, RoaringTreemap> = HashMap::new();
 
         for (docid, meta) in metas.into_iter().enumerate() {
@@ -1974,7 +1977,7 @@ impl PersistentIndex {
                 path_off: off,
                 path_len: len,
                 size: meta.size,
-                mtime: meta.mtime,
+                mtime_ns: mtime_to_ns(meta.mtime),
             });
 
             new_filekey_to_docid.insert(meta.file_key, docid);

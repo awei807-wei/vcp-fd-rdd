@@ -195,9 +195,20 @@ impl MmapSnapshotV6 {
     pub fn tombstones_bytes(&self) -> &[u8] {
         self.slice(self.tombstones.clone())
     }
-
-    pub fn file_key_map_bytes(&self) -> Option<&[u8]> {
+pub fn file_key_map_bytes(&self) -> Option<&[u8]> {
         self.file_key_map.clone().map(|r| self.slice(r))
+    }
+
+    /// Linux-only: hint kernel to drop cached pages for this mmap.
+    #[cfg(target_os = "linux")]
+    pub fn evict_mmap_pages(&self) {
+        let ptr = self.bytes().as_ptr();
+        let len = self.bytes().len();
+        if len > 0 {
+            unsafe {
+                libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTNEED);
+            }
+        }
     }
 }
 

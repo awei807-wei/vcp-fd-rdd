@@ -95,6 +95,12 @@ impl MmapIndex {
         &self.snap
     }
 
+    /// Linux-only: hint kernel to drop cached pages for this mmap.
+    #[cfg(target_os = "linux")]
+    pub fn evict_mmap_pages(&self) {
+        self.snap.evict_mmap_pages();
+    }
+
     pub fn file_count_estimate(&self) -> usize {
         self.snap.metas_bytes().len() / META_REC_SIZE
     }
