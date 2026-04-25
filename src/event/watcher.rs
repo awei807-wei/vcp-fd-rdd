@@ -1,4 +1,4 @@
-use notify::{Config, RecursiveMode, Watcher};
+use notify::{Config, ErrorKind, RecursiveMode, Watcher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,6 +9,11 @@ use crate::event::recovery::DirtyTracker;
 /// Heuristic check for ENOSPC / NoStorageSpace errors from notify/inotify.
 fn is_enospc_error(e: &notify::Error) -> bool {
     use std::error::Error;
+
+    // notify 6.1+ explicit error kind for inotify max_user_watches exceeded
+    if matches!(e.kind, ErrorKind::MaxFilesWatch) {
+        return true;
+    }
 
     // Check the error's own string representation
     let msg = e.to_string().to_lowercase();
@@ -231,12 +236,24 @@ pub fn watch_roots_enhanced(
 
     for root in roots {
         if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
-            tracing::warn!(
-                "Failed to watch {:?}: {} — will fallback to polling",
-                root,
-                e
-            );
-            failed_roots.push(root.clone());
+            if is_enospc_error(&e) {
+                tracing::warn!(
+                    "Failed to watch {:?}: {} — inotify limit exceeded, marking degraded for fast-sync fallback",
+                    root,
+                    e
+                );
+                if let Some(d) = dirty {
+                    d.mark_dirty_all();
+                }
+                degraded_roots.push(root.clone());
+            } else {
+                tracing::warn!(
+                    "Failed to watch {:?}: {} — will fallback to polling",
+                    root,
+                    e
+                );
+                failed_roots.push(root.clone());
+            }
         } else {
             #[cfg(target_os = "linux")]
             if let Some(limit_val) = limit {
