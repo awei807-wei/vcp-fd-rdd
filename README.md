@@ -37,6 +37,8 @@
 - **修复** apply_gate 写锁饥饿：使用 try_write 替代 write，避免写锁持续持有导致 tokio worker 的读优先饥饿。
 - **修复** compute_highlights 中文 UTF-8 越界 panic：cherry-pick 主分支修复，匹配后错误按 `+1` 推进 start，导致中文字符（多字节 UTF-8）下一轮切片落在字符中间，触发 panic；已改为按匹配子串实际字节长度推进。
 - **修复** 中文精确查询测试缺失 generation 字段：为 `chinese_exact_query_via_trigram` 测试补充 `FileKey` 中缺失的 `generation` 字段。
+- **修复** inotify max_user_watches 耗尽时深层子目录监听静默失效：watcher.rs 中 `handle_notify_result()` 不再静默丢弃 notify 错误，主动识别 ENOSPC（错误码 28 / "no space"）并将相关目录全部标记为脏；新增 `watch_roots_enhanced()` 在添加递归监听前预估每个 root 的 watch 需求量，若系统 limit 紧张则将该 root 标记为 degraded 并记录到 DirtyTracker，实现失效可感知。
+- **新增** Hybrid Crawler 降级根目录增量对账：stream.rs 中将简单轮询兜底替换为 Hybrid Crawler 后台任务。对 failed_roots 维持 60s 周期 fast-sync；对 degraded_roots 新增 30s 对账循环，迭代 DFS（最大深度 20，跳过隐藏目录与 ignore 路径）遍历目录树并比较 mtime，将变更子目录通过 `DirtyTracker::record_overflow_paths()` 标记为脏，由既有 overflow 恢复逻辑（cooldown/staleness）自动触发 `spawn_fast_sync` 增量补扫，解决深层子目录监听失效无 fallback 扫描的隐患。
 
 ## v0.5.9 更新
 
