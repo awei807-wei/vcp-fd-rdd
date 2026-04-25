@@ -196,13 +196,42 @@ impl DirtyTracker {
         self.last_sync_ns.store(now_ns(), Ordering::Relaxed);
         {
             // fast-sync 完成后，dirty set 往往已 drain/clear；此时可回收 HashSet 的高水位桶数组，
-            // 避免“风暴一次把 capacity 顶上去”后常驻不降，从而把 PD plateau 粘住。
+            // 避免"风暴一次把 capacity 顶上去"后常驻不降，从而把 PD plateau 粘住。
             let mut st = self.state.lock();
             let keep = self.max_dirty_dirs.clamp(64, 2048);
             if st.dirty_dirs.capacity() > keep.saturating_mul(2) {
                 st.dirty_dirs.shrink_to(keep);
             }
         }
+        self.sync_in_progress.store(false, Ordering::Release);
+    }
+
+    /// 当 fast-sync 因信号量被占用而未能实际执行时，回滚 sync_in_progress 和 dirty 状态，
+    /// 使下次调度能重新触发 fast-sync，避免"dirty 被消费但同步未执行"的状态丢失。
+    pub fn rollback_sync(&self, scope: DirtyScope) {
+        let mut st = self.state.lock();
+        match scope {
+            DirtyScope::All { .. } => {
+                st.dirty_all = true;
+            }
+            DirtyScope::Dirs { dirs, .. } => {
+                if !st.dirty_all {
+                    for d in dirs {
+                        st.dirty_dirs.insert(d);
+                    }
+                    if st.dirty_dirs.len() >= self.max_dirty_dirs {
+                        st.dirty_all = true;
+                        st.dirty_dirs.clear();
+                    }
+                }
+            }
+        }
+        drop(st);
+        // 恢复 first_dirty_ns，确保 cooldown/staleness 逻辑继续生效
+        let t = now_ns();
+        self.first_dirty_ns
+            .compare_exchange(0, t, Ordering::Relaxed, Ordering::Relaxed)
+            .ok();
         self.sync_in_progress.store(false, Ordering::Release);
     }
 }

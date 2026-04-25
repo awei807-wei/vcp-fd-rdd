@@ -39,6 +39,8 @@
 - **修复** 中文精确查询测试缺失 generation 字段：为 `chinese_exact_query_via_trigram` 测试补充 `FileKey` 中缺失的 `generation` 字段。
 - **修复** inotify max_user_watches 耗尽时深层子目录监听静默失效：watcher.rs 中 `handle_notify_result()` 不再静默丢弃 notify 错误，主动识别 ENOSPC（错误码 28 / "no space"）并将相关目录全部标记为脏；新增 `watch_roots_enhanced()` 在添加递归监听前预估每个 root 的 watch 需求量，若系统 limit 紧张则将该 root 标记为 degraded 并记录到 DirtyTracker，实现失效可感知。
 - **新增** Hybrid Crawler 降级根目录增量对账：stream.rs 中将简单轮询兜底替换为 Hybrid Crawler 后台任务。对 failed_roots 维持 60s 周期 fast-sync；对 degraded_roots 新增 30s 对账循环，迭代 DFS（最大深度 20，跳过隐藏目录与 ignore 路径）遍历目录树并比较 mtime，将变更子目录通过 `DirtyTracker::record_overflow_paths()` 标记为脏，由既有 overflow 恢复逻辑（cooldown/staleness）自动触发 `spawn_fast_sync` 增量补扫，解决深层子目录监听失效无 fallback 扫描的隐患。
+- **修复** fast-sync safety margin 断裂导致 degraded 模式下新文件丢失索引：Hybrid Crawler 的 `reconcile_degraded_root` 使用 `last_sync_ns - 10s` 检测变更目录，但 `fast_sync` 中 `DirtyScope::Dirs` 分支对 root_dirs 重新过滤时直接使用了原始 `cutoff_ns`，导致 reconcile 检测到的变更目录被错误过滤。已统一为 `cutoff_ns.saturating_sub(10_000_000_000)`，确保 safety margin 贯通。
+- **修复** fast-sync semaphore 竞争导致 dirty 状态被虚假消费：当 `spawn_fast_sync` 因信号量被占用而跳过时，原代码错误调用 `tracker.finish_sync()` 清除了 dirty 标记和 `sync_in_progress`，导致变更目录丢失索引机会。已改为调用新增的 `tracker.rollback_sync(scope)` 回滚 dirty 状态和 `sync_in_progress`，确保下次调度重试。
 
 ## v0.5.9 更新
 

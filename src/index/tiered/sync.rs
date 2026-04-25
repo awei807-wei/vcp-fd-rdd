@@ -349,7 +349,7 @@ impl TieredIndex {
             Ok(p) => p,
             Err(_) => {
                 tracing::debug!("Fast-sync already in progress, skipping duplicate spawn");
-                tracker.finish_sync();
+                tracker.rollback_sync(scope);
                 return;
             }
         };
@@ -389,8 +389,9 @@ impl TieredIndex {
                 let (root_dirs, leaf_dirs): (Vec<_>, Vec<_>) =
                     dirs.into_iter().partition(|d| root_set.contains(d));
 
+                let effective_cutoff_ns = cutoff_ns.saturating_sub(10_000_000_000);
                 let mut out = if !root_dirs.is_empty() {
-                    collect_dirs_changed_since(&root_dirs, ignore_prefixes, cutoff_ns)
+                    collect_dirs_changed_since(&root_dirs, ignore_prefixes, effective_cutoff_ns)
                 } else {
                     Vec::new()
                 };
