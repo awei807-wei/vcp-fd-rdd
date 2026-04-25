@@ -1,0 +1,214 @@
+name: fd-rdd Hybrid Large-Scale Stress Test
+# 混合大规模场景压力测试：验证 800,000 文件索引性能、查询延迟与系统资源阈值
+#
+# 预期指标输出（由 tests/common/sys_monitor.rs 的 ProcessMonitor 写入）：
+#   /tmp/fd-rdd-hybrid-metrics.json
+#   {
+#     "phases": {
+#       "initial_indexing": { "cpu_peak_percent": 95, "cpu_100_duration_ms": 2100, "rss_peak_kb": 312000 },
+#       "git_clone":        { "cpu_peak_percent": 92, "cpu_100_duration_ms": 1500, "rss_peak_kb": 298000 },
+#       "npm_install":      { "cpu_peak_percent": 88, "cpu_100_duration_ms": 1200, "rss_peak_kb": 305000 },
+#       "user_crud":        { "cpu_peak_percent": 75, "cpu_100_duration_ms": 800,  "rss_peak_kb": 280000 }
+#     },
+#     "overall": { "rss_peak_kb": 312000, "cpu_100_duration_ms": 2100 }
+#   }
+
+on:
+  push:
+    branches: [main, tests]
+  pull_request:
+    branches: [main, tests]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FD_RDD_PORT: 17060
+  FD_RDD_SNAPSHOT: /tmp/fd-rdd-ci-hybrid-snapshot
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 1: 编译 release binary
+  # ───────────────────────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: target/release/fd-rdd
+          retention-days: 1
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 2: 混合大规模场景压力测试（800,000 文件）
+  # ───────────────────────────────────────────────────────────────────────────
+  test-hybrid-large-scale:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: fd-rdd-binary
+          path: ./bin
+
+      - name: Make executable and install to target/release
+        run: |
+          chmod +x ./bin/fd-rdd
+          mkdir -p target/release
+          cp ./bin/fd-rdd target/release/fd-rdd
+          echo "Binary ready at: $(realpath target/release/fd-rdd)"
+
+      - name: Raise inotify watch limits
+        run: |
+          echo "Current max_user_watches: $(cat /proc/sys/fs/inotify/max_user_watches)"
+          sudo sysctl fs.inotify.max_user_watches=524288
+          echo "Raised to: $(cat /proc/sys/fs/inotify/max_user_watches)"
+
+      - name: Run hybrid large-scale test
+        run: |
+          echo "=== Running p2_large_scale_hybrid (ignored test) ==="
+          cargo test --test p2_large_scale_hybrid -- --ignored --nocapture
+
+      - name: Output performance metrics
+        if: always()
+        run: |
+          METRICS_FILE="/tmp/fd-rdd-hybrid-metrics.json"
+          echo "=== Performance Metrics Report ==="
+          if [ -f "$METRICS_FILE" ]; then
+            python3 - << 'PYEOF'
+          import json
+          with open("/tmp/fd-rdd-hybrid-metrics.json") as f:
+              data = json.load(f)
+          print(json.dumps(data, indent=2))
+          PYEOF
+          else
+            echo "⚠️  Metrics file not found at $METRICS_FILE"
+            echo "     (Expected from tests/common/sys_monitor.rs ProcessMonitor)"
+          fi
+
+      - name: Validate performance thresholds
+        if: always()
+        run: |
+          METRICS_FILE="/tmp/fd-rdd-hybrid-metrics.json"
+          echo "=== Threshold Validation ==="
+          if [ -f "$METRICS_FILE" ]; then
+            python3 - << 'PYEOF'
+          import json, sys
+
+          with open("/tmp/fd-rdd-hybrid-metrics.json") as f:
+              data = json.load(f)
+
+          # Extract worst-case values across all phases
+          cpu_100_duration_ms = 0
+          rss_peak_kb = 0
+
+          phases = data.get("phases", {})
+          if phases:
+              for phase_name, metrics in phases.items():
+                  if isinstance(metrics, dict):
+                      cpu_100_duration_ms = max(cpu_100_duration_ms, metrics.get("cpu_100_duration_ms", 0))
+                      rss_peak_kb = max(rss_peak_kb, metrics.get("rss_peak_kb", 0))
+          else:
+              # Flat fallback
+              cpu_100_duration_ms = data.get("cpu_100_duration_ms", 0)
+              rss_peak_kb = data.get("rss_peak_kb", 0)
+
+          rss_peak_mb = rss_peak_kb / 1024.0
+          print(f"CPU 100% duration: {cpu_100_duration_ms} ms  (threshold: 3000 ms)")
+          print(f"RSS peak:          {rss_peak_kb} KB = {rss_peak_mb:.1f} MB  (threshold: 400 MB)")
+          print()
+
+          failed = False
+          if cpu_100_duration_ms > 3000:
+              print(f"❌ FAIL: CPU 100% duration {cpu_100_duration_ms} ms exceeds 3000 ms threshold")
+              failed = True
+          else:
+              print(f"✅ PASS: CPU 100% duration within threshold")
+
+          if rss_peak_kb > 409600:  # 400 MB in KB
+              print(f"❌ FAIL: RSS peak {rss_peak_mb:.1f} MB exceeds 400 MB threshold")
+              failed = True
+          else:
+              print(f"✅ PASS: RSS peak within threshold")
+
+          if failed:
+              sys.exit(1)
+          else:
+              print("\n✅ All performance thresholds satisfied")
+          PYEOF
+          else
+            echo "⚠️  Skipping threshold validation: metrics file not found"
+            echo "     This step will fail once the test produces metrics."
+          fi
+
+      - name: Collect debug bundle
+        if: failure()
+        run: |
+          bash ./scripts/ci-collect-debug.sh \
+            --output "${{ runner.temp }}/fd-rdd-debug/${{ github.job }}" \
+            --job "${{ github.job }}" \
+            --workflow "stress-hybrid-large-scale" \
+            --port "${{ env.FD_RDD_PORT }}" \
+            --log /tmp/fd-rdd-daemon.log \
+            --log /tmp/fd-rdd.pid \
+            --log /tmp/fd-rdd-hybrid-metrics.json \
+            --path /tmp/fd-rdd-ci-test \
+            --path "${{ env.FD_RDD_SNAPSHOT }}*"
+
+      - name: Upload debug bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-debug-${{ github.job }}
+          path: ${{ runner.temp }}/fd-rdd-debug/${{ github.job }}
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Kill any leftover daemon started by the test
+          if [ -f /tmp/fd-rdd.pid ]; then
+            kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+            wait $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          fi
+          # Also try to find and kill by port if PID file missing
+          fuser ${{ env.FD_RDD_PORT }}/tcp 2>/dev/null || true
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* /tmp/fd-rdd-daemon.log /tmp/fd-rdd.pid /tmp/fd-rdd-hybrid-metrics.json
