@@ -142,6 +142,18 @@ impl L1Cache {
     }
 
     pub fn query(&self, matcher: &dyn Matcher) -> Option<Vec<FileMeta>> {
+        // O(1) fast path: exact full-path lookup via path_index
+        if let Some(path) = matcher.exact_path() {
+            if let Some(&fkey) = self.path_index.read().get(path) {
+                if let Some(meta) = self.inner.read().get(&fkey) {
+                    let mut lru = self.lru.lock();
+                    lru.touch(fkey);
+                    return Some(vec![meta.clone()]);
+                }
+            }
+            return None;
+        }
+
         let is_segment = matcher.glob_mode() == Some(GlobMode::Segment);
         let prefix = matcher.prefix();
         let case_sensitive = matcher.case_sensitive();

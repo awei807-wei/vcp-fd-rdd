@@ -10,7 +10,16 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-当前 tests 分支发布版本为 v0.6.2（索引查询正确性与稳定性修复）。
+当前 tests 分支发布版本为 v0.6.3（内存优化与功能修复）。
+
+## v0.6.3 更新（内存优化与功能修复）
+
+- **优化** `filekey_to_docid` 和 `path_hash_to_id` 索引结构：从 `BTreeMap` 改为 `HashMap`，这两个 map 仅做点查/插入/删除，无有序迭代依赖。利用 `HashMap` 的更低每条目开销（~41B vs ~59B），百万级文件合计约省 **48 MB** 常驻内存。
+- **优化** `EventPipeline::new()` 默认 channel 容量：从 `262_144` 降至 `131_072`，与 CLI 默认值 `65_536` 趋向一致，节省约 **11 MB**。生产路径已通过 CLI 覆盖，此改动消除死代码中的浪费。
+- **优化** `FAST_COMPACTION` 默认启用：`unwrap_or(false)` → `unwrap_or(true)`，compaction 默认走 `compact_layers_fast`（位图 OR 合并）而非逐条 re-tokenize 的慢路径，消除每次 compaction 的数十万次临时分配和 CPU 尖峰。CI 已验证此路径。
+- **优化** `short_component_index` 键类型：从 `HashMap<Box<[u8]>, RoaringTreemap>` 改为 `HashMap<u16, RoaringTreemap>`。短路径组件仅 1-2 字节，原 `Box<[u8]>` 堆分配导致元数据/数据比高达 21:1，改为栈上 `u16` 大端编码后消除堆碎片，约省 **3 MB**。
+- **新增** L1 Cache `path_index` O(1) 快速路径：`Matcher` trait 新增 `exact_path()` 方法，`WfnMatcher` 的精确全路径匹配跳过 O(N) 全扫描，利用已有的 `path_index` 实现 O(1) 查找。
+- **修复** 动态目录监控：启动后新创建的目录（`git clone`、`npm install`、`mkdir` 产生的新目录）不再丢失实时事件。事件处理循环中检测 `Create(Folder)` 事件时自动调用 `watcher.watch(new_dir, Recursive)` 注册递归监控。
 
 ## v0.6.2 更新（索引查询正确性与稳定性修复）
 

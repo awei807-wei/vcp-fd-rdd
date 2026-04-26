@@ -1,3 +1,4 @@
+use notify::Watcher;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,6 +29,34 @@ where
         return true;
     }
     false
+}
+
+/// 动态 watch 辅助：递归遍历新目录，将已有文件以合成 Create 事件入队，
+/// 弥补 watch 注册时间窗口内的 inotify 事件丢失。
+/// 使用 spawn_blocking 避免阻塞事件循环（新目录可能包含大量文件）。
+fn dyn_walk_and_enqueue(tx: tokio::sync::mpsc::Sender<notify::Event>, dir: std::path::PathBuf) {
+    tokio::task::spawn_blocking(move || {
+        let _ = walk_dir_send(&tx, &dir);
+    });
+}
+
+fn walk_dir_send(
+    tx: &tokio::sync::mpsc::Sender<notify::Event>,
+    dir: &std::path::Path,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            walk_dir_send(tx, &path)?;
+        } else if ft.is_file() {
+            let ev = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(path);
+            let _ = tx.try_send(ev);
+        }
+    }
+    Ok(())
 }
 
 use crate::util::maybe_trim_rss;
@@ -70,7 +99,7 @@ impl EventPipeline {
         Self {
             index,
             debounce_ms: 50,
-            channel_size: 262_144,
+            channel_size: 131_072,
             ignore_paths: Vec::new(),
             ignore_filter: None,
             total_events: Arc::new(AtomicU64::new(0)),
@@ -160,13 +189,14 @@ impl EventPipeline {
         let rescan_signals = self.rescan_signals.clone();
         let dirty = DirtyTracker::new(self.channel_size.saturating_mul(4).max(1024), roots.clone());
         let keep_cap = self.channel_size.max(256);
-        let (mut priority_rx, mut normal_rx, mut watcher) = EventWatcher::start(
-            &roots,
-            self.channel_size,
-            overflow_drops.clone(),
-            rescan_signals.clone(),
-            Some(dirty.clone()),
-        )?;
+        let (mut priority_rx, mut normal_rx, priority_tx, normal_tx, mut watcher) =
+            EventWatcher::start(
+                &roots,
+                self.channel_size,
+                overflow_drops.clone(),
+                rescan_signals.clone(),
+                Some(dirty.clone()),
+            )?;
         // inotify watch 数兜底检查
         check_inotify_limit(roots.len());
         let (failed_roots, degraded_roots): (Vec<PathBuf>, Vec<PathBuf>) =
@@ -216,8 +246,10 @@ impl EventPipeline {
         });
 
         tokio::spawn(async move {
-            // 保持 watcher 存活
-            let _watcher = watcher;
+            // 保持 watcher 存活，并用于动态注册新目录监控
+            let mut watcher = watcher;
+            let priority_tx = priority_tx;
+            let _normal_tx = normal_tx;
             let mut seq: u64 = 0;
             let mut raw_events: Vec<notify::Event> = Vec::with_capacity(256);
             let mut merge_scratch = MergeScratch::default();
@@ -293,6 +325,30 @@ impl EventPipeline {
                     {
                         Ok(Some((ev, _))) => raw_events.push(ev),
                         _ => break,
+                    }
+                }
+
+                // 动态注册新目录的递归监控。
+                // RecursiveMode::Recursive 不会自动为新创建的目录添加 inotify watch，
+                // 因此需要在检测到 Create(Folder) 事件时手动调用 watcher.watch()。
+                // 同时扫描新目录中的已有文件，生成合成 Create 事件，弥补 watch 注册
+                // 时间窗口内丢失的 inotify 事件（目录创建与 watch 生效之间存在竞态）。
+                for ev in &raw_events {
+                    if matches!(
+                        ev.kind,
+                        notify::EventKind::Create(notify::event::CreateKind::Folder)
+                    ) {
+                        for path in &ev.paths {
+                            if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
+                                tracing::debug!(
+                                    "Failed to add dynamic watch for {:?}: {}",
+                                    path,
+                                    e
+                                );
+                            }
+                            // 扫描新目录中可能已在 watch 注册前创建的文件
+                            dyn_walk_and_enqueue(priority_tx.clone(), path.clone());
+                        }
                     }
                 }
 

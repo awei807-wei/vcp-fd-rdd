@@ -93,30 +93,37 @@ fn handle_notify_result(
     }
 }
 
+/// (priority_rx, normal_rx, priority_tx, normal_tx, watcher)
+pub type WatcherBundle = (
+    mpsc::Receiver<notify::Event>,
+    mpsc::Receiver<notify::Event>,
+    mpsc::Sender<notify::Event>,
+    mpsc::Sender<notify::Event>,
+    notify::RecommendedWatcher,
+);
+
 /// 文件系统事件监听器
 /// 使用 bounded channel 做背压，避免无限堆积
 pub struct EventWatcher;
 
 impl EventWatcher {
-    /// 启动监听，返回事件接收端
-    /// 返回 (priority_rx, normal_rx, watcher)：Create 事件走 priority channel
+    /// 启动监听，返回事件接收端、发送端（用于合成事件）和 watcher。
     pub fn start(
         _roots: &[std::path::PathBuf],
         channel_size: usize,
         _overflow_drops: Arc<AtomicU64>,
         rescan_signals: Arc<AtomicU64>,
         dirty: Option<Arc<DirtyTracker>>,
-    ) -> anyhow::Result<(
-        mpsc::Receiver<notify::Event>,
-        mpsc::Receiver<notify::Event>,
-        notify::RecommendedWatcher,
-    )> {
+    ) -> anyhow::Result<WatcherBundle> {
         if channel_size == 0 {
             anyhow::bail!("event channel_size must be >= 1");
         }
         let (priority_tx, priority_rx) = mpsc::channel(channel_size);
         let (normal_tx, normal_rx) = mpsc::channel(channel_size);
         let dirty = dirty.clone();
+
+        let priority_tx_clone = priority_tx.clone();
+        let normal_tx_clone = normal_tx.clone();
 
         let watcher = notify::RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
@@ -132,8 +139,13 @@ impl EventWatcher {
             Config::default(),
         )?;
 
-        // 注意：watcher 必须由调用方持有，否则会被 drop
-        Ok((priority_rx, normal_rx, watcher))
+        Ok((
+            priority_rx,
+            normal_rx,
+            priority_tx_clone,
+            normal_tx_clone,
+            watcher,
+        ))
     }
 }
 

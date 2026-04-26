@@ -29,8 +29,13 @@ const FKM_MAGIC: [u8; 4] = *b"FKM\0";
 const FKM_HDR_SIZE: usize = 8;
 const FKM_FLAG_LEGACY: u16 = 0;
 
-type ShortComponentCache = parking_lot::Mutex<Option<Arc<HashMap<Box<[u8]>, RoaringTreemap>>>>;
+type ShortComponentCache = parking_lot::Mutex<Option<Arc<HashMap<u16, RoaringTreemap>>>>;
 const FKM_FLAG_RKYV: u16 = 1;
+
+#[inline]
+fn encode_short_component(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes([bytes[0], bytes.get(1).copied().unwrap_or(0)])
+}
 
 fn normalize_short_hint(hint: &[u8]) -> Option<Vec<u8>> {
     let normalized = String::from_utf8_lossy(hint).to_lowercase().into_bytes();
@@ -49,14 +54,19 @@ fn trigram_matches_short_hint(tri: [u8; 3], hint: &[u8]) -> bool {
     }
 }
 
-fn short_component_matches(component: &[u8], hint: &[u8]) -> bool {
-    if hint.is_empty() || component.len() < hint.len() {
+fn short_component_matches(encoded: u16, hint: &[u8]) -> bool {
+    if hint.is_empty() || hint.len() > 2 {
         return false;
     }
-    component.windows(hint.len()).any(|window| window == hint)
+    let bytes = encoded.to_be_bytes();
+    if hint.len() == 1 {
+        bytes[0] == hint[0] || bytes[1] == hint[0]
+    } else {
+        bytes == hint
+    }
 }
 
-fn for_each_short_component(path: &Path, mut f: impl FnMut(&[u8])) {
+fn for_each_short_component(path: &Path, mut f: impl FnMut(u16)) {
     for component in path.components() {
         let Component::Normal(os) = component else {
             continue;
@@ -64,7 +74,7 @@ fn for_each_short_component(path: &Path, mut f: impl FnMut(&[u8])) {
         let lower = os.to_string_lossy().to_lowercase();
         let bytes = lower.as_bytes();
         if (1..=2).contains(&bytes.len()) {
-            f(bytes);
+            f(encode_short_component(bytes));
         }
     }
 }
@@ -495,7 +505,7 @@ impl MmapIndex {
         }
         Some(acc)
     }
-    fn short_component_cache(&self) -> Arc<HashMap<Box<[u8]>, RoaringTreemap>> {
+    fn short_component_cache(&self) -> Arc<HashMap<u16, RoaringTreemap>> {
         if let Some(cache) = self.short_component_cache.lock().clone() {
             return cache;
         }
@@ -503,7 +513,7 @@ impl MmapIndex {
         let tomb = self.tombstones();
         let arena = self.snap.path_arena_bytes();
         let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u64;
-        let mut cache: HashMap<Box<[u8]>, RoaringTreemap> = HashMap::new();
+        let mut cache: HashMap<u16, RoaringTreemap> = HashMap::new();
 
         for docid in 0..n {
             if tomb.contains(docid) {
@@ -519,10 +529,7 @@ impl MmapIndex {
             };
             let path = compose_abs_path_buf(root_bytes_for_id(&self.snap.roots, root_id), rel);
             for_each_short_component(path.as_path(), |component| {
-                cache
-                    .entry(Box::<[u8]>::from(component))
-                    .or_default()
-                    .insert(docid);
+                cache.entry(component).or_default().insert(docid);
             });
         }
 
@@ -554,7 +561,7 @@ impl MmapIndex {
         }
 
         for (component, posting) in cache.iter() {
-            if short_component_matches(component.as_ref(), &hint) {
+            if short_component_matches(*component, &hint) {
                 acc |= posting.clone();
             }
         }

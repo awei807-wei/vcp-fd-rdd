@@ -2,7 +2,7 @@ use parking_lot::RwLock;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +19,13 @@ use crate::util::{
 
 /// Trigram：3 字节子串，用于倒排索引加速查询
 type Trigram = [u8; 3];
+
+/// 将 1-2 字节的短路径组件编码为 u16（大端序，零填充高位）。
+/// 1 字节: `[b]` → `[b, 0x00]`；2 字节: `[b0, b1]` → `[b0, b1]`。
+#[inline]
+fn encode_short_component(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes([bytes[0], bytes.get(1).copied().unwrap_or(0)])
+}
 
 fn normalize_short_hint(hint: &[u8]) -> Option<Vec<u8>> {
     let normalized = String::from_utf8_lossy(hint).to_lowercase().into_bytes();
@@ -37,11 +44,16 @@ fn trigram_matches_short_hint(tri: Trigram, hint: &[u8]) -> bool {
     }
 }
 
-fn short_component_matches(component: &[u8], hint: &[u8]) -> bool {
-    if hint.is_empty() || component.len() < hint.len() {
+fn short_component_matches(encoded: u16, hint: &[u8]) -> bool {
+    if hint.is_empty() || hint.len() > 2 {
         return false;
     }
-    component.windows(hint.len()).any(|window| window == hint)
+    let bytes = encoded.to_be_bytes();
+    if hint.len() == 1 {
+        bytes[0] == hint[0] || bytes[1] == hint[0]
+    } else {
+        bytes == hint
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -102,7 +114,7 @@ fn for_each_component_trigram(path: &Path, mut f: impl FnMut(Trigram)) {
     }
 }
 
-fn for_each_short_component(path: &Path, mut f: impl FnMut(&[u8])) {
+fn for_each_short_component(path: &Path, mut f: impl FnMut(u16)) {
     for c in path.components() {
         let Component::Normal(os) = c else {
             continue;
@@ -110,7 +122,7 @@ fn for_each_short_component(path: &Path, mut f: impl FnMut(&[u8])) {
         let lower = os.to_string_lossy().to_lowercase();
         let bytes = lower.as_bytes();
         if (1..=2).contains(&bytes.len()) {
-            f(bytes);
+            f(encode_short_component(bytes));
         }
     }
 }
@@ -365,17 +377,17 @@ pub struct PersistentIndex {
     /// DocId -> CompactMeta
     metas: RwLock<Vec<CompactMeta>>,
     /// FileKey -> DocId
-    filekey_to_docid: RwLock<BTreeMap<FileKey, DocId>>,
+    filekey_to_docid: RwLock<HashMap<FileKey, DocId>>,
     /// 路径 blob
     arena: RwLock<PathArena>,
 
     /// 路径反查：hash(path_bytes) -> DocId（或少量冲突列表）
-    path_hash_to_id: RwLock<BTreeMap<u64, OneOrManyDocId>>,
+    path_hash_to_id: RwLock<HashMap<u64, OneOrManyDocId>>,
 
     /// Trigram 倒排索引：trigram -> RoaringTreemap(DocId)
     trigram_index: RwLock<HashMap<Trigram, RoaringTreemap>>,
     /// 短组件索引：长度 1-2 的标准化路径组件 -> RoaringTreemap(DocId)
-    short_component_index: RwLock<HashMap<Box<[u8]>, RoaringTreemap>>,
+    short_component_index: RwLock<HashMap<u16, RoaringTreemap>>,
 
     /// 墓碑标记（DocId）
     tombstones: RwLock<RoaringTreemap>,
@@ -410,9 +422,9 @@ impl PersistentIndex {
             roots,
             roots_bytes,
             metas: RwLock::new(Vec::new()),
-            filekey_to_docid: RwLock::new(BTreeMap::new()),
+            filekey_to_docid: RwLock::new(HashMap::new()),
             arena: RwLock::new(PathArena::new()),
-            path_hash_to_id: RwLock::new(BTreeMap::new()),
+            path_hash_to_id: RwLock::new(HashMap::new()),
             trigram_index: RwLock::new(HashMap::new()),
             short_component_index: RwLock::new(HashMap::new()),
             tombstones: RwLock::new(RoaringTreemap::new()),
@@ -549,7 +561,7 @@ impl PersistentIndex {
                 });
                 for_each_short_component(abs_path.as_path(), |component| {
                     short_component_index
-                        .entry(Box::<[u8]>::from(component))
+                        .entry(component)
                         .or_default()
                         .insert(docid);
                 });
@@ -1547,10 +1559,10 @@ impl PersistentIndex {
         let metas_bytes = metas.capacity() as u64 * size_of::<CompactMeta>() as u64
             + size_of::<Vec<CompactMeta>>() as u64;
 
-        // mapping: BTreeMap<FileKey, DocId>
+        // mapping: HashMap<FileKey, DocId>
         let map_entry_bytes = size_of::<(FileKey, DocId)>() as u64;
         let filekey_to_docid_bytes = filekey_to_docid.len() as u64 * (map_entry_bytes + 1)
-            + size_of::<BTreeMap<FileKey, DocId>>() as u64;
+            + size_of::<HashMap<FileKey, DocId>>() as u64;
 
         // arena：Vec<u8>
         let arena_bytes = arena.data.capacity() as u64 + size_of::<Vec<u8>>() as u64;
@@ -1565,22 +1577,26 @@ impl PersistentIndex {
             }
         }
         let path_to_id_bytes = path_hash_to_id.len() as u64 * (path_entry_bytes + 1)
-            + size_of::<BTreeMap<u64, OneOrManyDocId>>() as u64
+            + size_of::<HashMap<u64, OneOrManyDocId>>() as u64
             + path_many_bytes;
 
         // trigram：HashMap<Trigram, RoaringTreemap> 的 entry + Roaring 的压缩存储量（serialized_size）
         let trigram_entry_bytes = size_of::<(Trigram, RoaringTreemap)>() as u64;
         let trigram_map_bytes = trigram_index.capacity() as u64 * (trigram_entry_bytes + 1)
             + size_of::<HashMap<Trigram, RoaringTreemap>>() as u64;
-        let short_component_entry_bytes = size_of::<(Box<[u8]>, RoaringTreemap)>() as u64;
+        let short_component_entry_bytes = size_of::<(u16, RoaringTreemap)>() as u64;
         let mut short_component_heap_bytes: u64 = 0;
         for (component, posting) in short_component_index.iter() {
-            short_component_heap_bytes += component.len() as u64;
+            short_component_heap_bytes += if component.to_be_bytes()[1] == 0 {
+                1
+            } else {
+                2
+            };
             short_component_heap_bytes += posting.serialized_size() as u64;
         }
         let short_component_bytes = short_component_index.capacity() as u64
             * (short_component_entry_bytes + 1)
-            + size_of::<HashMap<Box<[u8]>, RoaringTreemap>>() as u64
+            + size_of::<HashMap<u16, RoaringTreemap>>() as u64
             + short_component_heap_bytes;
         let trigram_bytes = trigram_map_bytes + trigram_heap_bytes + short_component_bytes;
 
@@ -1705,10 +1721,10 @@ impl PersistentIndex {
             }
         });
         for_each_short_component(path, |component| {
-            if let Some(posting) = short_idx.get_mut(component) {
+            if let Some(posting) = short_idx.get_mut(&component) {
                 posting.remove(docid);
                 if posting.is_empty() {
-                    short_idx.remove(component);
+                    short_idx.remove(&component);
                 }
             }
         });
@@ -1721,10 +1737,7 @@ impl PersistentIndex {
             tri_idx.entry(tri).or_default().insert(docid);
         });
         for_each_short_component(path, |component| {
-            short_idx
-                .entry(Box::<[u8]>::from(component))
-                .or_default()
-                .insert(docid);
+            short_idx.entry(component).or_default().insert(docid);
         });
     }
 
@@ -1823,7 +1836,7 @@ impl PersistentIndex {
         }
 
         for (component, posting) in short_idx.iter() {
-            if short_component_matches(component.as_ref(), &hint) {
+            if short_component_matches(*component, &hint) {
                 acc |= posting.clone();
             }
         }
@@ -1957,8 +1970,8 @@ impl PersistentIndex {
         {
             *self.metas.write() = Vec::new();
             *self.arena.write() = PathArena::new();
-            *self.filekey_to_docid.write() = BTreeMap::new();
-            *self.path_hash_to_id.write() = BTreeMap::new();
+            *self.filekey_to_docid.write() = HashMap::new();
+            *self.path_hash_to_id.write() = HashMap::new();
             *self.trigram_index.write() = HashMap::new();
             *self.short_component_index.write() = HashMap::new();
             *self.tombstones.write() = RoaringTreemap::new();
@@ -1967,9 +1980,9 @@ impl PersistentIndex {
 
         let mut new_metas = Vec::with_capacity(metas.len());
         let mut new_arena = PathArena::new();
-        let mut new_filekey_to_docid = BTreeMap::new();
-        let mut new_path_hash_to_id = BTreeMap::new();
-        let mut new_short_component_index: HashMap<Box<[u8]>, RoaringTreemap> = HashMap::new();
+        let mut new_filekey_to_docid = HashMap::new();
+        let mut new_path_hash_to_id = HashMap::new();
+        let mut new_short_component_index: HashMap<u16, RoaringTreemap> = HashMap::new();
 
         for (docid, meta) in metas.into_iter().enumerate() {
             let docid = docid as DocId;
@@ -1999,7 +2012,7 @@ impl PersistentIndex {
 
             for_each_short_component(meta.path.as_path(), |component| {
                 new_short_component_index
-                    .entry(Box::<[u8]>::from(component))
+                    .entry(component)
                     .or_default()
                     .insert(docid);
             });

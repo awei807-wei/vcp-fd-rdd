@@ -35,6 +35,10 @@ pub trait Matcher: Send + Sync {
     fn glob_mode(&self) -> Option<GlobMode> {
         None
     }
+    /// 若为精确全路径匹配，返回目标路径（用于 O(1) 索引查找跳过全扫描）
+    fn exact_path(&self) -> Option<&Path> {
+        None
+    }
 }
 
 fn normalize_match_input(input: &str) -> String {
@@ -358,6 +362,14 @@ impl Matcher for WfnMatcher {
             return None;
         }
         Some(self.pattern.as_bytes())
+    }
+
+    fn exact_path(&self) -> Option<&Path> {
+        if self.scope == PathScope::FullPath && self.case_sensitive {
+            Some(Path::new(&self.pattern))
+        } else {
+            None
+        }
     }
 }
 

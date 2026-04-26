@@ -63,7 +63,7 @@ impl TieredIndex {
             let use_fast = std::env::var("FAST_COMPACTION")
                 .ok()
                 .map(|v| v == "1")
-                .unwrap_or(false);
+                .unwrap_or(true);
             let result = if use_fast {
                 idx.compact_layers_fast(store, layers).await
             } else {

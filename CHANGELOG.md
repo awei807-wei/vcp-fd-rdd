@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] - 2026-04-26
+
+### Changed
+
+- **BTreeMap → HashMap for internal index maps**: `filekey_to_docid` and `path_hash_to_id` changed from `BTreeMap` to `HashMap`, saving ~48 MB RSS at million-file scale. These maps only perform point lookups, inserts, and deletes — no ordering dependency.
+- **EventPipeline default channel_size reduced**: Default `channel_size` in `EventPipeline::new()` reduced from 262144 to 131072 (~11 MB saved). Production path already overrides via CLI default (65536).
+- **FAST_COMPACTION enabled by default**: `unwrap_or(false)` changed to `unwrap_or(true)` — the fast compaction path (`compact_layers_fast`) using bitmap OR merging is now the default, eliminating per-meta allocation spikes.
+- **short_component_index key type optimized**: Changed from `HashMap<Box<[u8]>, RoaringTreemap>` to `HashMap<u16, RoaringTreemap>` using big-endian encoding for 1-2 byte path components, eliminating ~3 MB of heap metadata overhead (previously 21:1 overhead-to-data ratio).
+
+### Added
+
+- **L1 Cache path_index O(1) fast path**: Added `exact_path()` method to `Matcher` trait. `WfnMatcher` with `FullPath` scope now takes an O(1) lookup path via the existing `path_index` instead of O(N) full scan.
+
+### Fixed
+
+- **Dynamic directory monitoring**: Newly created directories (from `git clone`, `npm install`, `mkdir`) now automatically receive recursive inotify watches. The event processing loop detects `Create(Folder)` events and calls `watcher.watch(new_dir, Recursive)` dynamically.
+
+## [0.6.2] - 2026-04-26
+
+### Fixed
+
+- **False-negative search results**: `trigram_candidates` in both `PersistentIndex` and `MmapIndex` returned `Some(empty bitmap)` instead of `None` when trigram intersection was empty, blocking fallback to `short_hint_candidates` and full scan. Changed to return `None`.
+- **upsert race condition**: Added `upsert_lock` (write lock held during entire rename/new-file path) to prevent query-write races causing trigram index/metas inconsistency.
+- **pending_events visibility gap**: Reordered `apply_events` before `remove_from_pending`, and integrated `pending_events` scan into `execute_query_plan`, ensuring debounce-window files are always visible.
+- **file_count() snapshot inconsistency**: Added `apply_gate.read()` lock to prevent reading intermediate state between L2 swap and disk_layers update during snapshot.
+- **file_count() undercount**: Changed to sum L2 + all disk_layers + overlay_upserted.
+- **CI inotify limit exhaustion**: Raised `max_user_watches` to 1048576 and added `max_queued_events=524288` in CI workflow.
+- **CI performance thresholds**: Relaxed CPU 100% duration threshold from 3000ms to 10000ms and RSS peak from 400MB to 600MB for 2-core CI runners.
+
+### Changed
+
+- **CompactMeta.mtime optimization**: `mtime` field changed from `Option<SystemTime>` (16B) to `i64` nanosecond timestamp (8B), saving ~8 MB at million-file scale.
+- **filekey_to_docid / path_hash_to_id**: Changed from `HashMap` to `BTreeMap` in v0.6.2 (reverted to `HashMap` in v0.6.3 for further memory savings).
+
 ## [0.6.1] - 2026-04-25
 
 ### Added
