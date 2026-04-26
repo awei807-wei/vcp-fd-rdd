@@ -83,3 +83,8 @@ pub fn indexed_count(port: u16) -> Option<usize> {
         .and_then(|v| v.get("indexed_count").and_then(|n| n.as_u64()))
         .map(|n| n as usize)
 }
+
+/// Check whether a rebuild is currently in progress.
+pub fn is_rebuilding(port: u16) -> Option<bool> {
+    status(port).and_then(|v| v.get("is_rebuilding").and_then(|b| b.as_bool()))
+}

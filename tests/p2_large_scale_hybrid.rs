@@ -167,7 +167,18 @@ fn large_scale_hybrid_workspace_correctness() {
     std::fs::create_dir_all(&root).unwrap();
 
     // -----------------------------------------------------------------------
-    // 2. 启动 fd-rdd（使用 common::FdRddProcess）
+    // 2. 生成 80 万文件工作区（在启动 fd-rdd 之前，使全量构建能扫描到所有文件）
+    // -----------------------------------------------------------------------
+    let gen_start = Instant::now();
+    let mut ws = HybridWorkspace::generate(&root).unwrap();
+    let gen_dur = gen_start.elapsed();
+    eprintln!(
+        "[generate_workspace] dur={:?} (pre-daemon, no CPU/RSS monitoring)",
+        gen_dur
+    );
+
+    // -----------------------------------------------------------------------
+    // 3. 启动 fd-rdd（此时目录已包含 80 万文件，full_build 可完整索引）
     // -----------------------------------------------------------------------
     let port = 17060;
     let snapshot = root.join("snapshot");
@@ -181,13 +192,14 @@ fn large_scale_hybrid_workspace_correctness() {
 
     let mut all_metrics: Vec<PhaseMetrics> = Vec::new();
 
-    // -----------------------------------------------------------------------
-    // 3. 生成 80 万文件工作区
-    // -----------------------------------------------------------------------
-    let (mut ws, m) = monitor_phase("generate_workspace", pid, || {
-        HybridWorkspace::generate(&root).unwrap()
+    // 记录 generate_workspace 阶段指标（仅 wall-time；fd-rdd 尚未启动）
+    all_metrics.push(PhaseMetrics {
+        name: "generate_workspace",
+        duration: gen_dur,
+        cpu_peak_percent: 0.0,
+        cpu_100_duration_ms: 0,
+        rss_peak_kb: 0,
     });
-    all_metrics.push(m);
 
     // -----------------------------------------------------------------------
     // 4. 等待初始索引完成（等待 indexed_count 稳定 5 秒）
