@@ -53,7 +53,10 @@ fn walk_dir_send(
         } else if ft.is_file() {
             let ev = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
                 .add_path(path);
-            let _ = tx.try_send(ev);
+            // 使用 blocking_send 避免静默丢弃：spawn_blocking 中阻塞线程是安全的。
+            if let Err(e) = tx.blocking_send(ev) {
+                tracing::warn!("walk_dir_send: channel closed, dropping event: {:?}", e);
+            }
         }
     }
     Ok(())
