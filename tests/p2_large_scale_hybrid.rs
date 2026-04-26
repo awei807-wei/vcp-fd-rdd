@@ -259,9 +259,10 @@ fn large_scale_hybrid_workspace_correctness() {
     all_metrics.push(m);
 
     // npm install 中应包含一个可搜索的 probe 文件（非忽略）
+    // 注意：node_modules/ 本身被 .gitignore 忽略，probe 放在 src/ 下模拟用户文件
     let npm_probe = ws
         .user_create_file(
-            &format!("node_modules/{}/probe-{}.js", npm_pkg_name, npm_marker),
+            &format!("src/npm-probe-{}.js", npm_marker),
             &format!("probe content {}", npm_marker),
         )
         .unwrap();
