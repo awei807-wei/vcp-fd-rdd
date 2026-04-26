@@ -240,8 +240,12 @@ fn large_scale_hybrid_workspace_correctness() {
     all_metrics.push(m);
 
     // git clone 中应包含一个可搜索的 probe 文件（非忽略）
-    let cloned_dir = root.join(&git_repo_name);
-    let git_probe = cloned_dir.join(format!("probe-{}.md", git_marker));
+    let git_probe = ws
+        .user_create_file(
+            &format!("{}/probe-{}.md", git_repo_name, git_marker),
+            &format!("probe content {}", git_marker),
+        )
+        .unwrap();
     verify_file_searchable(port, &git_marker, &git_probe, 30);
 
     // -----------------------------------------------------------------------
@@ -255,8 +259,12 @@ fn large_scale_hybrid_workspace_correctness() {
     all_metrics.push(m);
 
     // npm install 中应包含一个可搜索的 probe 文件（非忽略）
-    let npm_dir = root.join("node_modules").join(&npm_pkg_name);
-    let npm_probe = npm_dir.join(format!("probe-{}.js", npm_marker));
+    let npm_probe = ws
+        .user_create_file(
+            &format!("node_modules/{}/probe-{}.js", npm_pkg_name, npm_marker),
+            &format!("probe content {}", npm_marker),
+        )
+        .unwrap();
     verify_file_searchable(port, &npm_marker, &npm_probe, 30);
 
     // -----------------------------------------------------------------------

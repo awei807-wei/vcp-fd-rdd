@@ -36,7 +36,9 @@ where
 /// 使用 spawn_blocking 避免阻塞事件循环（新目录可能包含大量文件）。
 fn dyn_walk_and_enqueue(tx: tokio::sync::mpsc::Sender<notify::Event>, dir: std::path::PathBuf) {
     tokio::task::spawn_blocking(move || {
-        let _ = walk_dir_send(&tx, &dir);
+        if let Err(e) = walk_dir_send(&tx, &dir) {
+            tracing::debug!("dyn_walk {:?} error: {}", dir, e);
+        }
     });
 }
 
