@@ -28,7 +28,15 @@ pub(super) struct OverlayState {
 
 impl TieredIndex {
     /// 批量应用事件到索引
+    ///
+    /// Phase 3：ASCII 快速通道——若所有事件的所有路径都是 ASCII，
+    /// NFC 归一化是恒等变换，跳过整批的 `to_vec()` clone。典型英文文件系统
+    /// 命中此路径，每批省掉 N 个 EventRecord clone（≈ N × 4 个 PathBuf）。
     pub fn apply_events(&self, events: &[EventRecord]) {
+        if !events.iter().any(Self::event_needs_normalize) {
+            self.apply_events_inner(events, true);
+            return;
+        }
         let mut normalized: Vec<EventRecord> = events.to_vec();
         for ev in &mut normalized {
             Self::normalize_event_paths(ev);
@@ -36,14 +44,54 @@ impl TieredIndex {
         self.apply_events_inner(&normalized, true);
     }
 
+    /// 路径需要 NFC 归一化吗？ASCII 字节集对 NFC 恒等，可以跳过。
+    fn event_needs_normalize(ev: &EventRecord) -> bool {
+        fn path_needs(p: &std::path::Path) -> bool {
+            !p.as_os_str().as_encoded_bytes().is_ascii()
+        }
+        if let FileIdentifier::Path(p) = &ev.id {
+            if path_needs(p) {
+                return true;
+            }
+        }
+        if let Some(p) = &ev.path_hint {
+            if path_needs(p) {
+                return true;
+            }
+        }
+        if let EventType::Rename {
+            from,
+            from_path_hint,
+        } = &ev.event_type
+        {
+            if let FileIdentifier::Path(p) = from {
+                if path_needs(p) {
+                    return true;
+                }
+            }
+            if let Some(p) = from_path_hint {
+                if path_needs(p) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// 批量应用事件到索引（drain 版本）：消费 `Vec<EventRecord>`，用于减少 PathBuf 克隆带来的非索引 PD 高水位。
     ///
     /// 说明：
     /// - 仅用于"事件生产者本就不需要保留 EventRecord"的路径（EventPipeline / fast-sync）。
     /// - 内部会清空 `events`，但保留 capacity 以便复用。
+    ///
+    /// Phase 3：ASCII 快速通道——批内全 ASCII 路径时跳过 `normalize_event_paths`
+    /// 的 NFC 重复分配（normalize 内部 `nfc().collect()` 总会 alloc，对 ASCII 字符集
+    /// 又是恒等变换，纯属浪费）。
     pub fn apply_events_drain(&self, events: &mut Vec<EventRecord>) {
-        for ev in events.iter_mut() {
-            Self::normalize_event_paths(ev);
+        if events.iter().any(Self::event_needs_normalize) {
+            for ev in events.iter_mut() {
+                Self::normalize_event_paths(ev);
+            }
         }
         self.apply_events_inner_drain(events, true);
     }
@@ -268,17 +316,21 @@ impl TieredIndex {
         self.note_pending_flush_batch(events);
         self.invalidate_l1_for_events(events);
 
-        // 将非 Delete 事件加入 pending_events，使 debounce 期间的新文件可被查询到。
+        // 将非 Delete 事件的 best_path 加入 pending_events，使 debounce 期间的
+        // 新文件可被查询到（参见 [`tiered::query::query_with_pending`]）。
+        // Phase 3：HashSet<PathBuf> 替代 Vec<EventRecord>——只 clone 一份 PathBuf，
+        // 不再拷贝 4 个 PathBuf 的整条 EventRecord。
         {
             let mut pending = self.pending_events.lock();
             for ev in events {
-                match &ev.event_type {
-                    EventType::Delete => {}
-                    _ => {
-                        if pending.len() < 4096 {
-                            pending.push(ev.clone());
-                        }
-                    }
+                if matches!(ev.event_type, EventType::Delete) {
+                    continue;
+                }
+                if pending.len() >= 4096 {
+                    break;
+                }
+                if let Some(p) = ev.best_path() {
+                    pending.insert(p.to_path_buf());
                 }
             }
         }
@@ -364,26 +416,21 @@ impl TieredIndex {
     }
 
     fn remove_from_pending(&self, events: &[EventRecord]) {
+        // Phase 3：HashSet<PathBuf> 让"K 个事件清 N 条 pending"从 O(K × N) 降为 O(K)。
         let mut pending = self.pending_events.lock();
         for ev in events {
-            match &ev.event_type {
-                EventType::Rename {
-                    from,
-                    from_path_hint,
-                } => {
-                    let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
-                    if let Some(from_path) = from_best {
-                        pending.retain(|p| p.best_path().map(|bp| bp != from_path).unwrap_or(true));
-                    }
-                    if let Some(path) = ev.best_path() {
-                        pending.retain(|p| p.best_path().map(|bp| bp != path).unwrap_or(true));
-                    }
+            if let EventType::Rename {
+                from,
+                from_path_hint,
+            } = &ev.event_type
+            {
+                let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
+                if let Some(from_path) = from_best {
+                    pending.remove(from_path);
                 }
-                _ => {
-                    if let Some(path) = ev.best_path() {
-                        pending.retain(|p| p.best_path().map(|bp| bp != path).unwrap_or(true));
-                    }
-                }
+            }
+            if let Some(path) = ev.best_path() {
+                pending.remove(path);
             }
         }
     }

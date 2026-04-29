@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::core::EventRecord;
 use crate::index::l2_partition::V6Segments;
-use crate::storage::snapshot::{LoadedSnapshot, LsmLoadedLayers, LsmSegmentLoaded, MmapSnapshotV6};
+use crate::storage::snapshot::{LsmLoadedLayers, LsmSegmentLoaded, MmapSnapshotV6};
 use crate::storage::wal::WalReplayResult;
 
 pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -39,8 +39,10 @@ pub trait SegmentStore {
         expected_roots: &[PathBuf],
     ) -> anyhow::Result<Option<MmapSnapshotV6>>;
 
-    /// Load a legacy snapshot (v2-v5) if present and valid.
-    fn load_if_valid<'a>(&'a self) -> StorageFuture<'a, anyhow::Result<Option<LoadedSnapshot>>>;
+    /// Validate a legacy snapshot file's header. **M4-C 之后**永远返回 `Ok(None)`：
+    /// v2-v5 反序列化已删除，调用方需要走 v6/v7 mmap 或全量重扫。保留这个 hook 方便
+    /// 兼容性测试继续验证 header 拒绝行为。
+    fn load_if_valid<'a>(&'a self) -> StorageFuture<'a, anyhow::Result<Option<()>>>;
 
     /// Load the full LSM layer stack (base + deltas) if a valid manifest exists.
     fn load_lsm_if_valid(
@@ -108,6 +110,28 @@ pub trait SegmentWriter {
         expected_roots: &'a [PathBuf],
         wal_seal_id: u64,
     ) -> StorageFuture<'a, anyhow::Result<LsmSegmentLoaded>>;
+
+    /// 写 v7 companion 文件（参见 `重构方案包/causal-chain-report.md` §8.9）。
+    /// 失败一律视为 non-fatal——LSM 仍是权威路径。
+    /// 默认实现 = no-op，便于内存测试 store 跳过。
+    fn write_v7_companion(&self, _bytes: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// 读 v7 companion 文件，缺失/损坏返回 Ok(None)；失败 fallback 到 LSM。
+    /// 默认实现 = 永远没有 v7 companion。
+    fn load_v7_companion(&self) -> anyhow::Result<Option<crate::storage::snapshot_v7::V7Snapshot>> {
+        Ok(None)
+    }
+
+    /// mmap 加载 v7 companion——`path_table.data` 借用 mmap，不复制路径字节。
+    /// 缺失/损坏/不支持的 store 返回 Ok(None)；上层会退回到 [`Self::load_v7_companion`]。
+    /// 默认实现 = 不支持（None），便于内存测试 store 跳过。
+    fn load_v7_companion_mmap(
+        &self,
+    ) -> anyhow::Result<Option<crate::storage::snapshot_v7::V7Snapshot>> {
+        Ok(None)
+    }
 }
 
 /// Factory trait that opens the project's WAL implementation behind a trait
@@ -140,7 +164,7 @@ where
         self.as_ref().load_v6_mmap_if_valid(expected_roots)
     }
 
-    fn load_if_valid<'a>(&'a self) -> StorageFuture<'a, anyhow::Result<Option<LoadedSnapshot>>> {
+    fn load_if_valid<'a>(&'a self) -> StorageFuture<'a, anyhow::Result<Option<()>>> {
         self.as_ref().load_if_valid()
     }
 
@@ -188,6 +212,20 @@ where
     ) -> StorageFuture<'a, anyhow::Result<LsmSegmentLoaded>> {
         self.as_ref()
             .replace_base_v6(segs, expected_prev, expected_roots, wal_seal_id)
+    }
+
+    fn write_v7_companion(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.as_ref().write_v7_companion(bytes)
+    }
+
+    fn load_v7_companion(&self) -> anyhow::Result<Option<crate::storage::snapshot_v7::V7Snapshot>> {
+        self.as_ref().load_v7_companion()
+    }
+
+    fn load_v7_companion_mmap(
+        &self,
+    ) -> anyhow::Result<Option<crate::storage::snapshot_v7::V7Snapshot>> {
+        self.as_ref().load_v7_companion_mmap()
     }
 }
 

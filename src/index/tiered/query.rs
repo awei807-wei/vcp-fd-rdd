@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::core::{EventType, FileKey, FileMeta};
+use crate::core::{FileKey, FileMeta};
 use crate::index::IndexLayer;
 use crate::query::dsl::compile_query;
 use crate::query::matcher::create_matcher;
@@ -127,12 +127,8 @@ impl TieredIndex {
         });
 
         let pending = self.pending_events.lock();
-        for ev in pending.iter() {
-            let path = match &ev.event_type {
-                EventType::Create | EventType::Modify | EventType::Rename { .. } => ev.best_path(),
-                EventType::Delete => continue,
-            };
-            let Some(path) = path else { continue };
+        for path in pending.iter() {
+            // Phase 3：HashSet 永远不放 Delete 事件，省掉 event_type 分支。
             let path = super::normalize_path(path);
             let path_bytes = path.as_os_str().as_encoded_bytes();
             if blocked_paths.contains(path_bytes)
@@ -245,17 +241,10 @@ impl TieredIndex {
         // Scan pending_events for files not yet applied to L2
         if results.len() < limit {
             let pending = self.pending_events.lock();
-            for ev in pending.iter() {
+            for path in pending.iter() {
                 if results.len() >= limit {
                     break;
                 }
-                let path = match &ev.event_type {
-                    EventType::Create | EventType::Modify | EventType::Rename { .. } => {
-                        ev.best_path()
-                    }
-                    EventType::Delete => continue,
-                };
-                let Some(path) = path else { continue };
                 let path = super::normalize_path(path);
                 let path_bytes = path.as_os_str().as_encoded_bytes();
                 if blocked_paths.contains(path_bytes) {

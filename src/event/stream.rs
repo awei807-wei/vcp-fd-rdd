@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::event::ignore_filter::IgnoreFilter;
-use crate::event::recovery::{DirtyScope, DirtyTracker};
 use crate::event::watcher::{check_inotify_limit, watch_roots_enhanced, EventWatcher};
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
@@ -192,7 +191,6 @@ impl EventPipeline {
         let roots = self.index.roots.clone();
         let overflow_drops = self.overflow_drops.clone();
         let rescan_signals = self.rescan_signals.clone();
-        let dirty = DirtyTracker::new(self.channel_size.saturating_mul(4).max(1024), roots.clone());
         let keep_cap = self.channel_size.max(256);
         let (mut priority_rx, mut normal_rx, priority_tx, normal_tx, mut watcher) =
             EventWatcher::start(
@@ -200,12 +198,11 @@ impl EventPipeline {
                 self.channel_size,
                 overflow_drops.clone(),
                 rescan_signals.clone(),
-                Some(dirty.clone()),
             )?;
         // inotify watch 数兜底检查
         check_inotify_limit(roots.len());
         let (failed_roots, degraded_roots): (Vec<PathBuf>, Vec<PathBuf>) =
-            watch_roots_enhanced(&mut watcher, &roots, Some(&dirty));
+            watch_roots_enhanced(&mut watcher, &roots);
         self.watch_failures
             .fetch_add(failed_roots.len() as u64, Ordering::Relaxed);
         self.degraded_roots.store(
@@ -227,7 +224,6 @@ impl EventPipeline {
         let raw_events_capacity = self.raw_events_capacity.clone();
         let merged_map_capacity = self.merged_map_capacity.clone();
         let records_capacity = self.records_capacity.clone();
-        let dirty_activity = dirty.clone();
         let pending_moves: Arc<tokio::sync::Mutex<PendingMoveMap>> =
             Arc::new(tokio::sync::Mutex::new(PendingMoveMap::new()));
         let pending_moves_cleaner = pending_moves.clone();
@@ -300,8 +296,6 @@ impl EventPipeline {
                 };
 
                 raw_events.push(first_ev);
-                // 活动信号：用于 cooldown/max-staleness 兜底调度。
-                dirty_activity.record_activity();
 
                 // debounce：Create 事件使用更短窗口，优先快速索引
                 let debounce_ms = if is_priority {
@@ -473,198 +467,14 @@ impl EventPipeline {
             tracing::warn!("Event pipeline stopped");
         });
 
-        // overflow 兜底调度：dirty region + cooldown/max-staleness → fast-sync
-        {
-            let idx = self.index.clone();
-            let dirty = dirty.clone();
-            let ignores = self.ignore_paths.clone();
-            tokio::spawn(async move {
-                // 经验值：静默 1s 触发；持续风暴 5s 强制触发一次（避免饿死）。
-                let cooldown_ns: u64 = 1_000_000_000;
-                let max_staleness_ns: u64 = 5_000_000_000;
-                let min_interval_ns: u64 = 5_000_000_000;
-
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    if dirty.sync_in_progress() {
-                        continue;
-                    }
-                    let Some(scope) =
-                        dirty.try_begin_sync(cooldown_ns, max_staleness_ns, min_interval_ns)
-                    else {
-                        continue;
-                    };
-                    tracing::warn!(
-                        "Event overflow recovery: triggering fast-sync ({:?})",
-                        scope
-                    );
-                    idx.spawn_fast_sync(scope, ignores.clone(), dirty.clone());
-                }
-            });
-        }
-
-        // Hybrid Crawler: handles both failed roots and degraded roots
-        if !failed_roots.is_empty() || !degraded_roots.is_empty() {
-            let crawl_idx = self.index.clone();
-            let crawl_ignores = self.ignore_paths.clone();
-            let crawl_dirty = dirty.clone();
-            let failed = failed_roots;
-            let degraded = degraded_roots;
-            tracing::warn!(
-                "Hybrid crawler enabled: {} failed roots, {} degraded roots",
-                failed.len(),
-                degraded.len()
-            );
-            tokio::spawn(async move {
-                let failed_poll_interval = std::time::Duration::from_secs(60);
-                let degraded_reconcile_interval = std::time::Duration::from_secs(30);
-
-                let mut last_failed_poll = tokio::time::Instant::now();
-                let mut last_degraded_reconcile = tokio::time::Instant::now();
-
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-                    // 1. Poll failed roots every 60s
-                    if !failed.is_empty() && last_failed_poll.elapsed() >= failed_poll_interval {
-                        let scope = DirtyScope::Dirs {
-                            cutoff_ns: 0,
-                            dirs: failed.clone(),
-                        };
-                        crawl_idx.spawn_fast_sync(
-                            scope,
-                            crawl_ignores.clone(),
-                            crawl_dirty.clone(),
-                        );
-                        last_failed_poll = tokio::time::Instant::now();
-                    }
-
-                    // 2. Reconcile degraded roots every 30s
-                    if !degraded.is_empty()
-                        && last_degraded_reconcile.elapsed() >= degraded_reconcile_interval
-                    {
-                        for root in &degraded {
-                            if let Err(e) = reconcile_degraded_root(
-                                root,
-                                &crawl_idx,
-                                &crawl_dirty,
-                                &crawl_ignores,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "Degraded root reconciliation failed for {:?}: {}",
-                                    root,
-                                    e
-                                );
-                            }
-                        }
-                        last_degraded_reconcile = tokio::time::Instant::now();
-                    }
-                }
-            });
-        }
+        // 注：原 overflow 兜底调度循环（200ms 轮询）与 Hybrid Crawler（30/60s DFS）已删除。
+        // 见 重构方案包/causal-chain-report.md 第 8.4 节 REMOVE 列表与 8.5 节"稳态行为"。
+        // failed_roots / degraded_roots 现在仅作为 stats 信号使用（参见上方 watcher_degraded）。
+        let _ = failed_roots;
+        let _ = degraded_roots;
 
         Ok(())
     }
-}
-
-/// Walk a degraded root and mark directories whose mtime is newer than the last sync
-/// as dirty via DirtyTracker. The existing overflow recovery loop will then pick them
-/// up and trigger fast-sync.
-async fn reconcile_degraded_root(
-    root: &std::path::PathBuf,
-    _index: &Arc<TieredIndex>,
-    dirty: &DirtyTracker,
-    ignore_paths: &[PathBuf],
-) -> anyhow::Result<()> {
-    let cutoff_ns = dirty.last_sync_ns();
-    // Safety margin: fast-sync finish time can race with file creation mtime.
-    // Back off 10s to avoid missing files created just before the last sync finished.
-    let effective_cutoff_ns = cutoff_ns.saturating_sub(10_000_000_000);
-    let mut changed_dirs: Vec<PathBuf> = Vec::new();
-
-    // Use a stack for iterative DFS to avoid deep recursion
-    let mut stack: Vec<(PathBuf, usize)> = vec![(root.clone(), 0)];
-    const MAX_DEPTH: usize = 20;
-
-    while let Some((dir, depth)) = stack.pop() {
-        if depth > MAX_DEPTH {
-            continue;
-        }
-
-        // Skip hidden directories
-        if dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with('.'))
-            .unwrap_or(false)
-        {
-            continue;
-        }
-
-        // Skip ignored paths
-        if ignore_paths
-            .iter()
-            .any(|ig| !ig.as_os_str().is_empty() && dir.starts_with(ig))
-        {
-            continue;
-        }
-
-        let md = match std::fs::symlink_metadata(&dir) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        if !md.is_dir() {
-            continue;
-        }
-
-        let changed = if let Ok(modified) = md.modified() {
-            let cutoff = std::time::UNIX_EPOCH
-                + std::time::Duration::new(
-                    effective_cutoff_ns / 1_000_000_000,
-                    (effective_cutoff_ns % 1_000_000_000) as u32,
-                );
-            effective_cutoff_ns == 0 || modified > cutoff
-        } else {
-            true
-        };
-
-        if changed {
-            changed_dirs.push(dir.clone());
-        }
-
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
-
-        for ent in rd {
-            let ent = match ent {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let ft = match ent.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                stack.push((ent.path(), depth + 1));
-            }
-        }
-    }
-
-    if !changed_dirs.is_empty() {
-        tracing::debug!(
-            "Degraded root reconciliation: marking {} dirs as dirty under {:?}",
-            changed_dirs.len(),
-            root
-        );
-        dirty.record_overflow_paths(&changed_dirs);
-    }
-
-    Ok(())
 }
 
 fn should_ignore_event(ev: &notify::Event, ignore_prefixes: &[PathBuf]) -> bool {

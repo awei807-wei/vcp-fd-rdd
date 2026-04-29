@@ -7,6 +7,8 @@ use super::arena::PathArenaSet;
 
 #[derive(Clone)]
 pub(super) struct DiskLayer {
+    /// 段 ID（compaction 已移除后仅在 LSM manifest 写入路径写入，但本结构体不再读取）。
+    #[allow(dead_code)]
     pub(super) id: u64,
     pub(super) idx: Arc<MmapIndex>,
     pub(super) deleted_paths: Arc<PathArenaSet>,

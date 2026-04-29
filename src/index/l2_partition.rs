@@ -1,8 +1,7 @@
 use parking_lot::RwLock;
 use roaring::RoaringTreemap;
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -10,12 +9,16 @@ use std::sync::Arc;
 #[cfg(feature = "rkyv")]
 use crate::core::FileKeyEntry;
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta};
+use crate::index::base_index::BaseIndex;
+use crate::index::delta_buffer::DeltaBuffer;
+use crate::index::file_entry::FileEntry;
+use crate::index::parent_index::ParentIndex;
+use crate::index::path_table::PathTable;
 use crate::index::IndexLayer;
 use crate::query::matcher::Matcher;
 use crate::stats::L2Stats;
-use crate::util::{
-    compose_abs_path_buf, compose_abs_path_bytes, pathbuf_from_encoded_vec, root_bytes_for_id,
-};
+use crate::storage::snapshot_v7::V7Snapshot;
+use crate::util::{compose_abs_path_bytes, pathbuf_from_encoded_vec, root_bytes_for_id};
 
 /// Trigram：3 字节子串，用于倒排索引加速查询
 type Trigram = [u8; 3];
@@ -127,169 +130,24 @@ fn for_each_short_component(path: &Path, mut f: impl FnMut(u16)) {
     }
 }
 
-/// Path blob arena：所有路径的连续字节存储
-#[derive(Clone, Debug, Default)]
-pub struct PathArena {
-    pub data: Arc<Vec<u8>>,
+/// 仅用于 v6 段落盘前的本地 PathArena 合成。M4-C 之后不再作为 PersistentIndex
+/// 字段或 IndexSnapshotV4/V5 字段——这些类型已删除。
+struct V6ExportArena {
+    data: Vec<u8>,
 }
 
-impl serde::Serialize for PathArena {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.data.as_ref().serialize(serializer)
+impl V6ExportArena {
+    fn new() -> Self {
+        Self { data: Vec::new() }
     }
-}
-
-impl<'de> serde::Deserialize<'de> for PathArena {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let data = Vec::<u8>::deserialize(deserializer)?;
-        Ok(PathArena {
-            data: Arc::new(data),
-        })
-    }
-}
-
-impl PathArena {
-    pub fn new() -> Self {
-        Self {
-            data: Arc::new(Vec::new()),
-        }
-    }
-
-    pub fn push_bytes(&mut self, bytes: &[u8]) -> Option<(u32, u16)> {
-        let len: u16 = match bytes.len().try_into() {
-            Ok(len) => len,
-            Err(_) => {
-                tracing::warn!(
-                    "Skipping indexed path longer than {} bytes: {} bytes",
-                    u16::MAX,
-                    bytes.len()
-                );
-                return None;
-            }
-        };
-        let data = Arc::make_mut(&mut self.data);
-        let off: u32 = data.len().try_into().ok()?;
-        data.extend_from_slice(bytes);
+    fn push_bytes(&mut self, bytes: &[u8]) -> Option<(u32, u16)> {
+        let len: u16 = bytes.len().try_into().ok()?;
+        let off: u32 = self.data.len().try_into().ok()?;
+        self.data.extend_from_slice(bytes);
         Some((off, len))
     }
-
-    pub fn push_path(&mut self, path: &Path) -> Option<(u32, u16)> {
-        let bytes = path.as_os_str().as_encoded_bytes();
-        self.push_bytes(bytes)
-    }
-
-    pub fn get_bytes(&self, off: u32, len: u16) -> Option<&[u8]> {
-        let start: usize = off as usize;
-        let end: usize = start.checked_add(len as usize)?;
-        self.data.get(start..end)
-    }
-
-    pub fn get_path_buf(&self, off: u32, len: u16) -> Option<PathBuf> {
-        let bytes = self.get_bytes(off, len)?.to_vec();
-        Some(pathbuf_from_encoded_vec(bytes))
-    }
-}
-
-/// 旧紧凑元数据（v4 快照）：不包含 root_id（存储的是绝对路径字节）
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CompactMetaV4 {
-    pub file_key: FileKey,
-    pub path_off: u32,
-    pub path_len: u16,
-    pub size: u64,
-    pub mtime: Option<std::time::SystemTime>,
-}
-
-/// 紧凑元数据（v5 起）：以 DocId 为下标（Vec 紧凑布局）
-///
-/// - arena 存储 root 相对路径 bytes（不含 root 前缀）
-/// - root_id 指向 `PersistentIndex.roots[root_id]`
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CompactMeta {
-    pub file_key: FileKey,
-    pub root_id: u16,
-    pub path_off: u32,
-    pub path_len: u16,
-    pub size: u64,
-    pub mtime_ns: i64,
-}
-
-/// 旧快照格式 v2（兼容读取）
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct IndexSnapshotV2 {
-    pub files: HashMap<FileKey, FileMeta>,
-    pub path_to_id: HashMap<PathBuf, FileKey>,
-    pub tombstones: HashSet<FileKey>,
-}
-
-impl IndexSnapshotV2 {
-    pub fn new() -> Self {
-        Self {
-            files: HashMap::new(),
-            path_to_id: HashMap::new(),
-            tombstones: HashSet::new(),
-        }
-    }
-}
-
-/// 旧快照格式 v3（兼容读取）：不落盘 path_to_id（可从 files 重建）
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct IndexSnapshotV3 {
-    pub files: HashMap<FileKey, FileMeta>,
-    pub tombstones: HashSet<FileKey>,
-}
-
-impl IndexSnapshotV3 {
-    pub fn new() -> Self {
-        Self {
-            files: HashMap::new(),
-            tombstones: HashSet::new(),
-        }
-    }
-}
-
-/// 新快照格式 v4：落盘紧凑布局（arena + metas + tombstones）
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct IndexSnapshotV4 {
-    pub arena: PathArena,
-    pub metas: Vec<CompactMetaV4>,
-    pub tombstones: Vec<u32>,
-}
-
-impl IndexSnapshotV4 {
-    pub fn new() -> Self {
-        Self {
-            arena: PathArena::new(),
-            metas: Vec::new(),
-            tombstones: Vec::new(),
-        }
-    }
-}
-
-/// 新快照格式 v5：落盘紧凑布局（arena(root-relative) + metas(root_id+offset/len) + tombstones）
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IndexSnapshotV5 {
-    /// 用于校验：root 列表（含 "/" 兜底）是否与当前运行时一致
-    pub roots_hash: u64,
-    pub arena: PathArena,
-    pub metas: Vec<CompactMeta>,
-    pub tombstones: Vec<u32>,
-}
-
-impl IndexSnapshotV5 {
-    pub fn new(roots_hash: u64) -> Self {
-        Self {
-            roots_hash,
-            arena: PathArena::new(),
-            metas: Vec::new(),
-            tombstones: Vec::new(),
-        }
+    fn into_bytes(self) -> Vec<u8> {
+        self.data
     }
 }
 
@@ -374,12 +232,8 @@ pub struct PersistentIndex {
     /// root 列表（root_id -> root Path）。root_id=0 固定为 "/" 作为兜底。
     roots: Vec<PathBuf>,
     roots_bytes: Vec<Vec<u8>>,
-    /// DocId -> CompactMeta
-    metas: RwLock<Vec<CompactMeta>>,
     /// FileKey -> DocId
     filekey_to_docid: RwLock<HashMap<FileKey, DocId>>,
-    /// 路径 blob
-    arena: RwLock<PathArena>,
 
     /// 路径反查：hash(path_bytes) -> DocId（或少量冲突列表）
     path_hash_to_id: RwLock<HashMap<u64, OneOrManyDocId>>,
@@ -392,12 +246,44 @@ pub struct PersistentIndex {
     /// 墓碑标记（DocId）
     tombstones: RwLock<RoaringTreemap>,
 
+    /// 父目录倒排索引：parent_path_hash → RoaringTreemap of DocIds.
+    ///
+    /// 用于 [`Self::for_each_live_meta_in_dirs`] 把"按目录定位 live 文件"从
+    /// O(N_total_metas) 降到 O(dir_size + bitmap)。语义参见
+    /// [`crate::index::parent_index::ParentIndex`] 与 `重构方案包/causal-chain-report.md` §一·链路1。
+    parent_index: RwLock<ParentIndex>,
+
     /// upsert 写锁：保护 alloc_docid → insert_trigrams / insert_path_hash 的原子性，
     /// 防止写入-查询竞态导致 trigram 索引与 metas 不一致。
     upsert_lock: RwLock<()>,
 
     /// 脏标记（自上次快照后是否有变更）
     dirty: std::sync::atomic::AtomicBool,
+
+    /// BaseDelta 内核（参见 `重构方案包/causal-chain-report.md` §8.6 第二阶段）。
+    ///
+    /// **M4 阶段**：此字段始终持有 [`BaseDeltaKernel`]——`new_with_roots` 初始化为
+    /// 空 base + 空 delta，所有 `from_snapshot_*` 加载完 metas+arena 后立即重建一次。
+    /// 写路径已经 M3 双写到 delta；M4-B/C 后续会让 BaseDelta 接管所有读路径并物理
+    /// 删除 metas+arena 字段。
+    base_delta: parking_lot::RwLock<BaseDeltaKernel>,
+}
+
+/// BaseDelta 内核：[`crate::index::base_index::BaseIndex`] 只读快照 +
+/// [`crate::index::delta_buffer::DeltaBuffer`] 运行时可写增量。
+///
+/// docid 空间分割：
+/// - `[0, base.by_path_idx().len())` 由 base 持有；通过 `base.resolve_path(docid)` 解析。
+/// - `[base.by_path_idx().len(), ...)` 由 delta 持有；通过
+///   `delta.added_path_bytes(docid - base_count)` 解析。
+///
+/// 这与 [`crate::index::l2_partition::PersistentIndex.metas`] 的 docid 空间是**独立**的——
+/// M1 阶段 BaseDelta 与 Legacy 并存，docid 含义不互通；切换需依赖
+/// [`Self::resolve_abs_path_bytes_for_docid`] 这个抽象。
+#[derive(Debug)]
+pub struct BaseDeltaKernel {
+    pub base: Arc<BaseIndex>,
+    pub delta: DeltaBuffer,
 }
 
 impl Default for PersistentIndex {
@@ -421,151 +307,252 @@ impl PersistentIndex {
         Self {
             roots,
             roots_bytes,
-            metas: RwLock::new(Vec::new()),
             filekey_to_docid: RwLock::new(HashMap::new()),
-            arena: RwLock::new(PathArena::new()),
             path_hash_to_id: RwLock::new(HashMap::new()),
             trigram_index: RwLock::new(HashMap::new()),
             short_component_index: RwLock::new(HashMap::new()),
             tombstones: RwLock::new(RoaringTreemap::new()),
+            parent_index: RwLock::new(ParentIndex::new()),
             upsert_lock: RwLock::new(()),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            base_delta: parking_lot::RwLock::new(BaseDeltaKernel {
+                base: Arc::new(BaseIndex::empty()),
+                delta: DeltaBuffer::new(),
+            }),
         }
     }
 
-    pub fn from_snapshot_v5(snap: IndexSnapshotV5, roots: Vec<PathBuf>) -> Self {
+    /// 计算路径父目录字节的哈希，与 [`crate::index::parent_index::parent_hash_bytes`] 等价。
+    /// 返回 None 表示路径无父目录（极少见，例如根 `/` 或空路径）。
+    fn parent_hash_for(abs_path: &Path) -> Option<u64> {
+        abs_path
+            .parent()
+            .map(|p| path_hash_bytes(p.as_os_str().as_encoded_bytes()))
+    }
+
+    /// 从 v7 snapshot 加载（参见 `重构方案包/causal-chain-report.md` §8.9）。
+    ///
+    /// 转换策略
+    /// - V7 的 entries 数组按 path_idx 升序排列；本入口把每条 entry 翻译回旧的
+    ///   `CompactMeta + PathArena` 内存模型，让现有 query/upsert/snapshot 路径完全无感。
+    /// - 新分配的 docid = V7 entries 的下标，因此 V7 中的 tombstones 可以原样套用。
+    /// - 若某条 entry 的 `path_idx` 损坏导致 PathTable 解析失败，整次加载视为损坏并放弃；
+    ///   宁可启动回退到全量重扫，也不要让索引和实际数据错位。
+    pub fn from_snapshot_v7(snap: V7Snapshot, roots: Vec<PathBuf>) -> Self {
         let idx = Self::new_with_roots(roots);
 
-        if snap.roots_hash != idx.roots_hash() {
+        // roots 兼容性：v7 文件里冻结了 roots 字节序列，必须与运行时一致。
+        let roots_match = snap.roots.len() == idx.roots_bytes.len()
+            && snap
+                .roots
+                .iter()
+                .zip(idx.roots_bytes.iter())
+                .all(|(a, b)| a == b);
+        if !roots_match {
             tracing::warn!(
-                "Snapshot roots_hash mismatch, ignoring snapshot ({} != {})",
-                snap.roots_hash,
-                idx.roots_hash()
+                "V7 snapshot roots mismatch ({} entries vs {}); ignoring snapshot",
+                snap.roots.len(),
+                idx.roots_bytes.len()
             );
             return idx;
         }
 
-        {
-            *idx.metas.write() = snap.metas;
-            *idx.arena.write() = snap.arena;
-            *idx.tombstones.write() = snap.tombstones.into_iter().map(|v| v as u64).collect();
-            idx.dirty.store(false, std::sync::atomic::Ordering::Release);
-        }
+        // Phase 4：BaseDelta 是唯一权威。直接复用 v7 的 path_table + entries（已排序），
+        // 不再走 BaseIndexBuilder 重建路径——节省 ≈ 800MB 临时分配 + 8-15s CPU
+        // （8M 文件场景）。v7 的 tombstones 转移到外层 PersistentIndex.tombstones，
+        // 因为查询/upsert 路径都在那里查表。
+        let mut snap = snap;
+        let snap_tombstones = std::mem::take(&mut snap.tombstones);
+        let entry_count = snap.entries.len() as u64;
+        let base_index = BaseIndex::from_v7_snapshot(snap);
+        let mut delta = DeltaBuffer::new();
+        delta.set_base_file_count(entry_count);
 
-        // rebuild derived indexes
-        idx.rebuild_derived_indexes();
-        idx
-    }
-
-    pub fn from_snapshot_v4(snap: IndexSnapshotV4, roots: Vec<PathBuf>) -> Self {
-        // v4 arena 里存的是绝对路径字节；这里迁移为 v5（root-relative + root_id）
-        let idx = Self::new_with_roots(roots);
-
-        let IndexSnapshotV4 {
-            arena: old_arena,
-            metas: old_metas,
-            tombstones,
-        } = snap;
-
-        let mut new_arena = PathArena::new();
-        let mut new_metas: Vec<CompactMeta> = Vec::with_capacity(old_metas.len());
-
-        for m in old_metas {
-            let abs_path = old_arena.get_path_buf(m.path_off, m.path_len);
-            let Some(abs_path) = abs_path else {
-                continue;
-            };
-            let (root_id, rel_bytes) = idx.split_root_relative_bytes(&abs_path);
-            let Some((off, len)) = new_arena.push_bytes(&rel_bytes) else {
-                continue;
-            };
-            new_metas.push(CompactMeta {
-                file_key: m.file_key,
-                root_id,
-                path_off: off,
-                path_len: len,
-                size: m.size,
-                mtime_ns: mtime_to_ns(m.mtime),
-            });
-        }
-
-        {
-            *idx.metas.write() = new_metas;
-            *idx.arena.write() = new_arena;
-            *idx.tombstones.write() = tombstones.into_iter().map(|v| v as u64).collect();
-            idx.dirty.store(false, std::sync::atomic::Ordering::Release);
-        }
+        *idx.base_delta.write() = BaseDeltaKernel {
+            base: Arc::new(base_index),
+            delta,
+        };
+        *idx.tombstones.write() = snap_tombstones;
+        idx.dirty.store(false, std::sync::atomic::Ordering::Release);
 
         idx.rebuild_derived_indexes();
         idx
     }
 
-    pub fn from_snapshot_v3(snap: IndexSnapshotV3, roots: Vec<PathBuf>) -> Self {
-        // v3 的 tombstones 不携带对应文档记录；阶段 A 的 DocId tombstone 以“保留 doc 槽位”实现，
-        // 因此这里仅重建 files，本质上等价于“干净加载”。
-        let idx = Self::new_with_roots(roots);
-        for (_k, meta) in snap.files {
-            idx.upsert(meta);
+    /// 把当前内存状态导出为 V7 snapshot（参见 `重构方案包/causal-chain-report.md` §8.9）。
+    ///
+    /// 注意：导出时按 abs_path 字典序对所有条目重新分配 docid（V7 的硬约束），
+    /// 因此**当前 PersistentIndex 里的 docid ≠ V7 里的 docid**；tombstones 在转换中
+    /// 一并按新 docid 重映射。
+    ///
+    /// M4-B：数据源从 metas+arena 切到 BaseDelta（base 段 + delta.added 段）；docid
+    /// 编号继承 legacy 空间，只在导出时重新按 abs path 字典序分配。
+    pub fn to_snapshot_v7(&self) -> V7Snapshot {
+        let bd = self.base_delta.read();
+        let tombstones = self.tombstones.read();
+        let base_count = bd.base.by_path_idx().len() as u64;
+        let total = base_count + bd.delta.added().len() as u64;
+
+        // 1) 收集 (abs_path_bytes, FileKey, size, mtime_ns, was_tombstoned)。
+        // Phase 4：base 半段走 path_table.for_each_path 顺序扫描，省 ~30× CPU。
+        let base_entries = bd.base.by_path_idx().entries();
+        let mut items: Vec<(Vec<u8>, FileKey, u64, i64, bool)> = Vec::with_capacity(total as usize);
+        bd.base.path_table().for_each_path(|path_idx, abs_bytes| {
+            let docid = path_idx as u64;
+            let Some(entry) = base_entries.get(path_idx as usize) else {
+                return;
+            };
+            items.push((
+                abs_bytes.to_vec(),
+                entry.file_key(),
+                entry.size,
+                entry.mtime_ns,
+                tombstones.contains(docid),
+            ));
+        });
+        for idx in 0..bd.delta.added().len() {
+            let docid = base_count + idx as u64;
+            let Some(entry) = bd.delta.added().get(idx) else {
+                continue;
+            };
+            let Some(abs_bytes) = bd.delta.added_path_bytes(idx) else {
+                continue;
+            };
+            items.push((
+                abs_bytes.to_vec(),
+                entry.file_key(),
+                entry.size,
+                entry.mtime_ns,
+                tombstones.contains(docid),
+            ));
         }
-        idx
+        let _ = total;
+
+        // 2) 字典序排序（v7 PathTable 的硬要求；同时 entries 按这个顺序分配新 docid）。
+        items.sort_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
+
+        // 3) 写 PathTable + 生成 FileEntries（path_idx == 新 docid）+ tombstones 重映射。
+        let mut path_table = PathTable::new();
+        let mut entries: Vec<FileEntry> = Vec::with_capacity(items.len());
+        let mut new_tombstones = roaring::RoaringTreemap::new();
+        for (i, (path, fk, size, mtime_ns, was_tomb)) in items.iter().enumerate() {
+            let path_idx = path_table.push(path);
+            entries.push(FileEntry::new(*fk, path_idx, *size, *mtime_ns));
+            if *was_tomb {
+                new_tombstones.insert(i as u64);
+            }
+        }
+
+        V7Snapshot {
+            roots: self.roots_bytes.clone(),
+            path_table,
+            entries,
+            tombstones: new_tombstones,
+            wal_seal_id: 0,
+        }
     }
 
-    pub fn from_snapshot_v2(snap: IndexSnapshotV2, roots: Vec<PathBuf>) -> Self {
-        let idx = Self::new_with_roots(roots);
-        for (_k, meta) in snap.files {
-            idx.upsert(meta);
-        }
-        idx
+    /// 同 [`Self::to_snapshot_v7`]，但写入指定的 `wal_seal_id`。供 LSM `replace_base_v6`
+    /// 成功后立即生成 v7 companion 时使用——v7 与 LSM 共享同一个 wal_seal_id 才能
+    /// 在启动时被判断为"与最新 LSM 同步"。
+    pub fn to_snapshot_v7_with_seal(&self, wal_seal_id: u64) -> V7Snapshot {
+        let mut snap = self.to_snapshot_v7();
+        snap.wal_seal_id = wal_seal_id;
+        snap
     }
 
+    // M4-C: from_snapshot_v2/v3/v4/v5 + IndexSnapshotV2-V5 + CompactMeta(V4) + PathArena
+    // 已删除。带旧 bincode index.db 的用户会在启动时被 load_if_valid 拒绝（返回
+    // Ok(None)），上层降级到全量重扫，等同于一次性丢索引重建。
+
+    /// M4-B: 重建派生索引（trigram/path_hash/parent_index 等）。
+    /// 数据源：BaseDelta（base + delta.added，docid 空间与 legacy `tombstones` 对齐）。
+    /// 与 metas+arena 不再耦合——下游 M4-C 删除 Legacy 字段后这条路径仍能用。
+    ///
+    /// Phase 4：base 半段用 [`PathTable::for_each_path`] 顺序遍历——单次 O(data.len())
+    /// 扫描代替每条目独立 resolve（每条 O(anchor_interval)）。8M 文件冷启动估算
+    /// 节省 ≈ 30× CPU on this loop。
     fn rebuild_derived_indexes(&self) {
-        let metas = self.metas.read();
-        let arena = self.arena.read();
         let tomb = self.tombstones.read();
+        let bd = self.base_delta.read();
+        let base_entries = bd.base.by_path_idx().entries();
+        let base_count = base_entries.len() as u64;
 
         let mut filekey_to_docid = self.filekey_to_docid.write();
         let mut path_hash_to_id = self.path_hash_to_id.write();
         let mut trigram_index = self.trigram_index.write();
         let mut short_component_index = self.short_component_index.write();
+        let mut parent_index = self.parent_index.write();
 
         filekey_to_docid.clear();
         path_hash_to_id.clear();
         trigram_index.clear();
         short_component_index.clear();
+        parent_index.clear();
 
-        for (docid_usize, meta) in metas.iter().enumerate() {
-            let docid: DocId = docid_usize as DocId;
-            filekey_to_docid.insert(meta.file_key, docid);
-
+        // base 与 delta 共用："插 trigram + parent + 可选 path_hash"。
+        // abs_bytes 在 base 半段是 path_table 内部 buffer 的借用（不分配），
+        // 在 delta 半段是 delta.added_path_bytes 的借用——两边都不再 to_vec。
+        //
+        // Phase 4：
+        // - filekey_to_docid 仅 delta 半段维护，base 半段走 BaseIndex.by_file_key 二分。
+        // - path_hash_to_id 仅 delta 半段维护，base 半段走 PathTable::find_path_idx。
+        //   8M 文件场景下省 ~160MB 常驻 HashMap（参见
+        //   `重构方案包/causal-chain-report.md` §8.7 的内存表）。
+        let mut insert_derived = |docid: u64,
+                                  abs_bytes: &[u8],
+                                  put_path_hash: bool,
+                                  path_hash_to_id: &mut HashMap<u64, OneOrManyDocId>| {
             if tomb.contains(docid) {
-                continue;
+                return;
             }
-
-            if let Some(rel_bytes) = arena.get_bytes(meta.path_off, meta.path_len) {
-                let abs_bytes = compose_abs_path_bytes(
-                    root_bytes_for_id(&self.roots_bytes, meta.root_id),
-                    rel_bytes,
-                );
-                let h = path_hash_bytes(&abs_bytes);
+            if put_path_hash {
+                let h = path_hash_bytes(abs_bytes);
                 path_hash_to_id
                     .entry(h)
                     .and_modify(|v| v.insert(docid))
                     .or_insert(OneOrManyDocId::One(docid));
-
-                let abs_path = compose_abs_path_buf(
-                    root_bytes_for_id(&self.roots_bytes, meta.root_id),
-                    rel_bytes,
-                );
-                for_each_component_trigram(abs_path.as_path(), |tri| {
-                    trigram_index.entry(tri).or_default().insert(docid);
-                });
-                for_each_short_component(abs_path.as_path(), |component| {
-                    short_component_index
-                        .entry(component)
-                        .or_default()
-                        .insert(docid);
-                });
             }
+
+            // PathBuf 仍要分配——`for_each_component_trigram` 走 `Path::components`
+            // 是平台感知的（Windows 处理 drive 前缀/反斜杠），底层字节迭代在这里
+            // 不容易替代。pathbuf_from_encoded_vec 在 Unix 上是 zero-copy move。
+            let abs_path = pathbuf_from_encoded_vec(abs_bytes.to_vec());
+            for_each_component_trigram(abs_path.as_path(), |tri| {
+                trigram_index.entry(tri).or_default().insert(docid);
+            });
+            for_each_short_component(abs_path.as_path(), |component| {
+                short_component_index
+                    .entry(component)
+                    .or_default()
+                    .insert(docid);
+            });
+            if let Some(ph) = Self::parent_hash_for(&abs_path) {
+                parent_index.insert(ph, docid);
+            }
+        };
+
+        // Base 半段：不登记 filekey_to_docid（走 by_file_key 二分），
+        // 也不登记 path_hash_to_id（走 PathTable::find_path_idx）。
+        bd.base.path_table().for_each_path(|path_idx, abs_bytes| {
+            let docid = path_idx as u64;
+            if base_entries.get(path_idx as usize).is_none() {
+                return;
+            }
+            insert_derived(docid, abs_bytes, false, &mut path_hash_to_id);
+        });
+
+        // Delta 半段：filekey_to_docid + path_hash_to_id 都登记。
+        for idx in 0..bd.delta.added().len() {
+            let docid = base_count + idx as u64;
+            let Some(entry) = bd.delta.added().get(idx) else {
+                continue;
+            };
+            let Some(abs_bytes) = bd.delta.added_path_bytes(idx) else {
+                continue;
+            };
+            filekey_to_docid.insert(entry.file_key(), docid);
+            insert_derived(docid, abs_bytes, true, &mut path_hash_to_id);
         }
     }
 
@@ -588,44 +575,41 @@ impl PersistentIndex {
         meta.path = crate::index::tiered::normalize_path(&meta.path);
         let fkey = meta.file_key;
         let (new_root_id, new_rel_bytes) = self.split_root_relative_bytes(meta.path.as_path());
+        let new_abs_bytes = compose_abs_path_bytes(
+            root_bytes_for_id(&self.roots_bytes, new_root_id),
+            &new_rel_bytes,
+        );
 
         // 先查 docid（只持有 mapping 的读锁）
-        let existing_docid = { self.filekey_to_docid.read().get(&fkey).copied() };
+        let existing_docid = self.lookup_docid_by_filekey(fkey);
 
         if let Some(docid) = existing_docid {
-            // 读旧路径 bytes（不持有 trigram/path_hash 锁）
-            let (old_root_id, old_off, old_len) = {
-                let metas = self.metas.read();
-                if let Some(old) = metas.get(docid as usize) {
-                    (old.root_id, old.path_off, old.path_len)
-                } else {
-                    (0, 0, 0)
-                }
-            };
-
-            let same_path = {
-                let arena = self.arena.read();
-                arena
-                    .get_bytes(old_off, old_len)
-                    .map(|b| old_root_id == new_root_id && b == new_rel_bytes.as_slice())
-                    .unwrap_or(false)
-            };
+            // M4-C: 读旧路径走 BaseDelta（不再访问 metas+arena）。
+            let old_abs_bytes = self.resolve_abs_path_bytes_for_docid(docid);
+            let same_path = old_abs_bytes
+                .as_deref()
+                .map(|b| b == new_abs_bytes.as_slice())
+                .unwrap_or(false);
 
             if same_path {
-                // 同路径重复上报：只更新元数据，避免 posting 重复写入
-                let mut metas = self.metas.write();
-                if let Some(existing) = metas.get_mut(docid as usize) {
-                    existing.size = meta.size;
-                    existing.mtime_ns = mtime_to_ns(meta.mtime);
-                }
+                // 同路径重复上报：只更新元数据，避免 posting 重复写入。
+                self.update_meta_in_delta(
+                    docid,
+                    fkey,
+                    &new_abs_bytes,
+                    meta.size,
+                    mtime_to_ns(meta.mtime),
+                );
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
             }
 
-            let old_path_missing = if force_path_update || old_len == 0 {
+            let old_path_missing = if force_path_update || old_abs_bytes.is_none() {
                 false
             } else {
-                self.absolute_path_buf(old_root_id, old_off, old_len)
+                old_abs_bytes
+                    .as_deref()
+                    .and_then(|b| std::str::from_utf8(b).ok().map(PathBuf::from))
                     .map(|old_path| match std::fs::symlink_metadata(&old_path) {
                         Ok(_) => false,
                         Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
@@ -636,57 +620,50 @@ impl PersistentIndex {
 
             // 路径不同：hardlink、rename，或旧路径已消失后的 reconcile
             if !force_path_update && !old_path_missing {
-                // hardlink/重复发现：保留旧路径，仅更新元数据
-                let mut metas = self.metas.write();
-                if let Some(existing) = metas.get_mut(docid as usize) {
-                    existing.size = meta.size;
-                    existing.mtime_ns = mtime_to_ns(meta.mtime);
-                }
+                // hardlink/重复发现：保留旧路径，仅更新元数据。
+                self.update_meta_in_delta(
+                    docid,
+                    fkey,
+                    old_abs_bytes.as_deref().unwrap_or(&new_abs_bytes),
+                    meta.size,
+                    mtime_to_ns(meta.mtime),
+                );
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
             }
 
             // rename：先移除旧路径关联
             let _guard = self.upsert_lock.write();
-            if old_len != 0 {
-                if let Some(old_path) = self.absolute_path_buf(old_root_id, old_off, old_len) {
-                    self.remove_trigrams(docid, &old_path);
-                    self.remove_path_hash(docid, &old_path);
-                }
+            if let Some(ref old_abs) = old_abs_bytes {
+                let old_path = pathbuf_from_encoded_vec(old_abs.clone());
+                self.remove_trigrams(docid, &old_path);
+                self.remove_path_hash(docid, &old_path);
+                self.remove_parent(docid, &old_path);
             }
 
-            let Some((new_off, new_len)) = self.arena.write().push_bytes(&new_rel_bytes) else {
+            // posting/path_hash 先写（与 query 锁顺序一致）。
+            self.insert_trigrams(docid, meta.path.as_path());
+            self.insert_path_hash(docid, meta.path.as_path());
+            self.insert_parent(docid, meta.path.as_path());
+
+            // M4-C: rename 写入 BaseDelta（不再写 metas+arena）。
+            let renamed = self.maybe_rename_in_delta(
+                docid,
+                fkey,
+                new_root_id,
+                &new_rel_bytes,
+                meta.size,
+                mtime_to_ns(meta.mtime),
+            );
+            if !renamed {
+                // 新 path 太长 / arena 溢出：把旧 docid tombstone 掉，避免 query 看到
+                // 半 rename 的"旧 path 在 trigram、entry 还指向旧"的不一致状态。
                 self.tombstones.write().insert(docid);
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
-            };
-
-            // posting/path_hash 先写（与 query 锁顺序一致：trigram -> metas）
-            self.insert_trigrams(docid, meta.path.as_path());
-            self.insert_path_hash(docid, meta.path.as_path());
-
-            let mut metas = self.metas.write();
-            if let Some(existing) = metas.get_mut(docid as usize) {
-                existing.root_id = new_root_id;
-                existing.path_off = new_off;
-                existing.path_len = new_len;
-                existing.size = meta.size;
-                existing.mtime_ns = mtime_to_ns(meta.mtime);
-            } else {
-                // 极端情况：docid 槽位不存在，降级为 append
-                if let Some(docid_new) = self.alloc_docid(
-                    fkey,
-                    new_root_id,
-                    &new_rel_bytes,
-                    meta.size,
-                    mtime_to_ns(meta.mtime),
-                ) {
-                    self.insert_trigrams(docid_new, meta.path.as_path());
-                    self.insert_path_hash(docid_new, meta.path.as_path());
-                }
             }
 
-            // rename 视为“存在且活跃”
+            // rename 视为"存在且活跃"
             self.tombstones.write().remove(docid);
             self.dirty.store(true, std::sync::atomic::Ordering::Release);
             return;
@@ -705,9 +682,15 @@ impl PersistentIndex {
         };
         self.insert_trigrams(docid, meta.path.as_path());
         self.insert_path_hash(docid, meta.path.as_path());
+        self.insert_parent(docid, meta.path.as_path());
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// M4-C：分配新 docid，仅写 BaseDelta 一处（不再走 metas+arena）。
+    ///
+    /// docid = `base_count + delta.added.len()` （写之前的快照），
+    /// 然后 [`DeltaBuffer::append_added`] 强制 push（**不**走 upsert_added，避免同
+    /// file_key 原地替换破坏 docid 对齐——recreate-after-delete 也得拿一个新 docid）。
     fn alloc_docid(
         &self,
         file_key: FileKey,
@@ -716,136 +699,201 @@ impl PersistentIndex {
         size: u64,
         mtime_ns: i64,
     ) -> Option<DocId> {
-        let (off, len) = self.arena.write().push_bytes(rel_bytes)?;
-
-        let mut metas = self.metas.write();
-        let docid: DocId = metas.len() as DocId;
-        metas.push(CompactMeta {
-            file_key,
-            root_id,
-            path_off: off,
-            path_len: len,
-            size,
-            mtime_ns,
-        });
+        let abs_bytes =
+            compose_abs_path_bytes(root_bytes_for_id(&self.roots_bytes, root_id), rel_bytes);
+        let docid = {
+            let mut bd = self.base_delta.write();
+            let base_count = bd.base.by_path_idx().len() as u64;
+            let docid = base_count + bd.delta.added().len() as u64;
+            if !bd.delta.append_added(file_key, &abs_bytes, size, mtime_ns) {
+                return None;
+            }
+            docid
+        };
 
         self.filekey_to_docid.write().insert(file_key, docid);
         self.tombstones.write().remove(docid);
+
+        // 注：parent_index 在调用方（upsert_inner / 提供完整 abs_path 的位置）维护，
+        // 这里不重复插入，避免重新组装 absolute path。
         Some(docid)
+    }
+
+    /// M4-C：更新某 docid 对应 entry 的 size+mtime（path 保持原样）。
+    /// 用于 same_path 重复上报、hardlink 等元数据-only 更新场景。
+    /// - docid < base_count：base 段 immutable，**当前不更新**——FileEntry.size/mtime
+    ///   会有轻微 staleness 直到下次 snapshot/merge。常见场景下 base 段只在启动时
+    ///   从 v7 加载、运行时极少接收元数据更新，影响可忽略。
+    /// - docid >= base_count：delta 段，直接 update_added_at 原地刷新。
+    fn update_meta_in_delta(
+        &self,
+        legacy_docid: DocId,
+        file_key: FileKey,
+        path_bytes: &[u8],
+        size: u64,
+        mtime_ns: i64,
+    ) {
+        let mut bd = self.base_delta.write();
+        let base_count = bd.base.by_path_idx().len() as u64;
+        if legacy_docid < base_count {
+            // base 段元数据 stale，留待下次 snapshot 重建。
+            return;
+        }
+        let idx = (legacy_docid - base_count) as usize;
+        bd.delta
+            .update_added_at(idx, file_key, path_bytes, size, mtime_ns);
+    }
+
+    /// M3 双写：根据 legacy docid 在 BaseDelta 空间标记删除。
+    /// - docid < base_count：base 段，调 `delta.mark_removed`
+    /// - docid >= base_count：delta 段——**不**物理 drop，仅依赖 legacy `tombstones`
+    ///   位图过滤。
+    ///
+    /// 不能 swap_remove 的原因：Legacy docid 与 `delta.added` 的下标在 delta 段是
+    /// `docid - base_count = idx` 这条对齐关系。任何 swap_remove 都会让后续条目的
+    /// 下标移位，从而打破 [`Self::resolve_entry_via_base_delta`] 等以 docid → idx
+    /// 直接定位的读路径。
+    ///
+    /// 副作用：`delta.added` 会保留已删除条目（被 tombstones 过滤但物理仍在）。
+    /// 这部分"幽灵"由后续 snapshot/merge 时再次过滤——见
+    /// [`Self::to_snapshot_v7`]，它走 metas+tombstones 已自动跳过；merge_with_delta
+    /// 路径若启用，需要在那里读 legacy tombstones 做对齐过滤。
+    fn maybe_mark_base_delta_removed(&self, legacy_docid: DocId, _file_key: FileKey) {
+        let mut bd = self.base_delta.write();
+        let base_count = bd.base.by_path_idx().len() as u64;
+        if legacy_docid < base_count {
+            bd.delta.mark_removed(legacy_docid);
+        }
+        // delta 段：保留物理 entry，由 legacy tombstones 在查询层过滤。
+    }
+
+    /// M3/M4-C 双写：同步 rename。新 path 落入 delta.added。
+    /// 返回 true 表示成功；false 表示路径过长/arena 满，调用方应把 docid 设为 tombstone。
+    /// - docid < base_count：mark_removed(docid) + delta.append_added(new path) (push 新位置)
+    /// - docid >= base_count：delta.update_added_at(idx, ...) —— 原地刷新当前 docid 对应 entry
+    fn maybe_rename_in_delta(
+        &self,
+        legacy_docid: DocId,
+        file_key: FileKey,
+        new_root_id: u16,
+        new_rel_bytes: &[u8],
+        size: u64,
+        mtime_ns: i64,
+    ) -> bool {
+        let abs_bytes = compose_abs_path_bytes(
+            root_bytes_for_id(&self.roots_bytes, new_root_id),
+            new_rel_bytes,
+        );
+        let mut bd = self.base_delta.write();
+        let base_count = bd.base.by_path_idx().len() as u64;
+        if legacy_docid < base_count {
+            // base 段：当前 docid 在 base，无法原地修改。mark_removed 屏蔽旧条目，
+            // append 新条目到 delta（注意 docid 不再对齐——见上方 update_meta_in_delta 注释）。
+            bd.delta.mark_removed(legacy_docid);
+            bd.delta.append_added(file_key, &abs_bytes, size, mtime_ns)
+        } else {
+            let idx = (legacy_docid - base_count) as usize;
+            bd.delta
+                .update_added_at(idx, file_key, &abs_bytes, size, mtime_ns)
+        }
     }
 
     /// 标记删除（tombstone）
     pub fn mark_deleted(&self, file_key: FileKey) {
-        let docid = { self.filekey_to_docid.read().get(&file_key).copied() };
-        let Some(docid) = docid else {
+        let Some(docid) = self.lookup_docid_by_filekey(file_key) else {
             return;
         };
 
-        let path = {
-            let metas = self.metas.read();
-            metas
-                .get(docid as usize)
-                .and_then(|m| self.absolute_path_buf(m.root_id, m.path_off, m.path_len))
-        };
+        // M2: 走统一 helper。BaseDelta 启用时从 base+delta 解析；否则 metas+arena。
+        let path = self.resolve_abs_path_for_docid(docid);
 
         // Atomicity: mark tombstone first so queries see deleted before trigrams are removed.
         self.filekey_to_docid.write().remove(&file_key);
         self.tombstones.write().insert(docid);
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
 
+        // M3: 同步 BaseDelta（如启用）—— legacy docid 在 BaseDelta 空间里要么属于 base，
+        // 要么属于 delta.added，分别对应 mark_removed / drop_added_by_file_key。
+        self.maybe_mark_base_delta_removed(docid, file_key);
+
         if let Some(p) = path {
             self.remove_trigrams(docid, &p);
             self.remove_path_hash(docid, &p);
+            self.remove_parent(docid, &p);
         }
     }
 
-    /// 按路径删除
+    /// 按路径删除（M4-B：file_key 从 BaseDelta 拿）
     pub fn mark_deleted_by_path(&self, path: &Path) {
         if let Some(docid) = self.lookup_docid_by_path(path) {
-            let file_key = {
-                let metas = self.metas.read();
-                metas.get(docid as usize).map(|m| m.file_key)
-            };
-            if let Some(k) = file_key {
-                self.mark_deleted(k);
+            if let Some((fk, _, _, _)) = self.resolve_entry_via_base_delta(docid) {
+                self.mark_deleted(fk);
             }
         }
     }
 
     /// 查询：trigram 候选集（Roaring 交集）→ 精确过滤
+    ///
+    /// M4-B：数据源切到 BaseDelta（base + delta.added），不再读 metas+arena。
     pub fn query(&self, matcher: &dyn Matcher, limit: usize) -> Vec<FileMeta> {
-        // 重要：先读取 trigram_index 计算候选集，再读取 metas/tombstones/arena。
-        // 写入路径通常是先更新 trigram_index 再更新 metas，如果这里反过来拿锁，
-        // 在“边写边查”场景下可能形成死锁。
+        // 重要：先读取 trigram_index 计算候选集，再读取 base_delta/tombstones。
+        // 写入路径通常是先更新 trigram_index 再更新 base_delta，如果这里反过来拿锁，
+        // 在"边写边查"场景下可能形成死锁。
         let candidates = self
             .trigram_candidates(matcher)
             .or_else(|| self.short_hint_candidates(matcher));
 
-        let metas = self.metas.read();
-        let arena = self.arena.read();
+        let bd = self.base_delta.read();
         let tombstones = self.tombstones.read();
+        let base_count = bd.base.by_path_idx().len() as u64;
+        let total = base_count + bd.delta.added().len() as u64;
+
+        let try_resolve = |docid: u64| -> Option<(FileKey, Vec<u8>, u64, i64)> {
+            if docid < base_count {
+                let entry = bd.base.by_path_idx().entries().get(docid as usize)?;
+                let abs = bd.base.resolve_path(docid)?;
+                Some((entry.file_key(), abs, entry.size, entry.mtime_ns))
+            } else {
+                let idx = (docid - base_count) as usize;
+                let entry = bd.delta.added().get(idx)?;
+                let abs = bd.delta.added_path_bytes(idx)?.to_vec();
+                Some((entry.file_key(), abs, entry.size, entry.mtime_ns))
+            }
+        };
+
+        let into_meta = |fk: FileKey, abs: Vec<u8>, size: u64, mtime_ns: i64| FileMeta {
+            file_key: fk,
+            path: pathbuf_from_encoded_vec(abs),
+            size,
+            mtime: mtime_from_ns(mtime_ns),
+            ctime: None,
+            atime: None,
+        };
 
         match candidates {
             Some(bitmap) => bitmap
                 .iter()
                 .filter(|docid| !tombstones.contains(*docid))
-                .filter_map(|docid| metas.get(docid as usize).map(|m| (docid, m)))
-                .filter(|(_, m)| {
-                    let rel = arena.get_bytes(m.path_off, m.path_len).unwrap_or(&[]);
-                    let abs = compose_abs_path_bytes(
-                        root_bytes_for_id(&self.roots_bytes, m.root_id),
-                        rel,
-                    );
-                    let s = std::str::from_utf8(&abs)
+                .filter_map(&try_resolve)
+                .filter(|(_, abs, _, _)| {
+                    let s = std::str::from_utf8(abs)
                         .map(std::borrow::Cow::Borrowed)
-                        .unwrap_or_else(|_| String::from_utf8_lossy(&abs));
+                        .unwrap_or_else(|_| String::from_utf8_lossy(abs));
                     matcher.matches(&s)
                 })
-                .filter_map(|(_, m)| {
-                    let rel = arena.get_bytes(m.path_off, m.path_len)?;
-                    let path =
-                        compose_abs_path_buf(root_bytes_for_id(&self.roots_bytes, m.root_id), rel);
-                    Some(FileMeta {
-                        file_key: m.file_key,
-                        path,
-                        size: m.size,
-                        mtime: mtime_from_ns(m.mtime_ns),
-                        ctime: None,
-                        atime: None,
-                    })
-                })
+                .map(|(fk, abs, size, mtime_ns)| into_meta(fk, abs, size, mtime_ns))
                 .collect(),
             None => {
                 // 无法用 trigram 加速（查询词太短），全量过滤
-                metas
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, m)| {
-                        let docid: DocId = i as DocId;
-                        if tombstones.contains(docid) {
-                            return None;
-                        }
-                        let rel = arena.get_bytes(m.path_off, m.path_len).unwrap_or(&[]);
-                        let abs = compose_abs_path_bytes(
-                            root_bytes_for_id(&self.roots_bytes, m.root_id),
-                            rel,
-                        );
+                (0..total)
+                    .filter(|docid| !tombstones.contains(*docid))
+                    .filter_map(try_resolve)
+                    .filter_map(|(fk, abs, size, mtime_ns)| {
                         let s = std::str::from_utf8(&abs)
                             .map(std::borrow::Cow::Borrowed)
                             .unwrap_or_else(|_| String::from_utf8_lossy(&abs));
                         if matcher.matches(&s) {
-                            let path = compose_abs_path_buf(
-                                root_bytes_for_id(&self.roots_bytes, m.root_id),
-                                rel,
-                            );
-                            Some(FileMeta {
-                                file_key: m.file_key,
-                                path,
-                                size: m.size,
-                                mtime: mtime_from_ns(m.mtime_ns),
-                                ctime: None,
-                                atime: None,
-                            })
+                            Some(into_meta(fk, abs, size, mtime_ns))
                         } else {
                             None
                         }
@@ -857,32 +905,58 @@ impl PersistentIndex {
     }
 
     /// 遍历所有"活跃"文档（跳过 tombstone），用于 Flush/Compaction/重建等离线流程。
+    /// M4-B：数据源切到 BaseDelta。
+    /// Phase 4：base 半段走 path_table.for_each_path 顺序扫描（query "" 与 snapshot
+    /// 合并都会调到这里，每次省 ~30× CPU on 8M 文件）。
     pub fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
-        let metas = self.metas.read();
-        let arena = self.arena.read();
+        let bd = self.base_delta.read();
         let tombstones = self.tombstones.read();
+        let base_entries = bd.base.by_path_idx().entries();
+        let base_count = base_entries.len() as u64;
 
-        for (i, m) in metas.iter().enumerate() {
-            let docid: DocId = i as DocId;
-            if tombstones.contains(docid) {
-                continue;
-            }
-            let Some(rel) = arena.get_bytes(m.path_off, m.path_len) else {
-                continue;
-            };
-            let path = compose_abs_path_buf(root_bytes_for_id(&self.roots_bytes, m.root_id), rel);
+        let mut emit = |fk: FileKey, abs_bytes: &[u8], size: u64, mtime_ns: i64| {
             f(FileMeta {
-                file_key: m.file_key,
-                path,
-                size: m.size,
-                mtime: mtime_from_ns(m.mtime_ns),
+                file_key: fk,
+                path: pathbuf_from_encoded_vec(abs_bytes.to_vec()),
+                size,
+                mtime: mtime_from_ns(mtime_ns),
                 ctime: None,
                 atime: None,
             });
+        };
+
+        bd.base.path_table().for_each_path(|path_idx, abs_bytes| {
+            let docid = path_idx as u64;
+            if tombstones.contains(docid) {
+                return;
+            }
+            let Some(entry) = base_entries.get(path_idx as usize) else {
+                return;
+            };
+            emit(entry.file_key(), abs_bytes, entry.size, entry.mtime_ns);
+        });
+
+        for idx in 0..bd.delta.added().len() {
+            let docid = base_count + idx as u64;
+            if tombstones.contains(docid) {
+                continue;
+            }
+            let Some(entry) = bd.delta.added().get(idx) else {
+                continue;
+            };
+            let Some(abs_bytes) = bd.delta.added_path_bytes(idx) else {
+                continue;
+            };
+            emit(entry.file_key(), abs_bytes, entry.size, entry.mtime_ns);
         }
     }
 
     /// Iterate live metas whose path's parent is in `dirs`.
+    ///
+    /// 旧实现是 O(N_total_metas) 全量扫描，每条还要重组 abs_path 与执行 `dirs.contains`，
+    /// 是 `重构方案包/causal-chain-report.md` 第三节排名第一（★★★★★）的 CPU/内存杀手。
+    /// 现在改用 [`ParentIndex`] 倒排索引：先按 dir 哈希拿到候选 DocId 位图，再做
+    /// tombstone 差集 + 防御性 parent 字符串校验（避免 hash collision 导致误回调）。
     pub fn for_each_live_meta_in_dirs<F>(
         &self,
         dirs: &std::collections::HashSet<PathBuf>,
@@ -890,32 +964,54 @@ impl PersistentIndex {
     ) where
         F: FnMut(FileMeta),
     {
-        let metas = self.metas.read();
-        let arena = self.arena.read();
-        let tombstones = self.tombstones.read();
-        for (i, m) in metas.iter().enumerate() {
-            let docid = i as DocId;
-            if tombstones.contains(docid) {
+        if dirs.is_empty() {
+            return;
+        }
+
+        // 1) 按目录哈希取候选 DocIds 并集，**不**持有 parent_index 锁做后续工作。
+        let parent_hashes: Vec<u64> = dirs
+            .iter()
+            .map(|d| path_hash_bytes(d.as_os_str().as_encoded_bytes()))
+            .collect();
+        let candidates = {
+            let pi = self.parent_index.read();
+            pi.files_in_dirs(parent_hashes)
+        };
+        if candidates.is_empty() {
+            return;
+        }
+
+        // 2) 减去墓碑后再展开。tombstones 这里是只读快照。
+        let live = {
+            let tombstones = self.tombstones.read();
+            &candidates - &*tombstones
+        };
+        if live.is_empty() {
+            return;
+        }
+
+        // 3) 重组绝对路径并发回。注意防御性：哈希碰撞时父目录字符串可能不匹配，
+        //   退化为旧版 `dirs.contains(parent)` 校验。
+        // M4-B: 走 BaseDelta 一次性拿 (file_key, abs, size, mtime)，每条 docid
+        // 只加一次 base_delta 锁。
+        for docid in live.iter() {
+            let Some((file_key, abs, size, mtime_ns)) = self.resolve_entry_via_base_delta(docid)
+            else {
+                continue;
+            };
+            let path = pathbuf_from_encoded_vec(abs);
+            let parent_matches = path.parent().map(|p| dirs.contains(p)).unwrap_or(false);
+            if !parent_matches {
                 continue;
             }
-            let rel = match arena.get_bytes(m.path_off, m.path_len) {
-                Some(r) => r,
-                None => continue,
-            };
-            let abs = compose_abs_path_bytes(root_bytes_for_id(&self.roots_bytes, m.root_id), rel);
-            let path = pathbuf_from_encoded_vec(abs.to_vec());
-            if let Some(parent) = path.parent() {
-                if dirs.contains(parent) {
-                    callback(FileMeta {
-                        file_key: m.file_key,
-                        path,
-                        size: m.size,
-                        mtime: mtime_from_ns(m.mtime_ns),
-                        ctime: None,
-                        atime: None,
-                    });
-                }
-            }
+            callback(FileMeta {
+                file_key,
+                path,
+                size,
+                mtime: mtime_from_ns(mtime_ns),
+                ctime: None,
+                atime: None,
+            });
         }
     }
 
@@ -957,12 +1053,8 @@ impl PersistentIndex {
     }
 
     fn existing_path_for_file_key(&self, fk: FileKey) -> Option<PathBuf> {
-        let docid = { self.filekey_to_docid.read().get(&fk).copied()? };
-        let metas = self.metas.read();
-        match metas.get(docid as usize) {
-            Some(m) => self.absolute_path_buf(m.root_id, m.path_off, m.path_len),
-            None => None,
-        }
+        let docid = self.lookup_docid_by_filekey(fk)?;
+        self.resolve_abs_path_for_docid(docid)
     }
 
     fn apply_event_ref(&self, ev: &EventRecord) {
@@ -1109,7 +1201,7 @@ impl PersistentIndex {
         };
 
         let docid_opt = if let Some(fk) = from_fid {
-            self.filekey_to_docid.read().get(&fk).copied()
+            self.lookup_docid_by_filekey(fk)
         } else {
             from_best_path
                 .as_deref()
@@ -1117,45 +1209,48 @@ impl PersistentIndex {
         };
 
         if let Some(docid) = docid_opt {
-            let old = {
-                let metas = self.metas.read();
-                metas.get(docid as usize).cloned()
+            // M4-C: 走 BaseDelta 拿当前 entry。若 docid 在 BaseDelta 也不存在，跳过。
+            let Some((file_key, _, cur_size, cur_mtime_ns)) =
+                self.resolve_entry_via_base_delta(docid)
+            else {
+                return;
             };
 
-            if let Some(mut m) = old {
-                if let Some(old_path) = self.absolute_path_buf(m.root_id, m.path_off, m.path_len) {
-                    self.remove_trigrams(docid, &old_path);
-                    self.remove_path_hash(docid, &old_path);
-                } else if let Some(ref path) = from_best_path {
-                    self.remove_trigrams(docid, path);
-                    self.remove_path_hash(docid, path);
-                }
-
-                if let Some(to_path) = to_path {
-                    let to_path = to_path.into_owned();
-                    let (root_id, rel_bytes) = self.split_root_relative_bytes(to_path.as_path());
-                    if let Some((off, len)) = self.arena.write().push_bytes(&rel_bytes) {
-                        m.root_id = root_id;
-                        m.path_off = off;
-                        m.path_len = len;
-                    }
-                    if let Some(meta) = to_meta {
-                        m.size = meta.size;
-                        m.mtime_ns = mtime_to_ns(meta.mtime);
-                    }
-                    self.insert_trigrams(docid, to_path.as_path());
-                    self.insert_path_hash(docid, to_path.as_path());
-                } else if let Some(meta) = fallback_meta {
-                    m.size = meta.size;
-                    m.mtime_ns = mtime_to_ns(meta.mtime);
-                }
-
-                if let Some(slot) = self.metas.write().get_mut(docid as usize) {
-                    *slot = m;
-                }
-                self.tombstones.write().remove(docid);
-                self.dirty.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(old_path) = self.resolve_abs_path_for_docid(docid) {
+                self.remove_trigrams(docid, &old_path);
+                self.remove_path_hash(docid, &old_path);
+            } else if let Some(ref path) = from_best_path {
+                self.remove_trigrams(docid, path);
+                self.remove_path_hash(docid, path);
             }
+
+            if let Some(to_path) = to_path {
+                let to_path = to_path.into_owned();
+                let (root_id, rel_bytes) = self.split_root_relative_bytes(to_path.as_path());
+                let (size, mtime_ns) = if let Some(meta) = to_meta {
+                    (meta.size, mtime_to_ns(meta.mtime))
+                } else {
+                    (cur_size, cur_mtime_ns)
+                };
+                self.insert_trigrams(docid, to_path.as_path());
+                self.insert_path_hash(docid, to_path.as_path());
+                // M4-C: rename 写入 BaseDelta（不再写 metas+arena）。
+                self.maybe_rename_in_delta(docid, file_key, root_id, &rel_bytes, size, mtime_ns);
+            } else if let Some(meta) = fallback_meta {
+                // 仅元数据更新（rename 没拿到 to_path，但 from_path 还在）。
+                let abs_bytes = self
+                    .resolve_abs_path_bytes_for_docid(docid)
+                    .unwrap_or_default();
+                self.update_meta_in_delta(
+                    docid,
+                    file_key,
+                    &abs_bytes,
+                    meta.size,
+                    mtime_to_ns(meta.mtime),
+                );
+            }
+            self.tombstones.write().remove(docid);
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
 
@@ -1169,26 +1264,6 @@ impl PersistentIndex {
                 ctime: None,
                 atime: None,
             });
-        }
-    }
-
-    /// 导出 v5 快照数据
-    pub fn export_snapshot_v5(&self) -> IndexSnapshotV5 {
-        let arena = self.arena.read().clone();
-        let metas = self.metas.read().clone();
-        let tombstones = self
-            .tombstones
-            .read()
-            .iter()
-            .map(|v| v as u32)
-            .collect::<Vec<u32>>();
-        self.dirty
-            .store(false, std::sync::atomic::Ordering::Release);
-        IndexSnapshotV5 {
-            roots_hash: self.roots_hash(),
-            arena,
-            metas,
-            tombstones,
         }
     }
 
@@ -1212,30 +1287,57 @@ impl PersistentIndex {
             roots_bytes.extend_from_slice(&rb[..len as usize]);
         }
 
-        // PathArena 段：raw bytes（root-relative）
-        let path_arena_bytes = Arc::clone(&self.arena.read().data);
-
-        // Metas 段：按 DocId 顺序顺排，固定记录大小（little-endian）
+        // M4-C: PathArena + Metas 段：从 BaseDelta 现场 synthesize v6 二进制布局。
         //
-        // MetaRecordV6:
-        //   dev u64
-        //   ino u64
-        //   root_id u16
-        //   path_off u32
-        //   path_len u16
-        //   size u64
-        //   mtime_unix_ns i64 (-1 表示 None)
-        let metas = self.metas.read();
-        let mut metas_bytes = Vec::with_capacity(metas.len() * 40);
-        for m in metas.iter() {
-            metas_bytes.extend_from_slice(&m.file_key.dev.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.file_key.ino.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.root_id.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.path_off.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.path_len.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.size.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.mtime_ns.to_le_bytes());
-        }
+        // MetaRecordV6 (40B):
+        //   dev u64, ino u64, root_id u16, path_off u32, path_len u16, size u64, mtime_unix_ns i64
+        //
+        // 注意：v6 metas 段必须按 DocId 顺序排列，与 PathArena 偏移一一对应。
+        // Phase 4：base 半段走 path_table.for_each_path（O(data_len) 单次扫描），
+        // 比逐条 resolve_path 省 ~30× CPU（8M 文件场景）；delta 半段保持索引访问。
+        let (metas_bytes, path_arena_bytes_vec) = {
+            let bd = self.base_delta.read();
+            let base_entries = bd.base.by_path_idx().entries();
+            let base_count = base_entries.len() as u64;
+            let total = base_count + bd.delta.added().len() as u64;
+
+            let mut metas_bytes = Vec::with_capacity(total as usize * 40);
+            let mut tmp_arena = V6ExportArena::new();
+            let mut emit = |file_key: FileKey, abs_bytes: &[u8], size: u64, mtime_ns: i64| {
+                let abs_path = pathbuf_from_encoded_vec(abs_bytes.to_vec());
+                let (root_id, rel_bytes) = self.split_root_relative_bytes(&abs_path);
+                let Some((path_off, path_len)) = tmp_arena.push_bytes(&rel_bytes) else {
+                    return;
+                };
+                metas_bytes.extend_from_slice(&file_key.dev.to_le_bytes());
+                metas_bytes.extend_from_slice(&file_key.ino.to_le_bytes());
+                metas_bytes.extend_from_slice(&root_id.to_le_bytes());
+                metas_bytes.extend_from_slice(&path_off.to_le_bytes());
+                metas_bytes.extend_from_slice(&path_len.to_le_bytes());
+                metas_bytes.extend_from_slice(&size.to_le_bytes());
+                metas_bytes.extend_from_slice(&mtime_ns.to_le_bytes());
+            };
+            // Base 半段：path_idx == docid，path_table 顺序扫描 + 同步索引到 entries。
+            bd.base.path_table().for_each_path(|path_idx, abs_bytes| {
+                let Some(entry) = base_entries.get(path_idx as usize) else {
+                    return;
+                };
+                emit(entry.file_key(), abs_bytes, entry.size, entry.mtime_ns);
+            });
+            // Delta 半段：原索引访问保持不变。
+            for idx in 0..bd.delta.added().len() {
+                let Some(entry) = bd.delta.added().get(idx) else {
+                    continue;
+                };
+                let Some(abs_bytes) = bd.delta.added_path_bytes(idx) else {
+                    continue;
+                };
+                emit(entry.file_key(), abs_bytes, entry.size, entry.mtime_ns);
+            }
+            let _ = total;
+            (metas_bytes, Arc::new(tmp_arena.into_bytes()))
+        };
+        let path_arena_bytes = path_arena_bytes_vec;
 
         // Tombstones 段：RoaringBitmap serialized bytes（v6 兼容格式；v8 后再切 Treemap）
         let tombstones = self.tombstones.read();
@@ -1308,11 +1410,8 @@ impl PersistentIndex {
         //   generation u32
         //   docid u32
         //
-        // 注意：来源为 filekey_to_docid（天然排除 tombstone）。
-        let mut pairs: Vec<(FileKey, DocId)> = {
-            let m = self.filekey_to_docid.read();
-            m.iter().map(|(k, v)| (*k, *v)).collect()
-        };
+        // Phase 4：base 段 file_key 现在从 BaseIndex.by_file_key 枚举，HashMap 仅承载 delta。
+        let mut pairs = self.collect_filekey_docid_pairs();
         pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino, k.generation));
         const FKM_MAGIC: [u8; 4] = *b"FKM\0";
         const FKM_VERSION: u16 = 1;
@@ -1384,24 +1483,49 @@ impl PersistentIndex {
         }
         Self::write_segment(writer, &roots_bytes)?;
 
-        // PathArena 段：raw bytes（root-relative）
-        let arena_guard = self.arena.read();
-        let path_arena_bytes = arena_guard.data.as_ref();
-        Self::write_segment(writer, path_arena_bytes)?;
+        // M4-C: PathArena + Metas 段从 BaseDelta synthesize（与 export_segments_v6 同逻辑）。
+        // Phase 4：base 走 path_table.for_each_path 顺序扫描，省 ~30× CPU（8M 文件场景）。
+        let (metas_bytes, path_arena_bytes) = {
+            let bd = self.base_delta.read();
+            let base_entries = bd.base.by_path_idx().entries();
+            let base_count = base_entries.len() as u64;
+            let total = base_count + bd.delta.added().len() as u64;
 
-        // Metas 段：按 DocId 顺序顺排，固定记录大小（little-endian）
-        let metas = self.metas.read();
-        let mut metas_bytes = Vec::with_capacity(metas.len() * 40);
-        for m in metas.iter() {
-            metas_bytes.extend_from_slice(&m.file_key.dev.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.file_key.ino.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.root_id.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.path_off.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.path_len.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.size.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.mtime_ns.to_le_bytes());
-        }
-        drop(metas);
+            let mut metas_bytes = Vec::with_capacity(total as usize * 40);
+            let mut tmp_arena = V6ExportArena::new();
+            let mut emit = |file_key: FileKey, abs_bytes: &[u8], size: u64, mtime_ns: i64| {
+                let abs_path = pathbuf_from_encoded_vec(abs_bytes.to_vec());
+                let (root_id, rel_bytes) = self.split_root_relative_bytes(&abs_path);
+                let Some((path_off, path_len)) = tmp_arena.push_bytes(&rel_bytes) else {
+                    return;
+                };
+                metas_bytes.extend_from_slice(&file_key.dev.to_le_bytes());
+                metas_bytes.extend_from_slice(&file_key.ino.to_le_bytes());
+                metas_bytes.extend_from_slice(&root_id.to_le_bytes());
+                metas_bytes.extend_from_slice(&path_off.to_le_bytes());
+                metas_bytes.extend_from_slice(&path_len.to_le_bytes());
+                metas_bytes.extend_from_slice(&size.to_le_bytes());
+                metas_bytes.extend_from_slice(&mtime_ns.to_le_bytes());
+            };
+            bd.base.path_table().for_each_path(|path_idx, abs_bytes| {
+                let Some(entry) = base_entries.get(path_idx as usize) else {
+                    return;
+                };
+                emit(entry.file_key(), abs_bytes, entry.size, entry.mtime_ns);
+            });
+            for idx in 0..bd.delta.added().len() {
+                let Some(entry) = bd.delta.added().get(idx) else {
+                    continue;
+                };
+                let Some(abs_bytes) = bd.delta.added_path_bytes(idx) else {
+                    continue;
+                };
+                emit(entry.file_key(), abs_bytes, entry.size, entry.mtime_ns);
+            }
+            let _ = total;
+            (metas_bytes, Arc::new(tmp_arena.into_bytes()))
+        };
+        Self::write_segment(writer, path_arena_bytes.as_ref())?;
         Self::write_segment(writer, &metas_bytes)?;
 
         // Tombstones 段：RoaringBitmap serialized bytes
@@ -1458,11 +1582,8 @@ impl PersistentIndex {
         Self::write_segment(writer, &trigram_table_bytes)?;
         Self::write_segment(writer, &postings_blob_bytes)?;
 
-        // FileKeyMap 段
-        let mut pairs: Vec<(FileKey, DocId)> = {
-            let m = self.filekey_to_docid.read();
-            m.iter().map(|(k, v)| (*k, *v)).collect()
-        };
+        // FileKeyMap 段（参见 export_segments_v6 同段说明）。
+        let mut pairs = self.collect_filekey_docid_pairs();
         pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino, k.generation));
         const FKM_MAGIC: [u8; 4] = *b"FKM\0";
         const FKM_VERSION: u16 = 1;
@@ -1517,7 +1638,8 @@ impl PersistentIndex {
     }
 
     pub fn file_count(&self) -> usize {
-        let total = self.metas.read().len();
+        let bd = self.base_delta.read();
+        let total = bd.base.by_path_idx().len() + bd.delta.added().len();
         let tomb = self.tombstones.read().len() as usize;
         total.saturating_sub(tomb)
     }
@@ -1526,15 +1648,16 @@ impl PersistentIndex {
     pub fn memory_stats(&self) -> L2Stats {
         use std::mem::size_of;
 
-        let metas = self.metas.read();
+        let bd = self.base_delta.read();
         let filekey_to_docid = self.filekey_to_docid.read();
         let path_hash_to_id = self.path_hash_to_id.read();
         let trigram_index = self.trigram_index.read();
         let short_component_index = self.short_component_index.read();
         let tombstones = self.tombstones.read();
-        let arena = self.arena.read();
 
-        let total_docs = metas.len();
+        // M4-C: 内存统计走 BaseDelta（base.estimated_bytes() + delta.estimated_bytes()）
+        // 替代 metas+arena 估算。
+        let total_docs = bd.base.by_path_idx().len() + bd.delta.added().len();
         let tombstone_count = tombstones.len() as usize;
         let file_count = total_docs.saturating_sub(tombstone_count);
 
@@ -1555,17 +1678,18 @@ impl PersistentIndex {
         // - 这是“近似占用”，不包含 allocator 产生的碎片/空闲块（RSS 高水位常驻的主要来源）。
         // - HashMap 的真实 bucket/ctrl 布局由 hashbrown 决定，这里按“entry + 1B ctrl”做近似。
 
-        // metas: Vec<CompactMeta>
-        let metas_bytes = metas.capacity() as u64 * size_of::<CompactMeta>() as u64
-            + size_of::<Vec<CompactMeta>>() as u64;
+        // BaseDelta（base+delta）的内存占用——取代旧的 metas+arena 估算。
+        // base.estimated_bytes() = path_table + by_path_idx*2 + parent_index + tombstones
+        // delta.estimated_bytes() = path_arena + added vec + lens vec + removed bitmap
+        let metas_bytes = bd.base.estimated_bytes() + bd.delta.estimated_bytes();
 
         // mapping: HashMap<FileKey, DocId>
         let map_entry_bytes = size_of::<(FileKey, DocId)>() as u64;
         let filekey_to_docid_bytes = filekey_to_docid.len() as u64 * (map_entry_bytes + 1)
             + size_of::<HashMap<FileKey, DocId>>() as u64;
 
-        // arena：Vec<u8>
-        let arena_bytes = arena.data.capacity() as u64 + size_of::<Vec<u8>>() as u64;
+        // arena 字段已删除——占位为 0 兼容 L2Stats 结构。
+        let arena_bytes: u64 = 0;
 
         // path hash 反查：HashMap<u64, OneOrManyDocId> + Many 的 Vec<DocId> 堆分配
         let path_entry_bytes = size_of::<(u64, OneOrManyDocId)>() as u64;
@@ -1614,11 +1738,11 @@ impl PersistentIndex {
             trigram_distinct,
             trigram_postings_total,
             tombstone_count,
-            metas_capacity: metas.capacity(),
+            metas_capacity: total_docs,
             filekey_to_docid_capacity: filekey_to_docid.len(),
             path_hash_to_id_capacity: path_hash_to_id.len(),
             trigram_index_capacity: trigram_index.capacity(),
-            arena_capacity: arena.data.capacity(),
+            arena_capacity: 0,
 
             core_table_bytes,
             metas_bytes,
@@ -1649,24 +1773,15 @@ impl PersistentIndex {
         self.short_component_index.write().clear();
         self.path_hash_to_id.write().clear();
         self.filekey_to_docid.write().clear();
-        self.metas.write().clear();
-        Arc::make_mut(&mut self.arena.write().data).clear();
+        *self.base_delta.write() = BaseDeltaKernel {
+            base: Arc::new(BaseIndex::empty()),
+            delta: DeltaBuffer::new(),
+        };
         self.tombstones.write().clear();
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 
     // ── 内部方法 ──
-
-    fn roots_hash(&self) -> u64 {
-        // 稳定哈希：按 root bytes 顺序（含 "/" 兜底 + 其余 root 的排序规则）拼接后 hash。
-        // 目的：避免 root 顺序变化导致 root_id 解释错位。
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for b in &self.roots_bytes {
-            b.hash(&mut hasher);
-            0xff_u8.hash(&mut hasher); // 分隔符，避免 ["ab","c"] 与 ["a","bc"] 冲突
-        }
-        hasher.finish()
-    }
 
     fn split_root_relative_bytes(&self, abs_path: &Path) -> (u16, Vec<u8>) {
         // 选择“最长匹配”的 root（避免 /home 与 /home/user 的歧义）。
@@ -1700,13 +1815,95 @@ impl PersistentIndex {
         (root_id, rel_bytes)
     }
 
-    fn absolute_path_buf(&self, root_id: u16, off: u32, len: u16) -> Option<PathBuf> {
-        let arena = self.arena.read();
-        let rel = arena.get_bytes(off, len)?;
-        Some(compose_abs_path_buf(
-            root_bytes_for_id(&self.roots_bytes, root_id),
-            rel,
-        ))
+    /// 通过 docid 解析绝对路径字节（参见 `重构方案包/causal-chain-report.md` §8.6 第二阶段）。
+    ///
+    /// **M4-B**: BaseDelta 是唯一权威数据源；不再 fallback 到 metas+arena。
+    /// 所有 from_snapshot_* 加载器与运行时写路径都把 BaseDelta 当作 first-class，
+    /// 而 metas+arena 已降级为"待删除字段"。
+    pub(super) fn resolve_abs_path_bytes_for_docid(&self, docid: DocId) -> Option<Vec<u8>> {
+        self.resolve_abs_path_bytes_for_docid_via_base_delta(docid)
+    }
+
+    /// `resolve_abs_path_bytes_for_docid` 的 PathBuf 包装。
+    pub(super) fn resolve_abs_path_for_docid(&self, docid: DocId) -> Option<PathBuf> {
+        self.resolve_abs_path_bytes_for_docid(docid)
+            .map(pathbuf_from_encoded_vec)
+    }
+
+    /// 在 BaseDelta 内核（M1 影子）上独立解析 docid → path，用于双内核校验。
+    /// 仅 BaseDelta 启用时返回 Some，否则返回 None；docid 越界也返回 None。
+    pub(super) fn resolve_abs_path_bytes_for_docid_via_base_delta(
+        &self,
+        docid: DocId,
+    ) -> Option<Vec<u8>> {
+        let bd = self.base_delta.read();
+        let base_count = bd.base.by_path_idx().len() as u64;
+        if docid < base_count {
+            bd.base.resolve_path(docid)
+        } else {
+            // delta 段：docid - base_count 是 added 数组下标。
+            let delta_idx = (docid - base_count) as usize;
+            bd.delta.added_path_bytes(delta_idx).map(|s| s.to_vec())
+        }
+    }
+
+    /// 枚举当前所有 (FileKey, DocId)——base 段从 by_file_key 取，delta 段从 HashMap 取。
+    /// 用于 v6 segment 写入时合成 FileKeyMap 段。
+    /// 不过滤 tombstone（与旧 HashMap-only 实现行为一致）。
+    pub(super) fn collect_filekey_docid_pairs(&self) -> Vec<(FileKey, DocId)> {
+        let bd = self.base_delta.read();
+        let base_entries = bd.base.by_path_idx().entries();
+        let map = self.filekey_to_docid.read();
+        let mut pairs: Vec<(FileKey, DocId)> = Vec::with_capacity(base_entries.len() + map.len());
+        // Base：path_idx 当 docid。
+        for entry in base_entries.iter() {
+            pairs.push((entry.file_key(), entry.path_idx as DocId));
+        }
+        // Delta：HashMap 里就是 delta 段 file_key → docid。
+        pairs.extend(map.iter().map(|(k, v)| (*k, *v)));
+        pairs
+    }
+
+    /// 通过 file_key 查 docid——Phase 4 之后 `filekey_to_docid` 仅承载 delta，
+    /// base 半段走 [`BaseIndex::by_file_key`] 二分。两边都查不到返回 None。
+    ///
+    /// 不变量：base 段 docid == path_idx == entries 数组下标（v7/Builder 都按字典序
+    /// 分配 idx）。所以 `entry.path_idx as u64` 直接当 docid 用。
+    ///
+    /// 行为对齐旧版 HashMap 的 last-wins 语义：
+    /// - 若 file_key 同时在 delta（HashMap）和 base（by_file_key）中存在
+    ///   （rename/hardlink 短暂状态），返回 delta 那个——更"新"。
+    /// - 单路径策略下不应出现重复 file_key，但保守按 last-wins。
+    pub(super) fn lookup_docid_by_filekey(&self, fk: FileKey) -> Option<DocId> {
+        if let Some(d) = self.filekey_to_docid.read().get(&fk).copied() {
+            return Some(d);
+        }
+        let bd = self.base_delta.read();
+        bd.base
+            .by_file_key()
+            .find(fk)
+            .map(|(_, e)| e.path_idx as u64)
+    }
+
+    /// M4-B：BaseDelta 上的 docid → 完整条目解析（FileKey + abs_path + size + mtime）。
+    /// 用于 `for_each_live_meta_in_dirs` 等需要一次性拿完整 FileMeta 的扫描路径，
+    /// 避免反复加 base_delta 锁。docid 越界返回 None。
+    pub(super) fn resolve_entry_via_base_delta(
+        &self,
+        docid: DocId,
+    ) -> Option<(FileKey, Vec<u8>, u64, i64)> {
+        let bd = self.base_delta.read();
+        let base_count = bd.base.by_path_idx().len() as u64;
+        if docid < base_count {
+            let entry = bd.base.by_path_idx().entries().get(docid as usize)?;
+            let abs = bd.base.resolve_path(docid)?;
+            Some((entry.file_key(), abs, entry.size, entry.mtime_ns))
+        } else {
+            let delta_idx = (docid - base_count) as usize;
+            let entry = bd.delta.added().get(delta_idx)?;
+            let abs = bd.delta.added_path_bytes(delta_idx)?.to_vec();
+            Some((entry.file_key(), abs, entry.size, entry.mtime_ns))
+        }
     }
 
     fn remove_trigrams(&self, docid: DocId, path: &Path) {
@@ -1741,7 +1938,16 @@ impl PersistentIndex {
         });
     }
 
+    /// path_hash_to_id 不变量（Phase 4）：仅 delta 范围 docid 进入。
+    /// base 范围（docid < base_count）的反查走 [`crate::index::path_table::PathTable::find_path_idx`]。
+    fn is_delta_docid(&self, docid: DocId) -> bool {
+        docid >= self.base_delta.read().base.by_path_idx().len() as u64
+    }
+
     fn insert_path_hash(&self, docid: DocId, path: &Path) {
+        if !self.is_delta_docid(docid) {
+            return;
+        }
         let bytes = path.as_os_str().as_encoded_bytes();
         let h = path_hash_bytes(bytes);
         let mut map = self.path_hash_to_id.write();
@@ -1751,6 +1957,9 @@ impl PersistentIndex {
     }
 
     fn remove_path_hash(&self, docid: DocId, path: &Path) {
+        if !self.is_delta_docid(docid) {
+            return;
+        }
         let bytes = path.as_os_str().as_encoded_bytes();
         let h = path_hash_bytes(bytes);
         let mut map = self.path_hash_to_id.write();
@@ -1762,37 +1971,52 @@ impl PersistentIndex {
         }
     }
 
+    /// 把 docid 注册到所属父目录的 ParentIndex 桶。
+    fn insert_parent(&self, docid: DocId, abs_path: &Path) {
+        if let Some(h) = Self::parent_hash_for(abs_path) {
+            self.parent_index.write().insert(h, docid);
+        }
+    }
+
+    /// 从所属父目录的 ParentIndex 桶里取出 docid（删除/迁移用）。
+    fn remove_parent(&self, docid: DocId, abs_path: &Path) {
+        if let Some(h) = Self::parent_hash_for(abs_path) {
+            self.parent_index.write().remove(h, docid);
+        }
+    }
+
     fn lookup_docid_by_path(&self, path: &Path) -> Option<DocId> {
         let bytes = path.as_os_str().as_encoded_bytes();
         let h = path_hash_bytes(bytes);
 
-        // 先复制候选 DocId（避免同时持有 path_hash_to_id 与 metas/arena 的锁）
-        let candidates: Vec<DocId> = {
+        // delta 半段：先查 path_hash_to_id（仅含 delta 路径，不再含 base，
+        // 参见 `重构方案包/causal-chain-report.md` §8.7 的内存表）。
+        let delta_candidates: Vec<DocId> = {
             let map = self.path_hash_to_id.read();
-            let v = map.get(&h)?;
-            v.iter().copied().collect()
+            map.get(&h).map(|v| v.iter().copied().collect()).unwrap_or_default()
         };
-
-        if candidates.is_empty() {
-            return None;
+        for docid in &delta_candidates {
+            if self
+                .resolve_abs_path_bytes_for_docid(*docid)
+                .map(|abs| abs == bytes)
+                .unwrap_or(false)
+            {
+                return Some(*docid);
+            }
         }
 
-        let metas = self.metas.read();
-        let arena = self.arena.read();
-        candidates.into_iter().find(|docid| {
-            metas
-                .get(*docid as usize)
-                .and_then(|m| {
-                    let rel = arena.get_bytes(m.path_off, m.path_len)?;
-                    Some(
-                        compose_abs_path_bytes(
-                            root_bytes_for_id(&self.roots_bytes, m.root_id),
-                            rel,
-                        ) == bytes,
-                    )
-                })
-                .unwrap_or(false)
-        })
+        // base 半段：PathTable 已按字典序排序，直接二分。
+        // 命中后还要确认该 docid 不在 tombstones / delta.removed 里。
+        let bd = self.base_delta.read();
+        let base_path_idx = bd.base.path_table().find_path_idx(bytes)?;
+        let docid = base_path_idx as u64;
+        if self.tombstones.read().contains(docid) {
+            return None;
+        }
+        if bd.delta.removed().contains(docid) {
+            return None;
+        }
+        Some(docid)
     }
 
     fn trigram_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringTreemap> {
@@ -1852,52 +2076,74 @@ impl IndexLayer for PersistentIndex {
             .trigram_candidates(matcher)
             .or_else(|| self.short_hint_candidates(matcher));
 
-        let metas = self.metas.read();
-        let arena = self.arena.read();
+        // M4-B: 改走 BaseDelta，避免 metas+arena 锁。
+        let bd = self.base_delta.read();
         let tombstones = self.tombstones.read();
+        let base_entries = bd.base.by_path_idx().entries();
+        let base_count = base_entries.len() as u64;
 
         let mut out: Vec<FileKey> = Vec::new();
+        let push_if_match = |out: &mut Vec<FileKey>, fk: FileKey, abs: &[u8]| {
+            let s = std::str::from_utf8(abs)
+                .map(std::borrow::Cow::Borrowed)
+                .unwrap_or_else(|_| String::from_utf8_lossy(abs));
+            if matcher.matches(&s) {
+                out.push(fk);
+            }
+        };
 
         match candidates {
             Some(bitmap) => {
+                // candidates 已被 trigram 过滤后通常很小，逐 docid 解析无伤大雅。
                 for docid in bitmap.iter() {
                     if tombstones.contains(docid) {
                         continue;
                     }
-                    let Some(m) = metas.get(docid as usize) else {
-                        continue;
-                    };
-                    let rel = arena.get_bytes(m.path_off, m.path_len).unwrap_or(&[]);
-                    let abs = compose_abs_path_bytes(
-                        root_bytes_for_id(&self.roots_bytes, m.root_id),
-                        rel,
-                    );
-                    let s = std::str::from_utf8(&abs)
-                        .map(std::borrow::Cow::Borrowed)
-                        .unwrap_or_else(|_| String::from_utf8_lossy(&abs));
-                    if matcher.matches(&s) {
-                        out.push(m.file_key);
+                    if docid < base_count {
+                        let Some(entry) = base_entries.get(docid as usize) else {
+                            continue;
+                        };
+                        let Some(abs) = bd.base.resolve_path(docid) else {
+                            continue;
+                        };
+                        push_if_match(&mut out, entry.file_key(), &abs);
+                    } else {
+                        let idx = (docid - base_count) as usize;
+                        let Some(entry) = bd.delta.added().get(idx) else {
+                            continue;
+                        };
+                        let Some(abs) = bd.delta.added_path_bytes(idx) else {
+                            continue;
+                        };
+                        push_if_match(&mut out, entry.file_key(), abs);
                     }
                 }
             }
             None => {
-                // 无法用 trigram 加速（查询词太短），全量过滤（不构造 PathBuf）。
-                for (i, m) in metas.iter().enumerate() {
-                    let docid: DocId = i as DocId;
+                // Phase 4：无 trigram 候选时全量扫描，base 半段走 path_table.for_each_path
+                // 顺序解码（~30× CPU 节省）。短查询命中此分支，节省可观。
+                bd.base.path_table().for_each_path(|path_idx, abs_bytes| {
+                    let docid = path_idx as u64;
+                    if tombstones.contains(docid) {
+                        return;
+                    }
+                    let Some(entry) = base_entries.get(path_idx as usize) else {
+                        return;
+                    };
+                    push_if_match(&mut out, entry.file_key(), abs_bytes);
+                });
+                for idx in 0..bd.delta.added().len() {
+                    let docid = base_count + idx as u64;
                     if tombstones.contains(docid) {
                         continue;
                     }
-                    let rel = arena.get_bytes(m.path_off, m.path_len).unwrap_or(&[]);
-                    let abs = compose_abs_path_bytes(
-                        root_bytes_for_id(&self.roots_bytes, m.root_id),
-                        rel,
-                    );
-                    let s = std::str::from_utf8(&abs)
-                        .map(std::borrow::Cow::Borrowed)
-                        .unwrap_or_else(|_| String::from_utf8_lossy(&abs));
-                    if matcher.matches(&s) {
-                        out.push(m.file_key);
-                    }
+                    let Some(entry) = bd.delta.added().get(idx) else {
+                        continue;
+                    };
+                    let Some(abs) = bd.delta.added_path_bytes(idx) else {
+                        continue;
+                    };
+                    push_if_match(&mut out, entry.file_key(), abs);
                 }
             }
         }
@@ -1906,19 +2152,16 @@ impl IndexLayer for PersistentIndex {
     }
 
     fn get_meta(&self, key: FileKey) -> Option<FileMeta> {
-        let docid = { self.filekey_to_docid.read().get(&key).copied()? };
+        let docid = self.lookup_docid_by_filekey(key)?;
         if self.tombstones.read().contains(docid) {
             return None;
         }
-        let m = { self.metas.read().get(docid as usize).cloned()? };
-        let arena = self.arena.read();
-        let rel = arena.get_bytes(m.path_off, m.path_len)?;
-        let path = compose_abs_path_buf(root_bytes_for_id(&self.roots_bytes, m.root_id), rel);
+        let (fk, abs, size, mtime_ns) = self.resolve_entry_via_base_delta(docid)?;
         Some(FileMeta {
-            file_key: m.file_key,
-            path,
-            size: m.size,
-            mtime: mtime_from_ns(m.mtime_ns),
+            file_key: fk,
+            path: pathbuf_from_encoded_vec(abs),
+            size,
+            mtime: mtime_from_ns(mtime_ns),
             ctime: None,
             atime: None,
         })
@@ -1953,80 +2196,6 @@ fn normalize_roots_with_fallback(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
     out.push(slash);
     out.extend(roots);
     out
-}
-
-impl PersistentIndex {
-    /// Fast-path bulk fill used by compaction dimension reduction.
-    /// Directly replaces metas, arena, trigram_index, and derived maps.
-    /// Paths are taken from `metas` (full FileMeta with absolute paths).
-    /// `trigrams` contains pre-merged DocId posting lists (DocId matches index in `metas`).
-    pub(crate) fn fill_from_compaction(
-        &self,
-        _roots: Vec<PathBuf>,
-        metas: Vec<FileMeta>,
-        trigrams: std::collections::HashMap<[u8; 3], roaring::RoaringTreemap>,
-    ) {
-        // Reset internal state
-        {
-            *self.metas.write() = Vec::new();
-            *self.arena.write() = PathArena::new();
-            *self.filekey_to_docid.write() = HashMap::new();
-            *self.path_hash_to_id.write() = HashMap::new();
-            *self.trigram_index.write() = HashMap::new();
-            *self.short_component_index.write() = HashMap::new();
-            *self.tombstones.write() = RoaringTreemap::new();
-            self.dirty.store(true, std::sync::atomic::Ordering::Release);
-        }
-
-        let mut new_metas = Vec::with_capacity(metas.len());
-        let mut new_arena = PathArena::new();
-        let mut new_filekey_to_docid = HashMap::new();
-        let mut new_path_hash_to_id = HashMap::new();
-        let mut new_short_component_index: HashMap<u16, RoaringTreemap> = HashMap::new();
-
-        for (docid, meta) in metas.into_iter().enumerate() {
-            let docid = docid as DocId;
-            let (root_id, rel_bytes) = self.split_root_relative_bytes(&meta.path);
-
-            let Some((off, len)) = new_arena.push_bytes(&rel_bytes) else {
-                continue;
-            };
-
-            new_metas.push(CompactMeta {
-                file_key: meta.file_key,
-                root_id,
-                path_off: off,
-                path_len: len,
-                size: meta.size,
-                mtime_ns: mtime_to_ns(meta.mtime),
-            });
-
-            new_filekey_to_docid.insert(meta.file_key, docid);
-
-            let bytes = meta.path.as_os_str().as_encoded_bytes();
-            let h = path_hash_bytes(bytes);
-            new_path_hash_to_id
-                .entry(h)
-                .and_modify(|v: &mut OneOrManyDocId| v.insert(docid))
-                .or_insert(OneOrManyDocId::One(docid));
-
-            for_each_short_component(meta.path.as_path(), |component| {
-                new_short_component_index
-                    .entry(component)
-                    .or_default()
-                    .insert(docid);
-            });
-        }
-
-        {
-            *self.metas.write() = new_metas;
-            *self.arena.write() = new_arena;
-            *self.filekey_to_docid.write() = new_filekey_to_docid;
-            *self.path_hash_to_id.write() = new_path_hash_to_id;
-            *self.trigram_index.write() = trigrams;
-            *self.short_component_index.write() = new_short_component_index;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2253,5 +2422,607 @@ mod tests {
             "expected 1 result for '文件', got {}",
             r2.len()
         );
+    }
+
+    /// 直接验证 `for_each_live_meta_in_dirs` 在 ParentIndex 介入后的语义：
+    /// - 同目录新增：bitmap 立刻看到。
+    /// - 删除：bitmap 不再返回。
+    /// - 改名跨目录：从旧 parent bitmap 移出、新 parent bitmap 加入。
+    /// - 多目录并集：返回所有指定父目录下的 live 条目。
+    #[test]
+    fn for_each_live_meta_in_dirs_uses_parent_index_lifecycle() {
+        use std::collections::HashSet;
+
+        let idx = PersistentIndex::new_with_roots(vec![PathBuf::from("/tmp")]);
+        let p_a = PathBuf::from("/tmp/d1/a.txt");
+        let p_b = PathBuf::from("/tmp/d1/b.txt");
+        let p_c = PathBuf::from("/tmp/d2/c.txt");
+
+        for (ino, path) in [(1u64, &p_a), (2, &p_b), (3, &p_c)] {
+            idx.upsert(FileMeta {
+                file_key: FileKey {
+                    dev: 1,
+                    ino,
+                    generation: 0,
+                },
+                path: path.clone(),
+                size: 1,
+                mtime: None,
+                ctime: None,
+                atime: None,
+            });
+        }
+
+        let mut dirs = HashSet::new();
+        dirs.insert(PathBuf::from("/tmp/d1"));
+
+        let mut seen: Vec<PathBuf> = Vec::new();
+        idx.for_each_live_meta_in_dirs(&dirs, |m| seen.push(m.path));
+        seen.sort();
+        assert_eq!(seen, vec![p_a.clone(), p_b.clone()]);
+
+        // delete /tmp/d1/a.txt
+        idx.mark_deleted(FileKey {
+            dev: 1,
+            ino: 1,
+            generation: 0,
+        });
+        let mut seen: Vec<PathBuf> = Vec::new();
+        idx.for_each_live_meta_in_dirs(&dirs, |m| seen.push(m.path));
+        assert_eq!(seen, vec![p_b.clone()]);
+
+        // rename /tmp/d1/b.txt → /tmp/d2/b.txt
+        let p_b_new = PathBuf::from("/tmp/d2/b.txt");
+        idx.upsert_rename(FileMeta {
+            file_key: FileKey {
+                dev: 1,
+                ino: 2,
+                generation: 0,
+            },
+            path: p_b_new.clone(),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        // /tmp/d1 现在为空。
+        let mut seen: Vec<PathBuf> = Vec::new();
+        idx.for_each_live_meta_in_dirs(&dirs, |m| seen.push(m.path));
+        assert!(seen.is_empty(), "/tmp/d1 should now be empty: {seen:?}");
+
+        // /tmp/d2 应能看到 c.txt 和 b.txt（被 rename 进来的）。
+        let mut dirs2 = HashSet::new();
+        dirs2.insert(PathBuf::from("/tmp/d2"));
+        let mut seen: Vec<PathBuf> = Vec::new();
+        idx.for_each_live_meta_in_dirs(&dirs2, |m| seen.push(m.path));
+        seen.sort();
+        assert_eq!(seen, vec![p_b_new, p_c.clone()]);
+
+        // 多目录并集：传入 d1 + d2，应等于 d2 的结果（d1 已空）。
+        let mut both = HashSet::new();
+        both.insert(PathBuf::from("/tmp/d1"));
+        both.insert(PathBuf::from("/tmp/d2"));
+        let mut seen: Vec<PathBuf> = Vec::new();
+        idx.for_each_live_meta_in_dirs(&both, |m| seen.push(m.path));
+        assert_eq!(seen.len(), 2);
+
+        // 不存在的目录返回空。
+        let mut nope = HashSet::new();
+        nope.insert(PathBuf::from("/tmp/no_such_dir"));
+        let mut seen: Vec<PathBuf> = Vec::new();
+        idx.for_each_live_meta_in_dirs(&nope, |m| seen.push(m.path));
+        assert!(seen.is_empty());
+    }
+
+    /// `mark_deleted_by_path` 同样要从 ParentIndex 中删除，否则 fast_sync delete 对齐
+    /// 会持续把已删文件错认为 live（hash 校验兜底但走 expensive 路径）。
+    ///
+    /// 注：路径用 [`Path::join`] 构造而不是 `"/tmp/d/x.txt"` 字面量。原因是
+    /// `lookup_docid_by_path` 内部用 [`compose_abs_path_bytes`] 重组绝对路径并做
+    /// 字节级 `==` 校验，而 `compose_abs_path_bytes` 在 Windows 上使用
+    /// `MAIN_SEPARATOR = '\\'`。如果用全斜线字面量 `/tmp/d/x.txt`，在 Windows 上
+    /// 字节级比对会失败，`mark_deleted_by_path` 会静默 no-op。
+    #[test]
+    fn mark_deleted_by_path_evicts_from_parent_index() {
+        use std::collections::HashSet;
+
+        let root = PathBuf::from("/tmp");
+        let dir = root.join("d");
+        let p = dir.join("x.txt");
+
+        let idx = PersistentIndex::new_with_roots(vec![root]);
+        idx.upsert(FileMeta {
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
+            path: p.clone(),
+            size: 0,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        let mut dirs = HashSet::new();
+        dirs.insert(dir);
+
+        let mut seen: Vec<PathBuf> = Vec::new();
+        idx.for_each_live_meta_in_dirs(&dirs, |m| seen.push(m.path));
+        assert_eq!(seen, vec![p.clone()]);
+
+        idx.mark_deleted_by_path(&p);
+        let mut seen: Vec<PathBuf> = Vec::new();
+        idx.for_each_live_meta_in_dirs(&dirs, |m| seen.push(m.path));
+        assert!(seen.is_empty());
+    }
+
+    /// V7 round-trip 验证（参见 `重构方案包/causal-chain-report.md` §8.9）。
+    /// 路径：upsert 若干 → to_snapshot_v7 → encode → decode → from_snapshot_v7
+    /// → 比对 query 结果。
+    #[test]
+    fn v7_snapshot_round_trip_preserves_query_results() {
+        let root = PathBuf::from("/tmp");
+        let p_a = root.join("d1").join("a.txt");
+        let p_b = root.join("d1").join("b.txt");
+        let p_c = root.join("d2").join("c.txt");
+
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        for (ino, path) in [(1u64, &p_a), (2, &p_b), (3, &p_c)] {
+            idx.upsert(FileMeta {
+                file_key: FileKey {
+                    dev: 1,
+                    ino,
+                    generation: 0,
+                },
+                path: path.clone(),
+                size: 100 + ino,
+                mtime: None,
+                ctime: None,
+                atime: None,
+            });
+        }
+        // 删一条以验证 tombstones 也能 round-trip。
+        idx.mark_deleted(FileKey {
+            dev: 1,
+            ino: 2,
+            generation: 0,
+        });
+
+        // V7 字节流 round-trip。
+        let snap = idx.to_snapshot_v7();
+        let bytes = snap.encode().expect("v7 encode");
+        let decoded = crate::storage::snapshot_v7::V7Snapshot::decode(&bytes).expect("v7 decode");
+
+        let restored = PersistentIndex::from_snapshot_v7(decoded, vec![root.clone()]);
+
+        // live 文件数：原来 3 条减 1 条墓碑 = 2 条。
+        // Phase 4：base 段的 file_key 现在不再登记到 `filekey_to_docid`，需走
+        // `lookup_docid_by_filekey`（fallback 到 BaseIndex.by_file_key 二分）。
+        let live_a = restored
+            .lookup_docid_by_filekey(FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            })
+            .is_some();
+        assert!(live_a, "ino=1 should survive round-trip");
+
+        // ino=2 已删除：BaseIndex.by_file_key 仍持有它（不区分 tombstone），
+        // 但 tombstones 应包含它的 docid。
+        let docid_for_ino2 = restored.lookup_docid_by_filekey(FileKey {
+            dev: 1,
+            ino: 2,
+            generation: 0,
+        });
+        if let Some(d) = docid_for_ino2 {
+            assert!(
+                restored.tombstones.read().contains(d),
+                "ino=2 must be tombstoned"
+            );
+        }
+
+        // 目录倒排：/tmp/d1 应只剩 a.txt（b 已删），/tmp/d2 仍有 c.txt。
+        use std::collections::HashSet;
+        let mut d1 = HashSet::new();
+        d1.insert(root.join("d1"));
+        let mut seen: Vec<PathBuf> = Vec::new();
+        restored.for_each_live_meta_in_dirs(&d1, |m| seen.push(m.path));
+        assert_eq!(
+            seen,
+            vec![p_a.clone()],
+            "after round-trip /tmp/d1 should have only a.txt"
+        );
+
+        let mut d2 = HashSet::new();
+        d2.insert(root.join("d2"));
+        let mut seen: Vec<PathBuf> = Vec::new();
+        restored.for_each_live_meta_in_dirs(&d2, |m| seen.push(m.path));
+        assert_eq!(seen, vec![p_c.clone()]);
+    }
+
+    /// 空索引的 v7 round-trip：仍应能加密 / 解密 / 重建出空 PersistentIndex。
+    #[test]
+    fn v7_empty_round_trip() {
+        let root = PathBuf::from("/tmp");
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+
+        let snap = idx.to_snapshot_v7();
+        let bytes = snap.encode().expect("v7 encode");
+        let decoded = crate::storage::snapshot_v7::V7Snapshot::decode(&bytes).expect("v7 decode");
+        let restored = PersistentIndex::from_snapshot_v7(decoded, vec![root]);
+
+        assert_eq!(restored.file_count(), 0);
+        assert_eq!(restored.tombstones.read().len(), 0);
+    }
+
+    /// roots 不匹配时 from_snapshot_v7 应返回空索引并打 warn（而不是把垃圾路径写进去）。
+    #[test]
+    fn v7_roots_mismatch_aborts_load() {
+        let idx = PersistentIndex::new_with_roots(vec![PathBuf::from("/tmp")]);
+        idx.upsert(FileMeta {
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
+            path: PathBuf::from("/tmp").join("x.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        let snap = idx.to_snapshot_v7();
+        // 用一个不同的 root 加载——应得到空索引。
+        let restored =
+            PersistentIndex::from_snapshot_v7(snap, vec![PathBuf::from("/different/root")]);
+        assert_eq!(restored.file_count(), 0);
+    }
+
+    /// M1：from_snapshot_v7 后 base_delta 内核应被启用，且
+    /// `resolve_abs_path_bytes_for_docid` 与
+    /// `resolve_abs_path_bytes_for_docid_via_base_delta` 在 live 范围内一致。
+    #[test]
+    fn v7_load_enables_base_delta_kernel_with_consistent_path_resolution() {
+        let root = PathBuf::from("/tmp");
+        let p_a = root.join("d1").join("a.txt");
+        let p_b = root.join("d1").join("b.txt");
+        let p_c = root.join("d2").join("c.txt");
+
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        for (ino, path) in [(1u64, &p_a), (2, &p_b), (3, &p_c)] {
+            idx.upsert(FileMeta {
+                file_key: FileKey {
+                    dev: 1,
+                    ino,
+                    generation: 0,
+                },
+                path: path.clone(),
+                size: 100 + ino,
+                mtime: None,
+                ctime: None,
+                atime: None,
+            });
+        }
+
+        // 走完整 round-trip：to_v7 → encode → decode → from_v7。
+        let snap = idx.to_snapshot_v7();
+        let bytes = snap.encode().unwrap();
+        let decoded = crate::storage::snapshot_v7::V7Snapshot::decode(&bytes).unwrap();
+        let restored = PersistentIndex::from_snapshot_v7(decoded, vec![root]);
+
+        // BaseDelta 内核应已填充——base 不再为空。
+        assert!(
+            !restored.base_delta.read().base.by_path_idx().is_empty(),
+            "BaseDelta kernel must be populated after from_snapshot_v7"
+        );
+
+        // 对每条 live docid，两条 helper 应返回相同 path bytes。
+        let total = restored.file_count();
+        assert_eq!(total, 3);
+        for d in 0..total as u64 {
+            let legacy = restored.resolve_abs_path_bytes_for_docid(d);
+            let bd = restored.resolve_abs_path_bytes_for_docid_via_base_delta(d);
+            assert_eq!(
+                legacy, bd,
+                "docid {d}: legacy and base_delta paths must agree"
+            );
+            assert!(legacy.is_some(), "docid {d} should have a path");
+        }
+    }
+
+    /// M1：BaseDelta 启用后，docid 越界（超过 base_count）应优雅返回 None；
+    /// 当前未启用 delta 写入，所以 [base_count, ...) 区间永远是 None。
+    #[test]
+    fn base_delta_oob_docid_returns_none() {
+        let root = PathBuf::from("/tmp");
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        idx.upsert(FileMeta {
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
+            path: root.join("only.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        let snap = idx.to_snapshot_v7();
+        let bytes = snap.encode().unwrap();
+        let decoded = crate::storage::snapshot_v7::V7Snapshot::decode(&bytes).unwrap();
+        let restored = PersistentIndex::from_snapshot_v7(decoded, vec![root]);
+
+        // 唯一 live docid = 0：应可解析。
+        assert!(restored
+            .resolve_abs_path_bytes_for_docid_via_base_delta(0)
+            .is_some());
+        // docid = 1 越界：返回 None（不 panic）。
+        assert!(restored
+            .resolve_abs_path_bytes_for_docid_via_base_delta(1)
+            .is_none());
+    }
+
+    /// M4：默认 PersistentIndex 的 BaseDelta 内核应是空的（base/delta 均空），
+    /// 而非 None——helper 对任意 docid 仍返回 None（base 为空）。
+    #[test]
+    fn fresh_index_has_empty_base_delta_kernel() {
+        let idx = PersistentIndex::new_with_roots(vec![PathBuf::from("/tmp")]);
+        {
+            let bd = idx.base_delta.read();
+            assert_eq!(bd.base.by_path_idx().len(), 0);
+            assert!(bd.delta.added().is_empty());
+            assert!(bd.delta.removed().is_empty());
+        }
+        // 空 kernel 对任意 docid 返回 None（base 为空 + delta 也为空）。
+        assert!(idx
+            .resolve_abs_path_bytes_for_docid_via_base_delta(0)
+            .is_none());
+    }
+
+    /// M3：BaseDelta 启用后，新建文件应同步写入 `delta.added`；helper 解析新 docid
+    /// 应从 delta 解析得到正确 path。
+    #[test]
+    fn m3_upsert_synchronizes_base_delta_added() {
+        let root = PathBuf::from("/tmp");
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+
+        // 走 v7 round-trip 启用 BaseDelta（base_count = 0，delta 干净）。
+        let snap = idx.to_snapshot_v7();
+        let bytes = snap.encode().unwrap();
+        let decoded = crate::storage::snapshot_v7::V7Snapshot::decode(&bytes).unwrap();
+        let restored = PersistentIndex::from_snapshot_v7(decoded, vec![root.clone()]);
+
+        // 新建一条文件——应同步进 delta。
+        let p = root.join("new.txt");
+        restored.upsert(FileMeta {
+            file_key: FileKey {
+                dev: 1,
+                ino: 42,
+                generation: 0,
+            },
+            path: p.clone(),
+            size: 7,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        // BaseDelta 现在应有 1 条 delta.added。
+        {
+            let bd = restored.base_delta.read();
+            let kernel = &*bd;
+            assert_eq!(kernel.delta.added().len(), 1);
+            // delta.added[0] 的 path 应等于 p 的字节。
+            let path_bytes = kernel.delta.added_path_bytes(0).unwrap();
+            assert_eq!(path_bytes, p.as_os_str().as_encoded_bytes());
+        }
+
+        // helper 通过 docid（base_count=0 + delta 0 = 0）应能解析 path。
+        let resolved = restored.resolve_abs_path_bytes_for_docid_via_base_delta(0);
+        assert_eq!(resolved.as_deref(), Some(p.as_os_str().as_encoded_bytes()));
+    }
+
+    /// M3：BaseDelta 启用后，mark_deleted 应同步：
+    /// - base 段 docid（< base_count）→ delta.removed += docid
+    /// - delta 段 docid（>= base_count）→ delta.added 中对应 file_key 被 drop
+    #[test]
+    fn m3_mark_deleted_synchronizes_base_delta() {
+        let root = PathBuf::from("/tmp");
+        // 先插一条到原 idx 然后 round-trip，让 base_count=1。
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        idx.upsert(FileMeta {
+            file_key: FileKey {
+                dev: 1,
+                ino: 1,
+                generation: 0,
+            },
+            path: root.join("a.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        let snap = idx.to_snapshot_v7();
+        let bytes = snap.encode().unwrap();
+        let decoded = crate::storage::snapshot_v7::V7Snapshot::decode(&bytes).unwrap();
+        let restored = PersistentIndex::from_snapshot_v7(decoded, vec![root.clone()]);
+
+        {
+            let bd = restored.base_delta.read();
+            let kernel = &*bd;
+            assert_eq!(kernel.base.by_path_idx().len(), 1, "base_count = 1");
+            assert_eq!(kernel.delta.added().len(), 0);
+        }
+
+        // 删 base 段那条（docid=0）→ delta.removed 应包含 0。
+        restored.mark_deleted(FileKey {
+            dev: 1,
+            ino: 1,
+            generation: 0,
+        });
+        {
+            let bd = restored.base_delta.read();
+            let kernel = &*bd;
+            assert!(
+                kernel.delta.removed().contains(0),
+                "base docid 0 should be marked removed in delta"
+            );
+        }
+
+        // 新建一条到 delta 段（docid=1）→ 然后再删它。
+        // M4-B: delta 段不再物理 drop（避免 swap_remove 打乱 docid→idx 对齐）；
+        // 由 legacy tombstones 过滤——所以 delta.added 会保留 entry，但
+        // tombstones 包含其 docid。
+        restored.upsert(FileMeta {
+            file_key: FileKey {
+                dev: 1,
+                ino: 2,
+                generation: 0,
+            },
+            path: root.join("b.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        {
+            let bd = restored.base_delta.read();
+            let kernel = &*bd;
+            assert_eq!(kernel.delta.added().len(), 1);
+        }
+        let new_docid = restored
+            .filekey_to_docid
+            .read()
+            .get(&FileKey {
+                dev: 1,
+                ino: 2,
+                generation: 0,
+            })
+            .copied()
+            .unwrap();
+        restored.mark_deleted(FileKey {
+            dev: 1,
+            ino: 2,
+            generation: 0,
+        });
+        {
+            let bd = restored.base_delta.read();
+            let kernel = &*bd;
+            // 物理 entry 仍在（保 docid 对齐）。
+            assert_eq!(
+                kernel.delta.added().len(),
+                1,
+                "delta.added entry should be retained for docid alignment"
+            );
+        }
+        // tombstones 应包含这个 docid。
+        assert!(
+            restored.tombstones.read().contains(new_docid),
+            "tombstones should include the deleted delta-segment docid"
+        );
+    }
+
+    /// M3：base 段条目被 rename 时，delta.removed 应屏蔽 base 旧 docid，
+    /// 同时 delta.added 应包含新 path。
+    #[test]
+    fn m3_rename_base_entry_synchronizes_base_delta() {
+        let root = PathBuf::from("/tmp");
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        let fk = FileKey {
+            dev: 1,
+            ino: 5,
+            generation: 0,
+        };
+        idx.upsert(FileMeta {
+            file_key: fk,
+            path: root.join("old.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        let snap = idx.to_snapshot_v7();
+        let bytes = snap.encode().unwrap();
+        let decoded = crate::storage::snapshot_v7::V7Snapshot::decode(&bytes).unwrap();
+        let restored = PersistentIndex::from_snapshot_v7(decoded, vec![root.clone()]);
+
+        // base 段 docid=0 持有 old.txt；走 upsert_rename 改名到 new.txt。
+        let new_path = root.join("new.txt");
+        restored.upsert_rename(FileMeta {
+            file_key: fk,
+            path: new_path.clone(),
+            size: 2,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        let bd = restored.base_delta.read();
+        let kernel = &*bd;
+        assert!(
+            kernel.delta.removed().contains(0),
+            "base docid 0 should be marked removed after rename"
+        );
+        assert_eq!(
+            kernel.delta.added().len(),
+            1,
+            "renamed entry should appear in delta.added"
+        );
+        let new_bytes = kernel.delta.added_path_bytes(0).unwrap();
+        assert_eq!(new_bytes, new_path.as_os_str().as_encoded_bytes());
+    }
+
+    /// M3：delta 段条目被 rename 时，delta.added 中对应 file_key 应原地替换为新 path。
+    /// 不应往 delta.removed 写任何东西（旧 entry 本来就在 delta，不在 base）。
+    #[test]
+    fn m3_rename_delta_entry_replaces_in_place() {
+        let root = PathBuf::from("/tmp");
+        // 空 base：v7 round-trip 后启用 BaseDelta，base_count = 0。
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        let snap = idx.to_snapshot_v7();
+        let bytes = snap.encode().unwrap();
+        let decoded = crate::storage::snapshot_v7::V7Snapshot::decode(&bytes).unwrap();
+        let restored = PersistentIndex::from_snapshot_v7(decoded, vec![root.clone()]);
+
+        // 先 upsert 一条进 delta（docid=0，base_count=0 → 在 delta 段）。
+        let fk = FileKey {
+            dev: 1,
+            ino: 9,
+            generation: 0,
+        };
+        restored.upsert(FileMeta {
+            file_key: fk,
+            path: root.join("old.txt"),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+        // 再 rename。
+        let new_path = root.join("renamed.txt");
+        restored.upsert_rename(FileMeta {
+            file_key: fk,
+            path: new_path.clone(),
+            size: 2,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        let bd = restored.base_delta.read();
+        let kernel = &*bd;
+        assert_eq!(
+            kernel.delta.added().len(),
+            1,
+            "should still be one entry (in-place upsert)"
+        );
+        assert!(
+            kernel.delta.removed().is_empty(),
+            "rename inside delta segment should not touch removed"
+        );
+        let bytes_now = kernel.delta.added_path_bytes(0).unwrap();
+        assert_eq!(bytes_now, new_path.as_os_str().as_encoded_bytes());
     }
 }

@@ -1,8 +1,3 @@
-use crate::index::l2_partition::IndexSnapshotV2;
-use crate::index::l2_partition::IndexSnapshotV3;
-use crate::index::l2_partition::IndexSnapshotV4;
-use crate::index::l2_partition::IndexSnapshotV5;
-use crate::index::l2_partition::PersistentIndex;
 use crate::index::l2_partition::V6Segments;
 use memmap2::Mmap;
 use std::collections::HashSet;
@@ -17,10 +12,6 @@ const MAGIC: u32 = 0xFDDD_0002;
 const VERSION_V6: u32 = 6; // legacy: SimpleChecksum
 const VERSION_V7: u32 = 7; // CRC32C (Castagnoli)
 const VERSION_CURRENT: u32 = VERSION_V7;
-const VERSION_COMPAT_V5: u32 = 5;
-const VERSION_COMPAT_V4: u32 = 4;
-const VERSION_COMPAT_V3: u32 = 3;
-const VERSION_COMPAT_V2: u32 = 2;
 const STATE_COMMITTED: u32 = 0x0000_0001;
 const STATE_INCOMPLETE: u32 = 0xFFFF_FFFF;
 const HEADER_SIZE: usize = 4 + 4 + 4 + 4 + 4; // magic + version + state + data_len + checksum
@@ -48,94 +39,9 @@ pub struct SnapshotStore {
     path: PathBuf,
 }
 
-#[derive(Clone, Debug)]
-pub enum LoadedSnapshot {
-    V5(IndexSnapshotV5),
-    V4(IndexSnapshotV4),
-    V3(IndexSnapshotV3),
-    V2(IndexSnapshotV2),
-}
-
-/// 统一的老版本快照反序列化 trait：用于消除 v2-v5 的复制粘贴式分发。
-pub trait LegacySnapshot: Sized {
-    const VERSION_NAME: &'static str;
-    fn deserialize_bincode(body: &[u8]) -> anyhow::Result<Self>;
-    fn into_loaded(self) -> LoadedSnapshot;
-}
-
-macro_rules! impl_legacy_snapshot {
-    ($ty:ty, $name:expr) => {
-        impl LegacySnapshot for $ty {
-            const VERSION_NAME: &'static str = $name;
-            fn deserialize_bincode(body: &[u8]) -> anyhow::Result<Self> {
-                Ok(bincode::deserialize::<$ty>(body)?)
-            }
-            fn into_loaded(self) -> LoadedSnapshot {
-                LoadedSnapshot::from(self)
-            }
-        }
-    };
-}
-
-impl_legacy_snapshot!(IndexSnapshotV2, "v2");
-impl_legacy_snapshot!(IndexSnapshotV3, "v3");
-impl_legacy_snapshot!(IndexSnapshotV4, "v4");
-impl_legacy_snapshot!(IndexSnapshotV5, "v5");
-
-impl From<IndexSnapshotV2> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV2) -> Self {
-        LoadedSnapshot::V2(v)
-    }
-}
-impl From<IndexSnapshotV3> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV3) -> Self {
-        LoadedSnapshot::V3(v)
-    }
-}
-impl From<IndexSnapshotV4> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV4) -> Self {
-        LoadedSnapshot::V4(v)
-    }
-}
-impl From<IndexSnapshotV5> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV5) -> Self {
-        LoadedSnapshot::V5(v)
-    }
-}
-
-fn load_legacy_snapshot<T: LegacySnapshot>(body: &[u8]) -> anyhow::Result<Option<LoadedSnapshot>> {
-    match T::deserialize_bincode(body) {
-        Ok(snap) => Ok(Some(snap.into_loaded())),
-        Err(e) => {
-            tracing::warn!("Snapshot {} deserialize failed: {}", T::VERSION_NAME, e);
-            Ok(None)
-        }
-    }
-}
-
-impl LoadedSnapshot {
-    /// 将加载出的老版本快照转换为 PersistentIndex，统一消除 tiered/load.rs 里的复制粘贴。
-    pub fn into_persistent_index(self, roots: Vec<PathBuf>) -> PersistentIndex {
-        match self {
-            LoadedSnapshot::V5(snap) => {
-                tracing::info!("Loaded index snapshot v5: {} docs", snap.metas.len());
-                PersistentIndex::from_snapshot_v5(snap, roots)
-            }
-            LoadedSnapshot::V4(snap) => {
-                tracing::info!("Loaded index snapshot v4: {} docs", snap.metas.len());
-                PersistentIndex::from_snapshot_v4(snap, roots)
-            }
-            LoadedSnapshot::V3(snap) => {
-                tracing::info!("Loaded index snapshot v3: {} files", snap.files.len());
-                PersistentIndex::from_snapshot_v3(snap, roots)
-            }
-            LoadedSnapshot::V2(snap) => {
-                tracing::info!("Loaded index snapshot v2: {} files", snap.files.len());
-                PersistentIndex::from_snapshot_v2(snap, roots)
-            }
-        }
-    }
-}
+// M4-C: LoadedSnapshot 与 IndexSnapshotV2-V5 加载已删除。
+// 旧 bincode v2-v5 文件遇到将走 [`SnapshotStore::load_if_valid`] 的"validate header,
+// 永远返回 None"路径——上层会回退到 v6/v7 mmap 或全量重扫，等同于一次性丢弃旧索引。
 
 /// v6：mmap 段式快照（只读视图）
 #[derive(Clone)]
@@ -326,39 +232,6 @@ fn compute_file_checksum_with(
 
 use crate::storage::checksum::{simple_checksum, Checksum32, Crc32c, SimpleChecksum};
 
-struct ChecksumWriter<'a, W: Write> {
-    inner: &'a mut W,
-    checksum: Crc32c,
-    bytes: u64,
-}
-
-impl<'a, W: Write> ChecksumWriter<'a, W> {
-    fn new(inner: &'a mut W) -> Self {
-        Self {
-            inner,
-            checksum: Crc32c::new(),
-            bytes: 0,
-        }
-    }
-
-    fn finish(self) -> (u64, u32) {
-        (self.bytes, self.checksum.finalize())
-    }
-}
-
-impl<'a, W: Write> Write for ChecksumWriter<'a, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.checksum.update(&buf[..n]);
-        self.bytes += n as u64;
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 impl SnapshotStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
@@ -373,6 +246,110 @@ impl SnapshotStore {
     /// 仅用于 watcher 事件过滤（避免 index 写入反哺 watcher）。
     pub fn derived_lsm_dir_path(&self) -> PathBuf {
         self.lsm_dir_path()
+    }
+
+    // ── v7 companion file（参见 `重构方案包/causal-chain-report.md` §8.9） ──
+    //
+    // 写入路径：`<base>.v7`。例如 base = `/var/lib/fd-rdd/index.db`，
+    // companion = `/var/lib/fd-rdd/index.v7`。
+    //
+    // 当前阶段：v7 与 LSM 并存。LSM 是权威；v7 仅在 LSM `replace_base_v6`
+    // 成功后被写一次（因为 base swap 是"完整快照点"）。增量 `append_delta_v6`
+    // 不刷新 v7——v7 略过这些事件，启动时由 WAL 回放补齐。
+    //
+    // 如此设计的目的：
+    // - 零侵入：`append_delta_v6` 路径不变，热路径无额外开销。
+    // - 可单独验证：用户只需删除 `<base>.v6` / LSM 目录，重启就能用 v7。
+    // - 可推进：未来 v7 替换 LSM 时只需改加载侧。
+
+    /// v7 companion 文件路径（伴随 base 索引文件）。
+    pub fn v7_companion_path(&self) -> PathBuf {
+        self.legacy_db_path().with_extension("v7")
+    }
+
+    /// 原子写入 v7 companion 文件：tmp → rename → fsync 父目录。
+    pub fn write_v7_companion(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let target = self.v7_companion_path();
+        let tmp = {
+            let mut t = target.clone();
+            let mut name = t.file_name().map(|s| s.to_os_string()).unwrap_or_default();
+            name.push(".tmp");
+            t.set_file_name(name);
+            t
+        };
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, &target)?;
+        // 父目录 fsync（best-effort，与 SnapshotStore 其它路径一致；Windows 上 noop）。
+        #[cfg(unix)]
+        if let Some(parent) = target.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    /// 尝试加载 v7 companion；缺失或损坏均返回 None（走 LSM fallback）。
+    pub fn load_v7_companion(
+        &self,
+    ) -> anyhow::Result<Option<crate::storage::snapshot_v7::V7Snapshot>> {
+        let p = self.v7_companion_path();
+        let bytes = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        match crate::storage::snapshot_v7::V7Snapshot::decode(&bytes) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) => {
+                tracing::warn!(
+                    "v7 companion {:?} decode failed: {}; falling back to LSM",
+                    p,
+                    e
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// mmap 加载 v7 companion：path_table.data 借用 mmap，不进堆。
+    /// 缺失或损坏均返回 None（让上层决定是否退回 [`Self::load_v7_companion`] 或 LSM）。
+    ///
+    /// 8M 文件冷启动时省 ≈100 MB 路径字节常驻 RSS。其余段（roots / file entries /
+    /// tombstones）仍然 eager 解码；这是 Phase 4 第一阶段的可控收益。
+    pub fn load_v7_companion_mmap(
+        &self,
+    ) -> anyhow::Result<Option<crate::storage::snapshot_v7::V7Snapshot>> {
+        let p = self.v7_companion_path();
+        let file = match std::fs::File::open(&p) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // SAFETY: v7 文件由 SnapshotStore 自己原子写入，加载期间不会被改写；
+        // 即使外部进程篡改也只会触发 v7 checksum 失败，不会 UB。
+        let mmap = match unsafe { memmap2::MmapOptions::new().map(&file) } {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("v7 companion {:?} mmap failed: {}; falling back", p, e);
+                return Ok(None);
+            }
+        };
+        let arc = std::sync::Arc::new(mmap);
+        match crate::storage::snapshot_v7::V7Snapshot::decode_mmap(arc) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) => {
+                tracing::warn!(
+                    "v7 companion {:?} mmap decode failed: {}; falling back",
+                    p,
+                    e
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// 兼容旧布局：当 `self.path` 指向目录（如 index.d）时，legacy db 路径为同名 index.db。
@@ -737,8 +714,12 @@ impl SnapshotStore {
         store.load_v6_mmap_if_valid(expected_roots)
     }
 
-    /// 加载快照（校验 magic/version/state/checksum）
-    pub async fn load_if_valid(&self) -> anyhow::Result<Option<LoadedSnapshot>> {
+    /// 校验 legacy snapshot 文件 header。**M4-C 之后永远返回 Ok(None)**——
+    /// v2-v5 反序列化已经删除，所有 bincode 旧文件被视为"无效快照"，上层回退到
+    /// v6/v7 mmap 路径或全量重扫。
+    /// 保留这个方法是因为 P0 兼容性测试还在校验 magic/version/state/checksum 这些 header
+    /// 异常的"拒绝"行为——它们的契约就是"拒绝就返回 Ok(None)"。
+    pub async fn load_if_valid(&self) -> anyhow::Result<Option<()>> {
         let path = self.legacy_db_path();
         if !path.exists() {
             return Ok(None);
@@ -750,7 +731,6 @@ impl SnapshotStore {
             return Ok(None);
         }
 
-        // 解析 header
         let magic = u32::from_le_bytes(data[0..4].try_into()?);
         let version = u32::from_le_bytes(data[4..8].try_into()?);
         let state = u32::from_le_bytes(data[8..12].try_into()?);
@@ -761,123 +741,24 @@ impl SnapshotStore {
             tracing::warn!("Snapshot magic mismatch: {:#x} != {:#x}", magic, MAGIC);
             return Ok(None);
         }
-        // v6/v7 走 mmap 段式加载路径，不在本方法中处理
-        if version == VERSION_V6 || version == VERSION_V7 {
-            return Ok(None);
-        }
-
-        if version != VERSION_COMPAT_V5
-            && version != VERSION_COMPAT_V4
-            && version != VERSION_COMPAT_V3
-            && version != VERSION_COMPAT_V2
-        {
-            tracing::warn!(
-                "Snapshot version mismatch: {} not in [{}, {}, {}, {}]",
-                version,
-                VERSION_COMPAT_V2,
-                VERSION_COMPAT_V3,
-                VERSION_COMPAT_V4,
-                VERSION_COMPAT_V5
-            );
-            return Ok(None);
-        }
         if state != STATE_COMMITTED {
             tracing::warn!("Snapshot state INCOMPLETE, ignoring");
             return Ok(None);
         }
-
         let body = &data[HEADER_SIZE..];
         if body.len() != data_len {
             tracing::warn!("Snapshot data length mismatch");
             return Ok(None);
         }
-
-        // 校验 checksum（简单 CRC32 替代）
-        let computed = simple_checksum(body);
-        if computed != stored_checksum {
-            tracing::warn!(
-                "Snapshot checksum mismatch: {} != {}",
-                computed,
-                stored_checksum
-            );
+        if simple_checksum(body) != stored_checksum {
+            tracing::warn!("Snapshot checksum mismatch");
             return Ok(None);
         }
 
-        match version {
-            VERSION_COMPAT_V2 => load_legacy_snapshot::<IndexSnapshotV2>(body),
-            VERSION_COMPAT_V3 => load_legacy_snapshot::<IndexSnapshotV3>(body),
-            VERSION_COMPAT_V4 => load_legacy_snapshot::<IndexSnapshotV4>(body),
-            _ => load_legacy_snapshot::<IndexSnapshotV5>(body),
-        }
-    }
-
-    /// 原子写入快照 v5（bincode；兼容保留）
-    pub async fn write_atomic_v5_bincode(&self, snap: &IndexSnapshotV5) -> anyhow::Result<()> {
-        let path = self.legacy_db_path();
-        // 确保目录存在
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        let tmp_path = path.with_extension("db.tmp");
-
-        // 1) 写 INCOMPLETE header（len/checksum 先置 0），然后流式写 body。
-        // 这样可避免把整个 body 序列化进一个巨型 Vec，降低峰值内存，缓解 RSS 漂移。
-        let mut file = std::fs::File::create(&tmp_path)?;
-        {
-            let mut header = [0u8; HEADER_SIZE];
-            header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-            header[4..8].copy_from_slice(&VERSION_COMPAT_V5.to_le_bytes());
-            header[8..12].copy_from_slice(&STATE_INCOMPLETE.to_le_bytes());
-            header[12..16].copy_from_slice(&0u32.to_le_bytes()); // data_len placeholder
-            header[16..20].copy_from_slice(&0u32.to_le_bytes()); // checksum placeholder
-            file.write_all(&header)?;
-        }
-
-        // 2) 流式写 body 并计算长度/校验
-        let (data_len_u64, checksum) = {
-            let mut cw = ChecksumWriter::new(&mut file);
-            bincode::serialize_into(&mut cw, snap)?;
-            cw.finish()
-        };
-
-        let data_len: u32 = data_len_u64
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Snapshot too large (>{} bytes)", u32::MAX))?;
-
-        // 3) seek 回开头覆盖 COMMITTED header
-        file.seek(SeekFrom::Start(0))?;
-        {
-            let mut header = [0u8; HEADER_SIZE];
-            header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-            header[4..8].copy_from_slice(&VERSION_COMPAT_V5.to_le_bytes());
-            header[8..12].copy_from_slice(&STATE_COMMITTED.to_le_bytes());
-            header[12..16].copy_from_slice(&data_len.to_le_bytes());
-            header[16..20].copy_from_slice(&checksum.to_le_bytes());
-            file.write_all(&header)?;
-        }
-
-        // 4) fsync — 确保数据与 header 都落盘
-        file.sync_all()?;
-
-        // 4) rename 原子替换（POSIX 保证原子性）
-        std::fs::rename(&tmp_path, &path)?;
-
-        // 5) fsync(dir) — 确保目录项更新落盘
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                if let Err(e) = dir.sync_all() {
-                    tracing::warn!("fsync directory failed: {e}");
-                }
-            }
-        }
-
-        tracing::info!(
-            "Snapshot written: {} files, {} bytes",
-            snap.metas.len(),
-            HEADER_SIZE + data_len as usize
-        );
-        Ok(())
+        // M4-C: v2-v5 已不再支持反序列化；v6/v7 由各自的 mmap 路径处理。
+        // 任何能走到这里的版本都被视为"无可用 legacy snapshot"。
+        let _ = version;
+        Ok(None)
     }
 
     /// 原子写入快照 v6（段式 + mmap + lazy decode）
@@ -1492,7 +1373,7 @@ impl crate::storage::traits::SegmentStore for SnapshotStore {
 
     fn load_if_valid<'a>(
         &'a self,
-    ) -> crate::storage::traits::StorageFuture<'a, anyhow::Result<Option<LoadedSnapshot>>> {
+    ) -> crate::storage::traits::StorageFuture<'a, anyhow::Result<Option<()>>> {
         Box::pin(async move { SnapshotStore::load_if_valid(self).await })
     }
 
@@ -1541,6 +1422,20 @@ impl crate::storage::traits::SegmentWriter for SnapshotStore {
             self.lsm_replace_base_v6(segs, expected_prev, expected_roots, wal_seal_id)
                 .await
         })
+    }
+
+    fn write_v7_companion(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        SnapshotStore::write_v7_companion(self, bytes)
+    }
+
+    fn load_v7_companion(&self) -> anyhow::Result<Option<crate::storage::snapshot_v7::V7Snapshot>> {
+        SnapshotStore::load_v7_companion(self)
+    }
+
+    fn load_v7_companion_mmap(
+        &self,
+    ) -> anyhow::Result<Option<crate::storage::snapshot_v7::V7Snapshot>> {
+        SnapshotStore::load_v7_companion_mmap(self)
     }
 }
 
@@ -1938,5 +1833,165 @@ mod tests {
             .lsm_dir_path()
             .join("seg-0000000000000002.del.tmp")
             .exists());
+    }
+
+    /// v7 companion 文件路径派生：base 为 index.db → companion 为 index.v7。
+    #[test]
+    fn v7_companion_path_derived_from_legacy_db() {
+        let root = unique_tmp_dir("v7-path");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SnapshotStore::new(root.join("index.db"));
+        let v7 = store.v7_companion_path();
+        assert_eq!(v7, root.join("index.v7"));
+    }
+
+    /// v7 companion 写入 + 读回完整 round-trip：
+    /// - 用 PersistentIndex 生成 V7Snapshot
+    /// - SnapshotStore.write_v7_companion → 读文件原字节
+    /// - 用 V7Snapshot::decode 解开
+    /// - 比对所有字段一致
+    #[test]
+    fn v7_companion_write_then_load_round_trip() {
+        use crate::index::l2_partition::PersistentIndex;
+        use crate::storage::snapshot_v7::V7Snapshot;
+
+        let root = unique_tmp_dir("v7-rt");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SnapshotStore::new(root.join("index.db"));
+
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        let p = root.join("hello.txt");
+        idx.upsert(FileMeta {
+            file_key: FileKey {
+                dev: 1,
+                ino: 7,
+                generation: 0,
+            },
+            path: p.clone(),
+            size: 0,
+            mtime: None,
+            ctime: None,
+            atime: None,
+        });
+
+        let snap = idx.to_snapshot_v7_with_seal(0xDEAD_BEEF);
+        let bytes = snap.encode().expect("encode");
+        store.write_v7_companion(&bytes).expect("write companion");
+
+        // 文件已落盘。
+        assert!(store.v7_companion_path().exists());
+
+        // load_v7_companion 应解析成功且字段一致。
+        let loaded = store
+            .load_v7_companion()
+            .expect("load companion ok")
+            .expect("companion present");
+        assert_eq!(loaded.wal_seal_id, 0xDEAD_BEEF);
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].file_key().ino, 7);
+
+        // 直接 decode 读回的字节也要对得上。
+        let raw = std::fs::read(store.v7_companion_path()).expect("read raw");
+        let decoded = V7Snapshot::decode(&raw).expect("decode raw");
+        assert_eq!(decoded.wal_seal_id, 0xDEAD_BEEF);
+    }
+
+    /// load_v7_companion 在文件缺失时应返回 Ok(None)（不是 Err）。
+    #[test]
+    fn v7_companion_load_missing_returns_none() {
+        let root = unique_tmp_dir("v7-missing");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SnapshotStore::new(root.join("index.db"));
+        let r = store.load_v7_companion().expect("load companion ok");
+        assert!(r.is_none());
+    }
+
+    /// load_v7_companion 在文件损坏时应返回 Ok(None) 让上层 fallback 到 LSM。
+    #[test]
+    fn v7_companion_load_corrupted_returns_none() {
+        let root = unique_tmp_dir("v7-corrupt");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SnapshotStore::new(root.join("index.db"));
+        // 写入垃圾字节——decode 会失败，应被吞掉返回 Ok(None)。
+        std::fs::write(store.v7_companion_path(), b"not a v7 file").unwrap();
+        let r = store.load_v7_companion().expect("non-fatal");
+        assert!(r.is_none(), "corrupted v7 should fallback, not panic");
+    }
+
+    /// mmap 加载器与 eager 加载器在 v7 文件存在时返回完全一致的 PathTable / entries / tombstones。
+    /// 关键：path_table.data 即使背靠 mmap，resolve(idx) 也要拿到与 eager 路径完全相同的字节。
+    #[test]
+    fn v7_companion_mmap_load_matches_eager() {
+        use crate::core::{FileKey, FileMeta};
+        use crate::index::l2_partition::PersistentIndex;
+
+        let root = unique_tmp_dir("v7-mmap");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SnapshotStore::new(root.join("index.db"));
+
+        let idx = PersistentIndex::new_with_roots(vec![root.clone()]);
+        for i in 0..50u32 {
+            let p = root.join(format!("file_{i:04}.txt"));
+            idx.upsert(FileMeta {
+                file_key: FileKey {
+                    dev: 1,
+                    ino: 100 + i as u64,
+                    generation: 0,
+                },
+                path: p,
+                size: i as u64,
+                mtime: None,
+                ctime: None,
+                atime: None,
+            });
+        }
+
+        let snap = idx.to_snapshot_v7_with_seal(0xCAFEBABE);
+        let bytes = snap.encode().expect("encode");
+        store.write_v7_companion(&bytes).expect("write companion");
+
+        let eager = store
+            .load_v7_companion()
+            .expect("eager load ok")
+            .expect("companion present");
+        let mmap_loaded = store
+            .load_v7_companion_mmap()
+            .expect("mmap load ok")
+            .expect("companion present");
+
+        assert_eq!(mmap_loaded.wal_seal_id, eager.wal_seal_id);
+        assert_eq!(mmap_loaded.entries, eager.entries);
+        assert_eq!(mmap_loaded.tombstones, eager.tombstones);
+        assert_eq!(mmap_loaded.roots, eager.roots);
+        assert_eq!(mmap_loaded.path_table.len(), eager.path_table.len());
+        for i in 0..eager.path_table.len() {
+            assert_eq!(
+                mmap_loaded.path_table.resolve(i),
+                eager.path_table.resolve(i),
+                "path_table[{}] divergence between mmap and eager",
+                i
+            );
+        }
+    }
+
+    /// load_v7_companion_mmap 在文件缺失时应返回 Ok(None)。
+    #[test]
+    fn v7_companion_mmap_load_missing_returns_none() {
+        let root = unique_tmp_dir("v7-mmap-miss");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SnapshotStore::new(root.join("index.db"));
+        let r = store.load_v7_companion_mmap().expect("load ok");
+        assert!(r.is_none());
+    }
+
+    /// load_v7_companion_mmap 在文件损坏时应返回 Ok(None)（让上层 fallback）。
+    #[test]
+    fn v7_companion_mmap_load_corrupted_returns_none() {
+        let root = unique_tmp_dir("v7-mmap-corrupt");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SnapshotStore::new(root.join("index.db"));
+        std::fs::write(store.v7_companion_path(), b"not a v7 file").unwrap();
+        let r = store.load_v7_companion_mmap().expect("non-fatal");
+        assert!(r.is_none());
     }
 }

@@ -4,24 +4,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::event::recovery::DirtyTracker;
-
 /// Heuristic check for ENOSPC / NoStorageSpace errors from notify/inotify.
 fn is_enospc_error(e: &notify::Error) -> bool {
     use std::error::Error;
 
-    // notify 6.1+ explicit error kind for inotify max_user_watches exceeded
     if matches!(e.kind, ErrorKind::MaxFilesWatch) {
         return true;
     }
 
-    // Check the error's own string representation
     let msg = e.to_string().to_lowercase();
     if msg.contains("no space") || msg.contains("enospc") || msg.contains("no storage") {
         return true;
     }
 
-    // Walk the error chain for wrapped io::Error
     let mut source: Option<&dyn Error> = e.source();
     while let Some(err) = source {
         if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
@@ -46,18 +41,15 @@ fn handle_notify_result(
     priority_tx: &mpsc::Sender<notify::Event>,
     normal_tx: &mpsc::Sender<notify::Event>,
     channel_size: usize,
-    dirty: Option<&DirtyTracker>,
     rescan_signals: &AtomicU64,
     res: notify::Result<notify::Event>,
 ) {
     match res {
         Ok(event) => {
-            // inotify 队列溢出（Q_OVERFLOW）会被 notify 标记为 Rescan：无 path，需要全局 dirty。
+            // inotify 队列溢出（Q_OVERFLOW）会被 notify 标记为 Rescan：仅累加可观测计数。
+            // 历史的 dirty-region 兜底已删除（参考 重构方案包/causal-chain-report.md 第 8.4 节）。
             if event.need_rescan() {
                 rescan_signals.fetch_add(1, Ordering::Relaxed);
-                if let Some(d) = dirty {
-                    d.mark_dirty_all();
-                }
             }
 
             // 分级队列：Create 事件走快速路径
@@ -71,21 +63,13 @@ fn handle_notify_result(
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
 
-            // 阻塞发送：利用 bounded channel 做背压，满时阻塞 watcher 线程而非丢弃
             if let Err(e) = tx.blocking_send(event) {
-                // 只有 channel 已关闭时才会失败
                 tracing::warn!("event channel closed, dropping event: {:?}", e);
             }
         }
         Err(e) => {
             if is_enospc_error(&e) {
-                tracing::warn!(
-                    "inotify watch limit exceeded (ENOSPC): {} — marking all dirty for fallback reconciliation",
-                    e
-                );
-                if let Some(d) = dirty {
-                    d.mark_dirty_all();
-                }
+                tracing::warn!("inotify watch limit exceeded (ENOSPC): {}", e);
             } else {
                 tracing::debug!("notify error (non-fatal): {}", e);
             }
@@ -113,14 +97,12 @@ impl EventWatcher {
         channel_size: usize,
         _overflow_drops: Arc<AtomicU64>,
         rescan_signals: Arc<AtomicU64>,
-        dirty: Option<Arc<DirtyTracker>>,
     ) -> anyhow::Result<WatcherBundle> {
         if channel_size == 0 {
             anyhow::bail!("event channel_size must be >= 1");
         }
         let (priority_tx, priority_rx) = mpsc::channel(channel_size);
         let (normal_tx, normal_rx) = mpsc::channel(channel_size);
-        let dirty = dirty.clone();
 
         let priority_tx_clone = priority_tx.clone();
         let normal_tx_clone = normal_tx.clone();
@@ -131,7 +113,6 @@ impl EventWatcher {
                     &priority_tx,
                     &normal_tx,
                     channel_size,
-                    dirty.as_deref(),
                     rescan_signals.as_ref(),
                     res,
                 );
@@ -156,7 +137,6 @@ pub fn check_inotify_limit(root_count: usize) -> Option<u64> {
     {
         if let Ok(content) = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches") {
             if let Ok(limit) = content.trim().parse::<u64>() {
-                // 粗略估算：每个根目录平均 ~1000 个子目录需要 watch
                 let estimated_need = (root_count as u64).saturating_mul(1000);
                 if limit < estimated_need {
                     tracing::warn!(
@@ -173,7 +153,7 @@ pub fn check_inotify_limit(root_count: usize) -> Option<u64> {
     None
 }
 
-/// 注册监听路径，返回加 watch 失败的目录列表（供降级轮询使用）。
+/// 注册监听路径，返回加 watch 失败的目录列表。
 pub fn watch_roots(
     watcher: &mut notify::RecommendedWatcher,
     roots: &[std::path::PathBuf],
@@ -194,12 +174,11 @@ pub fn watch_roots(
 
 #[cfg(target_os = "linux")]
 /// Roughly estimate the number of inotify watches a root will need.
-/// Capped at `max_depth` to avoid expensive traversal on huge trees.
 fn estimate_watch_count(path: &std::path::Path, max_depth: usize) -> u64 {
     if max_depth == 0 {
         return 1;
     }
-    let mut count = 1u64; // the root itself
+    let mut count = 1u64;
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
             if let Ok(ft) = entry.file_type() {
@@ -230,18 +209,14 @@ fn read_inotify_limit() -> Option<u64> {
     None
 }
 
-/// Enhanced version that also returns degraded roots and marks dirty on limit pressure.
+/// 注册监听路径并区分 failed / degraded（仅作为 stats 信号使用）。
 pub fn watch_roots_enhanced(
     watcher: &mut notify::RecommendedWatcher,
     roots: &[std::path::PathBuf],
-    dirty: Option<&DirtyTracker>,
 ) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
     let mut failed_roots = Vec::new();
     #[allow(unused_mut)]
     let mut degraded_roots = Vec::new();
-
-    // Silence unused warning on non-Linux; used inside Linux cfg block below.
-    let _ = dirty;
 
     #[cfg(target_os = "linux")]
     let limit = read_inotify_limit();
@@ -250,13 +225,10 @@ pub fn watch_roots_enhanced(
         if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
             if is_enospc_error(&e) {
                 tracing::warn!(
-                    "Failed to watch {:?}: {} — inotify limit exceeded, marking degraded for fast-sync fallback",
+                    "Failed to watch {:?}: {} — inotify limit exceeded, marking degraded",
                     root,
                     e
                 );
-                if let Some(d) = dirty {
-                    d.mark_dirty_all();
-                }
                 degraded_roots.push(root.clone());
             } else {
                 tracing::warn!(
@@ -276,10 +248,6 @@ pub fn watch_roots_enhanced(
                         "inotify limit tight for {:?}: limit={}, estimated_need={}+{}, marking degraded",
                         root, limit_val, estimated, safety_margin
                     );
-                    if let Some(d) = dirty {
-                        let path = root.clone();
-                        d.record_overflow_paths(&[path]);
-                    }
                     degraded_roots.push(root.clone());
                 }
             }
@@ -291,37 +259,24 @@ pub fn watch_roots_enhanced(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::recovery::DirtyScope;
 
     #[test]
     fn reject_zero_channel_size() {
         let drops = Arc::new(AtomicU64::new(0));
         let rescans = Arc::new(AtomicU64::new(0));
         let roots: Vec<std::path::PathBuf> = Vec::new();
-        let res = EventWatcher::start(&roots, 0, drops, rescans, None);
+        let res = EventWatcher::start(&roots, 0, drops, rescans);
         assert!(res.is_err());
     }
 
     #[test]
-    fn rescan_event_marks_dirty_all() {
-        let _drops = AtomicU64::new(0);
+    fn rescan_event_increments_signal_counter() {
         let rescans = AtomicU64::new(0);
         let (priority_tx, _priority_rx) = mpsc::channel(16);
         let (normal_tx, _normal_rx) = mpsc::channel(16);
-        let dirty = DirtyTracker::new(16, vec![]);
 
         let ev = notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
-        handle_notify_result(
-            &priority_tx,
-            &normal_tx,
-            16,
-            Some(dirty.as_ref()),
-            &rescans,
-            Ok(ev),
-        );
+        handle_notify_result(&priority_tx, &normal_tx, 16, &rescans, Ok(ev));
         assert_eq!(rescans.load(Ordering::Relaxed), 1);
-
-        let scope = dirty.try_begin_sync(0, 0, 0);
-        assert!(matches!(scope, Some(DirtyScope::All { .. })));
     }
 }

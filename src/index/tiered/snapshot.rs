@@ -122,6 +122,10 @@ impl TieredIndex {
             drop(old_delta);
 
             let segs = merged.export_segments_v6_compacted();
+            // 在 drop(merged) 之前生成 v7 内存快照（参见 §8.9）：v7 与 LSM 内容一致，
+            // 但 v7 是单文件 mmap-friendly，启动时优先尝试加载 v7 以加速冷启动。
+            // wal_seal_id 与 LSM manifest 同步，启动时用作"v7 是否过期"判断。
+            let v7_snap = merged.to_snapshot_v7_with_seal(wal_seal_id);
             drop(merged);
             let base = store
                 .replace_base_v6(&segs, None, &roots, wal_seal_id)
@@ -129,6 +133,22 @@ impl TieredIndex {
             drop(segs);
             if let Err(e) = store.gc_stale_segments() {
                 tracing::warn!("LSM gc stale segments failed after replace-base: {}", e);
+            }
+
+            // v7 写入是 best-effort：失败不影响 LSM 权威路径，下次 base 重建会再试。
+            match v7_snap.encode() {
+                Ok(bytes) => match store.write_v7_companion(&bytes) {
+                    Ok(()) => tracing::info!(
+                        "v7 companion written: {} bytes (file_count={})",
+                        bytes.len(),
+                        v7_snap.file_count()
+                    ),
+                    Err(e) => tracing::warn!(
+                        "v7 companion write failed (non-fatal, LSM remains authoritative): {}",
+                        e
+                    ),
+                },
+                Err(e) => tracing::warn!("v7 encode failed (non-fatal): {}", e),
             }
 
             // deleted_paths 在 append/replace-base 后通常会经历增长与扩容；这里 shrink 一次，避免把 capacity 高水位长期带到常驻层。
@@ -186,9 +206,7 @@ impl TieredIndex {
         }
         self.record_snapshot_success();
         self.reset_pending_flush_batch();
-
-        // compaction：段数达到阈值后后台合并
-        self.maybe_spawn_compaction(store);
+        let _ = store;
         // snapshot/flush 是临时分配大户；完成后尝试回吐。
         maybe_trim_rss();
         Ok(())

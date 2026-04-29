@@ -44,8 +44,6 @@ impl TieredIndex {
             rebuild_state: Mutex::new(RebuildState::default()),
             overlay_state: Mutex::new(OverlayState::default()),
             apply_gate: RwLock::new(()),
-            compaction_in_progress: AtomicBool::new(false),
-            compaction_last_started_at: Mutex::new(None),
             flush_requested: AtomicBool::new(false),
             flush_notify: Notify::new(),
             auto_flush_overlay_paths: AtomicU64::new(250_000),
@@ -55,12 +53,11 @@ impl TieredIndex {
             pending_flush_events: AtomicU64::new(0),
             pending_flush_bytes: AtomicU64::new(0),
             last_snapshot_time: AtomicU64::new(0),
-            pending_events: Mutex::new(Vec::new()),
+            pending_events: Mutex::new(std::collections::HashSet::new()),
             roots,
             include_hidden,
             ignore_enabled,
             follow_symlinks,
-            fast_sync_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -184,6 +181,51 @@ impl TieredIndex {
             }
         }
 
+        // v7 fast-path（参见 `重构方案包/causal-chain-report.md` §8.9）：
+        // - v7 是 base segment 的"完整内存镜像"，与 LSM 共享 wal_seal_id；
+        // - 若 v7 的 wal_seal_id == LSM manifest 的最新 seal_id，则 v7 fresh，
+        //   走单文件直加载，跳过多 segment 合并；
+        // - 否则 v7 已被后续 append delta 落下，fallback 到 LSM 路径。
+        // 优先 mmap 路径——path_table.data 借用 mmap，不进堆（省 ≈100MB RSS）。
+        // mmap 失败（NotFound/IO 错误/损坏）退回 eager 加载，最后退回 LSM。
+        let v7_loaded = store
+            .load_v7_companion_mmap()
+            .ok()
+            .flatten()
+            .or_else(|| store.load_v7_companion().ok().flatten());
+        if let Some(v7) = v7_loaded {
+            let manifest_seal = store.lsm_manifest_wal_seal_id().unwrap_or(0);
+            if v7.wal_seal_id != 0 && v7.wal_seal_id == manifest_seal {
+                tracing::info!(
+                    "v7 companion fresh (wal_seal_id={}, file_count={}); fast-path load",
+                    v7.wal_seal_id,
+                    v7.file_count()
+                );
+                let l2 = crate::index::l2_partition::PersistentIndex::from_snapshot_v7(
+                    v7,
+                    roots.clone(),
+                );
+                let idx = Self::new(
+                    l1,
+                    Arc::new(l2),
+                    l3,
+                    roots,
+                    include_hidden,
+                    ignore_enabled,
+                    false,
+                    Vec::new(),
+                );
+                idx.attach_wal(store)?;
+                idx.replay_wal_if_any(manifest_seal);
+                return Ok(idx);
+            }
+            tracing::debug!(
+                "v7 companion stale (v7_seal={} manifest_seal={}); fallback to LSM",
+                v7.wal_seal_id,
+                manifest_seal
+            );
+        }
+
         // 阶段 C：优先加载 LSM 目录布局（base + delta segments），启动后不做全量 hydration。
         if let Ok(Some(lsm)) = store.load_lsm_if_valid(&roots) {
             let mut layers: Vec<DiskLayer> = Vec::new();
@@ -253,16 +295,12 @@ impl TieredIndex {
             return Ok(idx);
         }
 
-        let l2 = match store.load_if_valid().await {
-            Ok(Some(snap)) => snap.into_persistent_index(roots.clone()),
-            Ok(None) => {
-                tracing::info!("No valid snapshot, starting with empty index");
-                PersistentIndex::new_with_roots(roots.clone())
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load snapshot: {}, starting empty", e);
-                PersistentIndex::new_with_roots(roots.clone())
-            }
+        // M4-C: legacy bincode v2-v5 已删除，load_if_valid 现在永远返回 Ok(None)。
+        // 仍然调一下用于产生 header 校验的 warn 日志，方便诊断遗留 index.db 文件。
+        let _ = store.load_if_valid().await;
+        let l2 = {
+            tracing::info!("No legacy snapshot loader (v2-v5 removed); starting empty");
+            PersistentIndex::new_with_roots(roots.clone())
         };
 
         let idx = Self::new(
