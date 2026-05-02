@@ -43,6 +43,7 @@ impl TieredIndex {
             event_seq: AtomicU64::new(0),
             rebuild_state: Mutex::new(RebuildState::default()),
             overlay_state: Mutex::new(OverlayState::default()),
+            delta_buffer: Mutex::new(crate::index::delta_buffer::DeltaBuffer::with_capacity(262_144)),
             apply_gate: RwLock::new(()),
             flush_requested: AtomicBool::new(false),
             flush_notify: Notify::new(),

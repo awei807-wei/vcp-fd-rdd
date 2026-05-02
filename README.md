@@ -10,7 +10,30 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-当前 tests 分支发布版本为 v0.6.3（内存优化与功能修复）。
+当前 tests 分支发布版本为 v0.6.5（ParentIndex 性能优化）。
+
+## v0.6.5 更新（Phase 2: ParentIndex 性能优化）
+
+- 新增 `src/index/parent_index.rs`：`ParentIndex` 模块，提供 `HashMap<Vec<u8>, RoaringTreemap>` 映射 parent 目录路径 → live DocIds
+- `PersistentIndex` 新增 `parent_index` 字段、`rebuild_parent_index()` 和 `delete_alignment_with_parent_index()` 方法
+- `fast_sync` Phase3 新增 `USE_PARENT_INDEX` 环境变量 A/B 切换：启用后删除对齐从 O(N) 全量扫描降为 O(D)（D=脏目录数），未设置时保留旧路径 fallback
+- 133 个单元测试全部通过，集成测试 15/15 通过
+
+## v0.6.4 更新（Phase 0 基准测试框架 + Phase 1 死代码清理）
+
+- **Phase 0 基准测试框架**：
+  - 新增 `scripts/bench.sh` 和 `scripts/profile.sh` 性能测试脚本
+  - 新增 `src/stats/mod.rs` 中 `StatsCollector` / `StatsReport`（原子计数器：查询、事件、快照、fast_sync）
+  - `src/query/server.rs` 新增 `/metrics` HTTP 端点返回 JSON 性能报告
+  - 新增 `BENCHMARK.md` 基线文档和 `.github/workflows/bench.yml` CI 工作流
+- **Phase 1 死代码清理**：
+  - 删除 `src/index/tiered/compaction.rs`（382 行），移除 `compact_layers_slow` 及其相关内存峰值问题
+  - `src/index/tiered/mod.rs` / `snapshot.rs` / `load.rs` 移除 compaction 相关字段和调用
+  - `src/index/tiered/memory.rs` 移除 `rss_trim_loop`（~70 行）
+  - `src/main.rs` 移除 RSS trim CLI 参数（`--trim-interval-secs`、`--trim-pd-threshold-mb`）和启动代码；移除 `--no-snapshot`、`--no-watch`、`--no-build`
+  - `src/event/stream.rs` 移除 `dyn_walk_and_enqueue` 和 `walk_dir_send`
+  - `src/index/tiered/sync.rs` 标记 `startup_reconcile` / `spawn_rebuild` 为 `#[deprecated]`
+  - 代码行数从 19,359 降至 18,781（-578 行，-3.0%）
 
 ## v0.6.3 更新（内存优化与功能修复）
 
@@ -420,12 +443,9 @@ curl "http://127.0.0.1:6060/health"
 - MemoryReport：区分堆高水位（Private_Dirty）与 file-backed 常驻（Private_Clean）
 - page faults：在真实查询压力下量化"零拷贝是否真的少触页"
 
-长期运行时可启用条件性 RSS trim（v0.4.4+）：
+~~长期运行时可启用条件性 RSS trim（v0.4.4+）：`--trim-interval-secs` 与 `--trim-pd-threshold-mb` 已在 **v0.6.4** 中移除。~~
 
-- `--trim-interval-secs`：检查周期（秒，0=禁用，默认 300）
-- `--trim-pd-threshold-mb`：`Private_Dirty` 触发阈值（MB，0=禁用，默认 128）
-
-如需减少"低频小变更也每轮都落成一个新 delta 段"的情况，可额外启用定时 flush 批量门槛：
+如需减少"低频小变更也每轮都落成一个新 delta 段"的情况，可启用定时 flush 批量门槛：
 
 - `--batch-flush-min-events`：周期性 flush 的最小事件数（0=禁用，默认 0）
 - `--batch-flush-min-bytes`：周期性 flush 的最小事件字节数（0=禁用，默认 0）
@@ -447,12 +467,10 @@ curl "http://127.0.0.1:6060/health"
 ./target/release/fd-rdd \
   --root /tmp/fd-rdd-churn \
   --snapshot-path /tmp/fd-rdd/index.db \
-  --no-build \
   --snapshot-interval-secs 0 \
   --auto-flush-overlay-paths 5000 \
   --auto-flush-overlay-bytes 0 \
-  --report-interval-secs 5 \
-  --trim-interval-secs 0
+  --report-interval-secs 5
 
 # 2) 生成文件系统事件（create/delete/rename/modify 混合）
 python3 scripts/fs-churn.py --root /tmp/fd-rdd-churn --reset --populate 20000 --ops 200000
@@ -500,12 +518,10 @@ python3 scripts/fs-churn.py \
   --spawn-fd ./target/release/fd-rdd \
     --root /tmp/fd-rdd-churn \
     --snapshot-path /tmp/fd-rdd/index.db \
-    --no-build \
     --snapshot-interval-secs 0 \
     --auto-flush-overlay-paths 5000 \
     --auto-flush-overlay-bytes 0 \
-    --report-interval-secs 5 \
-    --trim-interval-secs 0
+    --report-interval-secs 5
 ```
 
 ## TODO

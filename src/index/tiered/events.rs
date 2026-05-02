@@ -264,12 +264,21 @@ impl TieredIndex {
         // 若 rebuild 在进行：先缓冲 pending 事件；并在持锁期间捕获当前 l2 指针，
         // 避免切换窗口导致"事件已缓冲但应用到了新索引"而重复回放。
         let (l2, rebuild_in_progress) = self.capture_l2_for_apply(events);
-        self.update_overlay_for_events(events);
+        if std::env::var("USE_DELTA_BUFFER").is_ok() {
+            let mut db = self.delta_buffer.lock();
+            db.apply_events(events);
+            let overlay_paths = db.len();
+            let overlay_arena_bytes = db.estimated_bytes() as u64;
+            drop(db);
+            self.maybe_request_flush(overlay_paths, overlay_arena_bytes);
+        } else {
+            self.update_overlay_for_events(events);
+        }
         self.note_pending_flush_batch(events);
         self.invalidate_l1_for_events(events);
 
         // 将非 Delete 事件加入 pending_events，使 debounce 期间的新文件可被查询到。
-        {
+        if std::env::var("USE_DELTA_BUFFER").is_err() {
             let mut pending = self.pending_events.lock();
             for ev in events {
                 match &ev.event_type {
@@ -364,6 +373,9 @@ impl TieredIndex {
     }
 
     fn remove_from_pending(&self, events: &[EventRecord]) {
+        if std::env::var("USE_DELTA_BUFFER").is_ok() {
+            return;
+        }
         let mut pending = self.pending_events.lock();
         for ev in events {
             match &ev.event_type {

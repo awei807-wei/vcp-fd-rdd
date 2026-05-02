@@ -34,9 +34,14 @@ impl TieredIndex {
             let delta = idx.l2.load_full();
             let delta_dirty = delta.is_dirty();
 
-            let mut ov = idx.overlay_state.lock();
-            let overlay_dirty =
-                ov.deleted_paths.len_paths() != 0 || ov.upserted_paths.len_paths() != 0;
+            let use_db = std::env::var("USE_DELTA_BUFFER").is_ok();
+            let overlay_dirty = if use_db {
+                let db = idx.delta_buffer.lock();
+                !db.is_empty()
+            } else {
+                let ov = idx.overlay_state.lock();
+                ov.deleted_paths.len_paths() != 0 || ov.upserted_paths.len_paths() != 0
+            };
             if !delta_dirty && !overlay_dirty {
                 tracing::debug!("No delta/overlay changes, skipping flush");
                 idx.flush_requested.store(false, Ordering::Release);
@@ -64,16 +69,24 @@ impl TieredIndex {
                 .swap(Arc::new(PersistentIndex::new_with_roots(idx.roots.clone())));
 
             // 只保留"仍然有效"的 delete：若本轮 delta 又 upsert 了同一路径，则认为 delete 被抵消。
-            let mut deleted: Vec<Vec<u8>> = Vec::new();
-            ov.deleted_paths.for_each_bytes(|p| {
-                if !ov.upserted_paths.contains(p) {
-                    deleted.push(p.to_vec());
-                }
-            });
-            Arc::make_mut(&mut ov.deleted_paths).clear();
-            Arc::make_mut(&mut ov.upserted_paths).clear();
-            Arc::make_mut(&mut ov.deleted_paths).maybe_shrink_after_clear();
-            Arc::make_mut(&mut ov.upserted_paths).maybe_shrink_after_clear();
+            let deleted = if use_db {
+                let mut db = idx.delta_buffer.lock();
+                let paths = db.drain_deleted_for_flush();
+                paths
+            } else {
+                let mut ov = idx.overlay_state.lock();
+                let mut deleted: Vec<Vec<u8>> = Vec::new();
+                ov.deleted_paths.for_each_bytes(|p| {
+                    if !ov.upserted_paths.contains(p) {
+                        deleted.push(p.to_vec());
+                    }
+                });
+                Arc::make_mut(&mut ov.deleted_paths).clear();
+                Arc::make_mut(&mut ov.upserted_paths).clear();
+                Arc::make_mut(&mut ov.deleted_paths).maybe_shrink_after_clear();
+                Arc::make_mut(&mut ov.upserted_paths).maybe_shrink_after_clear();
+                deleted
+            };
             idx.flush_requested.store(false, Ordering::Release);
 
             Some((

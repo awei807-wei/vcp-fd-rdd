@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.6] - 2026-05-01
+
+### Added
+
+- **Phase 3: DeltaBuffer Unified Incremental Buffer**: Introduced `DeltaBuffer` module to unify `overlay_state` and `pending_events`.
+  - Added `src/index/delta_buffer.rs`: `DeltaBuffer` backed by `HashMap<Vec<u8>, DeltaState>` mapping paths to their latest delta state (Live/Deleted).
+  - Capacity limit 256K entries (default `262_144`), solving the original `pending_events` 4096 overflow issue.
+  - State transitions: `Create/Modify` → `Live`, `Delete` → `Deleted`, `Rename` marks from→Deleted and to→Live simultaneously.
+  - Refactored `TieredIndex`: added `delta_buffer` field, keeping old `overlay_state` / `pending_events` as fallback.
+  - Refactored query path: `execute_query_plan` / `collect_all_live_metas` now read deleted/upserted/live state from `DeltaBuffer`.
+  - Refactored event application path: `begin_apply_batch` / `update_overlay_for_events` changed to `update_delta_buffer_for_events`.
+  - Environment variable `USE_DELTA_BUFFER=1` enables the new path; old path remains as fallback when unset.
+  - 133 unit tests pass, integration tests pass.
+
+## [0.6.5] - 2026-05-01
+
+### Added
+
+- **Phase 2: ParentIndex Module**: Introduced `ParentIndex` to eliminate the core performance bottleneck in `fast_sync` Phase3.
+  - Added `src/index/parent_index.rs`: `ParentIndex` backed by `HashMap<PathBuf, RoaringTreemap>` mapping parent directories to their live `DocId`s.
+  - `PersistentIndex` now carries `parent_index: RwLock<Option<ParentIndex>>`.
+  - Added `rebuild_parent_index()` invoked after rebuild and snapshot to warm the index.
+  - `fast_sync` Phase3 supports `USE_PARENT_INDEX` environment variable for A/B switching between:
+    - `delete_alignment_with_parent_index()` (O(D) where D = dirty directory count)
+    - Legacy `for_each_live_meta_in_dirs()` (O(N) full scan) as fallback.
+
 ## [0.6.4] - 2026-05-01
 
 ### Added

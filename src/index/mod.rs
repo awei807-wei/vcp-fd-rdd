@@ -1,4 +1,5 @@
 pub mod content_filter;
+pub mod delta_buffer;
 pub mod l1_cache;
 pub mod l2_partition;
 pub mod l3_cold;

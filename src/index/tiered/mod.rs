@@ -56,6 +56,7 @@ pub struct TieredIndex {
     pub event_seq: AtomicU64,
     pub(self) rebuild_state: Mutex<RebuildState>,
     pub(self) overlay_state: Mutex<OverlayState>,
+    pub(self) delta_buffer: Mutex<crate::index::delta_buffer::DeltaBuffer>,
     pub(self) apply_gate: RwLock<()>,
     pub(self) flush_requested: AtomicBool,
     pub(self) flush_notify: Notify,
