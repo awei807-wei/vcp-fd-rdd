@@ -398,6 +398,9 @@ pub struct PersistentIndex {
 
     /// 脏标记（自上次快照后是否有变更）
     dirty: std::sync::atomic::AtomicBool,
+
+    /// 阶段 2: ParentIndex，替代 for_each_live_meta_in_dirs
+    parent_index: RwLock<Option<crate::index::parent_index::ParentIndex>>,
 }
 
 impl Default for PersistentIndex {
@@ -430,6 +433,7 @@ impl PersistentIndex {
             tombstones: RwLock::new(RoaringTreemap::new()),
             upsert_lock: RwLock::new(()),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            parent_index: RwLock::new(None),
         }
     }
 
@@ -916,6 +920,66 @@ impl PersistentIndex {
                     });
                 }
             }
+        }
+    }
+
+    /// 构建/重建 ParentIndex
+    pub fn rebuild_parent_index(&self) {
+        let mut dir_to_files: HashMap<Vec<u8>, RoaringTreemap> = HashMap::new();
+
+        let metas = self.metas.read();
+        let arena = self.arena.read();
+        let tombstones = self.tombstones.read();
+
+        for (i, m) in metas.iter().enumerate() {
+            let doc_id = i as DocId;
+            if tombstones.contains(doc_id) {
+                continue;
+            }
+            let rel = match arena.get_bytes(m.path_off, m.path_len) {
+                Some(r) => r,
+                None => continue,
+            };
+            let abs = compose_abs_path_bytes(root_bytes_for_id(&self.roots_bytes, m.root_id), rel);
+            let path = pathbuf_from_encoded_vec(abs.to_vec());
+            if let Some(parent) = path.parent() {
+                let parent_bytes = parent.as_os_str().as_encoded_bytes().to_vec();
+                dir_to_files
+                    .entry(parent_bytes)
+                    .or_default()
+                    .insert(doc_id);
+            }
+        }
+
+        let new_index = crate::index::parent_index::ParentIndex { dir_to_files };
+        *self.parent_index.write() = Some(new_index);
+    }
+
+    /// 使用 ParentIndex 的删除对齐（替代 for_each_live_meta_in_dirs）
+    #[allow(dead_code)]
+    pub fn delete_alignment_with_parent_index(
+        &self,
+        dirty_dirs: &std::collections::HashSet<PathBuf>,
+    ) -> Vec<(DocId, PathBuf)> {
+        let parent_idx = self.parent_index.read();
+        if let Some(ref index) = *parent_idx {
+            let to_check = index.files_in_dirs(dirty_dirs);
+            let mut result = Vec::new();
+            let metas = self.metas.read();
+            let arena = self.arena.read();
+            for doc_id in to_check.iter() {
+                let m = &metas[doc_id as usize];
+                let rel = match arena.get_bytes(m.path_off, m.path_len) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let abs = compose_abs_path_bytes(root_bytes_for_id(&self.roots_bytes, m.root_id), rel);
+                let path = pathbuf_from_encoded_vec(abs.to_vec());
+                result.push((doc_id, path));
+            }
+            result
+        } else {
+            Vec::new()
         }
     }
 

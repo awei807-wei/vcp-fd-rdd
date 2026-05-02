@@ -505,24 +505,48 @@ impl TieredIndex {
         let dirty_dirs: HashSet<PathBuf> = dirs.into_iter().collect();
 
         // 3) 删除对齐：只对齐"被标记 dirty 的目录"下的条目（但对文件做轻量存在性检查，避免构建巨大的 names set）。
-        // 注意：for_each_live_meta_in_dirs 内部持有读锁，期间不能调用 apply_events（会死锁）。
-        let l2 = self.l2.load_full();
         let mut delete_events: Vec<EventRecord> = Vec::new();
-        l2.for_each_live_meta_in_dirs(&dirty_dirs, |m| {
-            match std::fs::symlink_metadata(&m.path) {
-                Ok(_) => return,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return,
-            };
-            seq = seq.wrapping_add(1);
-            delete_events.push(EventRecord {
-                seq,
-                timestamp: std::time::SystemTime::now(),
-                event_type: EventType::Delete,
-                id: FileIdentifier::Path(m.path),
-                path_hint: None,
+
+        if std::env::var("USE_PARENT_INDEX").is_ok() {
+            // 新路径: 使用 ParentIndex
+            let l2 = self.l2.load_full();
+            // 如果 ParentIndex 未构建，先构建
+            l2.rebuild_parent_index();
+            let to_delete = l2.delete_alignment_with_parent_index(&dirty_dirs);
+            for (_doc_id, path) in to_delete {
+                match std::fs::symlink_metadata(&path) {
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => continue,
+                };
+                seq = seq.wrapping_add(1);
+                delete_events.push(EventRecord {
+                    seq,
+                    timestamp: std::time::SystemTime::now(),
+                    event_type: EventType::Delete,
+                    id: FileIdentifier::Path(path),
+                    path_hint: None,
+                });
+            }
+        } else {
+            // 旧路径: 保留原有 for_each_live_meta_in_dirs
+            let l2 = self.l2.load_full();
+            l2.for_each_live_meta_in_dirs(&dirty_dirs, |m| {
+                match std::fs::symlink_metadata(&m.path) {
+                    Ok(_) => return,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return,
+                };
+                seq = seq.wrapping_add(1);
+                delete_events.push(EventRecord {
+                    seq,
+                    timestamp: std::time::SystemTime::now(),
+                    event_type: EventType::Delete,
+                    id: FileIdentifier::Path(m.path),
+                    path_hint: None,
+                });
             });
-        });
+        }
 
         report.delete_events = delete_events.len();
         for chunk in delete_events.chunks(2048) {
