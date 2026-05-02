@@ -71,22 +71,6 @@ struct Args {
     /// 注意：已有 inode 去重可防止无限递归，但跟随可能导致索引范围远超预期。
     #[arg(long)]
     follow_symlinks: bool,
-
-    /// overlay 强制 flush 阈值（路径数）。达到阈值会唤醒 snapshot_loop 立即执行一次 snapshot_now（0=禁用）
-    #[arg(long, default_value_t = 250_000)]
-    auto_flush_overlay_paths: u64,
-
-    /// overlay 强制 flush 阈值（arena 字节数，近似“物理路径字节池”体量）（0=禁用）
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
-    auto_flush_overlay_bytes: u64,
-
-    /// 定时 flush 的最小事件数门槛；未达到时继续保留在 WAL/L2，等待后续批量落盘（0=禁用）
-    #[arg(long, default_value_t = 0)]
-    batch_flush_min_events: u64,
-
-    /// 定时 flush 的最小事件字节数门槛；未达到时继续保留在 WAL/L2，等待后续批量落盘（0=禁用）
-    #[arg(long, default_value_t = 0)]
-    batch_flush_min_bytes: u64,
 }
 
 #[tokio::main]
@@ -161,8 +145,6 @@ async fn main() -> anyhow::Result<()> {
     // 3) 从快照加载或空索引启动
     let index = TieredIndex::load_with_options(store.as_ref(), roots, args.include_hidden, ignore_enabled)
         .await?;
-    index.set_auto_flush_limits(args.auto_flush_overlay_paths, args.auto_flush_overlay_bytes);
-    index.set_periodic_flush_batch_limits(args.batch_flush_min_events, args.batch_flush_min_bytes);
     let _ = index.attach_wal(store.as_ref());
 
     // 4) 若索引为空，后台全量构建

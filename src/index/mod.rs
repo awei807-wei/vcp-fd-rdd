@@ -1,10 +1,13 @@
+pub mod base_index;
 pub mod content_filter;
 pub mod delta_buffer;
+pub mod file_entry_v2;
 pub mod l1_cache;
 pub mod l2_partition;
 pub mod l3_cold;
 pub mod mmap_index;
 pub mod parent_index;
+pub mod path_table_v2;
 pub mod pathtable;
 pub mod tiered;
 
@@ -30,5 +33,5 @@ pub use l2_partition::{
 };
 pub use l3_cold::IndexBuilder;
 pub use mmap_index::MmapIndex;
-pub use parent_index::ParentIndex;
+pub use parent_index::{ParentIndex, ParentIndexDelta, PathTable};
 pub use tiered::TieredIndex;

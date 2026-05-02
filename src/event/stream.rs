@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::event::ignore_filter::IgnoreFilter;
-
 use crate::event::watcher::{check_inotify_limit, watch_roots_enhanced, EventWatcher};
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
@@ -169,7 +168,7 @@ impl EventPipeline {
             )?;
         // inotify watch 数兜底检查
         check_inotify_limit(roots.len());
-        let failed_roots: Vec<PathBuf> = watch_roots_enhanced(&mut watcher, &roots);
+        let failed_roots = watch_roots_enhanced(&mut watcher, &roots);
         self.watch_failures
             .fetch_add(failed_roots.len() as u64, Ordering::Relaxed);
         self.watcher_degraded.store(

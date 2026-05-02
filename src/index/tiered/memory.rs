@@ -7,22 +7,20 @@ use crate::stats::{
 use super::TieredIndex;
 
 impl TieredIndex {
+    /// 手动刷新 base 索引（当 l2 被外部直接修改后需要调用）。
+    pub fn refresh_base(&self) {
+        let l2 = self.l2.load_full();
+        let new_base = Arc::new(l2.to_base_index_data());
+        self.base.store(new_base);
+    }
+
     pub fn file_count(&self) -> usize {
-        // Hold apply_gate read lock to prevent reading inconsistent state
-        // during snapshot (when L2 is swapped empty but disk_layers not yet updated).
-        let _gate = self.apply_gate.read();
-        let l2 = self.l2.load_full().file_count();
-        let disk = self
-            .disk_layers
-            .read()
-            .iter()
-            .map(|l| l.idx.file_count_estimate())
-            .sum::<usize>();
+        let base = self.base.load_full().file_count();
         let overlay = {
             let db = self.delta_buffer.lock();
-            db.live_records().count()
+            db.len()
         };
-        l2 + disk + overlay
+        base + overlay
     }
 
     /// 生成完整内存报告
@@ -51,47 +49,15 @@ impl TieredIndex {
         };
 
         let rebuild = {
-            use std::mem::size_of;
-
-            use super::rebuild::PendingEvent;
-            use crate::core::{EventType, FileIdentifier};
-
             let st = self.rebuild_state.lock();
-            let mut key_bytes = 0u64;
-            let mut from_bytes = 0u64;
-            for (k, v) in st.pending_events.iter() {
-                key_bytes += match k {
-                    FileIdentifier::Path(p) => p.as_os_str().as_encoded_bytes().len() as u64,
-                    FileIdentifier::Fid { .. } => 16,
-                };
-                if let EventType::Rename {
-                    from,
-                    from_path_hint,
-                } = &v.event_type
-                {
-                    from_bytes += match from {
-                        FileIdentifier::Path(p) => p.as_os_str().as_encoded_bytes().len() as u64,
-                        FileIdentifier::Fid { .. } => 16,
-                    };
-                    if let Some(p) = from_path_hint {
-                        from_bytes += p.as_os_str().as_encoded_bytes().len() as u64;
-                    }
-                }
-                if let Some(p) = &v.path_hint {
-                    key_bytes += p.as_os_str().as_encoded_bytes().len() as u64;
-                }
-            }
-            let cap = st.pending_events.capacity();
-            let entry = size_of::<(FileIdentifier, PendingEvent)>() as u64;
-            let estimated = cap as u64 * (entry + 16) + key_bytes + from_bytes;
 
             RebuildStats {
                 in_progress: st.in_progress,
-                pending_paths: st.pending_events.len(),
-                pending_map_cap: st.pending_events.capacity(),
-                pending_key_bytes: key_bytes,
-                pending_from_bytes: from_bytes,
-                estimated_bytes: estimated,
+                pending_paths: 0,
+                pending_map_cap: 0,
+                pending_key_bytes: 0,
+                pending_from_bytes: 0,
+                estimated_bytes: 0,
             }
         };
 
@@ -101,24 +67,10 @@ impl TieredIndex {
             disk_deleted_bytes,
             disk_deleted_estimated_bytes,
             disk_deleted_estimated_bytes_max,
-        ) = {
-            let layers = self.disk_layers.read();
-            let mut total_paths: usize = 0;
-            let mut total_bytes: u64 = 0;
-            let mut total_est: u64 = 0;
-            let mut max_est: u64 = 0;
-            for l in layers.iter() {
-                total_paths = total_paths.saturating_add(l.deleted_paths_count);
-                total_bytes = total_bytes.saturating_add(l.deleted_paths_bytes);
-                total_est = total_est.saturating_add(l.deleted_paths_estimated_bytes);
-                max_est = max_est.max(l.deleted_paths_estimated_bytes);
-            }
-            (layers.len(), total_paths, total_bytes, total_est, max_est)
-        };
+        ) = (0, 0, 0, 0, 0);
 
         let index_estimated_bytes = l1.estimated_bytes
             + l2.estimated_bytes
-            + disk_deleted_estimated_bytes
             + overlay.estimated_bytes
             + rebuild.estimated_bytes;
         let process_smaps_rollup = MemoryReport::read_smaps_rollup();

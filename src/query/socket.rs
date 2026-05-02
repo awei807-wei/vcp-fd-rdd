@@ -280,7 +280,7 @@ mod imp {
     mod tests {
         use super::*;
         use crate::core::{EventRecord, EventType, FileIdentifier};
-        use crate::event::recovery::DirtyScope;
+        use crate::event::sync::DirtyScope;
         use std::time::{SystemTime, UNIX_EPOCH};
         use tokio::io::duplex;
 

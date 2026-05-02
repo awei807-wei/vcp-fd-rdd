@@ -55,8 +55,7 @@ impl TieredIndex {
     }
 
     pub(crate) fn collect_all_live_metas(&self) -> Vec<FileMeta> {
-        let l2 = self.l2.load_full();
-        let layers = self.disk_layers.read().clone();
+        let base = self.base.load_full();
         let db = self.delta_buffer.lock();
         let mut del = PathArenaSet::default();
         for p in db.deleted_paths() {
@@ -70,12 +69,12 @@ impl TieredIndex {
         let overlay_deleted = Arc::new(del);
         let overlay_upserted = Arc::new(ups);
         let mut blocked_paths = PathArenaSet::default();
-        let mut deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
+        let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
         let mut seen: std::collections::HashSet<FileKey> =
-            std::collections::HashSet::with_capacity(l2.file_count().saturating_add(256));
-        let mut results: Vec<FileMeta> = Vec::with_capacity(l2.file_count().saturating_add(256));
+            std::collections::HashSet::with_capacity(base.file_count().saturating_add(256));
+        let mut results: Vec<FileMeta> = Vec::with_capacity(base.file_count().saturating_add(256));
 
-        l2.for_each_live_meta(|meta| {
+        base.for_each_live_meta(|meta| {
             collect_live_meta(
                 meta,
                 None,
@@ -85,20 +84,6 @@ impl TieredIndex {
                 &mut results,
             );
         });
-
-        for layer in layers.iter().rev() {
-            layer.idx.for_each_live_meta(|meta| {
-                collect_live_meta(
-                    meta,
-                    Some(layer.deleted_paths.as_ref()),
-                    deleted_sources.as_slice(),
-                    &mut seen,
-                    &mut blocked_paths,
-                    &mut results,
-                );
-            });
-            deleted_sources.push(layer.deleted_paths.clone());
-        }
 
         overlay_upserted.for_each_bytes(|bytes| {
             let path = super::pathbuf_from_bytes(bytes);
@@ -138,8 +123,7 @@ impl TieredIndex {
     }
 
     fn execute_query_plan(&self, plan: &QueryPlan, limit: usize) -> Vec<FileMeta> {
-        let l2 = self.l2.load_full();
-        let layers = self.disk_layers.read().clone();
+        let base = self.base.load_full();
         let db = self.delta_buffer.lock();
         let mut del = PathArenaSet::default();
         for p in db.deleted_paths() {
@@ -153,19 +137,19 @@ impl TieredIndex {
         let overlay_deleted = Arc::new(del);
         let overlay_upserted = Arc::new(ups);
         let mut blocked_paths = PathArenaSet::default();
-        let mut deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
+        let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
         let mut seen: std::collections::HashSet<FileKey> =
-            std::collections::HashSet::with_capacity(l2.file_count().saturating_add(256));
+            std::collections::HashSet::with_capacity(base.file_count().saturating_add(256));
         let mut results: Vec<FileMeta> = Vec::with_capacity(limit.min(128));
 
-        // ParentIndex fast path: if query has a parent filter, get exact candidates from L2
+        // ParentIndex fast path: if query has a parent filter, get exact candidates from base
         if let Some(ref parent_path) = plan.parent_filter() {
-            let candidates = l2.parent_candidates(parent_path);
+            let candidates = base.parent_candidates(parent_path);
             for key in candidates {
                 if !seen.insert(key) {
                     continue;
                 }
-                let Some(meta) = l2.get_meta(key) else {
+                let Some(meta) = base.get_meta(key) else {
                     continue;
                 };
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
@@ -186,7 +170,7 @@ impl TieredIndex {
 
         if self.query_layer(
             plan,
-            l2.as_ref(),
+            base.as_ref(),
             None,
             deleted_sources.as_slice(),
             &mut seen,
@@ -195,22 +179,6 @@ impl TieredIndex {
             limit,
         ) {
             return results;
-        }
-
-        for layer in layers.iter().rev() {
-            if self.query_layer(
-                plan,
-                layer.idx.as_ref(),
-                Some(layer.deleted_paths.as_ref()),
-                deleted_sources.as_slice(),
-                &mut seen,
-                &mut blocked_paths,
-                &mut results,
-                limit,
-            ) {
-                return results;
-            }
-            deleted_sources.push(layer.deleted_paths.clone());
         }
 
         // Supplement results from overlay upserted paths (e.g., during rebuild)

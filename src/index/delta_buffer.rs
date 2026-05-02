@@ -22,7 +22,7 @@ impl DeltaBuffer {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(cap.min(1024)),
-            max_capacity: 256 * 1024,
+            max_capacity: cap,
         }
     }
 
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_hard_capacity_limit_256k() {
-        let mut db = DeltaBuffer::with_capacity(1024);
+        let mut db = DeltaBuffer::with_capacity(256 * 1024);
         for i in 0..(256 * 1024) {
             let path = format!("/tmp/file_{}", i);
             assert!(

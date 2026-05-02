@@ -74,6 +74,9 @@ fn rename_event_updates_index() {
         atime: None,
     });
 
+    // L2 被外部直接修改后需要刷新 base 索引
+    index.refresh_base();
+
     // Verify old name is findable
     let results = index.query("old_name");
     assert!(

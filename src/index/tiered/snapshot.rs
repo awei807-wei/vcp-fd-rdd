@@ -2,14 +2,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::index::l2_partition::PersistentIndex;
-use crate::index::mmap_index::MmapIndex;
+use crate::storage::snapshot_v7::write_v7_snapshot_atomic;
 use crate::storage::traits::StorageBackend;
 use crate::util::maybe_trim_rss;
 
-use super::arena::{deleted_paths_stats, path_arena_set_from_paths};
-use super::disk_layer::DiskLayer;
-use super::pathbuf_from_bytes;
 use super::TieredIndex;
 
 const MIN_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
@@ -20,17 +16,8 @@ impl TieredIndex {
     where
         S: StorageBackend + 'static,
     {
-        // Flush：把当前内存 Delta 刷盘为新 Segment；必要时触发后台 compaction。
         let idx = self.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let _wg = match idx.apply_gate.try_write() {
-                Some(guard) => guard,
-                None => {
-                    tracing::debug!("apply_gate busy, deferring snapshot");
-                    return None;
-                }
-            };
-
             let delta = idx.l2.load_full();
             let delta_dirty = delta.is_dirty();
 
@@ -45,7 +32,7 @@ impl TieredIndex {
                 return None;
             }
 
-            // WAL：在 snapshot 边界 seal，确保新事件进入新 WAL（并可由 manifest checkpoint 判定回放范围）。
+            // WAL：在 snapshot 边界 seal，确保新事件进入新 WAL。
             let wal_seal_id = match idx.wal.lock().clone() {
                 Some(w) => match w.seal() {
                     Ok(id) => id,
@@ -57,33 +44,23 @@ impl TieredIndex {
                 None => 0,
             };
 
-            // FIX: export BEFORE swap, while data is still in L2
-            let segs = delta.export_segments_v6();
+            // 获取当前 base（完整状态）并写入 v7 单文件快照
+            let base = idx.base.load_full();
+            let v7_path = store.path().with_extension("v7");
 
-            let old = idx
-                .l2
-                .swap(Arc::new(PersistentIndex::new_with_roots(idx.roots.clone())));
-
-            // 只保留"仍然有效"的 delete：若本轮 delta 又 upsert 了同一路径，则认为 delete 被抵消。
-            let deleted = {
+            // 清空 delta_buffer（其增量已包含在 base / L2 中）
+            {
                 let mut db = idx.delta_buffer.lock();
-                let paths = db.drain_deleted_for_flush();
-                paths
-            };
+                db.clear();
+            }
             idx.flush_requested.store(false, Ordering::Release);
 
-            Some((
-                segs,
-                old,
-                deleted,
-                idx.disk_layers.read().clone(),
-                wal_seal_id,
-            ))
+            Some((base, v7_path, wal_seal_id))
         })
         .await
         .map_err(|e| anyhow::anyhow!("snapshot sync phase panicked: {}", e))?;
 
-        let (segs, old_delta, deleted_paths, layers_snapshot, wal_seal_id) = match result {
+        let (base, v7_path, wal_seal_id) = match result {
             Some(v) => v,
             None => {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -91,89 +68,13 @@ impl TieredIndex {
             }
         };
 
-        // 判断是否已有 LSM manifest：无则先 bootstrap 为 base（避免 legacy base 被"遗忘"）。
-        let roots = self.roots.clone();
-        let lsm_present = store.load_lsm_if_valid(&roots).ok().flatten().is_some();
-
-        if !lsm_present {
-            tracing::info!("LSM manifest not found, bootstrapping a new base segment...");
-
-            let merged = PersistentIndex::new_with_roots(roots.clone());
-
-            // 先灌入现有 disk base（可能是 legacy v6）。
-            for layer in &layers_snapshot {
-                layer.idx.for_each_live_meta(|m| merged.upsert_rename(m));
-            }
-            drop(layers_snapshot);
-
-            // 再应用跨段 delete（delete/rename-from）。
-            for p in &deleted_paths {
-                let pb = pathbuf_from_bytes(p);
-                merged.mark_deleted_by_path(&pb);
-            }
-            drop(deleted_paths);
-
-            // 最后灌入本次 delta（newest）。
-            old_delta.for_each_live_meta(|m| merged.upsert_rename(m));
-            drop(old_delta);
-
-            let segs = merged.export_segments_v6_compacted();
-            drop(merged);
-            let base = store
-                .replace_base_v6(&segs, None, &roots, wal_seal_id)
-                .await?;
-            drop(segs);
-            if let Err(e) = store.gc_stale_segments() {
-                tracing::warn!("LSM gc stale segments failed after replace-base: {}", e);
-            }
-
-            // deleted_paths 在 append/replace-base 后通常会经历增长与扩容；这里 shrink 一次，避免把 capacity 高水位长期带到常驻层。
-            let mut base_deleted_paths = base.deleted_paths;
-            base_deleted_paths.shrink_to_fit();
-            let deleted_paths = Arc::new(path_arena_set_from_paths(base_deleted_paths));
-            let (cnt, bytes, est) = deleted_paths_stats(deleted_paths.as_ref());
-            let new_layer = DiskLayer {
-                idx: Arc::new(MmapIndex::new(base.snap)),
-                deleted_paths,
-                deleted_paths_count: cnt,
-                deleted_paths_bytes: bytes,
-                deleted_paths_estimated_bytes: est,
-            };
-
-            *self.disk_layers.write() = vec![new_layer];
-            self.l1.clear();
-            if let Some(w) = self.wal.lock().clone() {
-                if let Err(e) = w.cleanup_sealed_up_to(wal_seal_id) {
-                    tracing::warn!("WAL cleanup_sealed_up_to failed: {e}");
-                }
-            }
-            self.record_snapshot_success();
-            self.reset_pending_flush_batch();
-            // snapshot/flush 是临时分配大户；完成后尝试回吐。
-            maybe_trim_rss();
-            return Ok(());
+        // 写入 v7 快照（原子写：tmp + rename）
+        if let Err(e) = write_v7_snapshot_atomic(&v7_path, &base) {
+            tracing::warn!("v7 snapshot write failed: {}", e);
+        } else {
+            tracing::info!("v7 snapshot written to {:?}", v7_path);
         }
 
-        drop(layers_snapshot);
-        drop(old_delta);
-        let seg = store
-            .append_delta_v6(&segs, &deleted_paths, &roots, wal_seal_id)
-            .await?;
-        drop(segs);
-        drop(deleted_paths);
-
-        // deleted_paths 在 append 后通常会经历增长与扩容；这里 shrink 一次，避免把 capacity 高水位长期带到常驻层。
-        let mut seg_deleted_paths = seg.deleted_paths;
-        seg_deleted_paths.shrink_to_fit();
-        let deleted_paths = Arc::new(path_arena_set_from_paths(seg_deleted_paths));
-        let (cnt, bytes, est) = deleted_paths_stats(deleted_paths.as_ref());
-        self.disk_layers.write().push(DiskLayer {
-            idx: Arc::new(MmapIndex::new(seg.snap)),
-            deleted_paths,
-            deleted_paths_count: cnt,
-            deleted_paths_bytes: bytes,
-            deleted_paths_estimated_bytes: est,
-        });
         self.l1.clear();
         if let Some(w) = self.wal.lock().clone() {
             let _ = w.cleanup_sealed_up_to(wal_seal_id);

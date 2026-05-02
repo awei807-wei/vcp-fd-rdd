@@ -1,5 +1,5 @@
 use crate::core::EventRecord;
-use crate::event::recovery::DirtyScope;
+use crate::event::sync::DirtyScope;
 use crate::index::TieredIndex;
 use std::collections::BTreeSet;
 use std::path::PathBuf;

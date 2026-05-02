@@ -11,7 +11,7 @@ echo "=== Startup Time (with index) ==="
 ./target/release/fd-rdd --root "$TEST_DIR" &
 FD_RDD_PID=$!
 sleep 5
-curl -s http://localhost:7878/status | jq '.indexed_count'
+curl -s http://localhost:6060/status | jq '.indexed_count'
 kill $FD_RDD_PID 2>/dev/null || true
 wait $FD_RDD_PID 2>/dev/null || true
 
@@ -37,7 +37,7 @@ echo "=== Query Performance ==="
 ./target/release/fd-rdd --root "$TEST_DIR" &
 FD_RDD_PID=$!
 sleep 10
-time curl -s "http://localhost:7878/search?q=*.rs&limit=1000"
+time curl -s "http://localhost:6060/search?q=*.rs&limit=1000"
 kill $FD_RDD_PID 2>/dev/null || true
 wait $FD_RDD_PID 2>/dev/null || true
 
@@ -49,7 +49,7 @@ mkdir -p "$TEST_DIR/storm"
 for i in $(seq 1 10000); do touch "$TEST_DIR/storm/file_$i.txt"; done
 echo "Created 10000 files"
 sleep 5
-curl -s "http://localhost:7878/search?q=file_*.txt&limit=10000" | jq '.total'
+curl -s "http://localhost:6060/search?q=file_*.txt&limit=10000" | jq '.total'
 kill $FD_RDD_PID 2>/dev/null || true
 wait $FD_RDD_PID 2>/dev/null || true
 

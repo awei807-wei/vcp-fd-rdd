@@ -1,7 +1,6 @@
 pub(crate) mod arena;
-mod disk_layer;
 pub(crate) mod events;
-mod load;
+pub(crate) mod load;
 mod memory;
 mod query;
 mod query_plan;
@@ -18,16 +17,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::core::AdaptiveScheduler;
 use crate::index::l1_cache::L1Cache;
+use crate::index::base_index::BaseIndexData;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::storage::traits::WriteAheadLog;
 
-use self::disk_layer::DiskLayer;
 use self::rebuild::RebuildState;
 
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
@@ -48,6 +47,7 @@ pub(crate) fn normalize_path(path: &std::path::Path) -> PathBuf {
 pub struct TieredIndex {
     pub l1: L1Cache,
     pub l2: ArcSwap<PersistentIndex>,
+    pub base: ArcSwap<BaseIndexData>,
     pub(self) disk_layers: RwLock<Vec<DiskLayer>>,
     pub l3: IndexBuilder,
     pub(self) scheduler: Mutex<AdaptiveScheduler>,
@@ -55,7 +55,6 @@ pub struct TieredIndex {
     pub event_seq: AtomicU64,
     pub(self) rebuild_state: Mutex<RebuildState>,
     pub(self) delta_buffer: Mutex<crate::index::delta_buffer::DeltaBuffer>,
-    pub(self) apply_gate: RwLock<()>,
     pub(self) flush_requested: AtomicBool,
     pub(self) flush_notify: Notify,
     pub(self) auto_flush_overlay_paths: AtomicU64,
@@ -79,5 +78,3 @@ impl TieredIndex {
 }
 
 // Re-exports
-#[cfg(test)]
-pub(crate) use self::disk_layer::event_record_estimated_bytes;

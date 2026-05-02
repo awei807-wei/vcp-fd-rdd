@@ -1,6 +1,7 @@
 use super::*;
 use crate::core::{EventRecord, EventType, FileIdentifier};
-use crate::event::recovery::DirtyScope;
+use crate::event::sync::DirtyScope;
+use crate::index::tiered::events::event_record_estimated_bytes;
 use crate::stats::EventPipelineStats;
 use crate::storage::snapshot::SnapshotStore;
 use std::path::PathBuf;
@@ -267,13 +268,11 @@ async fn auto_flush_overlay_wakes_snapshot_loop() {
     std::fs::write(&p, b"a").unwrap();
     idx.apply_events(&[mk_event(1, EventType::Create, p.clone())]);
 
+    let v7_path = store.path().with_extension("v7");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if !idx.disk_layers.read().is_empty() {
-            break;
-        }
+    while !v7_path.exists() {
         if tokio::time::Instant::now() >= deadline {
-            panic!("auto flush did not produce a disk layer in time");
+            panic!("auto flush did not produce a v7 snapshot in time");
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -293,9 +292,8 @@ async fn query_filters_do_not_leak_old_segment_meta() -> anyhow::Result<()> {
     std::fs::write(&p, b"x")?;
     idx.apply_events(&[mk_event(1, EventType::Create, p.clone())]);
 
-    // flush: 让旧元数据进入 disk layer
+    // flush: 让旧元数据进入 v7 快照
     idx.snapshot_now(store.clone()).await?;
-    assert!(!idx.disk_layers.read().is_empty());
 
     // 修改文件：新元数据进入 L2（size 变大）
     std::fs::write(&p, vec![b'a'; 128])?;
@@ -321,22 +319,21 @@ async fn periodic_flush_batch_threshold_skips_then_flushes() {
 
     let h = tokio::spawn(idx.clone().snapshot_loop(store.clone(), 1));
 
+    let v7_path = store.path().with_extension("v7");
+
     let p1 = root.join("a.txt");
     std::fs::write(&p1, b"a").unwrap();
     idx.apply_events(&[mk_event(1, EventType::Create, p1.clone())]);
 
     tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
-    assert!(idx.disk_layers.read().is_empty());
+    assert!(!v7_path.exists());
 
     let p2 = root.join("b.txt");
     std::fs::write(&p2, b"b").unwrap();
     idx.apply_events(&[mk_event(2, EventType::Create, p2.clone())]);
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if !idx.disk_layers.read().is_empty() {
-            break;
-        }
+    while !v7_path.exists() {
         if tokio::time::Instant::now() >= deadline {
             panic!("periodic flush did not flush after event threshold was met");
         }
@@ -362,21 +359,20 @@ async fn periodic_flush_batch_byte_threshold_skips_then_flushes() {
 
     let h = tokio::spawn(idx.clone().snapshot_loop(store.clone(), 1));
 
+    let v7_path = store.path().with_extension("v7");
+
     std::fs::write(&p1, b"a").unwrap();
     idx.apply_events(&[ev1]);
 
     tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
-    assert!(idx.disk_layers.read().is_empty());
+    assert!(!v7_path.exists());
 
     let p2 = root.join("beta-long-name.txt");
     std::fs::write(&p2, b"b").unwrap();
     idx.apply_events(&[mk_event(2, EventType::Create, p2.clone())]);
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if !idx.disk_layers.read().is_empty() {
-            break;
-        }
+    while !v7_path.exists() {
         if tokio::time::Instant::now() >= deadline {
             panic!("periodic flush did not flush after byte threshold was met");
         }
@@ -387,6 +383,7 @@ async fn periodic_flush_batch_byte_threshold_skips_then_flushes() {
 }
 
 #[tokio::test]
+#[ignore = "LSM/disk_layers removed in v7 migration"]
 async fn lsm_layering_delete_blocks_base() {
     use crate::core::{FileKey, FileMeta};
     use crate::index::PersistentIndex;
@@ -458,6 +455,7 @@ async fn lsm_layering_delete_blocks_base() {
 }
 
 #[tokio::test]
+#[ignore = "LSM/disk_layers removed in v7 migration"]
 async fn lsm_delete_then_recreate_prefers_newest() {
     use crate::core::{FileKey, FileMeta};
     use crate::index::PersistentIndex;
@@ -540,6 +538,7 @@ async fn lsm_delete_then_recreate_prefers_newest() {
 }
 
 #[tokio::test]
+#[ignore = "LSM/disk_layers removed in v7 migration"]
 async fn query_same_path_different_filekey_prefers_newest_segment() {
     use crate::core::{FileKey, FileMeta};
     use crate::index::PersistentIndex;
@@ -610,6 +609,7 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
 }
 
 #[tokio::test]
+#[ignore = "LSM/disk_layers removed in v7 migration"]
 async fn query_rename_from_tombstone_blocks_old_path() {
     use crate::core::{FileKey, FileMeta};
     use crate::index::PersistentIndex;
@@ -687,6 +687,7 @@ async fn query_rename_from_tombstone_blocks_old_path() {
 }
 
 #[tokio::test]
+#[ignore = "LSM/disk_layers removed in v7 migration"]
 async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
     use crate::core::{FileKey, FileMeta};
     use crate::index::PersistentIndex;
@@ -833,6 +834,6 @@ async fn lsm_offline_dir_mtime_change_skips_disk_segments() {
     let idx = TieredIndex::load_or_empty(&store, vec![content_root.clone()])
         .await
         .unwrap();
-    assert_eq!(idx.disk_layers.read().len(), 0);
+    assert_eq!(idx.file_count(), 0);
 }
 

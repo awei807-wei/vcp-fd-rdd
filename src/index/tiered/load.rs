@@ -1,15 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::index::base_index::BaseIndexData;
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
-use crate::index::mmap_index::MmapIndex;
 use crate::storage::traits::StorageBackend;
 
-use super::arena::{deleted_paths_stats, path_arena_set_from_paths, PathArenaSet};
-use super::disk_layer::DiskLayer;
-use super::sync::dir_tree_changed_since;
 use super::TieredIndex;
 
 impl TieredIndex {
@@ -17,12 +14,13 @@ impl TieredIndex {
     pub(super) fn new(
         l1: L1Cache,
         l2: Arc<PersistentIndex>,
+        base: Arc<BaseIndexData>,
         l3: IndexBuilder,
         roots: Vec<PathBuf>,
         include_hidden: bool,
         ignore_enabled: bool,
         follow_symlinks: bool,
-        disk_layers: Vec<DiskLayer>,
+        disk_layers: Vec<super::DiskLayer>,
     ) -> Self {
         use arc_swap::ArcSwap;
         use parking_lot::{Mutex, RwLock};
@@ -32,9 +30,12 @@ impl TieredIndex {
         use super::rebuild::RebuildState;
         use crate::core::AdaptiveScheduler;
 
+        let base = ArcSwap::from(Arc::new(l2.to_base_index_data()));
+
         Self {
             l1,
             l2: ArcSwap::from(l2),
+            base: ArcSwap::from(base),
             disk_layers: RwLock::new(disk_layers),
             l3,
             scheduler: Mutex::new(AdaptiveScheduler::new()),
@@ -42,7 +43,6 @@ impl TieredIndex {
             event_seq: AtomicU64::new(0),
             rebuild_state: Mutex::new(RebuildState::default()),
             delta_buffer: Mutex::new(crate::index::delta_buffer::DeltaBuffer::with_capacity(262_144)),
-            apply_gate: RwLock::new(()),
             flush_requested: AtomicBool::new(false),
             flush_notify: Notify::new(),
             auto_flush_overlay_paths: AtomicU64::new(250_000),
@@ -77,10 +77,12 @@ impl TieredIndex {
     ) -> Self {
         let l1 = L1Cache::with_capacity(1000);
         let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
+        let base = Arc::new(l2.to_base_index_data());
         let l3 = IndexBuilder::new_with_options(roots.clone(), include_hidden, ignore_enabled);
         Self::new(
             l1,
             l2,
+            base,
             l3,
             roots,
             include_hidden,
@@ -155,6 +157,68 @@ impl TieredIndex {
         let l1 = L1Cache::with_capacity(1000);
         let l3 = IndexBuilder::new_with_options(roots.clone(), include_hidden, ignore_enabled);
 
+        // 阶段 A：优先加载 v7 单文件快照（最快路径，<1s mmap + 反序列化）。
+        let v7_path = store.path().with_extension("v7");
+        match crate::storage::snapshot_v7::try_load_v7(&v7_path) {
+            Ok(Some(v7_data)) => {
+                tracing::info!(
+                    "v7 snapshot loaded: {} entries, {} trigrams",
+                    v7_data.entries_by_key.len(),
+                    v7_data.trigram_index.len()
+                );
+                let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
+                // 将 v7 数据灌入 L2（当前为简化实现：逐个 upsert；
+                // 后续可优化为直接构造内部结构，避免 trigram 重建开销）。
+                for i in 0..v7_data.entries_by_key.len() {
+                    if let Some(entry) = v7_data.entries_by_key.get(i) {
+                        if let Some(path_bytes) = v7_data.path_table.resolve(entry.path_idx) {
+                            let path = {
+                                #[cfg(unix)]
+                                {
+                                    use std::ffi::OsStr;
+                                    use std::os::unix::ffi::OsStrExt;
+                                    PathBuf::from(OsStr::from_bytes(&path_bytes))
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    PathBuf::from(std::str::from_utf8(&path_bytes).unwrap_or_default())
+                                }
+                            };
+                            let mtime = if entry.mtime_ns < 0 {
+                                None
+                            } else {
+                                Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(entry.mtime_ns as u64))
+                            };
+                            l2.upsert(crate::core::FileMeta {
+                                file_key: entry.file_key(),
+                                path,
+                                size: entry.size,
+                                mtime,
+                                ctime: None,
+                                atime: None,
+                            });
+                        }
+                    }
+                }
+                let base = Arc::new(l2.to_base_index_data());
+                let idx = Self::new(
+                    l1,
+                    l2,
+                    base,
+                    l3,
+                    roots,
+                    include_hidden,
+                    ignore_enabled,
+                    false,
+                    Vec::new(),
+                );
+                idx.attach_wal(store)?;
+                return Ok(idx);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("v7 load failed: {}", e),
+        }
+
         // 冷启动离线变更检测（仅 LSM 目录布局）：
         // - LSM 段可能包含停机期间的"幽灵记录"（已删除文件但索引仍在）。
         // - 查询会触发 mmap 触页把历史段读入 RSS（即使 L2 很小），造成突发内存暴涨与脏结果。
@@ -167,9 +231,12 @@ impl TieredIndex {
                     "LSM snapshot considered stale (offline dir mtime changed since last_build_ns={}), starting empty (will rebuild)",
                     last_build_ns
                 );
+                let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
+                let base = Arc::new(l2.to_base_index_data());
                 return Ok(Self::new(
                     l1,
-                    Arc::new(PersistentIndex::new_with_roots(roots.clone())),
+                    l2,
+                    base,
                     l3,
                     roots,
                     include_hidden,
@@ -206,9 +273,12 @@ impl TieredIndex {
                 });
             }
 
+            let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
+            let base = Arc::new(l2.to_base_index_data());
             let idx = Self::new(
                 l1,
-                Arc::new(PersistentIndex::new_with_roots(roots.clone())),
+                l2,
+                base,
                 l3,
                 roots,
                 include_hidden,
@@ -222,27 +292,32 @@ impl TieredIndex {
                 let l2 = idx.l2.load_full();
                 l2.rebuild_parent_index();
             }
+            let new_base = idx.l2.load_full().to_base_index_data();
+            idx.base.store(Arc::new(new_base));
             return Ok(idx);
         }
 
         // 兼容：legacy v6 单文件（mmap + lazy decode），作为长期 base 使用（不再 hydration）。
         if let Ok(Some(snap)) = store.load_v6_mmap_if_valid(&roots) {
-            let base = DiskLayer {
+            let base_layer = DiskLayer {
                 idx: Arc::new(MmapIndex::new(snap)),
                 deleted_paths: Arc::new(PathArenaSet::default()),
                 deleted_paths_count: 0,
                 deleted_paths_bytes: 0,
                 deleted_paths_estimated_bytes: 0,
             };
+            let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
+            let base = Arc::new(l2.to_base_index_data());
             let idx = Self::new(
                 l1,
-                Arc::new(PersistentIndex::new_with_roots(roots.clone())),
+                l2,
+                base,
                 l3,
                 roots,
                 include_hidden,
                 ignore_enabled,
                 false,
-                vec![base],
+                vec![base_layer],
             );
             idx.attach_wal(store)?;
             // legacy v6 没有 LSM manifest checkpoint：保守回放全部 WAL（如果存在）。
@@ -251,6 +326,8 @@ impl TieredIndex {
                 let l2 = idx.l2.load_full();
                 l2.rebuild_parent_index();
             }
+            let new_base = idx.l2.load_full().to_base_index_data();
+            idx.base.store(Arc::new(new_base));
             return Ok(idx);
         }
 
@@ -265,10 +342,14 @@ impl TieredIndex {
                 PersistentIndex::new_with_roots(roots.clone())
             }
         };
+        let base = Arc::new(l2.to_base_index_data());
+        let l2 = Arc::new(l2);
 
+        let base = Arc::new(l2.to_base_index_data());
         let idx = Self::new(
             l1,
-            Arc::new(l2),
+            l2,
+            base,
             l3,
             roots,
             include_hidden,
@@ -282,6 +363,8 @@ impl TieredIndex {
             let l2 = idx.l2.load_full();
             l2.rebuild_parent_index();
         }
+        let new_base = idx.l2.load_full().to_base_index_data();
+        idx.base.store(Arc::new(new_base));
         Ok(idx)
     }
 

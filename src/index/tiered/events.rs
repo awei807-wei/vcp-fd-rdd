@@ -1,17 +1,12 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use parking_lot::RwLockReadGuard;
-
 use crate::core::{EventRecord, EventType, FileIdentifier, FileMeta};
 use crate::index::l2_partition::PersistentIndex;
 
-use super::disk_layer::event_record_estimated_bytes;
-use super::rebuild::PendingEvent;
 use super::TieredIndex;
 
-pub(super) struct ApplyBatchState<'a> {
-    pub(super) _gate: RwLockReadGuard<'a, ()>,
+pub(super) struct ApplyBatchState {
     pub(super) l2: Arc<PersistentIndex>,
     pub(super) rebuild_in_progress: bool,
     pub(super) event_count: usize,
@@ -128,45 +123,12 @@ impl TieredIndex {
 
     pub(super) fn capture_l2_for_apply(
         &self,
-        events: &[EventRecord],
+        _events: &[EventRecord],
     ) -> (Arc<PersistentIndex>, bool) {
-        let mut st = self.rebuild_state.lock();
-        if !st.in_progress {
-            drop(st);
-            return (self.l2.load_full(), false);
-        }
-
-        // 有界化：按身份去重，只保留每条身份的最新事件（避免 rebuild 期间无限堆积）。
-        for ev in events {
-            let key = ev.id.clone();
-            match st.pending_events.get_mut(&key) {
-                Some(old) if old.seq >= ev.seq => {
-                    // 旧记录更新：忽略（避免乱序覆盖）。
-                }
-                Some(old) => {
-                    // 新事件覆盖旧事件；path_hint 仅在新事件提供时覆盖（"最后一次非空覆盖"）。
-                    old.seq = ev.seq;
-                    old.timestamp = ev.timestamp;
-                    old.event_type = ev.event_type.clone();
-                    if ev.path_hint.is_some() {
-                        old.path_hint = ev.path_hint.clone();
-                    }
-                }
-                None => {
-                    st.pending_events.insert(
-                        key,
-                        PendingEvent {
-                            seq: ev.seq,
-                            timestamp: ev.timestamp,
-                            event_type: ev.event_type.clone(),
-                            path_hint: ev.path_hint.clone(),
-                        },
-                    );
-                }
-            }
-        }
-
-        (self.l2.load_full(), true)
+        let st = self.rebuild_state.lock();
+        let in_progress = st.in_progress;
+        drop(st);
+        (self.l2.load_full(), in_progress)
     }
 
     pub(super) fn invalidate_l1_for_events(&self, events: &[EventRecord]) {
@@ -199,13 +161,10 @@ impl TieredIndex {
         &self,
         events: &[EventRecord],
         log_to_wal: bool,
-    ) -> Option<ApplyBatchState<'_>> {
+    ) -> Option<ApplyBatchState> {
         if events.is_empty() {
             return None;
         }
-
-        // flush/compaction 期间需要短暂阻塞写入，避免"指针 swap 后仍写旧 delta"的竞态。
-        let gate = self.apply_gate.read();
 
         // WAL：先写后用（best-effort）。replay 场景下禁用写回，避免重复追加。
         self.append_events_to_wal(events, log_to_wal);
@@ -229,7 +188,6 @@ impl TieredIndex {
         self.invalidate_l1_for_events(events);
 
         Some(ApplyBatchState {
-            _gate: gate,
             l2,
             rebuild_in_progress,
             event_count: events.len(),
@@ -264,6 +222,8 @@ impl TieredIndex {
         };
         batch.l2.apply_events(events);
         batch.l2.rebuild_parent_index();
+        let new_base = Arc::new(batch.l2.to_base_index_data());
+        self.base.store(new_base);
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
 
@@ -299,6 +259,8 @@ impl TieredIndex {
         };
         batch.l2.apply_events(events.as_slice());
         batch.l2.rebuild_parent_index();
+        let new_base = Arc::new(batch.l2.to_base_index_data());
+        self.base.store(new_base);
         events.clear();
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
@@ -321,12 +283,39 @@ impl TieredIndex {
         if batch.rebuild_in_progress {
             batch.l2.apply_file_metas(metas.as_slice());
             batch.l2.rebuild_parent_index();
-            metas.clear();
         } else {
             batch.l2.apply_file_metas_drain(metas);
             batch.l2.rebuild_parent_index();
         }
+        let new_base = Arc::new(batch.l2.to_base_index_data());
+        self.base.store(new_base);
+        metas.clear();
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
     }
+}
+
+fn file_identifier_estimated_bytes(id: &FileIdentifier) -> u64 {
+    match id {
+        FileIdentifier::Path(p) => p.as_os_str().as_encoded_bytes().len() as u64,
+        FileIdentifier::Fid { .. } => 16,
+    }
+}
+
+pub(crate) fn event_record_estimated_bytes(ev: &EventRecord) -> u64 {
+    let mut bytes = file_identifier_estimated_bytes(&ev.id);
+    if let Some(p) = &ev.path_hint {
+        bytes = bytes.saturating_add(p.as_os_str().as_encoded_bytes().len() as u64);
+    }
+    if let EventType::Rename {
+        from,
+        from_path_hint,
+    } = &ev.event_type
+    {
+        bytes = bytes.saturating_add(file_identifier_estimated_bytes(from));
+        if let Some(p) = from_path_hint {
+            bytes = bytes.saturating_add(p.as_os_str().as_encoded_bytes().len() as u64);
+        }
+    }
+    bytes
 }

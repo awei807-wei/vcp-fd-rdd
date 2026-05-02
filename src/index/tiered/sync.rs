@@ -3,11 +3,11 @@ use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Task};
-use crate::event::recovery::DirtyScope;
+use crate::event::sync::DirtyScope;
 use crate::index::l2_partition::PersistentIndex;
 use crate::util::maybe_trim_rss;
 
-use super::{TieredIndex, REBUILD_COOLDOWN};
+use super::{pathbuf_from_bytes, TieredIndex, REBUILD_COOLDOWN};
 
 fn visit_dirs_since(
     roots: &[PathBuf],
@@ -135,7 +135,6 @@ impl TieredIndex {
             return false;
         }
         st.in_progress = true;
-        st.pending_events.clear();
         st.requested = false;
         st.scheduled = false;
         st.last_started_at = Some(Instant::now());
@@ -169,9 +168,8 @@ impl TieredIndex {
             }
 
             if schedule_after.is_none() {
-                // 立即开始：清空 pending（新一轮 rebuild）并复位合并标记。
+                // 立即开始：复位合并标记。
                 st.in_progress = true;
-                st.pending_events.clear();
                 st.requested = false;
                 st.scheduled = false;
                 st.last_started_at = Some(now);
@@ -195,13 +193,14 @@ impl TieredIndex {
         loop {
             let batch = {
                 let mut st = self.rebuild_state.lock();
-                if st.pending_events.is_empty() {
+                let mut db = self.delta_buffer.lock();
+                if db.is_empty() {
                     // 切换点：持锁判空 -> 原子切换，避免丢事件窗口。
                     self.l1.clear();
                     self.l2.store(new_l2.clone());
-                    // rebuild 语义：新索引为权威数据源，旧 mmap segments 可能已过期，清空以避免双基座。
-                    self.disk_layers.write().clear();
                     new_l2.rebuild_parent_index();
+                    let new_base = Arc::new(new_l2.to_base_index_data());
+                    self.base.store(new_base);
                     self.note_pending_flush_rebuild(new_l2.as_ref());
                     st.in_progress = false;
                     // 若 rebuild 期间又被请求（例如 overflow 风暴），合并为下一轮 rebuild。
@@ -210,19 +209,21 @@ impl TieredIndex {
                     st.scheduled = false;
                     return again;
                 }
-                let mut v = st
-                    .pending_events
-                    .drain()
-                    .map(|(id, ev)| EventRecord {
-                        seq: ev.seq,
-                        timestamp: ev.timestamp,
-                        event_type: ev.event_type,
-                        id,
-                        path_hint: ev.path_hint,
-                    })
-                    .collect::<Vec<_>>();
-                v.sort_by_key(|e| e.seq);
-                v
+
+                let mut events: Vec<EventRecord> = db.live_records().cloned().collect();
+                for path_bytes in db.deleted_paths() {
+                    let path = pathbuf_from_bytes(path_bytes);
+                    events.push(EventRecord {
+                        seq: 0,
+                        timestamp: std::time::SystemTime::UNIX_EPOCH,
+                        event_type: EventType::Delete,
+                        id: FileIdentifier::Path(path.clone()),
+                        path_hint: Some(path),
+                    });
+                }
+                events.sort_by_key(|e| e.seq);
+                db.clear();
+                events
             };
 
             new_l2.apply_events(&batch);
@@ -252,7 +253,7 @@ impl TieredIndex {
             maybe_trim_rss();
             tracing::warn!(
                 "Background rebuild complete: {} files",
-                idx.l2.load_full().file_count()
+                idx.base.load_full().file_count()
             );
             if again {
                 let _ = idx.try_start_rebuild_with_cooldown("merged rebuild request after rebuild");
@@ -288,7 +289,7 @@ impl TieredIndex {
             maybe_trim_rss();
             tracing::info!(
                 "Background full build complete: {} files",
-                idx.l2.load_full().file_count()
+                idx.base.load_full().file_count()
             );
             if again {
                 let _ = idx.try_start_rebuild_with_cooldown("merged rebuild request after full build");

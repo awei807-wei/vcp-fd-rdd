@@ -8,7 +8,7 @@ pub enum DirtyScope {
         /// 上一次 fast-sync 完成时间（ns since epoch，best-effort）。
         cutoff_ns: u64,
     },
-    /// 可定位到“可能丢事件”的目录集合（去重、有上限）。
+    /// 可定位到"可能丢事件"的目录集合（去重、有上限）。
     Dirs {
         /// 上一次 fast-sync 完成时间（ns since epoch，best-effort）。
         cutoff_ns: u64,

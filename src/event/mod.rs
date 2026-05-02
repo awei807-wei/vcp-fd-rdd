@@ -1,5 +1,5 @@
 pub mod ignore_filter;
-pub mod recovery;
+pub mod sync;
 pub mod stream;
 pub mod watcher;
 

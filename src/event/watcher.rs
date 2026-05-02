@@ -4,8 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-
-
 /// Heuristic check for ENOSPC / NoStorageSpace errors from notify/inotify.
 fn is_enospc_error(e: &notify::Error) -> bool {
     use std::error::Error;
