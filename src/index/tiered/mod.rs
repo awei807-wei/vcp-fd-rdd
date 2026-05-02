@@ -22,7 +22,6 @@ use tokio::sync::Notify;
 
 use crate::core::AdaptiveScheduler;
 use crate::index::l1_cache::L1Cache;
-use crate::index::base_index::BaseIndexData;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::storage::traits::WriteAheadLog;
@@ -47,14 +46,13 @@ pub(crate) fn normalize_path(path: &std::path::Path) -> PathBuf {
 pub struct TieredIndex {
     pub l1: L1Cache,
     pub l2: ArcSwap<PersistentIndex>,
-    pub base: ArcSwap<BaseIndexData>,
-    pub(self) disk_layers: RwLock<Vec<DiskLayer>>,
     pub l3: IndexBuilder,
     pub(self) scheduler: Mutex<AdaptiveScheduler>,
     pub(self) wal: Mutex<Option<Arc<dyn WriteAheadLog + Send + Sync>>>,
     pub event_seq: AtomicU64,
     pub(self) rebuild_state: Mutex<RebuildState>,
     pub(self) delta_buffer: Mutex<crate::index::delta_buffer::DeltaBuffer>,
+    pub base: ArcSwap<crate::index::base_index::BaseIndexData>,
     pub(self) flush_requested: AtomicBool,
     pub(self) flush_notify: Notify,
     pub(self) auto_flush_overlay_paths: AtomicU64,

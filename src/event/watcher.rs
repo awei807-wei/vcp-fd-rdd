@@ -269,13 +269,7 @@ mod tests {
         let (normal_tx, _normal_rx) = mpsc::channel(16);
 
         let ev = notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
-        handle_notify_result(
-            &priority_tx,
-            &normal_tx,
-            16,
-            &rescans,
-            Ok(ev),
-        );
+        handle_notify_result(&priority_tx, &normal_tx, 16, &rescans, Ok(ev));
         assert_eq!(rescans.load(Ordering::Relaxed), 1);
     }
 }

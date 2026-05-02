@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.13] - 2026-05-02
+
+### PersistentIndex storage migration
+
+- Migrated `PersistentIndex` runtime storage to `FileEntry + Vec<Vec<u8>>` absolute paths.
+- Kept `CompactMeta + PathArena` only as legacy v4/v5 loading and v5/v6 compatibility export formats.
+- Kept `PathTableV2 + FileEntryIndex` as export-time read-only structures for `BaseIndexData` / v7 snapshots instead of maintaining them on the event hot path.
+- Updated overlong-path behavior: runtime indexing is no longer constrained by the legacy `u16 path_len` arena format.
+
+## [0.6.12] - 2026-05-02
+
+### Wrap-up stabilization
+
+- Restored the `tests` branch to a compiling and fully tested state after divergent wrap-up merges.
+- Removed `TieredIndex` `disk_layers` hot-path state and deleted the unused `src/index/tiered/disk_layer.rs`.
+- Kept `TieredIndex` startup on v7 snapshots or empty rebuild fallback; removed reintroduced LSM/v6 mmap loading from the query hot path.
+- Removed synchronous deep directory scans from event apply on directory rename.
+- Reconnected WAL replay after v7 snapshot loading and empty startup.
+- Fixed `snapshot_v7` serialization to match the current `ParentIndex` structure without `compat_dir_to_files`.
+- Added query-time BaseIndex refresh when direct L2 writes make the base snapshot stale.
+
 ## [0.6.11] - 2026-05-01
 
 ### Phase 8: DeltaBuffer 硬容量上限 + PathTable 内存优化 + Hybrid Crawler 清理

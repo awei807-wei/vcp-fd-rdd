@@ -226,34 +226,9 @@ impl TieredIndex {
         self.base.store(new_base);
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
-
-        // Deep sync for directory renames
-        for ev in events {
-            if let EventType::Rename { .. } = &ev.event_type {
-                if let Some(path) = ev.best_path() {
-                    if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
-                        let _ = self.scan_dirs_immediate_deep(&[path.to_path_buf()]);
-                    }
-                }
-            }
-        }
     }
 
     pub(super) fn apply_events_inner_drain(&self, events: &mut Vec<EventRecord>, log_to_wal: bool) {
-        // Capture rename dir paths before drain
-        let rename_dirs: Vec<std::path::PathBuf> = events
-            .iter()
-            .filter_map(|ev| {
-                if let EventType::Rename { .. } = &ev.event_type {
-                    ev.best_path()
-                        .filter(|p| std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false))
-                        .map(|p| p.to_path_buf())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
         let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal) else {
             return;
         };
@@ -264,10 +239,6 @@ impl TieredIndex {
         events.clear();
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
-
-        for dir in rename_dirs {
-            let _ = self.scan_dirs_immediate_deep(&[dir]);
-        }
     }
 
     pub(super) fn apply_upserted_metas_inner(

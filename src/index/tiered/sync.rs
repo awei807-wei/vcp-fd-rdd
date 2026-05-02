@@ -83,20 +83,6 @@ fn visit_dirs_since(
     false
 }
 
-pub(super) fn dir_tree_changed_since(
-    roots: &[PathBuf],
-    ignore_prefixes: &[PathBuf],
-    cutoff_ns: u64,
-) -> bool {
-    visit_dirs_since(
-        roots,
-        ignore_prefixes,
-        cutoff_ns,
-        "offline",
-        |_dir, changed| changed,
-    )
-}
-
 fn collect_dirs_changed_since(
     roots: &[PathBuf],
     ignore_prefixes: &[PathBuf],
@@ -292,12 +278,11 @@ impl TieredIndex {
                 idx.base.load_full().file_count()
             );
             if again {
-                let _ = idx.try_start_rebuild_with_cooldown("merged rebuild request after full build");
+                let _ =
+                    idx.try_start_rebuild_with_cooldown("merged rebuild request after full build");
             }
         });
     }
-
-
 
     /// overflow 兜底：dirty region + cooldown/max-staleness 触发后执行一次 fast-sync（best-effort）。
     ///
@@ -305,11 +290,7 @@ impl TieredIndex {
     /// - 避免 "overflow → 立刻全盘 rebuild" 在风暴中触发大分配/高水位；
     /// - 允许查询短暂陈旧，但不阻塞查询、不 OOM；
     /// - fast-sync 以"目录为单位"做对齐：只需要 read_dir + 必要的 metadata，不假设 mtime 冒泡。
-    pub fn spawn_fast_sync(
-        self: &Arc<Self>,
-        scope: DirtyScope,
-        ignore_prefixes: Vec<PathBuf>,
-    ) {
+    pub fn spawn_fast_sync(self: &Arc<Self>, scope: DirtyScope, ignore_prefixes: Vec<PathBuf>) {
         let permit = match self.fast_sync_semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {

@@ -98,7 +98,11 @@ impl ParentIndex {
 
     /// Recursively collect all doc_ids inside a directory and its subdirectories.
     pub fn files_in_dir_recursive(&self, dir_path_idx: u32) -> RoaringBitmap {
-        let mut result = self.dir_to_files.get(&dir_path_idx).cloned().unwrap_or_default();
+        let mut result = self
+            .dir_to_files
+            .get(&dir_path_idx)
+            .cloned()
+            .unwrap_or_default();
         if let Some(subdirs) = self.dir_to_subdirs.get(&dir_path_idx) {
             for &subdir in subdirs {
                 result |= self.files_in_dir_recursive(subdir);

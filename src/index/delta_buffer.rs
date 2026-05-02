@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::core::{EventRecord, EventType};
+use std::collections::HashMap;
 
 /// 统一增量缓冲区，替代 overlay_state + pending_events
 #[derive(Debug, Clone)]
@@ -56,14 +56,18 @@ impl DeltaBuffer {
 
         match &event.event_type {
             EventType::Delete => {
-                if self.entries.len() >= self.max_capacity && !self.entries.contains_key(&path_bytes) {
+                if self.entries.len() >= self.max_capacity
+                    && !self.entries.contains_key(&path_bytes)
+                {
                     return false;
                 }
                 self.entries.insert(path_bytes, DeltaState::Deleted);
                 true
             }
             EventType::Create | EventType::Modify => {
-                if self.entries.len() >= self.max_capacity && !self.entries.contains_key(&path_bytes) {
+                if self.entries.len() >= self.max_capacity
+                    && !self.entries.contains_key(&path_bytes)
+                {
                     return false;
                 }
                 self.entries.insert(path_bytes, DeltaState::Live(event));
@@ -167,7 +171,8 @@ impl DeltaBuffer {
         // HashMap 条目开销 + key/value 本身
         let entry_overhead = size_of::<(Vec<u8>, DeltaState)>() + 16;
         self.entries.len() * entry_overhead
-            + self.entries.capacity().saturating_sub(self.entries.len()) * size_of::<(Vec<u8>, DeltaState)>()
+            + self.entries.capacity().saturating_sub(self.entries.len())
+                * size_of::<(Vec<u8>, DeltaState)>()
     }
 }
 

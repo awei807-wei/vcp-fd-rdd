@@ -143,8 +143,9 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(SnapshotStore::new(snapshot_path));
 
     // 3) 从快照加载或空索引启动
-    let index = TieredIndex::load_with_options(store.as_ref(), roots, args.include_hidden, ignore_enabled)
-        .await?;
+    let index =
+        TieredIndex::load_with_options(store.as_ref(), roots, args.include_hidden, ignore_enabled)
+            .await?;
     let _ = index.attach_wal(store.as_ref());
 
     // 4) 若索引为空，后台全量构建
@@ -229,9 +230,7 @@ async fn main() -> anyhow::Result<()> {
         let report_index = index.clone();
         let report_interval_secs = args.report_interval_secs;
 
-        let stats_fn = Arc::new(move || {
-            pipeline.stats()
-        });
+        let stats_fn = Arc::new(move || pipeline.stats());
 
         tokio::spawn(async move {
             report_index

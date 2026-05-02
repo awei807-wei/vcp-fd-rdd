@@ -100,11 +100,10 @@ impl FileEntryIndex {
 
     /// Sort the `by_filekey` permutation in place.
     pub fn sort_by_key(&mut self) {
-        self.by_filekey
-            .sort_by_key(|&i| {
-                let e = &self.entries[i as usize];
-                (e.dev, e.ino, e.generation)
-            });
+        self.by_filekey.sort_by_key(|&i| {
+            let e = &self.entries[i as usize];
+            (e.dev, e.ino, e.generation)
+        });
     }
 
     /// Sort the `by_path` permutation in place.
@@ -115,10 +114,7 @@ impl FileEntryIndex {
 
     /// Lookup by `FileKey` using binary search. Returns a slice of matching entries
     /// (there may be multiple entries with the same key in edge cases).
-    pub fn lookup_by_filekey(
-        &self,
-        key: FileKey,
-    ) -> Option<&[FileEntry]> {
+    pub fn lookup_by_filekey(&self, key: FileKey) -> Option<&[FileEntry]> {
         let pos = self
             .by_filekey
             .binary_search_by(|&i| {
@@ -145,10 +141,7 @@ impl FileEntryIndex {
                 break;
             }
         }
-        Some(
-            &self.entries[self.by_filekey[start] as usize
-                ..= self.by_filekey[end - 1] as usize],
-        )
+        Some(&self.entries[self.by_filekey[start] as usize..=self.by_filekey[end - 1] as usize])
     }
 
     /// Lookup by `FileKey` and return the docid of the first matching entry.
@@ -165,22 +158,13 @@ impl FileEntryIndex {
 
     /// Lookup by `path_idx` using binary search. Returns a slice of entries
     /// sharing the same path (usually 0 or 1).
-    pub fn lookup_by_path_idx(
-        &self,
-        path_idx: u32,
-    ) -> Option<&[FileEntry]> {
+    pub fn lookup_by_path_idx(&self, path_idx: u32) -> Option<&[FileEntry]> {
         let pos = self
             .by_path
-            .binary_search_by(|&i| {
-                self.entries[i as usize]
-                    .path_idx
-                    .cmp(&path_idx)
-            })
+            .binary_search_by(|&i| self.entries[i as usize].path_idx.cmp(&path_idx))
             .ok()?;
         let mut start = pos;
-        while start > 0
-            && self.entries[self.by_path[start - 1] as usize].path_idx == path_idx
-        {
+        while start > 0 && self.entries[self.by_path[start - 1] as usize].path_idx == path_idx {
             start -= 1;
         }
         let mut end = pos + 1;
@@ -189,10 +173,7 @@ impl FileEntryIndex {
         {
             end += 1;
         }
-        Some(
-            &self.entries[self.by_path[start] as usize
-                ..= self.by_path[end - 1] as usize],
-        )
+        Some(&self.entries[self.by_path[start] as usize..=self.by_path[end - 1] as usize])
     }
 
     /// Iterate over all entries in DocId order.
@@ -246,9 +227,24 @@ mod tests {
     #[test]
     fn test_lookup_by_filekey() {
         let mut index = FileEntryIndex::new();
-        index.push(FileEntry::from_file_key(make_key(1, 100), 0, 1024, 1_000_000));
-        index.push(FileEntry::from_file_key(make_key(1, 200), 1, 2048, 2_000_000));
-        index.push(FileEntry::from_file_key(make_key(2, 100), 2, 512, 3_000_000));
+        index.push(FileEntry::from_file_key(
+            make_key(1, 100),
+            0,
+            1024,
+            1_000_000,
+        ));
+        index.push(FileEntry::from_file_key(
+            make_key(1, 200),
+            1,
+            2048,
+            2_000_000,
+        ));
+        index.push(FileEntry::from_file_key(
+            make_key(2, 100),
+            2,
+            512,
+            3_000_000,
+        ));
         let index = index.build();
 
         let r = index.lookup_by_filekey(make_key(1, 200)).unwrap();
@@ -261,8 +257,18 @@ mod tests {
     #[test]
     fn test_lookup_by_path_idx() {
         let mut index = FileEntryIndex::new();
-        index.push(FileEntry::from_file_key(make_key(1, 100), 10, 1024, 1_000_000));
-        index.push(FileEntry::from_file_key(make_key(1, 200), 20, 2048, 2_000_000));
+        index.push(FileEntry::from_file_key(
+            make_key(1, 100),
+            10,
+            1024,
+            1_000_000,
+        ));
+        index.push(FileEntry::from_file_key(
+            make_key(1, 200),
+            20,
+            2048,
+            2_000_000,
+        ));
         let index = index.build();
 
         let r = index.lookup_by_path_idx(20).unwrap();
@@ -276,12 +282,14 @@ mod tests {
     fn file_entry_lookup_matches_compact_meta() {
         // Build entries in a non-sorted order to verify index sorting.
         let mut entries: Vec<FileEntry> = (0..10_000)
-            .map(|i| FileEntry::from_file_key(
-                make_key(i as u64 % 100, i as u64),
-                i,
-                i as u64 * 16,
-                i as i64 * 1_000_000,
-            ))
+            .map(|i| {
+                FileEntry::from_file_key(
+                    make_key(i as u64 % 100, i as u64),
+                    i,
+                    i as u64 * 16,
+                    i as i64 * 1_000_000,
+                )
+            })
             .collect();
 
         // Reverse before insertion to test sorting.

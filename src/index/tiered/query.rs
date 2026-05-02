@@ -21,6 +21,12 @@ impl TieredIndex {
             return Vec::new();
         }
 
+        let base_count = self.base.load().file_count();
+        let l2_count = self.l2.load().file_count();
+        if base_count != l2_count {
+            self.refresh_base();
+        }
+
         let plan = match compile_query(keyword) {
             Ok(compiled) => QueryPlan::compiled(compiled),
             Err(e) => {

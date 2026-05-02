@@ -10,7 +10,24 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-当前 tests 分支发布版本为 v0.6.11（DeltaBuffer 硬容量上限 + PathTable 内存优化 + Hybrid Crawler 清理）。
+当前 tests 分支发布版本为 v0.6.13（PersistentIndex 主存储迁移 + 收尾稳定化）。
+
+## v0.6.13 更新（PersistentIndex 主存储迁移）
+
+- **运行时主存储切换**：`PersistentIndex` 不再以 `CompactMeta + PathArena` 作为热路径主表，改为 `FileEntry + Vec<Vec<u8>>` 绝对路径字节表。
+- **导出期构建只读索引**：`PathTableV2 + FileEntryIndex` 仅在 `BaseIndexData` / v7 快照导出时批量构建，避免事件热路径维护 front-encoding 压缩表。
+- **legacy 格式降级为兼容层**：v4/v5 快照读取时转换到新主存储，v5/v6 导出时临时构造 `CompactMeta + PathArena`。
+- **超长路径语义更新**：运行时 paths store 可索引超过 legacy `u16 path_len` 限制的路径。
+- **验证**：`cargo test -q` 全量通过。
+
+## v0.6.12 更新（收尾稳定化）
+
+- 恢复 `tests` 分支编译与全量测试通过，收敛 causal-chain / wrap-up 后续合并问题。
+- 移除 `TieredIndex` 的 `disk_layers` 热路径状态和未使用的 `src/index/tiered/disk_layer.rs`。
+- `TieredIndex` 启动路径收敛到 v7 snapshot 或空索引 rebuild fallback，不再把 v6 mmap / LSM 加载带回查询热路径。
+- 删除目录 rename 事件中的同步深度扫描，避免事件管线被递归 walk 阻塞。
+- v7 快照加载和空索引启动后回放 WAL，避免 snapshot 后未落盘事件在重启后丢失。
+- 修复 `snapshot_v7` 与当前 `ParentIndex` 结构的序列化兼容，并在 L2/BaseIndex 计数不一致时刷新 base。
 
 ## v0.6.11 更新（Phase 8: DeltaBuffer 硬容量上限 + PathTable 内存优化 + Hybrid Crawler 清理）
 

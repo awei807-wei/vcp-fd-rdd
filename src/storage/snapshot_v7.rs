@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::index::base_index::{BaseIndexData, FileEntryIndex, TrigramIndex};
-use crate::index::parent_index::ParentIndex;
 use crate::index::file_entry_v2::FileEntry;
+use crate::index::parent_index::ParentIndex;
 use crate::index::path_table_v2::{PathTableBuilder, PathTableV2};
 use crate::storage::checksum::{crc32c_checksum, Crc32c};
 
@@ -52,6 +52,13 @@ pub enum V7SegKind {
     TrigramIndex = 4,
     ParentIndex = 5,
     Tombstones = 6,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct V7SegDesc {
+    offset: u64,
+    len: u64,
+    crc32c: u32,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -165,7 +172,9 @@ fn encode_trigram_index(ti: &TrigramIndex) -> Vec<u8> {
         out.extend_from_slice(tri);
         out.push(0); // pad
         let mut posting = Vec::new();
-        bitmap.serialize_into(&mut posting).expect("roaring serialize");
+        bitmap
+            .serialize_into(&mut posting)
+            .expect("roaring serialize");
         let posting_len: u32 = posting.len().try_into().unwrap_or(u32::MAX);
         out.extend_from_slice(&posting_len.to_le_bytes());
         out.extend_from_slice(&posting);
@@ -191,9 +200,8 @@ fn decode_trigram_index(bytes: &[u8]) -> anyhow::Result<TrigramIndex> {
         if off + posting_len > bytes.len() {
             anyhow::bail!("trigram index posting truncated");
         }
-        let bitmap = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len]
-        )
-        .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
+        let bitmap = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
+            .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
         off += posting_len;
         ti.insert(tri, bitmap);
     }
@@ -206,16 +214,15 @@ fn decode_trigram_index(bytes: &[u8]) -> anyhow::Result<TrigramIndex> {
 
 fn encode_parent_index(pi: &ParentIndex) -> Vec<u8> {
     let mut out = Vec::new();
-    // Encode compat_dir_to_files: HashMap<Vec<u8>, RoaringBitmap>
-    let len = pi.compat_dir_to_files.len() as u32;
+    // Encode dir_to_files: HashMap<u32, RoaringBitmap>
+    let len = pi.dir_to_files.len() as u32;
     out.extend_from_slice(&len.to_le_bytes());
-    for (dir_bytes, bitmap) in &pi.compat_dir_to_files {
-        let dlen: u16 = dir_bytes.len().min(u16::MAX as usize) as u16;
-        out.extend_from_slice(&dlen.to_le_bytes());
-        out.extend_from_slice(&dir_bytes[..dlen as usize]);
-        let rb: RoaringBitmap = bitmap.iter().map(|v| v as u32).collect();
+    for (dir_idx, bitmap) in &pi.dir_to_files {
+        out.extend_from_slice(&dir_idx.to_le_bytes());
         let mut posting = Vec::new();
-        rb.serialize_into(&mut posting).expect("roaring serialize");
+        bitmap
+            .serialize_into(&mut posting)
+            .expect("roaring serialize");
         let posting_len: u32 = posting.len().try_into().unwrap_or(u32::MAX);
         out.extend_from_slice(&posting_len.to_le_bytes());
         out.extend_from_slice(&posting);
@@ -239,21 +246,16 @@ fn decode_parent_index(bytes: &[u8]) -> anyhow::Result<ParentIndex> {
         anyhow::bail!("parent index too small");
     }
     let mut off = 0usize;
-    // Decode compat_dir_to_files
+    // Decode dir_to_files
     let count = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
     off += 4;
-    let mut compat_dir_to_files: HashMap<Vec<u8>, RoaringBitmap> = HashMap::with_capacity(count);
+    let mut dir_to_files: HashMap<u32, RoaringBitmap> = HashMap::with_capacity(count);
     for _ in 0..count {
-        if off + 2 > bytes.len() {
-            anyhow::bail!("parent index dir_bytes len truncated");
+        if off + 4 > bytes.len() {
+            anyhow::bail!("parent index dir_idx truncated");
         }
-        let dlen = u16::from_le_bytes(bytes[off..off + 2].try_into()?) as usize;
-        off += 2;
-        if off + dlen > bytes.len() {
-            anyhow::bail!("parent index dir_bytes truncated");
-        }
-        let dir_bytes = bytes[off..off + dlen].to_vec();
-        off += dlen;
+        let dir_idx = u32::from_le_bytes(bytes[off..off + 4].try_into()?);
+        off += 4;
         if off + 4 > bytes.len() {
             anyhow::bail!("parent index posting len truncated");
         }
@@ -265,7 +267,7 @@ fn decode_parent_index(bytes: &[u8]) -> anyhow::Result<ParentIndex> {
         let rb = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
             .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
         off += posting_len;
-        compat_dir_to_files.insert(dir_bytes, rb);
+        dir_to_files.insert(dir_idx, rb);
     }
     // Decode dir_to_subdirs
     if off + 4 > bytes.len() {
@@ -296,9 +298,8 @@ fn decode_parent_index(bytes: &[u8]) -> anyhow::Result<ParentIndex> {
         dir_to_subdirs.insert(dir_idx, subdirs);
     }
     Ok(ParentIndex {
-        compat_dir_to_files,
+        dir_to_files,
         dir_to_subdirs,
-        ..Default::default()
     })
 }
 
@@ -396,7 +397,8 @@ impl V7Trailer {
         if &buf[magic_off..] != &V7_TRAILER_MAGIC {
             return None;
         }
-        let trailer_len = u64::from_le_bytes(buf[magic_off - 8..magic_off].try_into().ok()?) as usize;
+        let trailer_len =
+            u64::from_le_bytes(buf[magic_off - 8..magic_off].try_into().ok()?) as usize;
         if trailer_len < V7_TRAILER_FIXED_SIZE || trailer_len > file_len {
             return None;
         }
@@ -409,7 +411,8 @@ impl V7Trailer {
             return None;
         }
         let num_segments = u32::from_le_bytes(body[body.len() - 4..].try_into().ok()?) as usize;
-        let global_crc32c = u32::from_le_bytes(body[body.len() - 8..body.len() - 4].try_into().ok()?);
+        let global_crc32c =
+            u32::from_le_bytes(body[body.len() - 8..body.len() - 4].try_into().ok()?);
 
         let expected_body = num_segments * 8 + num_segments * 8 + num_segments * 4 + 8;
         if body.len() != expected_body {
@@ -538,19 +541,16 @@ pub fn load_v7_from_path(path: &Path) -> anyhow::Result<Option<V7Snapshot>> {
         return Ok(None);
     }
     let header_buf: [u8; V7_HEADER_SIZE] = bytes[0..V7_HEADER_SIZE].try_into()?;
-    let (num_segments, header_crc) = decode_header(&header_buf).ok_or_else(|| {
-        anyhow::anyhow!("v7 header decode failed")
-    })?;
+    let (num_segments, header_crc) =
+        decode_header(&header_buf).ok_or_else(|| anyhow::anyhow!("v7 header decode failed"))?;
     if compute_header_crc(&header_buf) != header_crc {
         tracing::warn!("v7 header crc mismatch, ignoring");
         return Ok(None);
     }
 
     // 解析 trailer（从末尾）
-    let (trailer, _trailer_start) =
-        V7Trailer::decode_from_file_end(bytes).ok_or_else(|| {
-            anyhow::anyhow!("v7 trailer decode failed")
-        })?;
+    let (trailer, _trailer_start) = V7Trailer::decode_from_file_end(bytes)
+        .ok_or_else(|| anyhow::anyhow!("v7 trailer decode failed"))?;
 
     if trailer.num_segments != num_segments {
         tracing::warn!("v7 segment count mismatch");
@@ -563,9 +563,9 @@ pub fn load_v7_from_path(path: &Path) -> anyhow::Result<Option<V7Snapshot>> {
         let off = trailer.segment_offsets[i] as usize;
         let len = trailer.segment_lens[i] as usize;
         let crc = trailer.segment_crcs[i];
-        let end = off.checked_add(len).ok_or_else(|| {
-            anyhow::anyhow!("v7 segment {} offset overflow", i)
-        })?;
+        let end = off
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("v7 segment {} offset overflow", i))?;
         if end > bytes.len() {
             tracing::warn!("v7 segment {} out of bounds", i);
             return Ok(None);
@@ -573,12 +573,7 @@ pub fn load_v7_from_path(path: &Path) -> anyhow::Result<Option<V7Snapshot>> {
         let seg_bytes = &bytes[off..end];
         let computed = crc32c_checksum(seg_bytes);
         if computed != crc {
-            tracing::warn!(
-                "v7 segment {} crc mismatch: {} != {}",
-                i,
-                computed,
-                crc
-            );
+            tracing::warn!("v7 segment {} crc mismatch: {} != {}", i, computed, crc);
             return Ok(None);
         }
         // kind 需要从 header 的 SegmentDesc 表中读取，但 trailer 中没有 kind 信息。
@@ -633,40 +628,54 @@ fn align_up(v: usize, a: usize) -> usize {
 pub fn write_v7_snapshot_atomic(path: &Path, data: &BaseIndexData) -> anyhow::Result<()> {
     let segments_bytes: Vec<(V7SegKind, Vec<u8>)> = vec![
         (V7SegKind::PathTable, encode_path_table(&data.path_table)),
-        (V7SegKind::EntriesByKey, encode_file_entry_index(&data.entries_by_key)),
-        (V7SegKind::EntriesByPath, encode_file_entry_index(&data.entries_by_path)),
-        (V7SegKind::TrigramIndex, encode_trigram_index(&data.trigram_index)),
-        (V7SegKind::ParentIndex, encode_parent_index(&data.parent_index)),
+        (
+            V7SegKind::EntriesByKey,
+            encode_file_entry_index(&data.entries_by_key),
+        ),
+        (
+            V7SegKind::EntriesByPath,
+            encode_file_entry_index(&data.entries_by_path),
+        ),
+        (
+            V7SegKind::TrigramIndex,
+            encode_trigram_index(&data.trigram_index),
+        ),
+        (
+            V7SegKind::ParentIndex,
+            encode_parent_index(&data.parent_index),
+        ),
         (V7SegKind::Tombstones, encode_tombstones(&data.tombstones)),
     ];
 
     let num_segments = segments_bytes.len() as u32;
-    let mut segment_offsets = Vec::with_capacity(segments_bytes.len());
-    let mut segment_lens = Vec::with_capacity(segments_bytes.len());
-    let mut segment_crcs = Vec::with_capacity(segments_bytes.len());
+    let mut seg_descs: Vec<V7SegDesc> = Vec::with_capacity(segments_bytes.len());
     let mut cursor = align_up(V7_HEADER_SIZE, 8);
-
-    let mut global_hasher = Crc32c::new();
 
     for (_, bytes) in &segments_bytes {
         let offset = cursor as u64;
         let len = bytes.len() as u64;
         let crc = crc32c_checksum(bytes);
-        segment_offsets.push(offset);
-        segment_lens.push(len);
-        segment_crcs.push(crc);
-        global_hasher.update(bytes);
+        seg_descs.push(V7SegDesc {
+            offset,
+            len,
+            crc32c: crc,
+        });
         cursor = align_up(cursor + bytes.len(), 8);
     }
 
+    // 计算 global crc
+    let mut global_hasher = Crc32c::new();
+    for (_, bytes) in &segments_bytes {
+        global_hasher.update(bytes);
+    }
     let global_crc = global_hasher.finalize();
 
     let trailer = V7Trailer {
         num_segments,
         global_crc32c: global_crc,
-        segment_offsets,
-        segment_lens,
-        segment_crcs,
+        segment_offsets: seg_descs.iter().map(|d| d.offset).collect(),
+        segment_lens: seg_descs.iter().map(|d| d.len).collect(),
+        segment_crcs: seg_descs.iter().map(|d| d.crc32c).collect(),
     };
     let trailer_bytes = trailer.encode();
 
@@ -682,7 +691,7 @@ pub fn write_v7_snapshot_atomic(path: &Path, data: &BaseIndexData) -> anyhow::Re
         // Segments
         let mut written = V7_HEADER_SIZE;
         for (i, (_, bytes)) in segments_bytes.iter().enumerate() {
-            let target = trailer.segment_offsets[i] as usize;
+            let target = seg_descs[i].offset as usize;
             if target > written {
                 file.write_all(&vec![0u8; target - written])?;
                 written = target;
@@ -764,10 +773,10 @@ pub fn snapshot_now_v7(
     for (tri, bm) in &delta.trigram_index.inner {
         merged.trigram_index.insert(*tri, bm.clone());
     }
-    for (dir, bm) in &delta.parent_index.compat_dir_to_files {
+    for (dir, bm) in &delta.parent_index.dir_to_files {
         merged
             .parent_index
-            .compat_dir_to_files
+            .dir_to_files
             .entry(dir.clone())
             .and_modify(|existing| *existing |= bm.clone())
             .or_insert_with(|| bm.clone());

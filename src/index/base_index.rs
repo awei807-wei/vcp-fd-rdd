@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::core::{FileKey, FileMeta};
-use crate::index::parent_index::ParentIndex;
 pub use crate::index::file_entry_v2::{FileEntry, FileEntryIndex};
+use crate::index::parent_index::ParentIndex;
 use crate::index::path_table_v2::PathTableV2;
 use crate::query::Matcher;
 use crate::util::pathbuf_from_encoded_vec;
@@ -59,7 +59,9 @@ pub struct BaseIndexData {
 
 impl BaseIndexData {
     pub fn file_count(&self) -> usize {
-        self.entries_by_key.len().saturating_sub(self.tombstones.len() as usize)
+        self.entries_by_key
+            .len()
+            .saturating_sub(self.tombstones.len() as usize)
     }
 
     pub fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
@@ -156,7 +158,10 @@ impl BaseIndexData {
     }
 
     pub fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
-        let parent_bytes = PathBuf::from(parent_path).as_os_str().as_encoded_bytes().to_vec();
+        let parent_bytes = PathBuf::from(parent_path)
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec();
         let dir_idx = match self.path_table.lookup(&parent_bytes) {
             Some(idx) => idx,
             None => return Vec::new(),

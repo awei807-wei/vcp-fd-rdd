@@ -1,42 +1,4 @@
-The user wants me to resolve a Git merge conflict in the file `src/index/path_table_v2.rs`. Let me analyze the conflict:
-
-The conflict is in the `lookup` method. Let me compare the two versions:
-
-HEAD version:
-```rust
-    /// Lookup a path by its bytes, returning the original `PathIdx`.
-    pub fn lookup(&self, target: &[u8]) -> Option<PathIdx> {
-        self.find_exact(target).map(|sorted| self.sorted_to_idx[sorted])
-    }
-```
-
-Incoming version (tiered-switcher):
-```rust
-    /// Lookup a path by bytes, returning its original PathIdx.
-    pub fn lookup(&self, path_bytes: &[u8]) -> Option<PathIdx> {
-        let sorted_pos = self.find_exact(path_bytes)?;
-        Some(self.sorted_to_idx[sorted_pos])
-    }
-```
-
-The differences are:
-1. Comment: "by its bytes" vs "by bytes" - minor wording difference
-2. Parameter name: `target` vs `path_bytes` - the incoming version is more descriptive
-3. Implementation: `.map(|sorted| self.sorted_to_idx[sorted])` vs `let sorted_pos = self.find_exact(path_bytes)?; Some(self.sorted_to_idx[sorted_pos])` - functionally identical, but the incoming version uses `?` operator which is cleaner
-
-I'll combine them intelligently: use the more descriptive parameter name `path_bytes` from the incoming version, keep the clean `?` operator style, and merge the doc comment. Actually, looking more carefully, both are functionally equivalent. I'll use the incoming version's style since it's slightly cleaner with the `?` operator and more descriptive parameter name.
-
-Let me output the fully resolved file. I need to remove the conflict markers and keep the best of both versions.
-
-Actually, looking at the rules again: "Output ONLY the resolved file content. No explanations, no markdown fences, no extra text."
-
-So I just need to output the complete file with the conflict resolved. I'll use the incoming version for the `lookup` method since it has a more descriptive parameter name (`path_bytes` vs `target`) and uses the `?` operator which is idiomatic Rust.
-
-Wait, let me re-read the instructions. "If changes are complementary (e.g. different functions added), include both. If changes directly conflict (e.g. same line modified differently), combine them intelligently."
-
-These are the same function with slightly different implementations. The incoming version is cleaner. I'll use that.
-
-Let me produce the complete resolved file. I need to be careful to output ONLY the file content, no markdown code fences, no explanations.//! PathTable v2: front-encoding delta-compressed path storage.
+//! PathTable v2: front-encoding delta-compressed path storage.
 //!
 //! Paths are sorted lexicographically. Every 256th entry is an anchor storing
 //! the full path. Non-anchor entries store only `shared_len` + `suffix`.
@@ -198,8 +160,8 @@ impl PathTableV2 {
 
     fn get_suffix(&self, pos: usize) -> &[u8] {
         let e = &self.entries[pos];
-        &self.suffix_bytes[e.suffix_offset as usize
-            ..(e.suffix_offset as usize + e.suffix_len as usize)]
+        &self.suffix_bytes
+            [e.suffix_offset as usize..(e.suffix_offset as usize + e.suffix_len as usize)]
     }
 
     /// Resolve a sorted position to the full path bytes.
@@ -235,10 +197,10 @@ impl PathTableV2 {
             .map(|sorted| self.sorted_to_idx[sorted])
     }
 
-    /// Lookup a path by bytes, returning its original PathIdx.
-    pub fn lookup(&self, path_bytes: &[u8]) -> Option<PathIdx> {
-        let sorted_pos = self.find_exact(path_bytes)?;
-        Some(self.sorted_to_idx[sorted_pos])
+    /// Lookup a path by its bytes, returning the original `PathIdx`.
+    pub fn lookup(&self, target: &[u8]) -> Option<PathIdx> {
+        self.find_exact(target)
+            .map(|sorted| self.sorted_to_idx[sorted])
     }
 
     /// Find the exact path by binary search, returning its sorted position.

@@ -1,8 +1,8 @@
-use std::collections::VecDeque;
-use std::sync::Arc;
 use crate::stats::{
     infer_heap_high_water, EventPipelineStats, MemoryReport, OverlayStats, RebuildStats,
 };
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 use super::TieredIndex;
 
@@ -71,6 +71,7 @@ impl TieredIndex {
 
         let index_estimated_bytes = l1.estimated_bytes
             + l2.estimated_bytes
+            + disk_deleted_estimated_bytes
             + overlay.estimated_bytes
             + rebuild.estimated_bytes;
         let process_smaps_rollup = MemoryReport::read_smaps_rollup();
@@ -153,4 +154,3 @@ impl TieredIndex {
         }
     }
 }
-

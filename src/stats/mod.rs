@@ -536,36 +536,54 @@ impl StatsCollector {
     }
 
     pub fn record_query(&self, elapsed_us: u64) {
-        self.queries_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.queries_total_us.fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+        self.queries_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.queries_total_us
+            .fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn record_events_applied(&self, count: u64) {
-        self.events_applied.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        self.events_applied
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn record_events_dropped(&self, count: u64) {
-        self.events_dropped.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        self.events_dropped
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn record_snapshot(&self) {
-        self.snapshot_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.snapshot_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn record_fast_sync(&self) {
-        self.fast_sync_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.fast_sync_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn report(&self) -> StatsReport {
-        let total = self.queries_total.load(std::sync::atomic::Ordering::Relaxed);
-        let total_us = self.queries_total_us.load(std::sync::atomic::Ordering::Relaxed);
+        let total = self
+            .queries_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let total_us = self
+            .queries_total_us
+            .load(std::sync::atomic::Ordering::Relaxed);
         StatsReport {
             queries_total: total,
             queries_avg_us: if total == 0 { 0 } else { total_us / total },
-            events_applied: self.events_applied.load(std::sync::atomic::Ordering::Relaxed),
-            events_dropped: self.events_dropped.load(std::sync::atomic::Ordering::Relaxed),
-            snapshot_count: self.snapshot_count.load(std::sync::atomic::Ordering::Relaxed),
-            fast_sync_count: self.fast_sync_count.load(std::sync::atomic::Ordering::Relaxed),
+            events_applied: self
+                .events_applied
+                .load(std::sync::atomic::Ordering::Relaxed),
+            events_dropped: self
+                .events_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            snapshot_count: self
+                .snapshot_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            fast_sync_count: self
+                .fast_sync_count
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }

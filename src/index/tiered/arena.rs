@@ -58,15 +58,6 @@ pub(crate) struct PathArenaSet {
 }
 
 impl PathArenaSet {
-
-    pub(crate) fn len_paths(&self) -> usize {
-        self.paths_len
-    }
-
-    pub(crate) fn active_bytes(&self) -> u64 {
-        self.active_bytes
-    }
-
     fn bytes_at(&self, span: Span) -> Option<&[u8]> {
         let r = span.range();
         self.arena.get(r)
@@ -136,43 +127,6 @@ impl PathArenaSet {
         self.paths_len = 0;
         self.active_bytes = 0;
     }
-
-    /// 估算 overlay 堆占用（粗估、偏保守）：arena + HashMap 桶 + collision Vec 容量。
-    pub(crate) fn estimated_bytes(&self) -> u64 {
-        use std::mem::size_of;
-
-        // HashMap 真实实现细节与装载因子会影响开销；这里取"桶数组 + 控制字节"的保守估算。
-        // 该值用于解释 RSS，目标是"不低估"，而不是字节级精确。
-        let bucket = size_of::<(u64, OneOrManySpan)>() as u64;
-        let ctrl = 16u64; // 经验保守常数：控制字节/对齐等摊销
-        let map_bytes = self.map.capacity() as u64 * (bucket + ctrl);
-
-        let mut many_bytes = 0u64;
-        for v in self.map.values() {
-            if let OneOrManySpan::Many(vs) = v {
-                many_bytes += vs.capacity() as u64 * size_of::<Span>() as u64;
-            }
-        }
-
-        self.arena.capacity() as u64 + map_bytes + many_bytes
-    }
-}
-
-pub(super) fn path_arena_set_from_paths(paths: Vec<Vec<u8>>) -> PathArenaSet {
-    let mut set = PathArenaSet::default();
-
-    for path in paths {
-        let _ = set.insert(&path);
-    }
-    set
-}
-
-pub(super) fn deleted_paths_stats(paths: &PathArenaSet) -> (usize, u64, u64) {
-    (
-        paths.len_paths(),
-        paths.active_bytes(),
-        paths.estimated_bytes(),
-    )
 }
 
 pub(super) fn path_deleted_by_any(path_bytes: &[u8], deleted_sets: &[Arc<PathArenaSet>]) -> bool {

@@ -836,4 +836,3 @@ async fn lsm_offline_dir_mtime_change_skips_disk_segments() {
         .unwrap();
     assert_eq!(idx.file_count(), 0);
 }
-

@@ -30,8 +30,6 @@ where
     false
 }
 
-
-
 /// 事件管道：bounded channel + debounce/合并 + 批量应用
 pub struct EventPipeline {
     index: Arc<TieredIndex>,
@@ -171,10 +169,8 @@ impl EventPipeline {
         let failed_roots = watch_roots_enhanced(&mut watcher, &roots);
         self.watch_failures
             .fetch_add(failed_roots.len() as u64, Ordering::Relaxed);
-        self.watcher_degraded.store(
-            !failed_roots.is_empty(),
-            Ordering::Relaxed,
-        );
+        self.watcher_degraded
+            .store(!failed_roots.is_empty(), Ordering::Relaxed);
 
         let index = self.index.clone();
         let debounce_ms = self.debounce_ms;
@@ -307,7 +303,6 @@ impl EventPipeline {
                                     e
                                 );
                             }
-
                         }
                     }
                 }
