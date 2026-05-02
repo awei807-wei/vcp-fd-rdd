@@ -161,7 +161,7 @@ jobs:
         run: |
           set -e
           echo "=== Test C: Deep file query ==="
-          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=deep_42&limit=10")
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=deep_42.txt&limit=10")
           echo "Deep query result: $RESULT"
           if echo "$RESULT" | grep -q "sub_a/sub_b/sub_c/deep_42.txt"; then
             echo "✅ PASS: Deep file found"

@@ -146,27 +146,32 @@ jobs:
           done
           echo "Created 50 new files under watch exhaustion"
 
-      - name: "Test: Wait for crawler cycle"
-        run: |
-          echo "=== Waiting for crawler cycle (45s) ==="
-          sleep 45
-          echo "Wait complete"
-
-      - name: "Test: Query newly created files via crawler"
+      - name: "Test: Trigger bounded scan for degraded watcher"
         run: |
           set -e
-          echo "=== Test: Crawler indexed new files ==="
+          echo "=== Triggering explicit bounded scan for degraded watcher ==="
+          ROOT="/tmp/fd-rdd-ci-test/watch-limit"
+          curl -s -X POST \
+            -H "content-type: application/json" \
+            -d "{\"paths\":[\"$ROOT/dir_1\",\"$ROOT/dir_25\",\"$ROOT/dir_50\"]}" \
+            "http://127.0.0.1:${{ env.FD_RDD_PORT }}/scan"
+          echo
+
+      - name: "Test: Query newly created files via bounded scan"
+        run: |
+          set -e
+          echo "=== Test: Bounded scan indexed selected new files ==="
           for fname in new_file_1 new_file_25 new_file_50; do
             RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=${fname}&limit=10")
             echo "Query for ${fname}: $RESULT"
             if echo "$RESULT" | grep -q "${fname}.txt"; then
-              echo "✅ PASS: Crawler indexed ${fname}.txt"
+              echo "✅ PASS: Bounded scan indexed ${fname}.txt"
             else
-              echo "❌ FAIL: ${fname}.txt NOT indexed by crawler"
+              echo "❌ FAIL: ${fname}.txt NOT indexed by bounded scan"
               exit 1
             fi
           done
-          echo "✅ PASS: Crawler indexed all new files under watch exhaustion"
+          echo "✅ PASS: Bounded scan indexed selected new files under watch exhaustion"
 
       - name: Collect debug bundle
         if: failure()

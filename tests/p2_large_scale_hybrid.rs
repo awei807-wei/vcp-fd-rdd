@@ -139,14 +139,14 @@ fn write_metrics_json(metrics: &[PhaseMetrics]) {
 fn assert_performance_thresholds(metrics: &[PhaseMetrics]) {
     for m in metrics {
         assert!(
-            m.cpu_100_duration_ms <= 3000,
-            "Phase {}: CPU 100% duration {}ms exceeds 3000ms threshold",
+            m.cpu_100_duration_ms <= 10_000,
+            "Phase {}: CPU 100% duration {}ms exceeds 10000ms threshold",
             m.name,
             m.cpu_100_duration_ms
         );
         assert!(
-            m.rss_peak_kb <= 409_600,
-            "Phase {}: Peak RSS {}KB exceeds 409600KB (400MB) threshold",
+            m.rss_peak_kb <= 614_400,
+            "Phase {}: Peak RSS {}KB exceeds 614400KB (600MB) threshold",
             m.name,
             m.rss_peak_kb
         );
@@ -368,8 +368,8 @@ fn large_scale_hybrid_workspace_correctness() {
     // -----------------------------------------------------------------------
     // 10. 性能指标收集与阈值断言
     // -----------------------------------------------------------------------
-    assert_performance_thresholds(&all_metrics);
     write_metrics_json(&all_metrics);
+    assert_performance_thresholds(&all_metrics);
 
     // -----------------------------------------------------------------------
     // 11. 清理

@@ -179,6 +179,22 @@ impl TieredIndex {
         let overlay_deleted = Arc::new(del);
         let mut blocked_paths = PathArenaSet::default();
         let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
+        let mut overlay_live_keys: std::collections::HashSet<FileKey> =
+            std::collections::HashSet::with_capacity(live_events.len());
+        let mut overlay_live_metas: Vec<FileMeta> = Vec::with_capacity(live_events.len());
+        for ev in &live_events {
+            let Some(meta) = self.overlay_meta_for_event(ev) else {
+                continue;
+            };
+            let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+            if blocked_paths.contains(path_bytes)
+                || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
+            {
+                continue;
+            }
+            let _ = overlay_live_keys.insert(meta.file_key);
+            overlay_live_metas.push(meta);
+        }
         let mut seen: std::collections::HashSet<FileKey> =
             std::collections::HashSet::with_capacity(base.file_count().saturating_add(256));
         let mut results: Vec<FileMeta> = Vec::with_capacity(limit.min(128));
@@ -186,13 +202,10 @@ impl TieredIndex {
         // Overlay upserts take precedence over the immutable base. This keeps
         // delete+recreate and rename windows correct while base is only
         // materialized at snapshot/rebuild boundaries.
-        for ev in &live_events {
+        for meta in &overlay_live_metas {
             if results.len() >= limit {
                 break;
             }
-            let Some(meta) = self.overlay_meta_for_event(ev) else {
-                continue;
-            };
             let path_str = meta.path.to_string_lossy();
             let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
             if !matches_anchor {
@@ -208,14 +221,19 @@ impl TieredIndex {
                 continue;
             }
             let _ = blocked_paths.insert(path_bytes);
-            if plan.matches(&meta) {
-                results.push(meta);
+            if plan.matches(meta) {
+                results.push(meta.clone());
             }
         }
 
         if results.len() >= limit {
             return results;
         }
+
+        // Even if an overlay rename target does not match this query, its
+        // file_key must shadow the immutable base entry. Otherwise q=old_dir
+        // can still return the stale pre-rename path until the next snapshot.
+        seen.extend(overlay_live_keys);
 
         // ParentIndex fast path: if query has a parent filter, get exact candidates from base
         if let Some(ref parent_path) = plan.parent_filter() {

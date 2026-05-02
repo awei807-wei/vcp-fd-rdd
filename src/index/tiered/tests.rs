@@ -285,7 +285,7 @@ fn nfd_query_matches_nfc_normalized_path() {
 fn deep_scan_reconciles_directory_rename_when_old_path_is_gone() {
     let root = unique_tmp_dir("deep-rename-reconcile");
     let old_project = root.join("old_project");
-    let deep_dir = old_project.join("node_modules/libA/dist");
+    let deep_dir = old_project.join("deps_tree/libA/out_js");
     std::fs::create_dir_all(&deep_dir).unwrap();
 
     let old_file = deep_dir.join("bundle_1.js");
@@ -306,7 +306,7 @@ fn deep_scan_reconciles_directory_rename_when_old_path_is_gone() {
         results.iter().any(|meta| meta
             .path
             .to_string_lossy()
-            .contains("new_project/node_modules/libA/dist/bundle_1.js")),
+            .contains("new_project/deps_tree/libA/out_js/bundle_1.js")),
         "renamed deep path should be visible after reconcile: {results:?}"
     );
     assert!(
@@ -314,6 +314,11 @@ fn deep_scan_reconciles_directory_rename_when_old_path_is_gone() {
             .iter()
             .all(|meta| !meta.path.to_string_lossy().contains("old_project/")),
         "old renamed path should be removed after reconcile: {results:?}"
+    );
+    let old_results = idx.query("old_project");
+    assert!(
+        old_results.is_empty(),
+        "renamed old subtree should be shadowed even when query only matches old path: {old_results:?}"
     );
 
     let _ = std::fs::remove_dir_all(&root);

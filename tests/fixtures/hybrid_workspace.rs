@@ -777,9 +777,14 @@ impl HybridWorkspace {
 
     /// Return only the user files that should be indexed by fd-rdd.
     ///
-    /// (Ignored and dependency files are excluded.)
-    pub fn indexable_files(&self) -> &[PathBuf] {
-        &self.user_files
+    /// Ignored/dependency files are excluded, and hidden-path user files are
+    /// excluded because fd-rdd defaults to `include_hidden = false`.
+    pub fn indexable_files(&self) -> Vec<PathBuf> {
+        self.user_files
+            .iter()
+            .filter(|p| !has_hidden_component(p.strip_prefix(&self.root).unwrap_or(p)))
+            .cloned()
+            .collect()
     }
 
     /// Sample up to `n` ignored file paths.
@@ -789,6 +794,15 @@ impl HybridWorkspace {
 
     /// Sample up to `n` searchable (user) file paths.
     pub fn sample_searchable_files(&self, n: usize) -> Vec<PathBuf> {
-        self.user_files.iter().take(n).cloned().collect()
+        self.indexable_files().into_iter().take(n).collect()
     }
+}
+
+fn has_hidden_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        name.as_encoded_bytes().first() == Some(&b'.')
+    })
 }

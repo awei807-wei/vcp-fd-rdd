@@ -28,7 +28,7 @@
 ## v0.6.1 测试相关变更
 
 - CI 格式化与 Clippy 警告修复相关变更已使全部测试辅助模块通过 `cargo fmt --all -- --check` 与 `cargo clippy --all-targets -- -D warnings`。
-- 新增大规模混合工作区测试 `tests/p2_large_scale_hybrid.rs`，覆盖 80 万文件冷扫、git clone、npm install、单文件 CRUD 与最终一致性验证，带性能阈值断言（CPU 100% 持续时间 ≤3000ms，峰值 RSS ≤400MB）。
+- 新增大规模混合工作区测试 `tests/p2_large_scale_hybrid.rs`，覆盖 80 万文件冷扫、git clone、npm install、单文件 CRUD 与最终一致性验证，带性能阈值断言（CPU 100% 持续时间 ≤10000ms，峰值 RSS ≤600MB，与 CI workflow 阈值一致）。
 
 ## v0.6.0 更新（零拷贝序列化 P1 + Compaction 降维 P2）
 
