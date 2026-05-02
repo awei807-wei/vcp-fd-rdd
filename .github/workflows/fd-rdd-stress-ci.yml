@@ -243,12 +243,12 @@ jobs:
         run: |
           ROOT="/tmp/fd-rdd-ci-test/rename-test"
           mkdir -p "$ROOT/old_project/src/components"
-          mkdir -p "$ROOT/old_project/deps_tree/libA/dist"
+          mkdir -p "$ROOT/old_project/deps_tree/libA/out_js"
           # Create files at various depths
           for i in $(seq 1 100); do
             echo "module $i" > "$ROOT/old_project/src/app_${i}.js"
             echo "component $i" > "$ROOT/old_project/src/components/widget_${i}.tsx"
-            echo "lib $i" > "$ROOT/old_project/deps_tree/libA/dist/bundle_${i}.js"
+            echo "lib $i" > "$ROOT/old_project/deps_tree/libA/out_js/bundle_${i}.js"
           done
           echo "Created $(find $ROOT -type f | wc -l) files"
 
@@ -897,8 +897,8 @@ jobs:
           set -e
           RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=crossmount-main&limit=20")
           echo "Canonical hardlink query: $RESULT"
-          ORIGINAL_COUNT=$(printf '%s' "$RESULT" | grep -o "original.txt" | wc -l | tr -d ' ')
-          HARDLINK_COUNT=$(printf '%s' "$RESULT" | grep -o "hardlink.txt" | wc -l | tr -d ' ')
+          ORIGINAL_COUNT=$(printf '%s' "$RESULT" | { grep -o "original.txt" || true; } | wc -l | tr -d ' ')
+          HARDLINK_COUNT=$(printf '%s' "$RESULT" | { grep -o "hardlink.txt" || true; } | wc -l | tr -d ' ')
           TOTAL=$((ORIGINAL_COUNT + HARDLINK_COUNT))
           if [ "$TOTAL" -eq 1 ]; then
             echo "✅ PASS: exactly one hardlink alias is indexed"

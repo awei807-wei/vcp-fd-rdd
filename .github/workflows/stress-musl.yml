@@ -68,11 +68,11 @@ jobs:
         run: |
           ROOT="/tmp/fd-rdd-musl-test/rename-test"
           mkdir -p "$ROOT/old_project/src/components"
-          mkdir -p "$ROOT/old_project/deps_tree/libA/dist"
+          mkdir -p "$ROOT/old_project/deps_tree/libA/out_js"
           for i in $(seq 1 100); do
             echo "module $i" > "$ROOT/old_project/src/app_${i}.js"
             echo "component $i" > "$ROOT/old_project/src/components/widget_${i}.tsx"
-            echo "lib $i" > "$ROOT/old_project/deps_tree/libA/dist/bundle_${i}.js"
+            echo "lib $i" > "$ROOT/old_project/deps_tree/libA/out_js/bundle_${i}.js"
           done
           echo "Created $(find $ROOT -type f | wc -l) files"
 

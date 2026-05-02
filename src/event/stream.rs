@@ -336,42 +336,50 @@ impl EventPipeline {
                 // 因此需要在检测到 Create(Folder) 事件时手动调用 watcher.watch()。
                 // 同时扫描新目录中的已有文件，生成合成 Create 事件，弥补 watch 注册
                 // 时间窗口内丢失的 inotify 事件（目录创建与 watch 生效之间存在竞态）。
-                let mut created_dirs: Vec<PathBuf> = Vec::new();
+                let mut changed_dirs: Vec<PathBuf> = Vec::new();
                 for ev in &raw_events {
-                    if matches!(
-                        ev.kind,
-                        notify::EventKind::Create(notify::event::CreateKind::Folder)
-                    ) {
-                        for path in &ev.paths {
-                            if ignore_paths
-                                .iter()
-                                .any(|ig| !ig.as_os_str().is_empty() && path.starts_with(ig))
-                                || path_has_excluded_component(path, &exclude_dirs)
-                            {
-                                continue;
-                            }
-                            if ignore_filter
-                                .as_ref()
-                                .is_some_and(|filter| filter.is_ignored(path))
-                            {
-                                continue;
-                            }
-                            if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
-                                tracing::debug!(
-                                    "Failed to add dynamic watch for {:?}: {}",
-                                    path,
-                                    e
-                                );
-                            }
-                            created_dirs.push(path.clone());
+                    let dir_paths = match ev.kind {
+                        notify::EventKind::Create(notify::event::CreateKind::Folder) => {
+                            ev.paths.as_slice()
                         }
+                        notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
+                            ev.paths.last().map(std::slice::from_ref).unwrap_or(&[])
+                        }
+                        _ => &[],
+                    };
+                    for path in dir_paths {
+                        if ignore_paths
+                            .iter()
+                            .any(|ig| !ig.as_os_str().is_empty() && path.starts_with(ig))
+                            || path_has_excluded_component(path, &exclude_dirs)
+                        {
+                            continue;
+                        }
+                        if ignore_filter
+                            .as_ref()
+                            .is_some_and(|filter| filter.is_ignored(path))
+                        {
+                            continue;
+                        }
+                        if !std::fs::symlink_metadata(path)
+                            .map(|m| m.is_dir())
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
+                            tracing::debug!("Failed to add dynamic watch for {:?}: {}", path, e);
+                        }
+                        changed_dirs.push(path.clone());
                     }
                 }
-                if !created_dirs.is_empty() {
-                    let (scanned, elapsed_ms) = index.scan_dirs_immediate(&created_dirs);
+                changed_dirs.sort();
+                changed_dirs.dedup();
+                if !changed_dirs.is_empty() {
+                    let (scanned, elapsed_ms) = index.scan_dirs_immediate_deep(&changed_dirs);
                     tracing::debug!(
-                        "Dynamic directory scan: dirs={} files={} elapsed_ms={}",
-                        created_dirs.len(),
+                        "Dynamic directory deep scan: dirs={} files={} elapsed_ms={}",
+                        changed_dirs.len(),
                         scanned,
                         elapsed_ms
                     );
