@@ -156,6 +156,8 @@ impl CompiledExpr {
     }
 }
 
+/// Filter enum for compiled query expressions.
+/// `Content(String)` is intentionally kept as a placeholder for future full-text search integration.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum Filter {

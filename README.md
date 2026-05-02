@@ -10,7 +10,14 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-当前 tests 分支发布版本为 v0.6.9（ParentIndex 查询加速 + 死代码清理）。
+当前 tests 分支发布版本为 v0.6.10（ParentIndex 增量维护正确性修复 + 死代码清理）。
+
+## v0.6.10 更新（Phase 7: ParentIndex 增量维护正确性修复 + 死代码清理）
+
+- 在 `finish_rebuild` 完成 L2 替换后重建 ParentIndex，确保 rebuild 后的 parent 查询正确
+- 在 `apply_events_inner`/`apply_events_inner_drain` 修改 L2 后重建 ParentIndex
+- 在 `apply_upserted_metas_inner` 修改 L2 后重建 ParentIndex
+- 进一步清理死代码警告（PathArenaSet 等）
 
 ## v0.6.9 更新（Phase 6: ParentIndex 查询加速 + 死代码清理）
 

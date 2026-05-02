@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.10] - 2026-05-01
+
+### Phase 7: ParentIndex 增量维护正确性修复 + 死代码清理
+
+- 在 `finish_rebuild` 完成 L2 替换后重建 ParentIndex，确保 rebuild 后的 parent 查询正确
+- 在 `apply_events_inner`/`apply_events_inner_drain` 修改 L2 后重建 ParentIndex
+- 在 `apply_upserted_metas_inner` 修改 L2 后重建 ParentIndex
+- 进一步清理死代码警告（PathArenaSet 等）
+
 ## [0.6.9] - 2026-05-01
 
 ### Phase 6: ParentIndex query acceleration + dead code cleanup

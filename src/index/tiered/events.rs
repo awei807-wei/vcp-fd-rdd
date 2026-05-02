@@ -257,6 +257,7 @@ impl TieredIndex {
             return;
         };
         batch.l2.apply_events(events);
+        batch.l2.rebuild_parent_index();
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
 
@@ -291,6 +292,7 @@ impl TieredIndex {
             return;
         };
         batch.l2.apply_events(events.as_slice());
+        batch.l2.rebuild_parent_index();
         events.clear();
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
@@ -312,9 +314,11 @@ impl TieredIndex {
         };
         if batch.rebuild_in_progress {
             batch.l2.apply_file_metas(metas.as_slice());
+            batch.l2.rebuild_parent_index();
             metas.clear();
         } else {
             batch.l2.apply_file_metas_drain(metas);
+            batch.l2.rebuild_parent_index();
         }
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);

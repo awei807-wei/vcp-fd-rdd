@@ -272,7 +272,6 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     })
 }
 
-#[allow(dead_code)]
 async fn metrics_handler(State(_state): State<QueryServerState>) -> impl IntoResponse {
     // TODO: wire to TieredIndex stats collector once it has one
     Json(StatsReport::default())

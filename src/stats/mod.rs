@@ -1,5 +1,4 @@
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 内存占用统计（字节级精确）
 #[derive(Clone, Debug, Default)]
@@ -510,79 +509,7 @@ impl fmt::Display for MemoryReport {
     }
 }
 
-/// 运行时指标收集器（原子计数器，线程安全）
-#[allow(dead_code)]
-pub struct StatsCollector {
-    pub queries_total: AtomicU64,
-    pub queries_duration_us: AtomicU64,
-    pub events_applied: AtomicU64,
-    pub events_dropped: AtomicU64,
-    pub snapshot_count: AtomicU64,
-    pub snapshot_duration_ms: AtomicU64,
-    pub fast_sync_count: AtomicU64,
-    pub fast_sync_duration_ms: AtomicU64,
-}
-
-impl StatsCollector {
-    pub fn new() -> Self {
-        Self {
-            queries_total: AtomicU64::new(0),
-            queries_duration_us: AtomicU64::new(0),
-            events_applied: AtomicU64::new(0),
-            events_dropped: AtomicU64::new(0),
-            snapshot_count: AtomicU64::new(0),
-            snapshot_duration_ms: AtomicU64::new(0),
-            fast_sync_count: AtomicU64::new(0),
-            fast_sync_duration_ms: AtomicU64::new(0),
-        }
-    }
-
-    pub fn record_query(&self, duration_us: u64) {
-        self.queries_total.fetch_add(1, Ordering::Relaxed);
-        self.queries_duration_us.fetch_add(duration_us, Ordering::Relaxed);
-    }
-
-    pub fn record_event_applied(&self) {
-        self.events_applied.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_event_dropped(&self) {
-        self.events_dropped.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_snapshot(&self, duration_ms: u64) {
-        self.snapshot_count.fetch_add(1, Ordering::Relaxed);
-        self.snapshot_duration_ms.fetch_add(duration_ms, Ordering::Relaxed);
-    }
-
-    pub fn record_fast_sync(&self, duration_ms: u64) {
-        self.fast_sync_count.fetch_add(1, Ordering::Relaxed);
-        self.fast_sync_duration_ms.fetch_add(duration_ms, Ordering::Relaxed);
-    }
-
-    pub fn report(&self) -> StatsReport {
-        let total = self.queries_total.load(Ordering::Relaxed);
-        let duration = self.queries_duration_us.load(Ordering::Relaxed);
-        let avg = if total > 0 { duration / total } else { 0 };
-        StatsReport {
-            queries_total: total,
-            queries_avg_us: avg,
-            events_applied: self.events_applied.load(Ordering::Relaxed),
-            events_dropped: self.events_dropped.load(Ordering::Relaxed),
-            snapshot_count: self.snapshot_count.load(Ordering::Relaxed),
-            fast_sync_count: self.fast_sync_count.load(Ordering::Relaxed),
-        }
-    }
-}
-
-impl Default for StatsCollector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[derive(Debug, Default, serde::Serialize)]
-#[allow(dead_code)]
 pub struct StatsReport {
     pub queries_total: u64,
     pub queries_avg_us: u64,
