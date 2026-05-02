@@ -96,8 +96,11 @@ impl TieredIndex {
             flush_notify: Notify::new(),
             auto_flush_overlay_paths: AtomicU64::new(250_000),
             auto_flush_overlay_bytes: AtomicU64::new(64 * 1024 * 1024),
-            periodic_flush_min_events: AtomicU64::new(0),
-            periodic_flush_min_bytes: AtomicU64::new(0),
+            // Periodic snapshot materializes the full visible base. Keep tiny
+            // event trickles in WAL/DeltaBuffer so a few filesystem events do
+            // not rebuild a 400K+ file base every interval.
+            periodic_flush_min_events: AtomicU64::new(4_096),
+            periodic_flush_min_bytes: AtomicU64::new(4 * 1024 * 1024),
             pending_flush_events: AtomicU64::new(0),
             pending_flush_bytes: AtomicU64::new(0),
             last_snapshot_time: AtomicU64::new(0),

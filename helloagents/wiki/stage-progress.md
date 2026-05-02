@@ -129,6 +129,7 @@
 - 新增 `watch_mode = "recursive" | "tiered" | "off"` 和 `--watch-mode`；默认保持 recursive，tiered 作为预算受控热点监听预览模式，先按 XDG 热点目录和 `max_watch_dirs` 准入 L0。
 - HTTP 新增 `/watch-state`，输出 watcher 模式、L0/L1/L2/L3 数量、估算 watch 目录预算、扫描 backlog 和 tiered 调度说明。
 - tiered 模式下未准入 L0 的热点候选进入有界 warm-scan loop，按 `l1_scan_interval_secs` 和 `scan_items_per_sec` 分批浅扫，避免直接回到全递归 watcher RSS。
+- 周期 snapshot 默认增加小批量门槛：少量事件先留在 WAL/DeltaBuffer，不再每个 snapshot interval 都全量 materialize 44 万级 base，避免 watcher 测试中出现非索引 RSS 高水位。
 
 仍保留 / 后续处理：
 
