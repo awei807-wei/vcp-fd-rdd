@@ -137,7 +137,7 @@ impl PathTableV2 {
     }
 
     /// Build from an iterator of `(PathIdx, path_bytes)`.
-    pub fn from_iter<I>(iter: I) -> Self
+    pub fn from_path_iter<I>(iter: I) -> Self
     where
         I: IntoIterator<Item = (PathIdx, Vec<u8>)>,
     {

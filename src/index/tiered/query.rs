@@ -23,7 +23,10 @@ impl TieredIndex {
             return Vec::new();
         }
 
-        if self.base.load().file_count() == 0 && self.l2.load().file_count() > 0 {
+        if self.base.load().file_count() == 0
+            && !self.rebuild_in_progress()
+            && self.l2.load().file_count() > 0
+        {
             self.refresh_base();
         }
 

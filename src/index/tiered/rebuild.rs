@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct RebuildState {
     pub(super) in_progress: bool,
     /// 最近一次 rebuild 开始时间（用于冷却/合并）
@@ -9,15 +9,4 @@ pub(super) struct RebuildState {
     pub(super) requested: bool,
     /// 冷却期触发的延迟 rebuild 是否已调度（避免重复 spawn sleep 线程）
     pub(super) scheduled: bool,
-}
-
-impl Default for RebuildState {
-    fn default() -> Self {
-        Self {
-            in_progress: false,
-            last_started_at: None,
-            requested: false,
-            scheduled: false,
-        }
-    }
 }

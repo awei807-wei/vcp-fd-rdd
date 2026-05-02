@@ -617,7 +617,7 @@ impl PersistentIndex {
                 continue;
             };
             if !abs_bytes.is_empty() {
-                let h = path_hash_bytes(&abs_bytes);
+                let h = path_hash_bytes(abs_bytes);
                 path_hash_to_id
                     .entry(h)
                     .and_modify(|v| v.insert(docid))
@@ -1163,8 +1163,8 @@ impl PersistentIndex {
                 } else {
                     self.entry_size_mtime(docid).unwrap_or((0, -1))
                 };
-                self.insert_trigrams(docid, &*to_path_owned);
-                self.insert_path_hash(docid, &*to_path_owned);
+                self.insert_trigrams(docid, &to_path_owned);
+                self.insert_path_hash(docid, &to_path_owned);
                 let abs_path_bytes = to_path_owned.as_os_str().as_encoded_bytes().to_vec();
                 self.update_entry_path(docid, &abs_path_bytes, size, mtime_ns);
             } else if let Some(meta) = fallback_meta {

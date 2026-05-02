@@ -61,6 +61,38 @@ fn rebuild_with_pending_events_no_loss() {
 }
 
 #[test]
+fn rebuild_in_progress_does_not_publish_partial_l2_as_ready() {
+    let root = unique_tmp_dir("rebuild-partial-visibility");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let partial_path = root.join("partial_ready.txt");
+    std::fs::write(&partial_path, b"partial").unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    assert!(idx.try_start_rebuild_force());
+
+    let partial_l2 = Arc::new(PersistentIndex::new_with_roots(vec![root.clone()]));
+    partial_l2.apply_events(&[mk_event(1, EventType::Create, partial_path.clone())]);
+    idx.l2.store(partial_l2.clone());
+
+    assert_eq!(
+        idx.file_count(),
+        0,
+        "status must not report rebuild scratch L2 as query-visible"
+    );
+    assert!(
+        idx.query("partial_ready").is_empty(),
+        "query must not materialize a partial rebuild L2 into base"
+    );
+
+    idx.finish_rebuild(partial_l2);
+    assert_eq!(idx.file_count(), 1);
+    assert!(!idx.query("partial_ready").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn event_apply_does_not_materialize_base_hot_path() {
     let root = unique_tmp_dir("hot-path-base");
     std::fs::create_dir_all(&root).unwrap();

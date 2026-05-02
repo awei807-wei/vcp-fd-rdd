@@ -310,7 +310,7 @@ fn encode_header(num_segments: u32, header_crc: u32) -> [u8; V7_HEADER_SIZE] {
 }
 
 fn decode_header(buf: &[u8; V7_HEADER_SIZE]) -> Option<(u32, u32)> {
-    if &buf[0..8] != &V7_MAGIC {
+    if buf[0..8] != V7_MAGIC {
         return None;
     }
     let version = u32::from_le_bytes(buf[8..12].try_into().ok()?);
@@ -369,7 +369,7 @@ impl V7Trailer {
         }
         let file_len = buf.len();
         let magic_off = file_len - 8;
-        if &buf[magic_off..] != &V7_TRAILER_MAGIC {
+        if buf[magic_off..] != V7_TRAILER_MAGIC {
             return None;
         }
         let trailer_len =
@@ -719,7 +719,7 @@ pub fn snapshot_now_v7(
         merged.path_table = b.path_table.clone();
         for i in 0..b.entries_by_key.len() {
             if let Some(e) = b.entries_by_key.get(i) {
-                merged.entries_by_key.push(e.clone());
+                merged.entries_by_key.push(*e);
             }
         }
         merged.trigram_index = b.trigram_index.clone();
@@ -730,7 +730,7 @@ pub fn snapshot_now_v7(
     // 再灌入 delta（简单追加；TODO: 真正归并去重）
     for i in 0..delta.entries_by_key.len() {
         if let Some(e) = delta.entries_by_key.get(i) {
-            merged.entries_by_key.push(e.clone());
+            merged.entries_by_key.push(*e);
         }
     }
     // trigram / parent / tombstones：简单合并（TODO: 真正归并）
@@ -741,7 +741,7 @@ pub fn snapshot_now_v7(
         merged
             .parent_index
             .dir_to_files
-            .entry(dir.clone())
+            .entry(*dir)
             .and_modify(|existing| {
                 existing.extend_from_slice(bm);
                 existing.sort_unstable();

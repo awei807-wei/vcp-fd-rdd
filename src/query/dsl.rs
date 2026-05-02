@@ -125,7 +125,7 @@ impl CompiledQuery {
         match expr {
             CompiledExpr::Filter(Filter::Parent(p)) => Some(p.clone()),
             CompiledExpr::And(v) | CompiledExpr::Or(v) => {
-                v.iter().find_map(|e| Self::find_parent_in_expr(e))
+                v.iter().find_map(Self::find_parent_in_expr)
             }
             _ => None,
         }

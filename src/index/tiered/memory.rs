@@ -22,6 +22,9 @@ impl TieredIndex {
             let overlay_upserts = self.delta_buffer.lock().upserted_paths().count();
             return base_count.saturating_add(overlay_upserts);
         }
+        if self.rebuild_in_progress() {
+            return self.delta_buffer.lock().upserted_paths().count();
+        }
         self.l2.load().file_count()
     }
 

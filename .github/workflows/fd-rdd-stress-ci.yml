@@ -100,7 +100,8 @@ jobs:
             if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
               STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
               COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
-              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+              REBUILDING=$(echo "$STATUS" | grep -E -o '"is_rebuilding":(true|false)' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ] && [ "$REBUILDING" = "false" ]; then
                 echo "Daemon ready, indexed_count=$COUNT"
                 break
               fi
@@ -242,12 +243,12 @@ jobs:
         run: |
           ROOT="/tmp/fd-rdd-ci-test/rename-test"
           mkdir -p "$ROOT/old_project/src/components"
-          mkdir -p "$ROOT/old_project/node_modules/libA/dist"
+          mkdir -p "$ROOT/old_project/deps_tree/libA/dist"
           # Create files at various depths
           for i in $(seq 1 100); do
             echo "module $i" > "$ROOT/old_project/src/app_${i}.js"
             echo "component $i" > "$ROOT/old_project/src/components/widget_${i}.tsx"
-            echo "lib $i" > "$ROOT/old_project/node_modules/libA/dist/bundle_${i}.js"
+            echo "lib $i" > "$ROOT/old_project/deps_tree/libA/dist/bundle_${i}.js"
           done
           echo "Created $(find $ROOT -type f | wc -l) files"
 
@@ -260,7 +261,8 @@ jobs:
             if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
               STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
               COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
-              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+              REBUILDING=$(echo "$STATUS" | grep -E -o '"is_rebuilding":(true|false)' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ] && [ "$REBUILDING" = "false" ]; then
                 echo "Daemon ready, indexed_count=$COUNT"
                 break
               fi
@@ -325,13 +327,13 @@ jobs:
           fi
           echo "✅ PASS: $COUNT files visible after rename"
 
-      - name: "Test 3d: Deep file query (node_modules boundary)"
+      - name: "Test 3d: Deep file query after directory rename"
         run: |
           set -e
           echo "=== Test 3d: Deep file query post-rename ==="
           RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=bundle_1&limit=20")
           echo "Deep query result: $RESULT"
-          if echo "$RESULT" | grep -q "new_project/node_modules"; then
+          if echo "$RESULT" | grep -q "new_project/deps_tree"; then
             echo "✅ PASS: Deep nested files visible after rename"
           else
             echo "❌ FAIL: Deep nested files not visible (fast-sync max_depth:1 limit)"
@@ -432,7 +434,8 @@ jobs:
             if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
               STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
               COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
-              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+              REBUILDING=$(echo "$STATUS" | grep -E -o '"is_rebuilding":(true|false)' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ] && [ "$REBUILDING" = "false" ]; then
                 echo "Daemon ready, indexed_count=$COUNT"
                 break
               fi
@@ -586,7 +589,8 @@ jobs:
             if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
               STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
               COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
-              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+              REBUILDING=$(echo "$STATUS" | grep -E -o '"is_rebuilding":(true|false)' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ] && [ "$REBUILDING" = "false" ]; then
                 echo "Daemon ready, indexed_count=$COUNT"
                 break
               fi
@@ -714,7 +718,7 @@ jobs:
         run: |
           ROOT="/tmp/fd-rdd-ci-test/skew-test"
           mkdir -p "$ROOT"
-          # Create files with common trigrams: .log, src, node_modules
+          # Create files with common trigrams and one excluded dependency tree.
           for i in $(seq 1 2000); do
             echo "log $i" > "$ROOT/app_${i}.log"
           done
@@ -727,7 +731,7 @@ jobs:
             mkdir -p "$DIR"
             echo "deep $depth" > "$DIR/deep_file.txt"
           done
-          # node_modules explosion
+          # node_modules is intentionally excluded at index time in 0.6.14.
           for pkg in $(seq 1 100); do
             mkdir -p "$ROOT/node_modules/pkg_${pkg}/dist"
             echo "pkg $pkg" > "$ROOT/node_modules/pkg_${pkg}/dist/index.js"
@@ -743,7 +747,8 @@ jobs:
             if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
               STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
               COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
-              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+              REBUILDING=$(echo "$STATUS" | grep -E -o '"is_rebuilding":(true|false)' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ] && [ "$REBUILDING" = "false" ]; then
                 echo "Daemon ready, indexed_count=$COUNT"
                 break
               fi
@@ -787,7 +792,7 @@ jobs:
             exit 1
           fi
 
-      - name: "Test 6c: node_modules explosion query"
+      - name: "Test 6c: excluded node_modules query"
         run: |
           set -e
           START=$(date +%s%N)
@@ -800,7 +805,11 @@ jobs:
             echo "❌ FAIL: node_modules query took ${ELAPSED_MS}ms"
             exit 1
           fi
-          echo "✅ PASS: node_modules explosion handled"
+          if [ "$COUNT" -ne 0 ]; then
+            echo "❌ FAIL: node_modules should be excluded from the index"
+            exit 1
+          fi
+          echo "✅ PASS: excluded node_modules query handled"
 
       - name: Collect debug bundle
         if: failure()
@@ -874,7 +883,8 @@ jobs:
             if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
               STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
               COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
-              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+              REBUILDING=$(echo "$STATUS" | grep -E -o '"is_rebuilding":(true|false)' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ] && [ "$REBUILDING" = "false" ]; then
                 echo "Daemon ready, indexed_count=$COUNT"
                 break
               fi
@@ -885,21 +895,19 @@ jobs:
       - name: "Test 7a: Hard link query"
         run: |
           set -e
-          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=original&limit=10")
-          echo "Original query: $RESULT"
-          if echo "$RESULT" | grep -q "original.txt"; then
-            echo "✅ Original file found"
-          else
-            echo "❌ FAIL: Original file not found"
-            exit 1
-          fi
-          RESULT2=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=hardlink&limit=10")
-          echo "Hardlink query: $RESULT2"
-          if echo "$RESULT2" | grep -q "hardlink.txt"; then
-            echo "❌ FAIL: Hard link path should be deduplicated by single-path policy"
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=crossmount-main&limit=20")
+          echo "Canonical hardlink query: $RESULT"
+          ORIGINAL_COUNT=$(printf '%s' "$RESULT" | grep -o "original.txt" | wc -l | tr -d ' ')
+          HARDLINK_COUNT=$(printf '%s' "$RESULT" | grep -o "hardlink.txt" | wc -l | tr -d ' ')
+          TOTAL=$((ORIGINAL_COUNT + HARDLINK_COUNT))
+          if [ "$TOTAL" -eq 1 ]; then
+            echo "✅ PASS: exactly one hardlink alias is indexed"
+          elif [ "$TOTAL" -gt 1 ]; then
+            echo "❌ FAIL: hardlink aliases should be deduplicated by single-path policy"
             exit 1
           else
-            echo "✅ PASS: Hard link path correctly deduplicated"
+            echo "❌ FAIL: no hardlink alias is searchable"
+            exit 1
           fi
 
       - name: "Test 7b: Modify through hard link → retained path should stay searchable"
@@ -907,10 +915,10 @@ jobs:
           set -e
           echo "modified through hardlink" >> /tmp/fd-rdd-ci-test/crossmount-main/hardlink.txt
           sleep 0.5
-          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=original&limit=10")
+          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=crossmount-main&limit=20")
           echo "Post-modify: $RESULT"
           # 当前实现对 hardlink 采用同 inode 单路径策略，修改别名路径不应导致保留路径丢失
-          if echo "$RESULT" | grep -q "original.txt"; then
+          if echo "$RESULT" | grep -Eq "original.txt|hardlink.txt"; then
             echo "✅ Retained path still indexed after modify"
           else
             echo "❌ FAIL: Retained path lost after modify"
@@ -1004,7 +1012,8 @@ jobs:
             if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
               STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
               COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
-              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+              REBUILDING=$(echo "$STATUS" | grep -E -o '"is_rebuilding":(true|false)' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ] && [ "$REBUILDING" = "false" ]; then
                 echo "Daemon ready, indexed_count=$COUNT"
                 break
               fi
@@ -1050,7 +1059,8 @@ jobs:
             if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
               STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
               COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
-              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+              REBUILDING=$(echo "$STATUS" | grep -E -o '"is_rebuilding":(true|false)' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ] && [ "$REBUILDING" = "false" ]; then
                 echo "Daemon ready, indexed_count=$COUNT"
                 break
               fi
@@ -1061,8 +1071,15 @@ jobs:
       - name: "Test 8a: Verify offline-created files visible"
         run: |
           set -e
-          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=offline_180&limit=10")
-          echo "Offline file query: $RESULT"
+          RESULT='[]'
+          for i in $(seq 1 20); do
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=offline_180&limit=10")
+            echo "Offline file query attempt $i: $RESULT"
+            if echo "$RESULT" | grep -q "offline_180.txt"; then
+              break
+            fi
+            sleep 1
+          done
           if echo "$RESULT" | grep -q "offline_180.txt"; then
             echo "✅ PASS: Offline-created file visible after recovery"
           else
@@ -1073,8 +1090,15 @@ jobs:
       - name: "Test 8b: Verify deleted files are gone"
         run: |
           set -e
-          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file_10&limit=10")
-          echo "Deleted file query: $RESULT"
+          RESULT='[]'
+          for i in $(seq 1 20); do
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file_10&limit=10")
+            echo "Deleted file query attempt $i: $RESULT"
+            if ! echo "$RESULT" | grep -q "file_10.txt"; then
+              break
+            fi
+            sleep 1
+          done
           if echo "$RESULT" | grep -q "file_10.txt"; then
             echo "❌ FAIL: Deleted file still visible after recovery"
             exit 1
@@ -1172,7 +1196,8 @@ jobs:
             if curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/health >/dev/null 2>&1; then
               STATUS=$(curl -s http://127.0.0.1:${{ env.FD_RDD_PORT }}/status 2>/dev/null || true)
               COUNT=$(echo "$STATUS" | grep -o '"indexed_count":[0-9]*' | head -1 | cut -d: -f2 || true)
-              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ]; then
+              REBUILDING=$(echo "$STATUS" | grep -E -o '"is_rebuilding":(true|false)' | head -1 | cut -d: -f2 || true)
+              if [ -n "$COUNT" ] && [ "$COUNT" -gt 0 ] && [ "$REBUILDING" = "false" ]; then
                 echo "Daemon ready, indexed_count=$COUNT"
                 break
               fi

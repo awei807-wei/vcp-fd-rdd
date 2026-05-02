@@ -1,6 +1,7 @@
 use clap::Parser;
 use fd_rdd::config::{default_snapshot_path, default_socket_path, Config, WatchMode};
 use fd_rdd::event::ignore_filter::IgnoreFilter;
+use fd_rdd::event::sync::DirtyScope;
 use fd_rdd::event::EventPipeline;
 use fd_rdd::index::TieredIndex;
 use fd_rdd::query::SocketServer;
@@ -183,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 2) 快照存储
     let snapshot_path = args.snapshot_path.unwrap_or_else(default_snapshot_path);
+    let startup_reconcile_cutoff_ns = modified_unix_ns(&snapshot_path.with_extension("v7"));
     let store = Arc::new(SnapshotStore::new(snapshot_path));
 
     // 3) 从快照加载或空索引启动
@@ -210,6 +212,14 @@ async fn main() -> anyhow::Result<()> {
     let mut startup_ignore_paths = args.ignore_paths.clone();
     startup_ignore_paths.push(store.path().to_path_buf());
     startup_ignore_paths.push(store.derived_lsm_dir_path());
+    if watch_enabled && index.file_count() > 0 && startup_reconcile_cutoff_ns > 0 {
+        index.spawn_fast_sync(
+            DirtyScope::All {
+                cutoff_ns: startup_reconcile_cutoff_ns,
+            },
+            startup_ignore_paths.clone(),
+        );
+    }
     let watch_plan = build_watch_plan(
         effective_watch_mode,
         &index.roots,
@@ -364,6 +374,22 @@ fn watch_mode_label(mode: WatchMode) -> &'static str {
         WatchMode::Tiered => "tiered",
         WatchMode::Off => "off",
     }
+}
+
+fn modified_unix_ns(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    let Ok(modified) = meta.modified() else {
+        return 0;
+    };
+    let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) else {
+        return 0;
+    };
+    duration
+        .as_secs()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(duration.subsec_nanos() as u64)
 }
 
 fn build_watch_plan(

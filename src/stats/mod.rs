@@ -645,7 +645,7 @@ impl StatsCollector {
             .load(std::sync::atomic::Ordering::Relaxed);
         StatsReport {
             queries_total: total,
-            queries_avg_us: if total == 0 { 0 } else { total_us / total },
+            queries_avg_us: total_us.checked_div(total).unwrap_or(0),
             events_applied: self
                 .events_applied
                 .load(std::sync::atomic::Ordering::Relaxed),

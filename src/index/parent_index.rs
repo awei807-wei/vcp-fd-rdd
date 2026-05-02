@@ -55,6 +55,7 @@ impl ParentIndex {
     ///
     /// For each file entry (where `path_table.is_dir(path_idx) == false`):
     /// - The file's doc_id is added to its immediate parent directory.
+    ///
     /// The index intentionally stores only direct children; recursive directory expansion is
     /// handled by higher-level scans when needed.
     pub fn build_from_entries(entries: &[(u32, u64)], path_table: &dyn PathTable) -> Self {
@@ -118,7 +119,7 @@ impl ParentIndex {
         }
         for (dir, bitmap) in &delta.removed {
             if let Some(existing) = self.dir_to_files.get_mut(dir) {
-                existing.retain(|docid| !bitmap.binary_search(docid).is_ok());
+                existing.retain(|docid| bitmap.binary_search(docid).is_err());
                 if existing.is_empty() {
                     self.dir_to_files.remove(dir);
                 }
@@ -172,18 +173,10 @@ mod tests {
         let idx = ParentIndex::build_from_entries(&entries, &pt);
 
         // files directly in /a/b (path_idx 2)
-        assert_eq!(
-            idx.files_in_dir(2)
-                .map(|b| b.iter().copied().collect::<Vec<_>>()),
-            Some(vec![100])
-        );
+        assert_eq!(idx.files_in_dir(2).map(|b| b.to_vec()), Some(vec![100]));
 
         // files directly in /a (path_idx 1)
-        assert_eq!(
-            idx.files_in_dir(1)
-                .map(|b| b.iter().copied().collect::<Vec<_>>()),
-            Some(vec![200])
-        );
+        assert_eq!(idx.files_in_dir(1).map(|b| b.to_vec()), Some(vec![200]));
 
         // recursive storage was removed from the hot index; this remains a direct lookup.
         let recursive = idx.files_in_dir_recursive(1);
@@ -248,10 +241,6 @@ mod tests {
             removed: HashMap::new(),
         };
         idx.apply_delta(&delta2);
-        assert_eq!(
-            idx.files_in_dir(1)
-                .map(|b| b.iter().copied().collect::<Vec<_>>()),
-            Some(vec![200])
-        );
+        assert_eq!(idx.files_in_dir(1).map(|b| b.to_vec()), Some(vec![200]));
     }
 }

@@ -161,18 +161,13 @@ pub struct Config {
     pub exclude_dirs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum WatchMode {
+    #[default]
     Recursive,
     Tiered,
     Off,
-}
-
-impl Default for WatchMode {
-    fn default() -> Self {
-        Self::Recursive
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -266,7 +261,7 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)?;
+        let text = std::fs::read_to_string(path)?;
         let value: toml::Value = toml::from_str(&text)?;
         let has_exclude_dirs = value.get("exclude_dirs").is_some();
         let mut cfg: Config = toml::from_str(&text)?;

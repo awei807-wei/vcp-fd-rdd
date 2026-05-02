@@ -11,6 +11,7 @@ use crate::core::FileKey;
 /// - path_idx: 4 bytes
 /// - size:     8 bytes
 /// - mtime_ns: 8 bytes
+///
 /// Total: 40 bytes
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
