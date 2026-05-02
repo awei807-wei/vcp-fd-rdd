@@ -1,6 +1,7 @@
 use crate::stats::{
     infer_heap_high_water, EventPipelineStats, MemoryReport, OverlayStats, RebuildStats,
 };
+use crate::util::maybe_trim_rss;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -12,20 +13,22 @@ impl TieredIndex {
         let l2 = self.l2.load_full();
         let new_base = Arc::new(l2.to_base_index_data());
         self.base.store(new_base);
+        self.delta_buffer.lock().clear();
     }
 
     pub fn file_count(&self) -> usize {
-        let base = self.base.load_full().file_count();
-        let overlay = {
-            let db = self.delta_buffer.lock();
-            db.len()
-        };
-        base + overlay
+        let base_count = self.base.load().file_count();
+        if base_count > 0 {
+            let overlay_upserts = self.delta_buffer.lock().upserted_paths().count();
+            return base_count.saturating_add(overlay_upserts);
+        }
+        self.l2.load().file_count()
     }
 
     /// 生成完整内存报告
     pub fn memory_report(&self, pipeline_stats: EventPipelineStats) -> MemoryReport {
         let l1 = self.l1.memory_stats();
+        let base = self.base.load().memory_stats();
         let l2 = self.l2.load_full().memory_stats();
         let overlay = {
             let db = self.delta_buffer.lock();
@@ -70,6 +73,7 @@ impl TieredIndex {
         ) = (0, 0, 0, 0, 0);
 
         let index_estimated_bytes = l1.estimated_bytes
+            + base.estimated_bytes
             + l2.estimated_bytes
             + disk_deleted_estimated_bytes
             + overlay.estimated_bytes
@@ -86,6 +90,7 @@ impl TieredIndex {
 
         MemoryReport {
             l1,
+            base,
             l2,
             disk_segments,
             disk_deleted_paths,
@@ -150,6 +155,17 @@ impl TieredIndex {
                 report.heap_high_water_suspected,
                 trend_mb_per_min
             );
+            if report.heap_high_water_suspected {
+                let before = report.process_rss_bytes;
+                maybe_trim_rss();
+                let after = MemoryReport::read_process_rss();
+                tracing::info!(
+                    "[heap-trim] suspected high-water; rss_before={} rss_after={} reclaimed={}",
+                    before,
+                    after,
+                    before.saturating_sub(after)
+                );
+            }
             tokio::time::sleep(interval).await;
         }
     }

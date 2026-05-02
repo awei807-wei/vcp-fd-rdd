@@ -66,6 +66,7 @@ pub struct TieredIndex {
     pub include_hidden: bool,
     pub ignore_enabled: bool,
     pub follow_symlinks: bool,
+    pub exclude_dirs: Vec<String>,
     pub(self) fast_sync_semaphore: Arc<tokio::sync::Semaphore>,
 }
 

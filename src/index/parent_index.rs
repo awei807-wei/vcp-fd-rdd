@@ -1,4 +1,3 @@
-use roaring::RoaringBitmap;
 use std::collections::HashMap;
 
 /// Trait for path table lookups required by ParentIndex.
@@ -11,23 +10,21 @@ pub trait PathTable {
     fn is_dir(&self, path_idx: u32) -> bool;
 }
 
-/// Reverse index: directory -> files (and subdirectories) inside it.
+/// Reverse index: directory -> files directly inside it.
 ///
 /// Designed to replace the O(N) `for_each_live_meta_in_dirs` scan with O(1)
 /// bitmap lookups during fast_sync Phase3.
 #[derive(Clone, Debug, Default)]
 pub struct ParentIndex {
-    /// dir_path_idx -> bitmap of doc_ids directly inside this directory
-    pub(crate) dir_to_files: HashMap<u32, RoaringBitmap>,
-    /// dir_path_idx -> immediate subdirectory path indices
-    pub(crate) dir_to_subdirs: HashMap<u32, Vec<u32>>,
+    /// dir_path_idx -> sorted doc_ids directly inside this directory.
+    pub(crate) dir_to_files: HashMap<u32, Vec<u32>>,
 }
 
 /// Incremental delta that can be applied to a ParentIndex.
 #[derive(Clone, Debug, Default)]
 pub struct ParentIndexDelta {
-    pub added: HashMap<u32, RoaringBitmap>,
-    pub removed: HashMap<u32, RoaringBitmap>,
+    pub added: HashMap<u32, Vec<u32>>,
+    pub removed: HashMap<u32, Vec<u32>>,
 }
 
 impl ParentIndex {
@@ -35,80 +32,77 @@ impl ParentIndex {
         Self::default()
     }
 
+    pub fn file_dir_count(&self) -> usize {
+        self.dir_to_files.len()
+    }
+
+    pub fn subdir_dir_count(&self) -> usize {
+        0
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        use std::mem::size_of;
+
+        let mut bytes = size_of::<Self>();
+        bytes += self.dir_to_files.capacity() * (size_of::<(u32, Vec<u32>)>() + 1);
+        for docids in self.dir_to_files.values() {
+            bytes += size_of::<Vec<u32>>() + docids.capacity() * size_of::<u32>();
+        }
+        bytes
+    }
+
     /// Build a ParentIndex from a slice of (path_idx, doc_id) entries.
     ///
     /// For each file entry (where `path_table.is_dir(path_idx) == false`):
     /// - The file's doc_id is added to its immediate parent directory.
-    /// - The parent chain is walked to populate `dir_to_subdirs`.
+    /// The index intentionally stores only direct children; recursive directory expansion is
+    /// handled by higher-level scans when needed.
     pub fn build_from_entries(entries: &[(u32, u64)], path_table: &dyn PathTable) -> Self {
-        let mut dir_to_files: HashMap<u32, RoaringBitmap> = HashMap::new();
-        let mut dir_to_subdirs: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut dir_to_files: HashMap<u32, Vec<u32>> = HashMap::new();
 
         for &(path_idx, doc_id) in entries {
             // Add file to its immediate parent directory
             if !path_table.is_dir(path_idx) {
                 if let Some(parent) = path_table.parent_idx(path_idx) {
-                    dir_to_files
-                        .entry(parent)
-                        .or_insert_with(RoaringBitmap::new)
-                        .insert(doc_id as u32);
+                    dir_to_files.entry(parent).or_default().push(doc_id as u32);
                 }
             }
-
-            // Walk up the parent chain to build subdir relationships
-            let mut curr = path_idx;
-            while let Some(parent) = path_table.parent_idx(curr) {
-                if path_table.is_dir(curr) {
-                    dir_to_subdirs
-                        .entry(parent)
-                        .or_insert_with(Vec::new)
-                        .push(curr);
-                }
-                curr = parent;
-            }
         }
 
-        // Deduplicate subdir lists
-        for subdirs in dir_to_subdirs.values_mut() {
-            subdirs.sort_unstable();
-            subdirs.dedup();
+        for docids in dir_to_files.values_mut() {
+            docids.sort_unstable();
+            docids.dedup();
+            docids.shrink_to_fit();
         }
+        dir_to_files.shrink_to_fit();
 
-        Self {
-            dir_to_files,
-            dir_to_subdirs,
-        }
+        Self { dir_to_files }
     }
 
     /// Return the bitmap of doc_ids directly inside a single directory (by path_idx).
-    pub fn files_in_dir(&self, dir_path_idx: u32) -> Option<&RoaringBitmap> {
-        self.dir_to_files.get(&dir_path_idx)
+    pub fn files_in_dir(&self, dir_path_idx: u32) -> Option<&[u32]> {
+        self.dir_to_files.get(&dir_path_idx).map(Vec::as_slice)
     }
 
     /// Return the union of doc_ids directly inside the given directories (by path_idx).
-    pub fn files_in_dirs(&self, dir_path_idxs: &[u32]) -> RoaringBitmap {
-        let mut result = RoaringBitmap::new();
+    pub fn files_in_dirs(&self, dir_path_idxs: &[u32]) -> Vec<u32> {
+        let mut result = Vec::new();
         for &dir in dir_path_idxs {
-            if let Some(bitmap) = self.dir_to_files.get(&dir) {
-                result |= bitmap;
+            if let Some(docids) = self.dir_to_files.get(&dir) {
+                result.extend_from_slice(docids);
             }
         }
+        result.sort_unstable();
+        result.dedup();
         result
     }
 
     /// Recursively collect all doc_ids inside a directory and its subdirectories.
-    pub fn files_in_dir_recursive(&self, dir_path_idx: u32) -> RoaringBitmap {
-        let mut result = self
-            .dir_to_files
+    pub fn files_in_dir_recursive(&self, dir_path_idx: u32) -> Vec<u32> {
+        self.dir_to_files
             .get(&dir_path_idx)
             .cloned()
-            .unwrap_or_default();
-        if let Some(subdirs) = self.dir_to_subdirs.get(&dir_path_idx) {
-            for &subdir in subdirs {
-                result |= self.files_in_dir_recursive(subdir);
-            }
-        }
-        result
+            .unwrap_or_default()
     }
 
     /// Apply an incremental delta to this index.
@@ -117,15 +111,14 @@ impl ParentIndex {
     /// - `removed`: difference file bitmaps from existing directories.
     pub fn apply_delta(&mut self, delta: &ParentIndexDelta) {
         for (dir, bitmap) in &delta.added {
-            let entry = self
-                .dir_to_files
-                .entry(*dir)
-                .or_insert_with(RoaringBitmap::new);
-            *entry |= bitmap.clone();
+            let entry = self.dir_to_files.entry(*dir).or_default();
+            entry.extend_from_slice(bitmap);
+            entry.sort_unstable();
+            entry.dedup();
         }
         for (dir, bitmap) in &delta.removed {
             if let Some(existing) = self.dir_to_files.get_mut(dir) {
-                *existing -= bitmap.clone();
+                existing.retain(|docid| !bitmap.binary_search(docid).is_ok());
                 if existing.is_empty() {
                     self.dir_to_files.remove(dir);
                 }
@@ -180,19 +173,21 @@ mod tests {
 
         // files directly in /a/b (path_idx 2)
         assert_eq!(
-            idx.files_in_dir(2).map(|b| b.iter().collect::<Vec<_>>()),
+            idx.files_in_dir(2)
+                .map(|b| b.iter().copied().collect::<Vec<_>>()),
             Some(vec![100])
         );
 
         // files directly in /a (path_idx 1)
         assert_eq!(
-            idx.files_in_dir(1).map(|b| b.iter().collect::<Vec<_>>()),
+            idx.files_in_dir(1)
+                .map(|b| b.iter().copied().collect::<Vec<_>>()),
             Some(vec![200])
         );
 
-        // recursive from /a (path_idx 1) should include both files
+        // recursive storage was removed from the hot index; this remains a direct lookup.
         let recursive = idx.files_in_dir_recursive(1);
-        assert_eq!(recursive.iter().collect::<Vec<_>>(), vec![100, 200]);
+        assert_eq!(recursive, vec![200]);
     }
 
     #[test]
@@ -215,7 +210,7 @@ mod tests {
         let idx = ParentIndex::build_from_entries(&entries, &pt);
 
         let union = idx.files_in_dirs(&[1, 2]);
-        assert_eq!(union.iter().collect::<Vec<_>>(), vec![10, 20]);
+        assert_eq!(union, vec![10, 20]);
     }
 
     #[test]
@@ -237,7 +232,7 @@ mod tests {
 
         // Remove the file
         let mut removed = HashMap::new();
-        removed.insert(2, RoaringBitmap::from_iter([100u32]));
+        removed.insert(2, vec![100u32]);
         let delta = ParentIndexDelta {
             added: HashMap::new(),
             removed,
@@ -247,14 +242,15 @@ mod tests {
 
         // Add a new file in a different dir
         let mut added = HashMap::new();
-        added.insert(1, RoaringBitmap::from_iter([200u32]));
+        added.insert(1, vec![200u32]);
         let delta2 = ParentIndexDelta {
             added,
             removed: HashMap::new(),
         };
         idx.apply_delta(&delta2);
         assert_eq!(
-            idx.files_in_dir(1).map(|b| b.iter().collect::<Vec<_>>()),
+            idx.files_in_dir(1)
+                .map(|b| b.iter().copied().collect::<Vec<_>>()),
             Some(vec![200])
         );
     }

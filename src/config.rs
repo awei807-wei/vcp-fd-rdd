@@ -4,7 +4,9 @@
 //! Config path: `~/.config/fd-rdd/config.toml`
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::util::{default_exclude_dirs, normalize_exclude_dirs};
 
 /// Returns the platform-appropriate default socket path (user-isolated).
 ///
@@ -149,6 +151,10 @@ pub struct Config {
     pub include_hidden: bool,
     /// Follow symlinks during scan and watch.
     pub follow_symlinks: bool,
+    /// Enable filesystem watcher for incremental updates.
+    pub watch_enabled: bool,
+    /// Directory names that are never indexed, regardless of .gitignore rules.
+    pub exclude_dirs: Vec<String>,
 }
 
 impl Default for Config {
@@ -162,6 +168,8 @@ impl Default for Config {
             snapshot_interval_secs: 300,
             include_hidden: false,
             follow_symlinks: false,
+            watch_enabled: true,
+            exclude_dirs: default_exclude_dirs(),
         }
     }
 }
@@ -178,11 +186,25 @@ impl Config {
         let Some(path) = Self::config_path() else {
             return Ok(Self::default());
         };
+        Self::load_from_path(&path)
+    }
+
+    fn load_from_path(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
         let text = std::fs::read_to_string(&path)?;
-        let cfg: Config = toml::from_str(&text)?;
+        let value: toml::Value = toml::from_str(&text)?;
+        let has_exclude_dirs = value.get("exclude_dirs").is_some();
+        let mut cfg: Config = toml::from_str(&text)?;
+        cfg.exclude_dirs = normalize_exclude_dirs(cfg.exclude_dirs);
+        if !has_exclude_dirs {
+            append_missing_exclude_dirs(path, &text, &cfg.exclude_dirs)?;
+        }
+        cfg.roots = cfg.roots.into_iter().map(expand_tilde_path).collect();
+        if let Some(socket) = cfg.socket_path.take() {
+            cfg.socket_path = Some(expand_tilde_path(socket));
+        }
         Ok(cfg)
     }
 
@@ -198,5 +220,123 @@ impl Config {
         let text = toml::to_string_pretty(self)?;
         std::fs::write(&path, text)?;
         Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct ExcludeDirsPatch<'a> {
+    exclude_dirs: &'a [String],
+}
+
+fn append_missing_exclude_dirs(
+    path: &Path,
+    existing_text: &str,
+    exclude_dirs: &[String],
+) -> anyhow::Result<()> {
+    let mut text = existing_text.to_string();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(
+        "# fd-rdd default index-time directory exclusions. Edit this list to customize.\n",
+    );
+    text.push_str(&toml::to_string_pretty(&ExcludeDirsPatch { exclude_dirs })?);
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+fn expand_tilde_path(path: PathBuf) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path;
+    };
+    if s == "~" {
+        return dirs::home_dir().unwrap_or(path);
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_exclude_dirs_uses_default_exclusions_and_persists_them() {
+        let root = std::env::temp_dir().join(format!("fd-rdd-config-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+roots = ["~"]
+http_port = 6060
+"#,
+        )
+        .expect("write config");
+
+        let cfg = Config::load_from_path(&path).expect("config should parse");
+
+        assert!(cfg.exclude_dirs.contains(&"node_modules".to_string()));
+        assert!(cfg.exclude_dirs.contains(&"target".to_string()));
+        assert!(cfg.exclude_dirs.contains(&".git".to_string()));
+
+        let persisted = std::fs::read_to_string(&path).expect("read persisted config");
+        assert!(persisted.contains("exclude_dirs"));
+        assert!(persisted.contains("node_modules"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_exclude_dirs_are_normalized_after_load_step() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+exclude_dirs = ["node_modules", "/target/", "", "node_modules"]
+"#,
+        )
+        .expect("config should parse");
+
+        cfg.exclude_dirs = normalize_exclude_dirs(cfg.exclude_dirs);
+
+        assert_eq!(
+            cfg.exclude_dirs,
+            vec!["node_modules".to_string(), "target".to_string()]
+        );
+    }
+
+    #[test]
+    fn explicit_exclude_dirs_are_not_replaced_by_defaults() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-config-explicit-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+roots = ["~"]
+exclude_dirs = ["custom_cache"]
+"#,
+        )
+        .expect("write config");
+
+        let cfg = Config::load_from_path(&path).expect("config should parse");
+
+        assert_eq!(cfg.exclude_dirs, vec!["custom_cache".to_string()]);
+        let persisted = std::fs::read_to_string(&path).expect("read persisted config");
+        assert!(!persisted.contains("node_modules"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

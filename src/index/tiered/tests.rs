@@ -61,6 +61,41 @@ fn rebuild_with_pending_events_no_loss() {
 }
 
 #[test]
+fn event_apply_does_not_materialize_base_hot_path() {
+    let root = unique_tmp_dir("hot-path-base");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let first = root.join("first_hot_path.txt");
+    std::fs::write(&first, b"first").unwrap();
+    idx.apply_events(&[mk_event(1, EventType::Create, first.clone())]);
+
+    assert_eq!(
+        idx.base.load().file_count(),
+        0,
+        "ordinary event application must not rebuild BaseIndex"
+    );
+    assert!(!idx.query("first_hot_path").is_empty());
+    assert!(
+        idx.base.load().file_count() > 0,
+        "query may lazily materialize an initially empty test index"
+    );
+
+    let second = root.join("second_hot_path.txt");
+    std::fs::write(&second, b"second").unwrap();
+    let before = idx.base.load().file_count();
+    idx.apply_events(&[mk_event(2, EventType::Create, second.clone())]);
+    assert_eq!(
+        idx.base.load().file_count(),
+        before,
+        "event application after base exists must still avoid full materialization"
+    );
+    assert!(!idx.query("second_hot_path").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn overlay_delete_then_recreate_cancels_deleted() {
     let root = unique_tmp_dir("overlay-cancel");
     std::fs::create_dir_all(&root).unwrap();
@@ -308,6 +343,52 @@ async fn query_filters_do_not_leak_old_segment_meta() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn v7_load_mounts_base_without_l2_hydration_and_preserves_next_snapshot() -> anyhow::Result<()>
+{
+    let root = unique_tmp_dir("v7-direct-load");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+
+    let alpha = content_root.join("alpha_direct_v7.txt");
+    std::fs::write(&alpha, b"alpha")?;
+    idx.apply_events(&[mk_event(1, EventType::Create, alpha.clone())]);
+    idx.snapshot_now(store.clone()).await?;
+
+    let loaded = Arc::new(TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?);
+    assert_eq!(
+        loaded.l2.load().file_count(),
+        0,
+        "v7 load should mount BaseIndexData directly instead of hydrating L2"
+    );
+    assert_eq!(loaded.file_count(), 1);
+    assert!(!loaded.query("alpha_direct_v7").is_empty());
+
+    let beta = content_root.join("beta_after_direct_load.txt");
+    std::fs::write(&beta, b"beta")?;
+    loaded.apply_events(&[mk_event(2, EventType::Create, beta.clone())]);
+    assert!(!loaded.query("beta_after_direct_load").is_empty());
+    loaded.snapshot_now(store.clone()).await?;
+
+    let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    assert_eq!(
+        reloaded.l2.load().file_count(),
+        0,
+        "reloaded v7 snapshot should still avoid L2 hydration"
+    );
+    assert_eq!(reloaded.file_count(), 2);
+    assert!(!reloaded.query("alpha_direct_v7").is_empty());
+    assert!(!reloaded.query("beta_after_direct_load").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn periodic_flush_batch_threshold_skips_then_flushes() {
     let root = unique_tmp_dir("periodic-batch-events");
     std::fs::create_dir_all(&root).unwrap();
@@ -382,166 +463,57 @@ async fn periodic_flush_batch_byte_threshold_skips_then_flushes() {
     h.abort();
 }
 
-#[tokio::test]
-#[ignore = "LSM/disk_layers removed in v7 migration"]
-async fn lsm_layering_delete_blocks_base() {
-    use crate::core::{FileKey, FileMeta};
-    use crate::index::PersistentIndex;
-
+#[test]
+fn base_delta_delete_blocks_base() {
     let root = unique_tmp_dir("lsm-del");
     std::fs::create_dir_all(&root).unwrap();
 
     let alpha = root.join("alpha_test.txt");
     let gamma = root.join("gamma_test.txt");
+    std::fs::write(&alpha, b"alpha").unwrap();
 
-    let store = Arc::new(SnapshotStore::new(root.join("index.db")));
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, alpha.clone())]);
+    assert_eq!(idx.query("alpha").len(), 1);
 
-    // base: alpha
-    let base_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
-    base_idx.upsert(FileMeta {
-        file_key: FileKey {
-            dev: 1,
-            ino: 1,
-            generation: 0,
-        },
-        path: alpha.clone(),
-        size: 1,
-        mtime: None,
-        ctime: None,
-        atime: None,
-    });
-    store
-        .lsm_replace_base_v6(
-            &base_idx.export_segments_v6(),
-            None,
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
-    store.gc_stale_segments().unwrap();
-
-    // delta seg: gamma + delete(alpha)
-    let delta_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
-    delta_idx.upsert(FileMeta {
-        file_key: FileKey {
-            dev: 1,
-            ino: 2,
-            generation: 0,
-        },
-        path: gamma.clone(),
-        size: 1,
-        mtime: None,
-        ctime: None,
-        atime: None,
-    });
-    let deleted = vec![alpha.as_os_str().as_encoded_bytes().to_vec()];
-    store
-        .lsm_append_delta_v6(
-            &delta_idx.export_segments_v6(),
-            &deleted,
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
-
-    let idx = TieredIndex::load_or_empty(&store, vec![root.clone()])
-        .await
-        .unwrap();
+    std::fs::remove_file(&alpha).unwrap();
+    std::fs::write(&gamma, b"gamma").unwrap();
+    idx.apply_events(&[
+        mk_event(2, EventType::Delete, alpha.clone()),
+        mk_event(3, EventType::Create, gamma.clone()),
+    ]);
 
     assert!(idx.query("alpha").is_empty());
     assert_eq!(idx.query("gamma").len(), 1);
 }
 
-#[tokio::test]
-#[ignore = "LSM/disk_layers removed in v7 migration"]
-async fn lsm_delete_then_recreate_prefers_newest() {
-    use crate::core::{FileKey, FileMeta};
-    use crate::index::PersistentIndex;
-
+#[test]
+fn base_delta_delete_then_recreate_prefers_newest() {
     let root = unique_tmp_dir("lsm-recreate");
     std::fs::create_dir_all(&root).unwrap();
 
     let alpha = root.join("alpha_test.txt");
-    let store = Arc::new(SnapshotStore::new(root.join("index.db")));
+    std::fs::write(&alpha, b"a").unwrap();
 
-    // base: alpha
-    let base_idx = PersistentIndex::new_with_roots(vec![root.clone()]);
-    base_idx.upsert(FileMeta {
-        file_key: FileKey {
-            dev: 1,
-            ino: 1,
-            generation: 0,
-        },
-        path: alpha.clone(),
-        size: 1,
-        mtime: None,
-        ctime: None,
-        atime: None,
-    });
-    store
-        .lsm_replace_base_v6(
-            &base_idx.export_segments_v6(),
-            None,
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
-    store.gc_stale_segments().unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, alpha.clone())]);
+    assert_eq!(idx.query("alpha").len(), 1);
 
-    // delta1: delete(alpha)
-    let d1 = PersistentIndex::new_with_roots(vec![root.clone()]);
-    let deleted = vec![alpha.as_os_str().as_encoded_bytes().to_vec()];
-    store
-        .lsm_append_delta_v6(
-            &d1.export_segments_v6(),
-            &deleted,
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
+    std::fs::remove_file(&alpha).unwrap();
+    idx.apply_events(&[mk_event(2, EventType::Delete, alpha.clone())]);
+    assert!(idx.query("alpha").is_empty());
 
-    // delta2: recreate(alpha)
-    let d2 = PersistentIndex::new_with_roots(vec![root.clone()]);
-    d2.upsert(FileMeta {
-        file_key: FileKey {
-            dev: 1,
-            ino: 42,
-            generation: 0,
-        },
-        path: alpha.clone(),
-        size: 2,
-        mtime: None,
-        ctime: None,
-        atime: None,
-    });
-    store
-        .lsm_append_delta_v6(
-            &d2.export_segments_v6(),
-            &[],
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
-
-    let idx = TieredIndex::load_or_empty(&store, vec![root.clone()])
-        .await
-        .unwrap();
+    std::fs::write(&alpha, b"bb").unwrap();
+    idx.apply_events(&[mk_event(3, EventType::Create, alpha.clone())]);
 
     let r = idx.query("alpha");
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].size, 2);
 }
 
-#[tokio::test]
-#[ignore = "LSM/disk_layers removed in v7 migration"]
-async fn query_same_path_different_filekey_prefers_newest_segment() {
+#[test]
+fn query_same_path_different_filekey_prefers_delta_overlay() {
     use crate::core::{FileKey, FileMeta};
-    use crate::index::PersistentIndex;
 
     let root = unique_tmp_dir("q-samepath-newest");
     std::fs::create_dir_all(&root).unwrap();
@@ -549,11 +521,9 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
     let a = root.join("a.txt");
     std::fs::write(&a, b"x").unwrap();
 
-    let store = Arc::new(SnapshotStore::new(root.join("index.db")));
-
-    // seg1 (older): (dev=1, ino=100, path=/a.txt)
-    let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
-    seg1.upsert(FileMeta {
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let l2 = idx.l2.load_full();
+    l2.upsert(FileMeta {
         file_key: FileKey {
             dev: 1,
             ino: 100,
@@ -565,55 +535,16 @@ async fn query_same_path_different_filekey_prefers_newest_segment() {
         ctime: None,
         atime: None,
     });
-    store
-        .lsm_replace_base_v6(
-            &seg1.export_segments_v6(),
-            None,
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
-
-    // seg2 (newer): (dev=1, ino=200, path=/a.txt) -- no delete sidecar
-    let seg2 = PersistentIndex::new_with_roots(vec![root.clone()]);
-    seg2.upsert(FileMeta {
-        file_key: FileKey {
-            dev: 1,
-            ino: 200,
-            generation: 0,
-        },
-        path: a.clone(),
-        size: 2,
-        mtime: None,
-        ctime: None,
-        atime: None,
-    });
-    store
-        .lsm_append_delta_v6(
-            &seg2.export_segments_v6(),
-            &[],
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
-
-    let idx = TieredIndex::load_or_empty(&store, vec![root.clone()])
-        .await
-        .unwrap();
+    idx.refresh_base();
+    idx.apply_events(&[mk_event(2, EventType::Create, a.clone())]);
 
     let r = idx.query("a.txt");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0].file_key.ino, 200);
+    assert_ne!(r[0].file_key.ino, 100);
 }
 
-#[tokio::test]
-#[ignore = "LSM/disk_layers removed in v7 migration"]
-async fn query_rename_from_tombstone_blocks_old_path() {
-    use crate::core::{FileKey, FileMeta};
-    use crate::index::PersistentIndex;
-
+#[test]
+fn query_rename_from_tombstone_blocks_old_path() {
     let root = unique_tmp_dir("q-rename-tombstone");
     std::fs::create_dir_all(&root).unwrap();
 
@@ -622,60 +553,14 @@ async fn query_rename_from_tombstone_blocks_old_path() {
     std::fs::write(&old, b"old").unwrap();
     std::fs::write(&newp, b"new").unwrap();
 
-    let store = SnapshotStore::new(root.join("index.db"));
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, old.clone())]);
+    assert_eq!(idx.query("old.txt").len(), 1);
 
-    // seg1 (older): /old.txt
-    let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
-    seg1.upsert(FileMeta {
-        file_key: FileKey {
-            dev: 1,
-            ino: 10,
-            generation: 0,
-        },
-        path: old.clone(),
-        size: 1,
-        mtime: None,
-        ctime: None,
-        atime: None,
-    });
-    store
-        .lsm_replace_base_v6(
-            &seg1.export_segments_v6(),
-            None,
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
-
-    // seg2 (newer): /new.txt + tombstone(/old.txt)
-    let seg2 = PersistentIndex::new_with_roots(vec![root.clone()]);
-    seg2.upsert(FileMeta {
-        file_key: FileKey {
-            dev: 1,
-            ino: 11,
-            generation: 0,
-        },
-        path: newp.clone(),
-        size: 1,
-        mtime: None,
-        ctime: None,
-        atime: None,
-    });
-    let deleted = vec![old.as_os_str().as_encoded_bytes().to_vec()];
-    store
-        .lsm_append_delta_v6(
-            &seg2.export_segments_v6(),
-            &deleted,
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
-
-    let idx = TieredIndex::load_or_empty(&store, vec![root.clone()])
-        .await
-        .unwrap();
+    idx.apply_events(&[
+        mk_event(2, EventType::Delete, old.clone()),
+        mk_event(3, EventType::Create, newp.clone()),
+    ]);
 
     assert!(idx.query("old.txt").is_empty());
     assert_eq!(idx.query("new.txt").len(), 1);
@@ -686,12 +571,8 @@ async fn query_rename_from_tombstone_blocks_old_path() {
     assert!(all[0].path.to_string_lossy().ends_with("new.txt"));
 }
 
-#[tokio::test]
-#[ignore = "LSM/disk_layers removed in v7 migration"]
-async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
-    use crate::core::{FileKey, FileMeta};
-    use crate::index::PersistentIndex;
-
+#[test]
+fn query_same_filekey_multiple_paths_only_returns_newest_path() {
     let root = unique_tmp_dir("q-samekey-newestpath");
     std::fs::create_dir_all(&root).unwrap();
 
@@ -702,82 +583,28 @@ async fn query_same_filekey_multiple_paths_only_returns_newest_path() {
     std::fs::write(&p2, b"2").unwrap();
     std::fs::write(&p3, b"3").unwrap();
 
-    let store = SnapshotStore::new(root.join("index.db"));
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, p1.clone())]);
+    assert_eq!(idx.query("ghost_").len(), 1);
+    idx.apply_events(&[mk_event(
+        2,
+        EventType::Rename {
+            from: FileIdentifier::Path(p1.clone()),
+            from_path_hint: Some(p1.clone()),
+        },
+        p2.clone(),
+    )]);
+    idx.apply_events(&[mk_event(
+        3,
+        EventType::Rename {
+            from: FileIdentifier::Path(p2.clone()),
+            from_path_hint: Some(p2.clone()),
+        },
+        p3.clone(),
+    )]);
 
-    let k = FileKey {
-        dev: 1,
-        ino: 999,
-        generation: 0,
-    };
-
-    // seg1 (older): k -> p1
-    let seg1 = PersistentIndex::new_with_roots(vec![root.clone()]);
-    seg1.upsert(FileMeta {
-        file_key: k,
-        path: p1.clone(),
-        size: 1,
-        mtime: None,
-        ctime: None,
-        atime: None,
-    });
-    store
-        .lsm_replace_base_v6(
-            &seg1.export_segments_v6(),
-            None,
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
-
-    // seg2: k -> p2
-    let seg2 = PersistentIndex::new_with_roots(vec![root.clone()]);
-    seg2.upsert(FileMeta {
-        file_key: k,
-        path: p2.clone(),
-        size: 2,
-        mtime: None,
-        ctime: None,
-        atime: None,
-    });
-    store
-        .lsm_append_delta_v6(
-            &seg2.export_segments_v6(),
-            &[],
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
-
-    // seg3 (newest): k -> p3
-    let seg3 = PersistentIndex::new_with_roots(vec![root.clone()]);
-    seg3.upsert(FileMeta {
-        file_key: k,
-        path: p3.clone(),
-        size: 3,
-        mtime: None,
-        ctime: None,
-        atime: None,
-    });
-    store
-        .lsm_append_delta_v6(
-            &seg3.export_segments_v6(),
-            &[],
-            std::slice::from_ref(&root),
-            0,
-        )
-        .await
-        .unwrap();
-
-    let idx = TieredIndex::load_or_empty(&store, vec![root.clone()])
-        .await
-        .unwrap();
-
-    // 如果 seen(FileKey) 去重语义回退，这里会返回 3 条（路径不同，blocked 兜不住）。
     let r = idx.query("ghost_");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0].file_key.ino, 999);
     assert!(r[0].path.to_string_lossy().ends_with("ghost_v3.txt"));
 }
 

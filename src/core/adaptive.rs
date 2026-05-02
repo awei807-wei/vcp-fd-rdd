@@ -70,12 +70,11 @@ impl AdaptiveScheduler {
                 // 小范围更新：串行避免调度开销
                 ExecutionStrategy::Serial
             }
-            Task::ColdBuild { total_dirs } if *total_dirs > 10000 => {
-                // 大规模冷启动：分片并行 + 流式
-                ExecutionStrategy::Parallel {
-                    shards: self.target_parallelism.load(Ordering::Relaxed) * 2,
-                    streaming: true,
-                }
+            Task::ColdBuild { .. } => {
+                // 冷启动是长时间 I/O + metadata 扫描任务。并行 walker 会把 CPU
+                // 长时间推到多核满载，压垮交互查询和事件处理；默认串行执行，把
+                // materialize 成本留在后台，用更低 CPU 峰值换取稳定性。
+                ExecutionStrategy::Serial
             }
             Task::VerifyGap { gap_size } if *gap_size > 1000 => {
                 // 大缺口校验：弹性并行

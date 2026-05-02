@@ -5,7 +5,9 @@ use fd_rdd::event::EventPipeline;
 use fd_rdd::index::TieredIndex;
 use fd_rdd::query::SocketServer;
 use fd_rdd::query::{HealthTelemetry, QueryServer};
+use fd_rdd::stats::EventPipelineStats;
 use fd_rdd::storage::snapshot::SnapshotStore;
+use fd_rdd::util::normalize_exclude_dirs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -33,35 +35,39 @@ struct Args {
     include_hidden: bool,
 
     /// HTTP 查询端口
-    #[arg(long, default_value_t = 6060)]
-    http_port: u16,
+    #[arg(long)]
+    http_port: Option<u16>,
 
     /// Unix domain socket 查询地址（可选）：用于流式输出（避免 HTTP/JSON 聚合带来的峰值）
     #[arg(long, value_name = "PATH")]
     uds_socket: Option<PathBuf>,
 
     /// 快照写入间隔（秒）
-    #[arg(long, default_value_t = 300)]
-    snapshot_interval_secs: u64,
+    #[arg(long)]
+    snapshot_interval_secs: Option<u64>,
 
     /// 内存报告间隔（秒）
-    #[arg(long, default_value_t = 60)]
-    report_interval_secs: u64,
+    #[arg(long)]
+    report_interval_secs: Option<u64>,
 
     /// watcher 事件 channel 容量（越大越不容易 overflow，但会占用更多内存）
     /// 默认 65536，足以应对 git clone 等批量操作；降低此值可减少内存占用但可能丢失事件。
-    #[arg(long, default_value_t = 65536)]
-    event_channel_size: usize,
+    #[arg(long)]
+    event_channel_size: Option<usize>,
 
     /// watcher 事件 debounce 窗口（毫秒）
-    #[arg(long, default_value_t = 10)]
-    debounce_ms: u64,
+    #[arg(long)]
+    debounce_ms: Option<u64>,
 
     /// watcher 忽略路径前缀（可重复）；用于排除 snapshot/log 等“自触发”路径
     ///
     /// 说明：fd-rdd 会默认忽略 `--snapshot-path` 以及派生的 `index.d/`；这里用于补充额外忽略项。
     #[arg(long = "ignore-path", value_name = "PATH")]
     ignore_paths: Vec<PathBuf>,
+
+    /// 全局排除的目录名（可重复）。命中这些目录名的路径不会进入索引。
+    #[arg(long = "exclude-dir", value_name = "NAME")]
+    exclude_dirs: Vec<String>,
 
     /// 禁用 `.gitignore` / `.ignore` / git exclude / global gitignore 规则
     #[arg(long)]
@@ -71,6 +77,10 @@ struct Args {
     /// 注意：已有 inode 去重可防止无限递归，但跟随可能导致索引范围远超预期。
     #[arg(long)]
     follow_symlinks: bool,
+
+    /// 禁用文件系统 watcher，仅使用已加载快照和手动 /scan 更新。
+    #[arg(long)]
+    no_watch: bool,
 }
 
 #[tokio::main]
@@ -94,10 +104,15 @@ async fn main() -> anyhow::Result<()> {
         // 用 CLI 参数构建配置，覆盖默认值
         let mut cfg = Config {
             roots: args.roots.clone(),
-            http_port: args.http_port,
-            snapshot_interval_secs: args.snapshot_interval_secs,
+            http_port: args
+                .http_port
+                .unwrap_or_else(|| Config::default().http_port),
+            snapshot_interval_secs: args
+                .snapshot_interval_secs
+                .unwrap_or_else(|| Config::default().snapshot_interval_secs),
             include_hidden: args.include_hidden,
             follow_symlinks: args.follow_symlinks,
+            watch_enabled: !args.no_watch,
             ignore_enabled: !args.no_ignore,
             ..Config::default()
         };
@@ -137,15 +152,34 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let ignore_enabled = !args.no_ignore && cfg.ignore_enabled;
+    let include_hidden = args.include_hidden || cfg.include_hidden;
+    let follow_symlinks = args.follow_symlinks || cfg.follow_symlinks;
+    let watch_enabled = cfg.watch_enabled && !args.no_watch;
+    let http_port = args.http_port.unwrap_or(cfg.http_port);
+    let snapshot_interval_secs = args
+        .snapshot_interval_secs
+        .unwrap_or(cfg.snapshot_interval_secs);
+    let report_interval_secs = args.report_interval_secs.unwrap_or(60);
+    let event_channel_size = args.event_channel_size.unwrap_or(65_536);
+    let debounce_ms = args.debounce_ms.unwrap_or(10);
+    let mut exclude_dirs = cfg.exclude_dirs.clone();
+    exclude_dirs.extend(args.exclude_dirs.clone());
+    let exclude_dirs = normalize_exclude_dirs(exclude_dirs);
 
     // 2) 快照存储
     let snapshot_path = args.snapshot_path.unwrap_or_else(default_snapshot_path);
     let store = Arc::new(SnapshotStore::new(snapshot_path));
 
     // 3) 从快照加载或空索引启动
-    let index =
-        TieredIndex::load_with_options(store.as_ref(), roots, args.include_hidden, ignore_enabled)
-            .await?;
+    let index = TieredIndex::load_with_options_follow_and_excludes(
+        store.as_ref(),
+        roots,
+        include_hidden,
+        ignore_enabled,
+        follow_symlinks,
+        exclude_dirs.clone(),
+    )
+    .await?;
     let _ = index.attach_wal(store.as_ref());
 
     // 4) 若索引为空，后台全量构建
@@ -168,13 +202,20 @@ async fn main() -> anyhow::Result<()> {
     let pipeline = Arc::new(
         EventPipeline::new_with_config_and_ignores(
             index.clone(),
-            args.debounce_ms,
-            args.event_channel_size,
+            debounce_ms,
+            event_channel_size,
             startup_ignore_paths.clone(),
         )
-        .with_ignore_filter(ignore_filter.clone()),
+        .with_ignore_filter(ignore_filter.clone())
+        .with_exclude_dirs(exclude_dirs.clone()),
     );
-    pipeline.start().await?;
+    if watch_enabled {
+        pipeline.start().await?;
+    } else {
+        tracing::warn!(
+            "Filesystem watcher disabled; index updates require manual /scan or rebuild"
+        );
+    }
 
     // 6) 启动 HTTP 查询服务
     let health_provider = {
@@ -184,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
             let stats = pipeline.stats();
             HealthTelemetry {
                 last_snapshot_time: index.last_snapshot_time(),
+                watch_enabled,
                 watch_failures: stats.watch_failures,
                 watcher_degraded: stats.watcher_degraded,
                 degraded_roots: stats.degraded_roots,
@@ -192,8 +234,13 @@ async fn main() -> anyhow::Result<()> {
             }
         })
     };
-    let query_server = QueryServer::new(index.clone()).with_health_provider(health_provider);
-    let http_port = args.http_port;
+    let stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync> = {
+        let pipeline = pipeline.clone();
+        Arc::new(move || pipeline.stats())
+    };
+    let query_server = QueryServer::new(index.clone())
+        .with_health_provider(health_provider)
+        .with_stats_provider(stats_provider.clone());
     tokio::spawn(async move {
         if let Err(e) = query_server.run(http_port).await {
             tracing::error!("Query server error: {}", e);
@@ -218,7 +265,6 @@ async fn main() -> anyhow::Result<()> {
     // 7) 启动定期快照循环（每 300 秒）
     let snap_index = index.clone();
     let snap_store = store.clone();
-    let snapshot_interval_secs = args.snapshot_interval_secs;
     tokio::spawn(async move {
         snap_index
             .snapshot_loop(snap_store, snapshot_interval_secs)
@@ -228,20 +274,17 @@ async fn main() -> anyhow::Result<()> {
     // 8) 启动内存报告循环（每 60 秒）
     {
         let report_index = index.clone();
-        let report_interval_secs = args.report_interval_secs;
-
-        let stats_fn = Arc::new(move || pipeline.stats());
 
         tokio::spawn(async move {
             report_index
-                .memory_report_loop(stats_fn, report_interval_secs)
+                .memory_report_loop(stats_provider, report_interval_secs)
                 .await;
         });
     }
 
     info!(
         "fd-rdd ready. Query via: http://localhost:{}/search?q=keyword",
-        args.http_port
+        http_port
     );
 
     // 9) 优雅退出：Ctrl+C → 最终快照

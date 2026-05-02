@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.13] - 2026-05-02
 
+### Runtime footprint hardening
+
+- Added default index-time directory exclusions for dependency/build/cache trees such as `.git`, `.cache`, `.cargo`, `.npm`, `.pnpm-store`, `.yarn`, `node_modules`, `target`, `dist`, `build`, and `vendor`.
+- Wired exclusions through cold full build, incremental scans, fast sync collection, and watcher event filtering so excluded directories do not enter the index instead of being merely demoted at query scoring time.
+- Added repeatable `--exclude-dir NAME` CLI overrides and `exclude_dirs` config support; existing config files without the field keep the default exclusion list.
+- On startup, existing `config.toml` files that do not declare `exclude_dirs` are migrated by appending the default list, making the exclusions visible and user-editable.
+- Added `GET /memory` to expose the same `MemoryReport` data as JSON for RSS/smaps/index/overlay/event-pipeline attribution.
+- Included `BaseIndexData` in memory attribution and removed the redundant runtime `entries_by_path` clone; v7 snapshots still write the segment for format compatibility, but runtime uses a single `FileEntryIndex`.
+- Triggered allocator collection after v7 snapshot loading and WAL replay to reduce startup decode/build high-water RSS.
+- Removed the unused `FileEntryIndex` path permutation and tightened `PathTableV2` entry layout to reduce per-file base overhead.
+- Changed newly written v7 path-table segments to store the compressed `PathTableV2` representation directly while keeping legacy full-path segment loading support.
+- Added automatic high-water RSS trimming in the memory report loop, a one-shot idle trim after event bursts, and `GET/POST /trim` for manual allocator collection.
+- Replaced runtime `ParentIndex` per-directory `RoaringBitmap` storage with sorted `Vec<u32>` direct-child doc IDs, keeping v7 parent segment compatibility while reducing many small heap allocations.
+- Added `watch_enabled` config and `--no-watch` to run in static snapshot/manual-scan mode, allowing watcher memory attribution and low-RSS read-only operation.
+
 ### PersistentIndex storage migration
 
 - Migrated `PersistentIndex` runtime storage to `FileEntry + Vec<Vec<u8>>` absolute paths.

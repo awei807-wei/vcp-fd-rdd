@@ -1,10 +1,12 @@
 use std::fmt;
 
 /// 内存占用统计（字节级精确）
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct MemoryReport {
     /// L1 热缓存
     pub l1: L1Stats,
+    /// 只读 base 索引（v7 snapshot / full build materialized base）
+    pub base: BaseStats,
     /// L2 持久索引
     pub l2: L2Stats,
     /// 磁盘只读 segments（mmap 基座 + delta 段数量）
@@ -29,7 +31,7 @@ pub struct MemoryReport {
     pub process_smaps_rollup: Option<SmapsRollupStats>,
     /// 进程级 page faults（从 /proc/self/stat 读取；Linux-only）
     pub process_faults: Option<FaultStats>,
-    /// 索引相关结构估算总和（L1 + L2 + Disk tombstones + overlay + rebuild）
+    /// 索引相关结构估算总和（L1 + Base + L2 + Disk tombstones + overlay + rebuild）
     pub index_estimated_bytes: u64,
     /// 非索引 Private_Dirty（smaps.private_dirty - index_estimated；仅在 smaps 可用时有值）
     pub non_index_private_dirty_bytes: Option<u64>,
@@ -38,7 +40,7 @@ pub struct MemoryReport {
 }
 
 /// Service-level observability stats (uptime, snapshot, watcher health).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ServiceStats {
     /// Seconds since the daemon started.
     pub uptime_secs: u64,
@@ -50,7 +52,7 @@ pub struct ServiceStats {
     pub watcher_degraded: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct SmapsRollupStats {
     pub rss_bytes: u64,
     pub pss_bytes: u64,
@@ -58,13 +60,13 @@ pub struct SmapsRollupStats {
     pub private_dirty_bytes: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct FaultStats {
     pub minflt: u64,
     pub majflt: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct L1Stats {
     /// L1 主存储条目数
     pub entry_count: usize,
@@ -76,7 +78,25 @@ pub struct L1Stats {
     pub estimated_bytes: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct BaseStats {
+    pub file_count: usize,
+    pub path_table_entries: usize,
+    pub path_table_bytes: u64,
+    pub entries_count: usize,
+    pub entries_bytes: u64,
+    pub trigram_distinct: usize,
+    pub trigram_postings_total: usize,
+    pub trigram_bytes: u64,
+    pub parent_file_dirs: usize,
+    pub parent_subdir_dirs: usize,
+    pub parent_bytes: u64,
+    pub tombstone_count: usize,
+    pub tombstone_bytes: u64,
+    pub estimated_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct L2Stats {
     /// files 条目数（活跃文档数，不含 tombstone）
     pub file_count: usize,
@@ -117,7 +137,7 @@ pub struct L2Stats {
     pub estimated_bytes: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct EventPipelineStats {
     /// 当前批次处理的事件数（最近一次 debounce 窗口）
     pub last_batch_size: usize,
@@ -141,7 +161,7 @@ pub struct EventPipelineStats {
     pub records_capacity: usize,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct OverlayStats {
     pub deleted_paths: usize,
     pub upserted_paths: usize,
@@ -159,7 +179,7 @@ pub struct OverlayStats {
     pub estimated_bytes: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct RebuildStats {
     pub in_progress: bool,
     pub pending_paths: usize,
@@ -322,6 +342,38 @@ impl fmt::Display for MemoryReport {
             f,
             "║   estimated:    {:>10}                       ║",
             human_bytes(self.l1.estimated_bytes)
+        )?;
+        writeln!(f, "╠──────────────────────────────────────────────────╣")?;
+        writeln!(f, "║ Base Index:                                      ║")?;
+        writeln!(
+            f,
+            "║   files:        {:>10}                       ║",
+            self.base.file_count
+        )?;
+        writeln!(
+            f,
+            "║   path table:   {:>10}                       ║",
+            human_bytes(self.base.path_table_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   entries:      {:>10}                       ║",
+            human_bytes(self.base.entries_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   trigram:      {:>10}                       ║",
+            human_bytes(self.base.trigram_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   parent:       {:>10}                       ║",
+            human_bytes(self.base.parent_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   total est:    {:>10}                       ║",
+            human_bytes(self.base.estimated_bytes)
         )?;
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ L2 PersistentIndex:                              ║")?;

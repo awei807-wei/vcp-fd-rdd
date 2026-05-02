@@ -443,6 +443,9 @@ impl RebuildPathTable {
 impl PathTableTrait for RebuildPathTable {
     fn parent_idx(&self, path_idx: u32) -> Option<u32> {
         let path = self.id_to_path.get(path_idx as usize)?;
+        if path.as_slice() == b"/" {
+            return None;
+        }
         let parent_len = match path.iter().rposition(|&b| b == b'/') {
             Some(0) => 1,
             Some(pos) => pos,
@@ -907,7 +910,7 @@ impl PersistentIndex {
             let to_check = index.files_in_dirs(&dir_idxs);
             let mut result = Vec::new();
             let paths = self.paths.read();
-            for doc_id in to_check.iter() {
+            for doc_id in to_check {
                 let Some(path_bytes) = paths.get(doc_id as usize) else {
                     continue;
                 };
@@ -942,8 +945,8 @@ impl PersistentIndex {
         };
 
         let entries = self.entries.read();
-        let mut keys = Vec::with_capacity(bitmap.len() as usize);
-        for doc_id in bitmap.iter() {
+        let mut keys = Vec::with_capacity(bitmap.len());
+        for &doc_id in bitmap {
             if let Some(entry) = entries.get(doc_id as usize) {
                 keys.push(entry.file_key());
             }
@@ -1950,18 +1953,39 @@ impl PersistentIndex {
         let paths_v2 = self.paths.read();
         let tombstones = self.tombstones.read();
         let trigram_index = self.trigram_index.read();
-        let parent_index = self.parent_index.read();
 
-        let mut path_table_builder =
-            crate::index::path_table_v2::PathTableBuilder::with_capacity(entries_v2.len());
+        let mut rebuild_path_table = RebuildPathTable::new();
+        for root in &self.roots_bytes {
+            if !root.is_empty() {
+                let _ = rebuild_path_table.intern(root.clone(), true);
+            }
+        }
+        let mut entry_path_idxs: Vec<u32> = Vec::with_capacity(entries_v2.len());
+        let mut parent_entries: Vec<(u32, u64)> = Vec::with_capacity(entries_v2.len());
+
+        for (docid_usize, abs_bytes) in paths_v2.iter().enumerate() {
+            intern_parent_dirs(&mut rebuild_path_table, abs_bytes);
+            let path_idx = rebuild_path_table.intern(abs_bytes.clone(), false);
+            entry_path_idxs.push(path_idx);
+            let docid = docid_usize as DocId;
+            if !tombstones.contains(docid) {
+                parent_entries.push((path_idx, docid as u64));
+            }
+        }
+
+        let mut path_table_builder = crate::index::path_table_v2::PathTableBuilder::with_capacity(
+            rebuild_path_table.id_to_path.len(),
+        );
+        for (idx, path_bytes) in rebuild_path_table.id_to_path.iter().enumerate() {
+            path_table_builder.push(idx as u32, path_bytes);
+        }
         let mut entry_index =
             crate::index::file_entry_v2::FileEntryIndex::with_capacity(entries_v2.len());
 
         for (docid_usize, entry) in entries_v2.iter().enumerate() {
-            let docid = docid_usize as DocId;
-            let abs_bytes = &paths_v2[docid_usize];
-            let path_idx = docid as u32;
-            path_table_builder.push(path_idx, abs_bytes);
+            let Some(&path_idx) = entry_path_idxs.get(docid_usize) else {
+                continue;
+            };
             let new_entry = crate::index::file_entry_v2::FileEntry::from_file_key(
                 entry.file_key(),
                 path_idx,
@@ -1973,7 +1997,10 @@ impl PersistentIndex {
 
         let path_table = path_table_builder.build();
         let entries_by_key = entry_index.build();
-        let entries_by_path = entries_by_key.clone();
+        let parent_index = crate::index::parent_index::ParentIndex::build_from_entries(
+            &parent_entries,
+            &rebuild_path_table,
+        );
 
         let mut tri = crate::index::base_index::TrigramIndex::new();
         for (trigram, posting) in trigram_index.iter() {
@@ -1987,11 +2014,34 @@ impl PersistentIndex {
         crate::index::base_index::BaseIndexData {
             path_table,
             entries_by_key,
-            entries_by_path,
             trigram_index: tri,
-            parent_index: parent_index.clone().unwrap_or_default(),
+            parent_index,
             tombstones: tombstones_bitmap,
         }
+    }
+}
+
+fn intern_parent_dirs(path_table: &mut RebuildPathTable, path: &[u8]) {
+    let mut end = match path.iter().rposition(|&b| b == b'/') {
+        Some(0) => {
+            let _ = path_table.intern(b"/".to_vec(), true);
+            return;
+        }
+        Some(pos) => pos,
+        None => return,
+    };
+
+    loop {
+        if end == 0 {
+            let _ = path_table.intern(b"/".to_vec(), true);
+            break;
+        }
+        let _ = path_table.intern(path[..end].to_vec(), true);
+        end = match path[..end].iter().rposition(|&b| b == b'/') {
+            Some(0) => 0,
+            Some(pos) => pos,
+            None => break,
+        };
     }
 }
 

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::core::{FileKey, FileMeta};
+use crate::core::{EventRecord, FileKey, FileMeta};
+use crate::index::base_index::BaseIndexData;
+use crate::index::l2_partition::PersistentIndex;
 use crate::index::IndexLayer;
 use crate::query::dsl::compile_query;
 use crate::query::matcher::create_matcher;
@@ -21,9 +23,7 @@ impl TieredIndex {
             return Vec::new();
         }
 
-        let base_count = self.base.load().file_count();
-        let l2_count = self.l2.load().file_count();
-        if base_count != l2_count {
+        if self.base.load().file_count() == 0 && self.l2.load().file_count() > 0 {
             self.refresh_base();
         }
 
@@ -67,18 +67,31 @@ impl TieredIndex {
         for p in db.deleted_paths() {
             let _ = del.insert(p);
         }
-        let mut ups = PathArenaSet::default();
-        for p in db.upserted_paths() {
-            let _ = ups.insert(p);
-        }
+        let live_events: Vec<EventRecord> = db.live_records().cloned().collect();
         drop(db);
         let overlay_deleted = Arc::new(del);
-        let overlay_upserted = Arc::new(ups);
         let mut blocked_paths = PathArenaSet::default();
         let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
         let mut seen: std::collections::HashSet<FileKey> =
             std::collections::HashSet::with_capacity(base.file_count().saturating_add(256));
         let mut results: Vec<FileMeta> = Vec::with_capacity(base.file_count().saturating_add(256));
+
+        for ev in &live_events {
+            let Some(meta) = self.overlay_meta_for_event(ev) else {
+                continue;
+            };
+            let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+            if blocked_paths.contains(path_bytes)
+                || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
+            {
+                continue;
+            }
+            if !seen.insert(meta.file_key) {
+                continue;
+            }
+            let _ = blocked_paths.insert(path_bytes);
+            results.push(meta);
+        }
 
         base.for_each_live_meta(|meta| {
             collect_live_meta(
@@ -91,41 +104,64 @@ impl TieredIndex {
             );
         });
 
-        overlay_upserted.for_each_bytes(|bytes| {
-            let path = super::pathbuf_from_bytes(bytes);
-            let path = super::normalize_path(&path);
-            let path_bytes = path.as_os_str().as_encoded_bytes();
+        results
+    }
+
+    pub(crate) fn materialize_snapshot_base(&self) -> Arc<BaseIndexData> {
+        let mut db = self.delta_buffer.lock();
+        let mut del = PathArenaSet::default();
+        for p in db.deleted_paths() {
+            let _ = del.insert(p);
+        }
+        let live_events: Vec<EventRecord> = db.live_records().cloned().collect();
+        db.clear();
+
+        let base = self.base.load_full();
+        let overlay_deleted = Arc::new(del);
+        let mut blocked_paths = PathArenaSet::default();
+        let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
+        let mut seen: std::collections::HashSet<FileKey> =
+            std::collections::HashSet::with_capacity(base.file_count().saturating_add(256));
+        let mut metas: Vec<FileMeta> = Vec::with_capacity(base.file_count().saturating_add(256));
+
+        for ev in &live_events {
+            let Some(meta) = self.overlay_meta_for_event(ev) else {
+                continue;
+            };
+            let path_bytes = meta.path.as_os_str().as_encoded_bytes();
             if blocked_paths.contains(path_bytes)
                 || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
             {
-                return;
+                continue;
             }
-
-            let meta = match std::fs::metadata(&path) {
-                Ok(m) => {
-                    let file_key = match FileKey::from_path_and_metadata(&path, &m) {
-                        Some(fk) => fk,
-                        None => return,
-                    };
-                    if !seen.insert(file_key) {
-                        return;
-                    }
-                    FileMeta {
-                        file_key,
-                        path: path.clone(),
-                        size: m.len(),
-                        mtime: m.modified().ok(),
-                        ctime: m.created().ok(),
-                        atime: m.accessed().ok(),
-                    }
-                }
-                Err(_) => return,
-            };
+            if !seen.insert(meta.file_key) {
+                continue;
+            }
             let _ = blocked_paths.insert(path_bytes);
-            results.push(meta);
+            metas.push(meta);
+        }
+
+        base.for_each_live_meta(|meta| {
+            collect_live_meta(
+                meta,
+                None,
+                deleted_sources.as_slice(),
+                &mut seen,
+                &mut blocked_paths,
+                &mut metas,
+            );
         });
 
-        results
+        let compact = PersistentIndex::new_with_roots(self.roots.clone());
+        for meta in metas {
+            compact.upsert_rename(meta);
+        }
+        let new_base = Arc::new(compact.to_base_index_data());
+        self.base.store(new_base.clone());
+        self.l2.store(Arc::new(PersistentIndex::new_with_roots(
+            self.roots.clone(),
+        )));
+        new_base
     }
 
     fn execute_query_plan(&self, plan: &QueryPlan, limit: usize) -> Vec<FileMeta> {
@@ -135,18 +171,48 @@ impl TieredIndex {
         for p in db.deleted_paths() {
             let _ = del.insert(p);
         }
-        let mut ups = PathArenaSet::default();
-        for p in db.upserted_paths() {
-            let _ = ups.insert(p);
-        }
+        let live_events: Vec<EventRecord> = db.live_records().cloned().collect();
         drop(db);
         let overlay_deleted = Arc::new(del);
-        let overlay_upserted = Arc::new(ups);
         let mut blocked_paths = PathArenaSet::default();
         let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
         let mut seen: std::collections::HashSet<FileKey> =
             std::collections::HashSet::with_capacity(base.file_count().saturating_add(256));
         let mut results: Vec<FileMeta> = Vec::with_capacity(limit.min(128));
+
+        // Overlay upserts take precedence over the immutable base. This keeps
+        // delete+recreate and rename windows correct while base is only
+        // materialized at snapshot/rebuild boundaries.
+        for ev in &live_events {
+            if results.len() >= limit {
+                break;
+            }
+            let Some(meta) = self.overlay_meta_for_event(ev) else {
+                continue;
+            };
+            let path_str = meta.path.to_string_lossy();
+            let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
+            if !matches_anchor {
+                continue;
+            }
+            let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+            if blocked_paths.contains(path_bytes)
+                || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
+            {
+                continue;
+            }
+            if !seen.insert(meta.file_key) {
+                continue;
+            }
+            let _ = blocked_paths.insert(path_bytes);
+            if plan.matches(&meta) {
+                results.push(meta);
+            }
+        }
+
+        if results.len() >= limit {
+            return results;
+        }
 
         // ParentIndex fast path: if query has a parent filter, get exact candidates from base
         if let Some(ref parent_path) = plan.parent_filter() {
@@ -187,49 +253,25 @@ impl TieredIndex {
             return results;
         }
 
-        // Supplement results from overlay upserted paths (e.g., during rebuild)
-        if results.len() < limit {
-            overlay_upserted.for_each_bytes(|bytes| {
-                if results.len() >= limit {
-                    return;
-                }
-                let path = super::pathbuf_from_bytes(bytes);
-                let path = super::normalize_path(&path);
-                let path_str = path.to_string_lossy();
-                let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
-                if !matches_anchor {
-                    return;
-                }
-                let meta = match std::fs::metadata(&path) {
-                    Ok(m) => {
-                        let file_key = match FileKey::from_path_and_metadata(&path, &m) {
-                            Some(fk) => fk,
-                            None => return,
-                        };
-                        if !seen.insert(file_key) {
-                            return;
-                        }
-                        FileMeta {
-                            file_key,
-                            path: path.clone(),
-                            size: m.len(),
-                            mtime: m.modified().ok(),
-                            ctime: m.created().ok(),
-                            atime: m.accessed().ok(),
-                        }
-                    }
-                    Err(_) => {
-                        // File may have been deleted after upsert; skip.
-                        return;
-                    }
-                };
-                if plan.matches(&meta) {
-                    results.push(meta);
-                }
+        results
+    }
+
+    fn overlay_meta_for_event(&self, ev: &EventRecord) -> Option<FileMeta> {
+        let path = ev.best_path().map(super::normalize_path)?;
+        if let Ok(m) = std::fs::metadata(&path) {
+            let file_key = FileKey::from_path_and_metadata(&path, &m)?;
+            return Some(FileMeta {
+                file_key,
+                path,
+                size: m.len(),
+                mtime: m.modified().ok(),
+                ctime: m.created().ok(),
+                atime: m.accessed().ok(),
             });
         }
 
-        results
+        let fk = ev.id.as_file_key()?;
+        self.l2.load_full().get_meta(fk)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -10,6 +10,7 @@ use crate::event::ignore_filter::IgnoreFilter;
 use crate::event::watcher::{check_inotify_limit, watch_roots_enhanced, EventWatcher};
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
+use crate::util::{maybe_trim_rss, path_has_excluded_component};
 
 fn shrink_if_large_vec<T>(v: &mut Vec<T>, keep_cap: usize) -> bool {
     if v.capacity() > keep_cap.saturating_mul(2) {
@@ -41,6 +42,8 @@ pub struct EventPipeline {
     ignore_paths: Vec<PathBuf>,
     /// .gitignore-based filter for incremental events (None = disabled / --no-ignore)
     ignore_filter: Option<IgnoreFilter>,
+    /// Directory names that are never indexed.
+    exclude_dirs: Vec<String>,
     /// 共享计数器：累计处理事件数
     pub total_events: Arc<AtomicU64>,
     /// 共享计数器：最近批次大小
@@ -71,6 +74,7 @@ impl EventPipeline {
             channel_size: 131_072,
             ignore_paths: Vec::new(),
             ignore_filter: None,
+            exclude_dirs: Vec::new(),
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -91,6 +95,7 @@ impl EventPipeline {
             channel_size,
             ignore_paths: Vec::new(),
             ignore_filter: None,
+            exclude_dirs: Vec::new(),
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -116,6 +121,7 @@ impl EventPipeline {
             channel_size,
             ignore_paths,
             ignore_filter: None,
+            exclude_dirs: Vec::new(),
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -132,6 +138,11 @@ impl EventPipeline {
     /// Set the .gitignore filter. Pass `None` to disable (e.g. --no-ignore).
     pub fn with_ignore_filter(mut self, filter: Option<IgnoreFilter>) -> Self {
         self.ignore_filter = filter;
+        self
+    }
+
+    pub fn with_exclude_dirs(mut self, exclude_dirs: Vec<String>) -> Self {
+        self.exclude_dirs = exclude_dirs;
         self
     }
 
@@ -179,6 +190,7 @@ impl EventPipeline {
         let last_batch_size = self.last_batch_size.clone();
         let ignore_paths = self.ignore_paths.clone();
         let ignore_filter = self.ignore_filter.clone();
+        let exclude_dirs = self.exclude_dirs.clone();
         let raw_events_capacity = self.raw_events_capacity.clone();
         let merged_map_capacity = self.merged_map_capacity.clone();
         let records_capacity = self.records_capacity.clone();
@@ -213,6 +225,7 @@ impl EventPipeline {
             let mut raw_events: Vec<notify::Event> = Vec::with_capacity(256);
             let mut merge_scratch = MergeScratch::default();
             let mut last_idle_trim = tokio::time::Instant::now();
+            let mut last_idle_trim_total_events = 0u64;
             let pending_moves = pending_moves;
 
             loop {
@@ -236,6 +249,7 @@ impl EventPipeline {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                         // idle maintenance：每 5s 最多触发一次 shrink+trim，避免频繁抖动。
                         if last_idle_trim.elapsed() >= std::time::Duration::from_secs(5) {
+                            let current_total = total_events.load(Ordering::Relaxed);
                             let mut shrunk = false;
                             shrunk |= shrink_if_large_vec(&mut raw_events, keep_cap);
                             shrunk |= shrink_if_large_map(&mut merge_scratch.merged, keep_cap);
@@ -246,6 +260,10 @@ impl EventPipeline {
                                 merged_map_capacity.store(merge_scratch.merged.capacity() as u64, Ordering::Relaxed);
                                 records_capacity.store(merge_scratch.records.capacity() as u64, Ordering::Relaxed);
 
+                            }
+                            if current_total != last_idle_trim_total_events {
+                                maybe_trim_rss();
+                                last_idle_trim_total_events = current_total;
                             }
                             last_idle_trim = tokio::time::Instant::now();
                         }
@@ -285,17 +303,46 @@ impl EventPipeline {
                     }
                 }
 
+                // 过滤：全局目录排除和索引自身写入路径，必须在动态 watch / fast path 前执行。
+                raw_events.retain(|ev| {
+                    !should_ignore_event(ev, &ignore_paths)
+                        && !ev
+                            .paths
+                            .iter()
+                            .any(|p| path_has_excluded_component(p, &exclude_dirs))
+                });
+                if let Some(ref gi) = ignore_filter {
+                    raw_events.retain(|ev| !ev.paths.iter().any(|p| gi.is_ignored(p)));
+                }
+                if raw_events.is_empty() {
+                    continue;
+                }
+
                 // 动态注册新目录的递归监控。
                 // RecursiveMode::Recursive 不会自动为新创建的目录添加 inotify watch，
                 // 因此需要在检测到 Create(Folder) 事件时手动调用 watcher.watch()。
                 // 同时扫描新目录中的已有文件，生成合成 Create 事件，弥补 watch 注册
                 // 时间窗口内丢失的 inotify 事件（目录创建与 watch 生效之间存在竞态）。
+                let mut created_dirs: Vec<PathBuf> = Vec::new();
                 for ev in &raw_events {
                     if matches!(
                         ev.kind,
                         notify::EventKind::Create(notify::event::CreateKind::Folder)
                     ) {
                         for path in &ev.paths {
+                            if ignore_paths
+                                .iter()
+                                .any(|ig| !ig.as_os_str().is_empty() && path.starts_with(ig))
+                                || path_has_excluded_component(path, &exclude_dirs)
+                            {
+                                continue;
+                            }
+                            if ignore_filter
+                                .as_ref()
+                                .is_some_and(|filter| filter.is_ignored(path))
+                            {
+                                continue;
+                            }
                             if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
                                 tracing::debug!(
                                     "Failed to add dynamic watch for {:?}: {}",
@@ -303,8 +350,18 @@ impl EventPipeline {
                                     e
                                 );
                             }
+                            created_dirs.push(path.clone());
                         }
                     }
+                }
+                if !created_dirs.is_empty() {
+                    let (scanned, elapsed_ms) = index.scan_dirs_immediate(&created_dirs);
+                    tracing::debug!(
+                        "Dynamic directory scan: dirs={} files={} elapsed_ms={}",
+                        created_dirs.len(),
+                        scanned,
+                        elapsed_ms
+                    );
                 }
 
                 // Fast path: if all events are Create for distinct paths, apply immediately.
@@ -334,16 +391,6 @@ impl EventPipeline {
                 }
 
                 let raw_count = raw_events.len();
-
-                // 过滤：忽略索引自身写入（snapshot/segments/log 等）导致的"自触发事件风暴"
-                if !ignore_paths.is_empty() {
-                    raw_events.retain(|ev| !should_ignore_event(ev, &ignore_paths));
-                }
-
-                // .gitignore filtering
-                if let Some(ref gi) = ignore_filter {
-                    raw_events.retain(|ev| !ev.paths.iter().any(|p| gi.is_ignored(p)));
-                }
 
                 // 合并去重
                 // 跨批次 Rename 配对：将 inotify 拆分的 From/To 事件合并为完整 Rename

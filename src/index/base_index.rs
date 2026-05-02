@@ -9,6 +9,7 @@ pub use crate::index::file_entry_v2::{FileEntry, FileEntryIndex};
 use crate::index::parent_index::ParentIndex;
 use crate::index::path_table_v2::PathTableV2;
 use crate::query::Matcher;
+use crate::stats::BaseStats;
 use crate::util::pathbuf_from_encoded_vec;
 
 /// TrigramIndex: 只读的 trigram → RoaringBitmap 映射。
@@ -42,6 +43,19 @@ impl TrigramIndex {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    pub fn memory_stats(&self) -> (usize, usize, u64) {
+        use std::mem::size_of;
+
+        let mut postings_total = 0usize;
+        let mut bytes =
+            size_of::<Self>() + self.inner.capacity() * (size_of::<([u8; 3], RoaringBitmap)>() + 1);
+        for bitmap in self.inner.values() {
+            postings_total += bitmap.len() as usize;
+            bytes += size_of::<RoaringBitmap>() + bitmap.serialized_size();
+        }
+        (self.inner.len(), postings_total, bytes as u64)
+    }
 }
 
 /// BaseIndexData: 只读基础索引的快照数据。
@@ -51,7 +65,6 @@ impl TrigramIndex {
 pub struct BaseIndexData {
     pub path_table: PathTableV2,
     pub entries_by_key: FileEntryIndex,
-    pub entries_by_path: FileEntryIndex,
     pub trigram_index: TrigramIndex,
     pub parent_index: ParentIndex,
     pub tombstones: RoaringBitmap,
@@ -62,6 +75,35 @@ impl BaseIndexData {
         self.entries_by_key
             .len()
             .saturating_sub(self.tombstones.len() as usize)
+    }
+
+    pub fn memory_stats(&self) -> BaseStats {
+        let path_table_bytes = self.path_table.allocated_bytes() as u64;
+        let entries_bytes = self.entries_by_key.allocated_bytes() as u64;
+        let (trigram_distinct, trigram_postings_total, trigram_bytes) =
+            self.trigram_index.memory_stats();
+        let parent_bytes = self.parent_index.allocated_bytes() as u64;
+        let tombstone_bytes =
+            std::mem::size_of::<RoaringBitmap>() as u64 + self.tombstones.serialized_size() as u64;
+        let estimated_bytes =
+            path_table_bytes + entries_bytes + trigram_bytes + parent_bytes + tombstone_bytes;
+
+        BaseStats {
+            file_count: self.file_count(),
+            path_table_entries: self.path_table.len(),
+            path_table_bytes,
+            entries_count: self.entries_by_key.len(),
+            entries_bytes,
+            trigram_distinct,
+            trigram_postings_total,
+            trigram_bytes,
+            parent_file_dirs: self.parent_index.file_dir_count(),
+            parent_subdir_dirs: self.parent_index.subdir_dir_count(),
+            parent_bytes,
+            tombstone_count: self.tombstones.len() as usize,
+            tombstone_bytes,
+            estimated_bytes,
+        }
     }
 
     pub fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
@@ -147,8 +189,11 @@ impl BaseIndexData {
 
         let to_check = self.parent_index.files_in_dirs(&dir_idxs);
         let mut result = Vec::new();
-        for doc_id in to_check.iter() {
-            let Some(path_bytes) = self.path_table.resolve(doc_id) else {
+        for doc_id in to_check {
+            let Some(entry) = self.entries_by_key.get(doc_id as usize) else {
+                continue;
+            };
+            let Some(path_bytes) = self.path_table.resolve(entry.path_idx) else {
                 continue;
             };
             let path = pathbuf_from_encoded_vec(path_bytes);
@@ -172,9 +217,9 @@ impl BaseIndexData {
             None => return Vec::new(),
         };
 
-        let mut keys = Vec::with_capacity(bitmap.len() as usize);
-        for doc_id in bitmap.iter() {
-            if let Some(entry) = self.entries_by_path.get(doc_id as usize) {
+        let mut keys = Vec::with_capacity(bitmap.len());
+        for &doc_id in bitmap {
+            if let Some(entry) = self.entries_by_key.get(doc_id as usize) {
                 keys.push(entry.file_key());
             }
         }

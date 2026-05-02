@@ -1,17 +1,19 @@
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Task};
 use crate::event::sync::DirtyScope;
 use crate::index::l2_partition::PersistentIndex;
-use crate::util::maybe_trim_rss;
+use crate::util::{maybe_trim_rss, path_has_excluded_component};
 
 use super::{pathbuf_from_bytes, TieredIndex, REBUILD_COOLDOWN};
 
 fn visit_dirs_since(
     roots: &[PathBuf],
     ignore_prefixes: &[PathBuf],
+    exclude_dirs: &[String],
     cutoff_ns: u64,
     log_prefix: &str,
     mut on_dir: impl FnMut(&std::path::Path, bool) -> bool,
@@ -33,6 +35,9 @@ fn visit_dirs_since(
     let mut stack: Vec<PathBuf> = roots.to_vec();
     while let Some(dir) = stack.pop() {
         if should_skip(&dir) {
+            continue;
+        }
+        if path_has_excluded_component(&dir, exclude_dirs) {
             continue;
         }
 
@@ -86,12 +91,14 @@ fn visit_dirs_since(
 fn collect_dirs_changed_since(
     roots: &[PathBuf],
     ignore_prefixes: &[PathBuf],
+    exclude_dirs: &[String],
     cutoff_ns: u64,
 ) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     visit_dirs_since(
         roots,
         ignore_prefixes,
+        exclude_dirs,
         cutoff_ns,
         "fast-sync",
         |dir, changed| {
@@ -183,11 +190,15 @@ impl TieredIndex {
                 if db.is_empty() {
                     // 切换点：持锁判空 -> 原子切换，避免丢事件窗口。
                     self.l1.clear();
-                    self.l2.store(new_l2.clone());
-                    new_l2.rebuild_parent_index();
                     let new_base = Arc::new(new_l2.to_base_index_data());
                     self.base.store(new_base);
                     self.note_pending_flush_rebuild(new_l2.as_ref());
+                    self.l2.store(Arc::new(PersistentIndex::new_with_roots(
+                        self.roots.clone(),
+                    )));
+                    if !self.flush_requested.swap(true, Ordering::AcqRel) {
+                        self.flush_notify.notify_one();
+                    }
                     st.in_progress = false;
                     // 若 rebuild 期间又被请求（例如 overflow 风暴），合并为下一轮 rebuild。
                     let again = st.requested;
@@ -325,9 +336,12 @@ impl TieredIndex {
 
         // 1) 计算需要对齐的目录集合
         let mut dirs: Vec<PathBuf> = match scope {
-            DirtyScope::All { cutoff_ns } => {
-                collect_dirs_changed_since(&self.roots, ignore_prefixes, cutoff_ns)
-            }
+            DirtyScope::All { cutoff_ns } => collect_dirs_changed_since(
+                &self.roots,
+                ignore_prefixes,
+                &self.exclude_dirs,
+                cutoff_ns,
+            ),
             DirtyScope::Dirs { dirs, cutoff_ns } => {
                 let root_set: HashSet<_> = self.roots.iter().cloned().collect();
                 let (root_dirs, leaf_dirs): (Vec<_>, Vec<_>) =
@@ -335,7 +349,12 @@ impl TieredIndex {
 
                 let effective_cutoff_ns = cutoff_ns.saturating_sub(10_000_000_000);
                 let mut out = if !root_dirs.is_empty() {
-                    collect_dirs_changed_since(&root_dirs, ignore_prefixes, effective_cutoff_ns)
+                    collect_dirs_changed_since(
+                        &root_dirs,
+                        ignore_prefixes,
+                        &self.exclude_dirs,
+                        effective_cutoff_ns,
+                    )
                 } else {
                     Vec::new()
                 };
@@ -351,6 +370,7 @@ impl TieredIndex {
             if ignore_prefixes
                 .iter()
                 .any(|ig| !ig.as_os_str().is_empty() && d.starts_with(ig))
+                || path_has_excluded_component(d, &self.exclude_dirs)
             {
                 return false;
             }
@@ -384,6 +404,12 @@ impl TieredIndex {
                 .git_ignore(self.ignore_enabled)
                 .git_global(self.ignore_enabled)
                 .git_exclude(self.ignore_enabled);
+            let exclude_dirs = self.exclude_dirs.clone();
+            if !exclude_dirs.is_empty() {
+                builder.filter_entry(move |entry| {
+                    !path_has_excluded_component(entry.path(), &exclude_dirs)
+                });
+            }
 
             for ent in builder.build() {
                 let ent = match ent {
@@ -444,15 +470,17 @@ impl TieredIndex {
             upsert_events.clear();
         }
 
+        if self.base.load().file_count() == 0 && self.l2.load().file_count() > 0 {
+            self.refresh_base();
+        }
+
         let dirty_dirs: HashSet<PathBuf> = dirs.into_iter().collect();
 
         // 3) 删除对齐：只对齐"被标记 dirty 的目录"下的条目（但对文件做轻量存在性检查，避免构建巨大的 names set）。
         let mut delete_events: Vec<EventRecord> = Vec::new();
 
-        let l2 = self.l2.load_full();
-        // ParentIndex 可能是空的，需要在 fast_sync 时重建
-        l2.rebuild_parent_index();
-        let to_delete = l2.delete_alignment_with_parent_index(&dirty_dirs);
+        let base = self.base.load_full();
+        let to_delete = base.delete_alignment_with_parent_index(&dirty_dirs);
         for (_doc_id, path) in to_delete {
             match std::fs::symlink_metadata(&path) {
                 Ok(_) => continue,
@@ -503,6 +531,12 @@ impl TieredIndex {
                 .git_ignore(self.ignore_enabled)
                 .git_global(self.ignore_enabled)
                 .git_exclude(self.ignore_enabled);
+            let exclude_dirs = self.exclude_dirs.clone();
+            if !exclude_dirs.is_empty() {
+                builder.filter_entry(move |entry| {
+                    !path_has_excluded_component(entry.path(), &exclude_dirs)
+                });
+            }
             for ent in builder.build() {
                 let ent = match ent {
                     Ok(e) => e,

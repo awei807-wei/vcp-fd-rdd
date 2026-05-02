@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 // ── RSS trim：主动向 OS 归还空闲堆内存 ──
 
@@ -73,4 +73,49 @@ pub fn root_bytes_for_id(roots: &[Vec<u8>], root_id: u16) -> &[u8] {
         .get(root_id as usize)
         .map(|v| v.as_slice())
         .unwrap_or(b"/")
+}
+
+pub const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".cache",
+    ".cargo",
+    ".npm",
+    ".pnpm-store",
+    ".yarn",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "vendor",
+];
+
+pub fn default_exclude_dirs() -> Vec<String> {
+    DEFAULT_EXCLUDE_DIRS.iter().map(|s| s.to_string()).collect()
+}
+
+pub fn normalize_exclude_dirs(mut dirs: Vec<String>) -> Vec<String> {
+    dirs.retain(|s| !s.trim().is_empty());
+    for s in &mut dirs {
+        *s = s.trim().trim_matches('/').trim_matches('\\').to_string();
+    }
+    dirs.retain(|s| !s.is_empty());
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+pub fn path_has_excluded_component(path: &Path, exclude_dirs: &[String]) -> bool {
+    if exclude_dirs.is_empty() {
+        return false;
+    }
+    path.components().any(|component| {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        exclude_dirs
+            .iter()
+            .any(|excluded| name == excluded.as_str())
+    })
 }

@@ -111,16 +111,6 @@ impl PathArenaSet {
         true
     }
 
-    pub(crate) fn for_each_bytes(&self, mut f: impl FnMut(&[u8])) {
-        for v in self.map.values() {
-            for s in v.iter() {
-                if let Some(b) = self.bytes_at(*s) {
-                    f(b);
-                }
-            }
-        }
-    }
-
     pub(crate) fn clear(&mut self) {
         self.map.clear();
         self.arena.clear();

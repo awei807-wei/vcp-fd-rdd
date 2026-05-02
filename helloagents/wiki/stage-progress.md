@@ -112,8 +112,23 @@
 - v7 快照加载和空索引启动后回放 WAL，避免 snapshot 后未落盘事件在重启后丢失。
 - 查询入口在 L2/BaseIndex 计数不一致时自动刷新 base，兼容测试和内部直接写 L2 的路径。
 - `PersistentIndex` 运行时主存储迁移为 `FileEntry + Vec<Vec<u8>>` 绝对路径表，`FileEntry.path_idx == DocId`；`PathTableV2 + FileEntryIndex` 仅在 `BaseIndexData`/v7 导出时构建，`CompactMeta + PathArena` 仅用于旧快照读取和 v5/v6 兼容导出。
+- 事件热路径不再每批 `rebuild_parent_index()` + `to_base_index_data()`。普通事件只更新 L2 与 `DeltaBuffer`；查询以 `BaseIndexData + DeltaBuffer` 合并可见性；完整 BaseIndex materialize 收敛到 snapshot/rebuild 边界，以及空 base 测试兼容路径。
+- `BaseIndexData` 的 `PathTableV2` 现在同时包含文件路径和父目录路径，ParentIndex 删除对齐可以基于 base 执行，不再在 fast_sync Phase3 临时全量重建 ParentIndex。
+- v7 快照加载直接挂载到 `BaseIndexData`，L2 保持为空增量层，避免启动时逐条回灌快照和二次 `to_base_index_data()`；`file_count()` 改为以 base 为准，避免主程序误触发 `spawn_full_build()`。
+- snapshot 边界改为物化当前可见全集（base + DeltaBuffer），再写 v7；修复 v7 反序列化后 `FileEntryIndex` 未重建排序置换导致“计数正确但查询 miss”的问题。
+- `cargo test -q -- --ignored` 大规模压测通过；`p2_large_scale_hybrid` initial_indexing 指标：CPU 峰值 125%，CPU>=100% 时长 2034ms，RSS 峰值 237680KB。
+- 冷启动 full_build 默认改为保守串行策略，并在串行扫描中批次短 sleep，避免 800K 文件初始索引长时间多核满载。
+- 新建目录 watch 注册后补一次浅层 `scan_dirs_immediate()`，补齐目录创建与 watch 生效之间丢失文件事件的竞态，不恢复目录 rename 递归深扫。
+- 默认全局目录排除从“搜索降权”前移到索引入口：`.git`、`.cache`、`.cargo`、`.npm`、`.pnpm-store`、`.yarn`、`node_modules`、`target`、`dist`、`build`、`vendor` 等目录在 cold full build、incremental scan、fast-sync 与 watcher 事件路径中都不会进入索引；旧配置未写 `exclude_dirs` 时仍使用默认排除列表。
+- `config.toml` 缺少 `exclude_dirs` 时启动会追加写入默认列表，让默认屏蔽项变为用户可见、可编辑配置；新增 `GET /memory` JSON 端点用于真机 RSS/smaps/索引拆项归因。
+- 真机 `/memory` 显示旧索引 445K 文件时 base 估算约 100MB、非索引匿名脏页约 131MB；后续修正 MemoryReport 纳入 base 拆项，并移除运行时冗余 `entries_by_path` 副本，v7 加载后主动触发 allocator collect。
+- 继续压缩 base：移除 `FileEntryIndex` 未使用的 path permutation，压紧 `PathTableV2::EncodedEntry` 字段布局；新写 v7 path-table 段改为直接保存压缩结构，旧完整路径段仍可读取。
+- 补齐 RSS 回吐触发点：memory report loop 在 heap high-water suspected 时执行 trim；事件批处理结束并进入 idle 后对本轮事件高水位做一次 trim；HTTP 新增 `/trim` 手动触发端点。
+- ParentIndex 运行时表示从每目录 `RoaringBitmap` 改为排序 `Vec<u32>` 直属文件列表；v7 父索引段仍按旧 Roaring 编码读写兼容，但加载后不再常驻大量小 Roaring 对象。
+- 新增 `watch_enabled` / `--no-watch` 静态模式，用于验证 watcher 在大 `$HOME` 场景下的常驻 RSS，并支持只读快照查询 + 手动 `/scan`。
 
 仍保留 / 后续处理：
 
 - `spawn_full_build` 仍作为无 v7 快照时的 fallback。
 - legacy v6 snapshot 底层 API 仍存在，但不再由 `TieredIndex` 加载热路径使用。
+- `refresh_base()` 仍是全量 materialize；仅应作为 snapshot/rebuild/测试兼容入口使用，不能重新放回普通事件批次或查询常规路径。

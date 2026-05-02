@@ -18,6 +18,13 @@
 - **导出期构建只读索引**：`PathTableV2 + FileEntryIndex` 仅在 `BaseIndexData` / v7 快照导出时批量构建，避免事件热路径维护 front-encoding 压缩表。
 - **legacy 格式降级为兼容层**：v4/v5 快照读取时转换到新主存储，v5/v6 导出时临时构造 `CompactMeta + PathArena`。
 - **超长路径语义更新**：运行时 paths store 可索引超过 legacy `u16 path_len` 限制的路径。
+- **索引入口硬排除**：默认在冷启动全扫、增量补扫、fast-sync 与 watcher 事件入口跳过 `.git`、`.cache`、`.cargo`、`.npm`、`.pnpm-store`、`.yarn`、`node_modules`、`target`、`dist`、`build`、`vendor` 等目录；启动时若现有 `config.toml` 缺少 `exclude_dirs`，会自动追加默认列表，之后用户可手动编辑。
+- **内存归因端点**：新增 `GET /memory`，以 JSON 返回 RSS、smaps、索引估算、DeltaBuffer、事件管线等拆项。
+- **Base 内存压缩**：`BaseIndexData` 运行时不再保留第二份 `FileEntryIndex`，同时 `/memory` 纳入 base path table、entries、trigram、parent index 拆项。
+- **v7 加载高水位优化**：新写出的 v7 快照直接保存压缩 `PathTableV2` 段，减少下次启动时“完整路径列表 → 重新压缩”的临时分配；旧 v7 路径段仍兼容读取。
+- **RSS 回吐补齐**：内存报告循环发现 heap high-water 时会主动 trim，事件风暴结束进入 idle 后会做一次 trim，并提供 `GET/POST /trim` 手动触发。
+- **ParentIndex 轻量化**：运行时目录反查索引从每目录 `RoaringBitmap` 改为排序 `Vec<u32>`，保留精确 `parent:` / `infolder:` 和 fast-sync 删除对齐能力，减少小对象堆碎片。
+- **Watcher 可关闭**：新增配置 `watch_enabled` 与 CLI `--no-watch`，支持只加载快照/手动 `/scan` 的静态模式，用于大 `$HOME` 场景下验证和降低 watcher 常驻开销。
 - **验证**：`cargo test -q` 全量通过。
 
 ## v0.6.12 更新（收尾稳定化）
@@ -457,6 +464,8 @@ cargo build --release --no-default-features
 - 默认 `--snapshot-path` / `--uds-socket` 会优先落到 `$XDG_RUNTIME_DIR/fd-rdd/`，回退 `/run/user/$UID/fd-rdd/`，最后才使用 `/tmp/fd-rdd-$UID...`，避免多用户互相冲突。
 - 默认会跳过 `.` 开头的文件/目录；如需将 dotfiles / dotdirs 纳入冷启动全扫、后台重建与增量补扫，请显式加 `--include-hidden`。
 - 默认会读取 `.gitignore`、`.ignore`、`.git/info/exclude` 和全局 gitignore；如需关闭这套规则，可显式传入 `--no-ignore`。
+- 默认还会在索引入口硬排除常见依赖、构建和缓存目录：`.git`、`.cache`、`.cargo`、`.npm`、`.pnpm-store`、`.yarn`、`node_modules`、`target`、`dist`、`build`、`vendor`。这些路径不会进入索引；现有配置缺少 `exclude_dirs` 时，fd-rdd 会在启动时把默认列表追加写入 `config.toml`，之后以用户手动编辑后的列表为准。也可重复传入 `--exclude-dir dir_name` 临时增补。
+- 如需验证 watcher 常驻内存或运行只读查询模式，可传入 `--no-watch`；此时索引不会自动响应文件事件，需使用 `POST /scan` 或重建来更新。
 
 查询：
 

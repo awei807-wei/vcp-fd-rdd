@@ -12,11 +12,11 @@ pub type PathIdx = u32;
 /// A single encoded entry in the path table.
 #[derive(Clone, Debug)]
 struct EncodedEntry {
+    /// Byte offset into `suffix_bytes` where this entry's suffix starts.
+    suffix_offset: u32,
     /// For anchor entries (every 256th) this is 0.
     /// For delta entries this is the shared prefix length with the previous entry.
     shared_len: u16,
-    /// Byte offset into `suffix_bytes` where this entry's suffix starts.
-    suffix_offset: u32,
     /// Length of the suffix stored in `suffix_bytes`.
     suffix_len: u16,
 }
@@ -121,6 +121,12 @@ impl PathTableV2 {
             prev_path = path;
         }
 
+        entries.shrink_to_fit();
+        suffix_bytes.shrink_to_fit();
+        anchors.shrink_to_fit();
+        idx_to_sorted.shrink_to_fit();
+        sorted_to_idx.shrink_to_fit();
+
         Self {
             entries,
             suffix_bytes,
@@ -158,6 +164,103 @@ impl PathTableV2 {
             + self.sorted_to_idx.capacity() * std::mem::size_of::<u32>()
     }
 
+    pub fn encode_raw(&self) -> Vec<u8> {
+        const MAGIC: &[u8; 8] = b"PTV2raw\0";
+        let mut out = Vec::with_capacity(8 + 5 * 4 + self.allocated_bytes());
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.suffix_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.anchors.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.idx_to_sorted.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.sorted_to_idx.len() as u32).to_le_bytes());
+        for entry in &self.entries {
+            out.extend_from_slice(&entry.suffix_offset.to_le_bytes());
+            out.extend_from_slice(&entry.shared_len.to_le_bytes());
+            out.extend_from_slice(&entry.suffix_len.to_le_bytes());
+        }
+        out.extend_from_slice(&self.suffix_bytes);
+        for v in &self.anchors {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &self.idx_to_sorted {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &self.sorted_to_idx {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn decode_raw(bytes: &[u8]) -> Option<Self> {
+        const MAGIC: &[u8; 8] = b"PTV2raw\0";
+        if bytes.len() < 8 + 5 * 4 || &bytes[..8] != MAGIC {
+            return None;
+        }
+        let mut off = 8usize;
+        let read_u32 = |bytes: &[u8], off: &mut usize| -> Option<u32> {
+            let v = u32::from_le_bytes(bytes.get(*off..*off + 4)?.try_into().ok()?);
+            *off += 4;
+            Some(v)
+        };
+        let entries_len = read_u32(bytes, &mut off)? as usize;
+        let suffix_len = read_u32(bytes, &mut off)? as usize;
+        let anchors_len = read_u32(bytes, &mut off)? as usize;
+        let idx_len = read_u32(bytes, &mut off)? as usize;
+        let sorted_len = read_u32(bytes, &mut off)? as usize;
+
+        let entries_bytes = entries_len.checked_mul(8)?;
+        let suffix_end = off.checked_add(entries_bytes)?.checked_add(suffix_len)?;
+        let anchors_bytes = anchors_len.checked_mul(4)?;
+        let idx_bytes = idx_len.checked_mul(4)?;
+        let sorted_bytes = sorted_len.checked_mul(4)?;
+        let total = suffix_end
+            .checked_add(anchors_bytes)?
+            .checked_add(idx_bytes)?
+            .checked_add(sorted_bytes)?;
+        if total > bytes.len() {
+            return None;
+        }
+
+        let mut entries = Vec::with_capacity(entries_len);
+        for _ in 0..entries_len {
+            let suffix_offset = read_u32(bytes, &mut off)?;
+            let shared_len = u16::from_le_bytes(bytes.get(off..off + 2)?.try_into().ok()?);
+            off += 2;
+            let suffix_len = u16::from_le_bytes(bytes.get(off..off + 2)?.try_into().ok()?);
+            off += 2;
+            entries.push(EncodedEntry {
+                suffix_offset,
+                shared_len,
+                suffix_len,
+            });
+        }
+
+        let suffix_bytes = bytes.get(off..off + suffix_len)?.to_vec();
+        off += suffix_len;
+
+        let read_u32_vec = |bytes: &[u8], off: &mut usize, len: usize| -> Option<Vec<u32>> {
+            let mut out = Vec::with_capacity(len);
+            for _ in 0..len {
+                out.push(u32::from_le_bytes(
+                    bytes.get(*off..*off + 4)?.try_into().ok()?,
+                ));
+                *off += 4;
+            }
+            Some(out)
+        };
+        let anchors = read_u32_vec(bytes, &mut off, anchors_len)?;
+        let idx_to_sorted = read_u32_vec(bytes, &mut off, idx_len)?;
+        let sorted_to_idx = read_u32_vec(bytes, &mut off, sorted_len)?;
+
+        Some(Self {
+            entries,
+            suffix_bytes,
+            anchors,
+            idx_to_sorted,
+            sorted_to_idx,
+        })
+    }
+
     fn get_suffix(&self, pos: usize) -> &[u8] {
         let e = &self.entries[pos];
         &self.suffix_bytes
@@ -186,6 +289,9 @@ impl PathTableV2 {
     pub fn parent_idx(&self, idx: PathIdx) -> Option<PathIdx> {
         let sorted_pos = *self.idx_to_sorted.get(idx as usize)? as usize;
         let path = self.resolve_sorted(sorted_pos);
+        if path.as_slice() == b"/" {
+            return None;
+        }
         // Find the last '/' before the end.
         let parent_len = match path.iter().rposition(|&b| b == b'/') {
             Some(0) => 1, // root "/"
@@ -359,6 +465,25 @@ mod tests {
         assert_eq!(end - start, 2);
 
         assert!(table.find_prefix_range(b"/nonexistent/").is_none());
+    }
+
+    #[test]
+    fn raw_roundtrip_preserves_lookup_and_resolution() {
+        let paths = vec![
+            "/home/user/a.txt",
+            "/home/user/project/src/main.rs",
+            "/home/user/project/src/lib.rs",
+            "/var/log/syslog",
+        ];
+        let table = make_table(&paths);
+        let decoded = PathTableV2::decode_raw(&table.encode_raw()).expect("raw decode");
+
+        assert_eq!(decoded.len(), table.len());
+        for (idx, expected) in paths.iter().enumerate() {
+            let resolved = decoded.resolve(idx as PathIdx).unwrap();
+            assert_eq!(std::str::from_utf8(&resolved).unwrap(), *expected);
+            assert_eq!(decoded.lookup(expected.as_bytes()), Some(idx as PathIdx));
+        }
     }
 
     #[test]

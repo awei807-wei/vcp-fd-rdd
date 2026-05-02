@@ -221,9 +221,6 @@ impl TieredIndex {
             return;
         };
         batch.l2.apply_events(events);
-        batch.l2.rebuild_parent_index();
-        let new_base = Arc::new(batch.l2.to_base_index_data());
-        self.base.store(new_base);
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
     }
@@ -233,9 +230,6 @@ impl TieredIndex {
             return;
         };
         batch.l2.apply_events(events.as_slice());
-        batch.l2.rebuild_parent_index();
-        let new_base = Arc::new(batch.l2.to_base_index_data());
-        self.base.store(new_base);
         events.clear();
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
@@ -253,13 +247,9 @@ impl TieredIndex {
         };
         if batch.rebuild_in_progress {
             batch.l2.apply_file_metas(metas.as_slice());
-            batch.l2.rebuild_parent_index();
         } else {
             batch.l2.apply_file_metas_drain(metas);
-            batch.l2.rebuild_parent_index();
         }
-        let new_base = Arc::new(batch.l2.to_base_index_data());
-        self.base.store(new_base);
         metas.clear();
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);

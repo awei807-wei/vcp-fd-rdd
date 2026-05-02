@@ -25,7 +25,11 @@ impl TieredIndex {
                 let db = idx.delta_buffer.lock();
                 !db.is_empty()
             };
-            if !delta_dirty && !overlay_dirty {
+            let pending_flush_dirty = idx.pending_flush_events.load(Ordering::Relaxed) > 0
+                || idx.pending_flush_bytes.load(Ordering::Relaxed) > 0;
+            let unsnapshotted_base = idx.last_snapshot_time.load(Ordering::Relaxed) == 0
+                && idx.base.load().file_count() > 0;
+            if !delta_dirty && !overlay_dirty && !pending_flush_dirty && !unsnapshotted_base {
                 tracing::debug!("No delta/overlay changes, skipping flush");
                 idx.flush_requested.store(false, Ordering::Release);
                 idx.reset_pending_flush_batch();
@@ -44,15 +48,14 @@ impl TieredIndex {
                 None => 0,
             };
 
-            // 获取当前 base（完整状态）并写入 v7 单文件快照
-            let base = idx.base.load_full();
+            // Snapshot is the materialization boundary: ordinary event batches
+            // update the delta path only, so the full visible BaseIndex is
+            // rebuilt on this cold path and then written as v7.
+            let base = idx.materialize_snapshot_base();
             let v7_path = store.path().with_extension("v7");
 
-            // 清空 delta_buffer（其增量已包含在 base / L2 中）
-            {
-                let mut db = idx.delta_buffer.lock();
-                db.clear();
-            }
+            // delta_buffer has been cleared by materialize_snapshot_base after
+            // its content was folded into base.
             idx.flush_requested.store(false, Ordering::Release);
 
             Some((base, v7_path, wal_seal_id))

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::util::path_has_excluded_component;
+
 /// 文件身份：Linux 上用 (dev, ino, generation) 做主键，rename 时 ino 不变，
 /// generation 用于区分 inode 复用（ext4 i_generation）。
 ///
@@ -147,6 +149,7 @@ pub struct FsScanRDD {
     include_hidden: bool,
     follow_links: bool,
     ignore_enabled: bool,
+    exclude_dirs: Vec<String>,
 }
 
 impl FsScanRDD {
@@ -166,6 +169,7 @@ impl FsScanRDD {
             include_hidden: false,
             follow_links: false,
             ignore_enabled: true,
+            exclude_dirs: Vec::new(),
         }
     }
 
@@ -193,6 +197,12 @@ impl FsScanRDD {
         self
     }
 
+    /// 控制不进入索引的目录名列表（独立于 .gitignore）。
+    pub fn with_exclude_dirs(mut self, exclude_dirs: Vec<String>) -> Self {
+        self.exclude_dirs = exclude_dirs;
+        self
+    }
+
     /// 按指定并行度遍历所有文件元数据（用于冷启动/重建的弹性构建）。
     ///
     /// 注意：这是 FsScanRDD 的专用入口，不改变 `BuildRDD` 的 Iterator 抽象，
@@ -216,6 +226,7 @@ impl FsScanRDD {
                 self.include_hidden,
                 self.follow_links,
                 self.ignore_enabled,
+                self.exclude_dirs.clone(),
                 sink.clone(),
             );
         }
@@ -241,6 +252,12 @@ impl BuildRDD<FileMeta> for FsScanRDD {
             .git_ignore(self.ignore_enabled)
             .git_global(self.ignore_enabled)
             .git_exclude(self.ignore_enabled);
+        let exclude_dirs = self.exclude_dirs.clone();
+        if !exclude_dirs.is_empty() {
+            builder.filter_entry(move |entry| {
+                !path_has_excluded_component(entry.path(), &exclude_dirs)
+            });
+        }
         let walker = builder.build();
 
         let iter = walker
@@ -285,6 +302,7 @@ fn scan_partition_parallel(
     include_hidden: bool,
     follow_links: bool,
     ignore_enabled: bool,
+    exclude_dirs: Vec<String>,
     sink: Arc<dyn Fn(FileMeta) + Send + Sync>,
 ) {
     use ignore::{WalkBuilder, WalkState};
@@ -301,6 +319,10 @@ fn scan_partition_parallel(
         .git_global(ignore_enabled)
         .git_exclude(ignore_enabled)
         .threads(parallelism);
+    if !exclude_dirs.is_empty() {
+        builder
+            .filter_entry(move |entry| !path_has_excluded_component(entry.path(), &exclude_dirs));
+    }
     let walker = builder.build_parallel();
 
     walker.run(|| {
@@ -422,6 +444,27 @@ mod tests {
 
         assert!(seen.iter().any(|p| p.ends_with("visible.txt")));
         assert!(seen.iter().any(|p| p.ends_with(".hidden.txt")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_skips_excluded_directory_names() {
+        let root = unique_tmp_dir("exclude-dirs");
+        fs::create_dir_all(root.join("node_modules/pkg")).expect("create node_modules");
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("node_modules/pkg/index.js"), b"ignored").expect("write ignored");
+        fs::write(root.join("src/main.rs"), b"visible").expect("write visible");
+
+        let rdd = FsScanRDD::from_roots(vec![root.clone()])
+            .with_exclude_dirs(vec!["node_modules".to_string()]);
+        let mut seen = Vec::new();
+        rdd.for_each(|meta| seen.push(meta.path));
+
+        assert!(seen.iter().any(|p| p.ends_with("src/main.rs")));
+        assert!(!seen
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == "node_modules")));
 
         let _ = fs::remove_dir_all(root);
     }

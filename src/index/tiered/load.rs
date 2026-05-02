@@ -1,15 +1,17 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::index::base_index::BaseIndexData;
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::storage::traits::StorageBackend;
+use crate::util::maybe_trim_rss;
 
 use super::TieredIndex;
 
 impl TieredIndex {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(super) fn new(
         l1: L1Cache,
         l2: Arc<PersistentIndex>,
@@ -19,6 +21,54 @@ impl TieredIndex {
         ignore_enabled: bool,
         follow_symlinks: bool,
     ) -> Self {
+        Self::new_with_excludes(
+            l1,
+            l2,
+            l3,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            Vec::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_with_excludes(
+        l1: L1Cache,
+        l2: Arc<PersistentIndex>,
+        l3: IndexBuilder,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+        exclude_dirs: Vec<String>,
+    ) -> Self {
+        Self::new_with_base(
+            l1,
+            l2,
+            l3,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            exclude_dirs,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_with_base(
+        l1: L1Cache,
+        l2: Arc<PersistentIndex>,
+        l3: IndexBuilder,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+        exclude_dirs: Vec<String>,
+        base_data: Option<BaseIndexData>,
+    ) -> Self {
         use arc_swap::ArcSwap;
         use parking_lot::Mutex;
         use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -27,7 +77,8 @@ impl TieredIndex {
         use super::rebuild::RebuildState;
         use crate::core::AdaptiveScheduler;
 
-        let base = ArcSwap::from(Arc::new(l2.to_base_index_data()));
+        let base_data = base_data.unwrap_or_else(|| l2.to_base_index_data());
+        let base = ArcSwap::from(Arc::new(base_data));
 
         Self {
             l1,
@@ -54,6 +105,7 @@ impl TieredIndex {
             include_hidden,
             ignore_enabled,
             follow_symlinks,
+            exclude_dirs,
             fast_sync_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
@@ -73,10 +125,50 @@ impl TieredIndex {
         include_hidden: bool,
         ignore_enabled: bool,
     ) -> Self {
+        Self::empty_with_options_and_follow(roots, include_hidden, ignore_enabled, false)
+    }
+
+    pub fn empty_with_options_and_follow(
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+    ) -> Self {
+        Self::empty_with_options_follow_and_excludes(
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            Vec::new(),
+        )
+    }
+
+    pub fn empty_with_options_follow_and_excludes(
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+        exclude_dirs: Vec<String>,
+    ) -> Self {
         let l1 = L1Cache::with_capacity(1000);
         let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
-        let l3 = IndexBuilder::new_with_options(roots.clone(), include_hidden, ignore_enabled);
-        Self::new(l1, l2, l3, roots, include_hidden, ignore_enabled, false)
+        let l3 = IndexBuilder::new_with_options_follow_and_excludes(
+            roots.clone(),
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            exclude_dirs.clone(),
+        );
+        Self::new_with_excludes(
+            l1,
+            l2,
+            l3,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            exclude_dirs,
+        )
     }
 
     /// 从快照加载（或回退为空），并在返回前执行启动清扫：
@@ -103,8 +195,46 @@ impl TieredIndex {
         include_hidden: bool,
         ignore_enabled: bool,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::load_with_options_and_follow(store, roots, include_hidden, ignore_enabled, false)
+            .await
+    }
+
+    pub async fn load_with_options_and_follow<S: StorageBackend + ?Sized>(
+        store: &S,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::load_with_options_follow_and_excludes(
+            store,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn load_with_options_follow_and_excludes<S: StorageBackend + ?Sized>(
+        store: &S,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+        exclude_dirs: Vec<String>,
+    ) -> anyhow::Result<Arc<Self>> {
         let index = Arc::new(
-            Self::load_or_empty_with_options(store, roots, include_hidden, ignore_enabled).await?,
+            Self::load_or_empty_with_options_follow_and_excludes(
+                store,
+                roots,
+                include_hidden,
+                ignore_enabled,
+                follow_symlinks,
+                exclude_dirs,
+            )
+            .await?,
         );
 
         // 1) 物理清理不在 MANIFEST 里的孤儿文件（best-effort）
@@ -141,60 +271,75 @@ impl TieredIndex {
         include_hidden: bool,
         ignore_enabled: bool,
     ) -> anyhow::Result<Self> {
+        Self::load_or_empty_with_options_and_follow(
+            store,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            false,
+        )
+        .await
+    }
+
+    pub async fn load_or_empty_with_options_and_follow<S: StorageBackend + ?Sized>(
+        store: &S,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+    ) -> anyhow::Result<Self> {
+        Self::load_or_empty_with_options_follow_and_excludes(
+            store,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn load_or_empty_with_options_follow_and_excludes<S: StorageBackend + ?Sized>(
+        store: &S,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+        exclude_dirs: Vec<String>,
+    ) -> anyhow::Result<Self> {
         let l1 = L1Cache::with_capacity(1000);
-        let l3 = IndexBuilder::new_with_options(roots.clone(), include_hidden, ignore_enabled);
+        let l3 = IndexBuilder::new_with_options_follow_and_excludes(
+            roots.clone(),
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            exclude_dirs.clone(),
+        );
 
         // 阶段 A：优先加载 v7 单文件快照（最快路径，<1s mmap + 反序列化）。
         let v7_path = store.path().with_extension("v7");
         match crate::storage::snapshot_v7::try_load_v7(&v7_path) {
             Ok(Some(v7_data)) => {
                 tracing::info!(
-                    "v7 snapshot loaded: {} entries, {} trigrams",
+                    "v7 snapshot loaded directly into base: {} entries, {} trigrams",
                     v7_data.entries_by_key.len(),
                     v7_data.trigram_index.len()
                 );
                 let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
-                // 将 v7 数据灌入 L2（当前为简化实现：逐个 upsert；
-                // 后续可优化为直接构造内部结构，避免 trigram 重建开销）。
-                for i in 0..v7_data.entries_by_key.len() {
-                    if let Some(entry) = v7_data.entries_by_key.get(i) {
-                        if let Some(path_bytes) = v7_data.path_table.resolve(entry.path_idx) {
-                            let path = {
-                                #[cfg(unix)]
-                                {
-                                    use std::ffi::OsStr;
-                                    use std::os::unix::ffi::OsStrExt;
-                                    PathBuf::from(OsStr::from_bytes(&path_bytes))
-                                }
-                                #[cfg(not(unix))]
-                                {
-                                    PathBuf::from(
-                                        std::str::from_utf8(&path_bytes).unwrap_or_default(),
-                                    )
-                                }
-                            };
-                            let mtime = if entry.mtime_ns < 0 {
-                                None
-                            } else {
-                                Some(
-                                    std::time::UNIX_EPOCH
-                                        + std::time::Duration::from_nanos(entry.mtime_ns as u64),
-                                )
-                            };
-                            l2.upsert(crate::core::FileMeta {
-                                file_key: entry.file_key(),
-                                path,
-                                size: entry.size,
-                                mtime,
-                                ctime: None,
-                                atime: None,
-                            });
-                        }
-                    }
-                }
-                let idx = Self::new(l1, l2, l3, roots, include_hidden, ignore_enabled, false);
+                let idx = Self::new_with_base(
+                    l1,
+                    l2,
+                    l3,
+                    roots,
+                    include_hidden,
+                    ignore_enabled,
+                    follow_symlinks,
+                    exclude_dirs,
+                    Some(v7_data),
+                );
                 idx.attach_wal(store)?;
                 idx.replay_wal_if_any(0);
+                maybe_trim_rss();
                 return Ok(idx);
             }
             Ok(None) => {}
@@ -203,7 +348,16 @@ impl TieredIndex {
 
         // 无 v7 快照：回退到空索引启动（由上层触发 rebuild）。
         let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
-        let idx = Self::new(l1, l2, l3, roots, include_hidden, ignore_enabled, false);
+        let idx = Self::new_with_excludes(
+            l1,
+            l2,
+            l3,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            exclude_dirs,
+        );
         idx.attach_wal(store)?;
         idx.replay_wal_if_any(0);
         Ok(idx)

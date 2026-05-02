@@ -9,6 +9,8 @@ pub struct IndexBuilder {
     pub roots: Vec<PathBuf>,
     pub include_hidden: bool,
     pub ignore_enabled: bool,
+    pub follow_symlinks: bool,
+    pub exclude_dirs: Vec<String>,
 }
 
 impl IndexBuilder {
@@ -25,10 +27,37 @@ impl IndexBuilder {
         include_hidden: bool,
         ignore_enabled: bool,
     ) -> Self {
+        Self::new_with_options_and_follow(roots, include_hidden, ignore_enabled, false)
+    }
+
+    pub fn new_with_options_and_follow(
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+    ) -> Self {
+        Self::new_with_options_follow_and_excludes(
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            Vec::new(),
+        )
+    }
+
+    pub fn new_with_options_follow_and_excludes(
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+        exclude_dirs: Vec<String>,
+    ) -> Self {
         Self {
             roots,
             include_hidden,
             ignore_enabled,
+            follow_symlinks,
+            exclude_dirs,
         }
     }
 
@@ -36,7 +65,9 @@ impl IndexBuilder {
     pub fn full_build(&self, index: &PersistentIndex) {
         let rdd = FsScanRDD::from_roots(self.roots.clone())
             .with_hidden(self.include_hidden)
-            .with_ignore_rules(self.ignore_enabled);
+            .with_ignore_rules(self.ignore_enabled)
+            .with_follow_links(self.follow_symlinks)
+            .with_exclude_dirs(self.exclude_dirs.clone());
         let mut count = 0usize;
 
         rdd.for_each(|meta: FileMeta| {
@@ -67,6 +98,8 @@ impl IndexBuilder {
         let rdd = FsScanRDD::from_roots(self.roots.clone())
             .with_hidden(self.include_hidden)
             .with_ignore_rules(self.ignore_enabled)
+            .with_follow_links(self.follow_symlinks)
+            .with_exclude_dirs(self.exclude_dirs.clone())
             .with_parallelism(parallelism);
         let count = Arc::new(AtomicUsize::new(0));
         let idx = index.clone();
@@ -77,6 +110,9 @@ impl IndexBuilder {
             let n = c.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_multiple_of(10000) {
                 tracing::info!("IndexBuilder: scanned {} files...", n);
+            }
+            if parallelism <= 1 && n.is_multiple_of(24) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
         });
 
@@ -93,7 +129,9 @@ impl IndexBuilder {
     pub fn incremental_scan(&self, index: &PersistentIndex, dirs: Vec<PathBuf>) {
         let rdd = FsScanRDD::from_roots(dirs)
             .with_hidden(self.include_hidden)
-            .with_ignore_rules(self.ignore_enabled);
+            .with_ignore_rules(self.ignore_enabled)
+            .with_follow_links(self.follow_symlinks)
+            .with_exclude_dirs(self.exclude_dirs.clone());
         let mut count = 0usize;
 
         rdd.for_each(|meta: FileMeta| {

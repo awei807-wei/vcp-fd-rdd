@@ -1,4 +1,4 @@
-//! FileEntry v2: fixed-size 40-byte struct + dual-sort index views.
+//! FileEntry v2: fixed-size 40-byte struct + file-key lookup index.
 
 use crate::core::FileKey;
 
@@ -48,15 +48,13 @@ impl FileEntry {
     }
 }
 
-/// Index over `FileEntry` providing O(log N) lookups by different keys.
+/// Index over `FileEntry` providing DocId-order iteration and O(log N) lookup by file key.
 #[derive(Clone, Debug)]
 pub struct FileEntryIndex {
     /// Entries in insertion order ( DocId order ).
     entries: Vec<FileEntry>,
     /// Permutation sorted by `(dev, ino, generation)`.
     by_filekey: Vec<u32>,
-    /// Permutation sorted by `path_idx`.
-    by_path: Vec<u32>,
 }
 
 impl FileEntryIndex {
@@ -64,7 +62,6 @@ impl FileEntryIndex {
         Self {
             entries: Vec::new(),
             by_filekey: Vec::new(),
-            by_path: Vec::new(),
         }
     }
 
@@ -72,12 +69,19 @@ impl FileEntryIndex {
         Self {
             entries: Vec::with_capacity(cap),
             by_filekey: Vec::with_capacity(cap),
-            by_path: Vec::with_capacity(cap),
         }
     }
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        use std::mem::size_of;
+
+        size_of::<Self>()
+            + self.entries.capacity() * size_of::<FileEntry>()
+            + self.by_filekey.capacity() * size_of::<u32>()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -88,13 +92,11 @@ impl FileEntryIndex {
         let idx = self.entries.len() as u32;
         self.entries.push(entry);
         self.by_filekey.push(idx);
-        self.by_path.push(idx);
     }
 
-    /// Finalize the index: sort the permutation vectors.
+    /// Finalize the index: sort the file-key permutation vector.
     pub fn build(mut self) -> Self {
         self.sort_by_key();
-        self.sort_by_path();
         self
     }
 
@@ -104,12 +106,6 @@ impl FileEntryIndex {
             let e = &self.entries[i as usize];
             (e.dev, e.ino, e.generation)
         });
-    }
-
-    /// Sort the `by_path` permutation in place.
-    pub fn sort_by_path(&mut self) {
-        self.by_path
-            .sort_by_key(|&i| self.entries[i as usize].path_idx);
     }
 
     /// Lookup by `FileKey` using binary search. Returns a slice of matching entries
@@ -154,26 +150,6 @@ impl FileEntryIndex {
             })
             .ok()?;
         Some(self.by_filekey[pos])
-    }
-
-    /// Lookup by `path_idx` using binary search. Returns a slice of entries
-    /// sharing the same path (usually 0 or 1).
-    pub fn lookup_by_path_idx(&self, path_idx: u32) -> Option<&[FileEntry]> {
-        let pos = self
-            .by_path
-            .binary_search_by(|&i| self.entries[i as usize].path_idx.cmp(&path_idx))
-            .ok()?;
-        let mut start = pos;
-        while start > 0 && self.entries[self.by_path[start - 1] as usize].path_idx == path_idx {
-            start -= 1;
-        }
-        let mut end = pos + 1;
-        while end < self.by_path.len()
-            && self.entries[self.by_path[end] as usize].path_idx == path_idx
-        {
-            end += 1;
-        }
-        Some(&self.entries[self.by_path[start] as usize..=self.by_path[end - 1] as usize])
     }
 
     /// Iterate over all entries in DocId order.
@@ -255,30 +231,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_by_path_idx() {
-        let mut index = FileEntryIndex::new();
-        index.push(FileEntry::from_file_key(
-            make_key(1, 100),
-            10,
-            1024,
-            1_000_000,
-        ));
-        index.push(FileEntry::from_file_key(
-            make_key(1, 200),
-            20,
-            2048,
-            2_000_000,
-        ));
-        let index = index.build();
-
-        let r = index.lookup_by_path_idx(20).unwrap();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].ino, 200);
-
-        assert!(index.lookup_by_path_idx(999).is_none());
-    }
-
-    #[test]
     fn file_entry_lookup_matches_compact_meta() {
         // Build entries in a non-sorted order to verify index sorting.
         let mut entries: Vec<FileEntry> = (0..10_000)
@@ -317,12 +269,6 @@ mod tests {
                 "Mismatch for key {:?}",
                 e.file_key()
             );
-        }
-
-        // Also verify every path_idx lookup.
-        for e in &entries {
-            let r = index.lookup_by_path_idx(e.path_idx).unwrap();
-            assert_eq!(r[0], *e);
         }
     }
 }

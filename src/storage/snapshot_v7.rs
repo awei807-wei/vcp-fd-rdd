@@ -66,22 +66,13 @@ struct V7SegDesc {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn encode_path_table(pt: &PathTableV2) -> Vec<u8> {
-    let mut out = Vec::new();
-    let len = pt.len() as u32;
-    out.extend_from_slice(&len.to_le_bytes());
-    for i in 0..pt.len() {
-        if let Some(path) = pt.resolve(i as u32) {
-            let blen: u16 = path.len().min(u16::MAX as usize) as u16;
-            out.extend_from_slice(&blen.to_le_bytes());
-            out.extend_from_slice(&path[..blen as usize]);
-        } else {
-            out.extend_from_slice(&0u16.to_le_bytes());
-        }
-    }
-    out
+    pt.encode_raw()
 }
 
 fn decode_path_table(bytes: &[u8]) -> anyhow::Result<PathTableV2> {
+    if let Some(table) = PathTableV2::decode_raw(bytes) {
+        return Ok(table);
+    }
     if bytes.len() < 4 {
         anyhow::bail!("path table too small");
     }
@@ -157,7 +148,7 @@ fn decode_file_entry_index(bytes: &[u8]) -> anyhow::Result<FileEntryIndex> {
             mtime_ns,
         ));
     }
-    Ok(fei)
+    Ok(fei.build())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -217,8 +208,9 @@ fn encode_parent_index(pi: &ParentIndex) -> Vec<u8> {
     // Encode dir_to_files: HashMap<u32, RoaringBitmap>
     let len = pi.dir_to_files.len() as u32;
     out.extend_from_slice(&len.to_le_bytes());
-    for (dir_idx, bitmap) in &pi.dir_to_files {
+    for (dir_idx, docids) in &pi.dir_to_files {
         out.extend_from_slice(&dir_idx.to_le_bytes());
+        let bitmap: RoaringBitmap = docids.iter().copied().collect();
         let mut posting = Vec::new();
         bitmap
             .serialize_into(&mut posting)
@@ -227,17 +219,8 @@ fn encode_parent_index(pi: &ParentIndex) -> Vec<u8> {
         out.extend_from_slice(&posting_len.to_le_bytes());
         out.extend_from_slice(&posting);
     }
-    // Encode dir_to_subdirs: HashMap<u32, Vec<u32>>
-    let subdir_len = pi.dir_to_subdirs.len() as u32;
-    out.extend_from_slice(&subdir_len.to_le_bytes());
-    for (dir_idx, subdirs) in &pi.dir_to_subdirs {
-        out.extend_from_slice(&dir_idx.to_le_bytes());
-        let subdir_count = subdirs.len() as u32;
-        out.extend_from_slice(&subdir_count.to_le_bytes());
-        for &sub in subdirs {
-            out.extend_from_slice(&sub.to_le_bytes());
-        }
-    }
+    // Legacy subdir section is kept in the wire format but no longer materialized at runtime.
+    out.extend_from_slice(&0u32.to_le_bytes());
     out
 }
 
@@ -249,7 +232,7 @@ fn decode_parent_index(bytes: &[u8]) -> anyhow::Result<ParentIndex> {
     // Decode dir_to_files
     let count = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
     off += 4;
-    let mut dir_to_files: HashMap<u32, RoaringBitmap> = HashMap::with_capacity(count);
+    let mut dir_to_files: HashMap<u32, Vec<u32>> = HashMap::with_capacity(count);
     for _ in 0..count {
         if off + 4 > bytes.len() {
             anyhow::bail!("parent index dir_idx truncated");
@@ -267,40 +250,32 @@ fn decode_parent_index(bytes: &[u8]) -> anyhow::Result<ParentIndex> {
         let rb = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
             .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
         off += posting_len;
-        dir_to_files.insert(dir_idx, rb);
+        dir_to_files.insert(dir_idx, rb.iter().collect());
     }
-    // Decode dir_to_subdirs
+    // Decode and discard legacy dir_to_subdirs.
     if off + 4 > bytes.len() {
         anyhow::bail!("parent index subdir count truncated");
     }
     let subdir_count = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
     off += 4;
-    let mut dir_to_subdirs: HashMap<u32, Vec<u32>> = HashMap::with_capacity(subdir_count);
     for _ in 0..subdir_count {
         if off + 4 > bytes.len() {
             anyhow::bail!("parent index subdir dir_idx truncated");
         }
-        let dir_idx = u32::from_le_bytes(bytes[off..off + 4].try_into()?);
         off += 4;
         if off + 4 > bytes.len() {
             anyhow::bail!("parent index subdir list count truncated");
         }
         let list_count = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
         off += 4;
-        let mut subdirs = Vec::with_capacity(list_count);
         for _ in 0..list_count {
             if off + 4 > bytes.len() {
                 anyhow::bail!("parent index subdir entry truncated");
             }
-            subdirs.push(u32::from_le_bytes(bytes[off..off + 4].try_into()?));
             off += 4;
         }
-        dir_to_subdirs.insert(dir_idx, subdirs);
     }
-    Ok(ParentIndex {
-        dir_to_files,
-        dir_to_subdirs,
-    })
+    Ok(ParentIndex { dir_to_files })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -488,11 +463,6 @@ impl V7Snapshot {
             .map(decode_file_entry_index)
             .transpose()?
             .unwrap_or_default();
-        let entries_by_path = self
-            .segment(V7SegKind::EntriesByPath)
-            .map(decode_file_entry_index)
-            .transpose()?
-            .unwrap_or_default();
         let trigram_index = self
             .segment(V7SegKind::TrigramIndex)
             .map(decode_trigram_index)
@@ -512,7 +482,6 @@ impl V7Snapshot {
         Ok(BaseIndexData {
             path_table,
             entries_by_key,
-            entries_by_path,
             trigram_index,
             parent_index,
             tombstones,
@@ -634,7 +603,7 @@ pub fn write_v7_snapshot_atomic(path: &Path, data: &BaseIndexData) -> anyhow::Re
         ),
         (
             V7SegKind::EntriesByPath,
-            encode_file_entry_index(&data.entries_by_path),
+            encode_file_entry_index(&data.entries_by_key),
         ),
         (
             V7SegKind::TrigramIndex,
@@ -764,11 +733,6 @@ pub fn snapshot_now_v7(
             merged.entries_by_key.push(e.clone());
         }
     }
-    for i in 0..delta.entries_by_path.len() {
-        if let Some(e) = delta.entries_by_path.get(i) {
-            merged.entries_by_path.push(e.clone());
-        }
-    }
     // trigram / parent / tombstones：简单合并（TODO: 真正归并）
     for (tri, bm) in &delta.trigram_index.inner {
         merged.trigram_index.insert(*tri, bm.clone());
@@ -778,14 +742,17 @@ pub fn snapshot_now_v7(
             .parent_index
             .dir_to_files
             .entry(dir.clone())
-            .and_modify(|existing| *existing |= bm.clone())
+            .and_modify(|existing| {
+                existing.extend_from_slice(bm);
+                existing.sort_unstable();
+                existing.dedup();
+            })
             .or_insert_with(|| bm.clone());
     }
     merged.tombstones |= delta.tombstones.clone();
 
-    // 排序（key 与 path）
+    // 排序（key）
     merged.entries_by_key.sort_by_key();
-    merged.entries_by_path.sort_by_path();
 
     write_v7_snapshot_atomic(path, &merged)
 }
