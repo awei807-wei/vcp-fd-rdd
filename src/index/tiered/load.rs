@@ -29,7 +29,6 @@ impl TieredIndex {
         use std::sync::atomic::{AtomicBool, AtomicU64};
         use tokio::sync::Notify;
 
-        use super::events::OverlayState;
         use super::rebuild::RebuildState;
         use crate::core::AdaptiveScheduler;
 
@@ -42,7 +41,6 @@ impl TieredIndex {
             wal: Mutex::new(None),
             event_seq: AtomicU64::new(0),
             rebuild_state: Mutex::new(RebuildState::default()),
-            overlay_state: Mutex::new(OverlayState::default()),
             delta_buffer: Mutex::new(crate::index::delta_buffer::DeltaBuffer::with_capacity(262_144)),
             apply_gate: RwLock::new(()),
             flush_requested: AtomicBool::new(false),
@@ -54,7 +52,6 @@ impl TieredIndex {
             pending_flush_events: AtomicU64::new(0),
             pending_flush_bytes: AtomicU64::new(0),
             last_snapshot_time: AtomicU64::new(0),
-            pending_events: Mutex::new(Vec::new()),
             roots,
             include_hidden,
             ignore_enabled,

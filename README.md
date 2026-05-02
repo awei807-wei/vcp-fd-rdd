@@ -10,7 +10,28 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-当前 tests 分支发布版本为 v0.6.5（ParentIndex 性能优化）。
+当前 tests 分支发布版本为 v0.6.8（DeltaBuffer 默认启用 + 旧增量缓冲区清理）。
+
+## v0.6.8 更新（Phase 5: DeltaBuffer 默认启用）
+
+- DeltaBuffer 统一增量缓冲区默认启用，移除 `USE_DELTA_BUFFER` 环境变量
+- 删除旧的 `overlay_state`（`PathArenaSet` 对）和 `pending_events`（`Vec<EventRecord>`）
+- 消除增量状态的双重维护，简化事件应用和查询路径
+- 容量上限从 4096 提升到 256K，大批量事件场景下不再溢出
+
+## v0.6.7 更新（Phase 4: ParentIndex 默认启用 + Deprecated 清理）
+
+- ParentIndex 默认启用，移除 `USE_PARENT_INDEX` 环境变量
+- 启动时自动构建 ParentIndex，消除冷启动延迟
+- 移除 `for_each_live_meta_in_dirs` fallback
+- 移除 deprecated `startup_reconcile` / `spawn_rebuild`
+
+## v0.6.6 更新（Phase 3: DeltaBuffer 统一增量缓冲区）
+
+- 新增 `src/index/delta_buffer.rs`：`DeltaBuffer` 统一替代 `overlay_state` + `pending_events`
+- `HashMap<Vec<u8>, DeltaState>` 按路径去重，容量上限 256K 条
+- `USE_DELTA_BUFFER=1` 启用新路径（A/B 验证），未设置时保留旧 fallback
+- 查询和事件应用路径统一从 DeltaBuffer 读取
 
 ## v0.6.5 更新（Phase 2: ParentIndex 性能优化）
 

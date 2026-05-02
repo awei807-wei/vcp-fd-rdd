@@ -6,7 +6,6 @@ use parking_lot::RwLockReadGuard;
 use crate::core::{EventRecord, EventType, FileIdentifier, FileMeta};
 use crate::index::l2_partition::PersistentIndex;
 
-use super::arena::PathArenaSet;
 use super::disk_layer::event_record_estimated_bytes;
 use super::rebuild::PendingEvent;
 use super::TieredIndex;
@@ -16,14 +15,6 @@ pub(super) struct ApplyBatchState<'a> {
     pub(super) l2: Arc<PersistentIndex>,
     pub(super) rebuild_in_progress: bool,
     pub(super) event_count: usize,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct OverlayState {
-    /// delete / rename-from：需要跨段屏蔽更老 segment 结果，并在 flush 时写入 seg-*.del
-    pub(super) deleted_paths: Arc<PathArenaSet>,
-    /// create/modify/rename-to：用于抵消同一路径的 deleted（delete→recreate）
-    pub(super) upserted_paths: Arc<PathArenaSet>,
 }
 
 impl TieredIndex {
@@ -178,48 +169,6 @@ impl TieredIndex {
         (self.l2.load_full(), true)
     }
 
-    pub(super) fn update_overlay_for_events(&self, events: &[EventRecord]) {
-        let mut ov = self.overlay_state.lock();
-        for ev in events {
-            let Some(path) = ev.best_path() else {
-                // FID-only 且无路径：阶段 1 保守跳过 overlay 更新（后续 fanotify 反查完善）。
-                continue;
-            };
-            let path_bytes = path.as_os_str().as_encoded_bytes();
-            match &ev.event_type {
-                EventType::Delete => {
-                    let _ = Arc::make_mut(&mut ov.upserted_paths).remove(path_bytes);
-                    let _ = Arc::make_mut(&mut ov.deleted_paths).insert(path_bytes);
-                }
-                EventType::Create | EventType::Modify => {
-                    let _ = Arc::make_mut(&mut ov.deleted_paths).remove(path_bytes);
-                    let _ = Arc::make_mut(&mut ov.upserted_paths).insert(path_bytes);
-                }
-                EventType::Rename {
-                    from,
-                    from_path_hint,
-                } => {
-                    let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
-                    if let Some(from_path) = from_best {
-                        let from_bytes = from_path.as_os_str().as_encoded_bytes();
-                        let _ = Arc::make_mut(&mut ov.upserted_paths).remove(from_bytes);
-                        let _ = Arc::make_mut(&mut ov.deleted_paths).insert(from_bytes);
-                    }
-
-                    let _ = Arc::make_mut(&mut ov.deleted_paths).remove(path_bytes);
-                    let _ = Arc::make_mut(&mut ov.upserted_paths).insert(path_bytes);
-                }
-            }
-        }
-
-        // overlay 达阈值时请求强制 flush（合并触发，避免无界膨胀）。
-        let overlay_paths = ov.deleted_paths.len_paths() + ov.upserted_paths.len_paths();
-        let overlay_arena_bytes =
-            (ov.deleted_paths.arena_len() + ov.upserted_paths.arena_len()) as u64;
-        drop(ov);
-        self.maybe_request_flush(overlay_paths, overlay_arena_bytes);
-    }
-
     pub(super) fn invalidate_l1_for_events(&self, events: &[EventRecord]) {
         for ev in events {
             match &ev.event_type {
@@ -264,33 +213,14 @@ impl TieredIndex {
         // 若 rebuild 在进行：先缓冲 pending 事件；并在持锁期间捕获当前 l2 指针，
         // 避免切换窗口导致"事件已缓冲但应用到了新索引"而重复回放。
         let (l2, rebuild_in_progress) = self.capture_l2_for_apply(events);
-        if std::env::var("USE_DELTA_BUFFER").is_ok() {
-            let mut db = self.delta_buffer.lock();
-            db.apply_events(events);
-            let overlay_paths = db.len();
-            let overlay_arena_bytes = db.estimated_bytes() as u64;
-            drop(db);
-            self.maybe_request_flush(overlay_paths, overlay_arena_bytes);
-        } else {
-            self.update_overlay_for_events(events);
-        }
+        let mut db = self.delta_buffer.lock();
+        db.apply_events(events);
+        let overlay_paths = db.len();
+        let overlay_arena_bytes = db.estimated_bytes() as u64;
+        drop(db);
+        self.maybe_request_flush(overlay_paths, overlay_arena_bytes);
         self.note_pending_flush_batch(events);
         self.invalidate_l1_for_events(events);
-
-        // 将非 Delete 事件加入 pending_events，使 debounce 期间的新文件可被查询到。
-        if std::env::var("USE_DELTA_BUFFER").is_err() {
-            let mut pending = self.pending_events.lock();
-            for ev in events {
-                match &ev.event_type {
-                    EventType::Delete => {}
-                    _ => {
-                        if pending.len() < 4096 {
-                            pending.push(ev.clone());
-                        }
-                    }
-                }
-            }
-        }
 
         Some(ApplyBatchState {
             _gate: gate,
@@ -327,7 +257,6 @@ impl TieredIndex {
             return;
         };
         batch.l2.apply_events(events);
-        self.remove_from_pending(events);
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
 
@@ -362,41 +291,12 @@ impl TieredIndex {
             return;
         };
         batch.l2.apply_events(events.as_slice());
-        self.remove_from_pending(events.as_slice());
         events.clear();
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
 
         for dir in rename_dirs {
             let _ = self.scan_dirs_immediate_deep(&[dir]);
-        }
-    }
-
-    fn remove_from_pending(&self, events: &[EventRecord]) {
-        if std::env::var("USE_DELTA_BUFFER").is_ok() {
-            return;
-        }
-        let mut pending = self.pending_events.lock();
-        for ev in events {
-            match &ev.event_type {
-                EventType::Rename {
-                    from,
-                    from_path_hint,
-                } => {
-                    let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
-                    if let Some(from_path) = from_best {
-                        pending.retain(|p| p.best_path().map(|bp| bp != from_path).unwrap_or(true));
-                    }
-                    if let Some(path) = ev.best_path() {
-                        pending.retain(|p| p.best_path().map(|bp| bp != path).unwrap_or(true));
-                    }
-                }
-                _ => {
-                    if let Some(path) = ev.best_path() {
-                        pending.retain(|p| p.best_path().map(|bp| bp != path).unwrap_or(true));
-                    }
-                }
-            }
         }
     }
 
@@ -418,6 +318,5 @@ impl TieredIndex {
         }
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
-        self.remove_from_pending(events);
     }
 }

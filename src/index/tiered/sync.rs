@@ -201,13 +201,6 @@ impl TieredIndex {
                     self.l2.store(new_l2.clone());
                     // rebuild 语义：新索引为权威数据源，旧 mmap segments 可能已过期，清空以避免双基座。
                     self.disk_layers.write().clear();
-                    {
-                        let mut ov = self.overlay_state.lock();
-                        Arc::make_mut(&mut ov.deleted_paths).clear();
-                        Arc::make_mut(&mut ov.upserted_paths).clear();
-                        Arc::make_mut(&mut ov.deleted_paths).maybe_shrink_after_clear();
-                        Arc::make_mut(&mut ov.upserted_paths).maybe_shrink_after_clear();
-                    }
                     self.note_pending_flush_rebuild(new_l2.as_ref());
                     st.in_progress = false;
                     // 若 rebuild 期间又被请求（例如 overflow 风暴），合并为下一轮 rebuild。

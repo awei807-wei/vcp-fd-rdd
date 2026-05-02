@@ -19,13 +19,8 @@ impl TieredIndex {
             .map(|l| l.idx.file_count_estimate())
             .sum::<usize>();
         let overlay = {
-            if std::env::var("USE_DELTA_BUFFER").is_ok() {
-                let db = self.delta_buffer.lock();
-                db.live_records().count()
-            } else {
-                let ov = self.overlay_state.lock();
-                ov.upserted_paths.len_paths()
-            }
+            let db = self.delta_buffer.lock();
+            db.live_records().count()
         };
         l2 + disk + overlay
     }
@@ -35,43 +30,23 @@ impl TieredIndex {
         let l1 = self.l1.memory_stats();
         let l2 = self.l2.load_full().memory_stats();
         let overlay = {
-            if std::env::var("USE_DELTA_BUFFER").is_ok() {
-                let db = self.delta_buffer.lock();
-                let deleted_count = db.deleted_paths().count();
-                let upserted_count = db.upserted_paths().count();
-                OverlayStats {
-                    deleted_paths: deleted_count,
-                    upserted_paths: upserted_count,
-                    deleted_bytes: 0,
-                    upserted_bytes: 0,
-                    deleted_arena_len: 0,
-                    deleted_arena_cap: 0,
-                    upserted_arena_len: 0,
-                    upserted_arena_cap: 0,
-                    deleted_map_len: deleted_count,
-                    deleted_map_cap: db.len(),
-                    upserted_map_len: upserted_count,
-                    upserted_map_cap: db.len(),
-                    estimated_bytes: db.estimated_bytes() as u64,
-                }
-            } else {
-                let ov = self.overlay_state.lock();
-                OverlayStats {
-                    deleted_paths: ov.deleted_paths.len_paths(),
-                    upserted_paths: ov.upserted_paths.len_paths(),
-                    deleted_bytes: ov.deleted_paths.active_bytes(),
-                    upserted_bytes: ov.upserted_paths.active_bytes(),
-                    deleted_arena_len: ov.deleted_paths.arena_len(),
-                    deleted_arena_cap: ov.deleted_paths.arena_cap(),
-                    upserted_arena_len: ov.upserted_paths.arena_len(),
-                    upserted_arena_cap: ov.upserted_paths.arena_cap(),
-                    deleted_map_len: ov.deleted_paths.map_len(),
-                    deleted_map_cap: ov.deleted_paths.map_cap(),
-                    upserted_map_len: ov.upserted_paths.map_len(),
-                    upserted_map_cap: ov.upserted_paths.map_cap(),
-                    estimated_bytes: ov.deleted_paths.estimated_bytes()
-                        + ov.upserted_paths.estimated_bytes(),
-                }
+            let db = self.delta_buffer.lock();
+            let deleted_count = db.deleted_paths().count();
+            let upserted_count = db.upserted_paths().count();
+            OverlayStats {
+                deleted_paths: deleted_count,
+                upserted_paths: upserted_count,
+                deleted_bytes: 0,
+                upserted_bytes: 0,
+                deleted_arena_len: 0,
+                deleted_arena_cap: 0,
+                upserted_arena_len: 0,
+                upserted_arena_cap: 0,
+                deleted_map_len: deleted_count,
+                deleted_map_cap: db.len(),
+                upserted_map_len: upserted_count,
+                upserted_map_cap: db.len(),
+                estimated_bytes: db.estimated_bytes() as u64,
             }
         };
 

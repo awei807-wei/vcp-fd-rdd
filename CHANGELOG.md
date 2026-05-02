@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.8] - 2026-05-01
+
+### Phase 5: DeltaBuffer Default Enable
+
+- **Default-enable DeltaBuffer**: Removed `USE_DELTA_BUFFER` environment variable gate. DeltaBuffer is now the sole overlay mechanism for event buffering.
+- **Removed deprecated `overlay_state`**: Deleted `OverlayState` struct and `update_overlay_for_events` method from `src/index/tiered/events.rs`.
+- **Removed `pending_events`**: Deleted the `pending_events: Mutex<Vec<EventRecord>>` field from `TieredIndex` and all related push/drain logic.
+- **Simplified query paths**: `collect_all_live_metas` and `execute_query_plan` now unconditionally read from `delta_buffer`.
+- **Simplified memory reporting**: `file_count()` and `memory_report()` no longer branch on environment variable.
+- **Simplified snapshot flush**: `snapshot_now` unconditionally uses `delta_buffer` for dirty checks and drain.
+- **Updated `finish_rebuild`**: Replaced `overlay_state` clear with `delta_buffer.clear()`.
+- **Code reduction**: ~362 lines removed across 7 files in `src/index/tiered/`.
+
+## [0.6.7] - 2026-05-01
+
+### Changed
+
+- **Phase 4: ParentIndex Default Enable + Deprecated Cleanup**
+  - **Default enabled** `ParentIndex`: removed `USE_PARENT_INDEX` environment variable A/B switch. `fast_sync` Phase3 delete alignment now always uses `delete_alignment_with_parent_index()` (O(D)), removing the legacy `for_each_live_meta_in_dirs()` O(N) fallback.
+  - **Removed** `for_each_live_meta_in_dirs()` method: no longer has any callers after the fallback path removal.
+  - **Build ParentIndex at startup**: `rebuild_parent_index()` is now automatically called after each snapshot recovery path (LSM / v6 / v2-v5) in `load_or_empty_with_options`, eliminating cold-start latency on first `fast_sync`.
+  - **Removed** deprecated `startup_reconcile()` and `spawn_rebuild()`:
+    - Deleted both deprecated functions from `src/index/tiered/sync.rs`
+    - Removed `startup_reconcile()` call from `src/main.rs`
+    - Removed related test cases from `src/index/tiered/tests.rs`
+  - Net code reduction from eliminating fallback paths and deprecated code.
+
 ## [0.6.6] - 2026-05-01
 
 ### Added

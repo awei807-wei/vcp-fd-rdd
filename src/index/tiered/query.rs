@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::core::{EventType, FileKey, FileMeta};
+use crate::core::{FileKey, FileMeta};
 use crate::index::IndexLayer;
 use crate::query::dsl::compile_query;
 use crate::query::matcher::create_matcher;
@@ -57,22 +57,18 @@ impl TieredIndex {
     pub(crate) fn collect_all_live_metas(&self) -> Vec<FileMeta> {
         let l2 = self.l2.load_full();
         let layers = self.disk_layers.read().clone();
-        let use_db = std::env::var("USE_DELTA_BUFFER").is_ok();
-        let (overlay_deleted, overlay_upserted) = if use_db {
-            let db = self.delta_buffer.lock();
-            let mut del = PathArenaSet::default();
-            for p in db.deleted_paths() {
-                let _ = del.insert(p);
-            }
-            let mut ups = PathArenaSet::default();
-            for p in db.upserted_paths() {
-                let _ = ups.insert(p);
-            }
-            (Arc::new(del), Arc::new(ups))
-        } else {
-            let ov = self.overlay_state.lock();
-            (ov.deleted_paths.clone(), ov.upserted_paths.clone())
-        };
+        let db = self.delta_buffer.lock();
+        let mut del = PathArenaSet::default();
+        for p in db.deleted_paths() {
+            let _ = del.insert(p);
+        }
+        let mut ups = PathArenaSet::default();
+        for p in db.upserted_paths() {
+            let _ = ups.insert(p);
+        }
+        drop(db);
+        let overlay_deleted = Arc::new(del);
+        let overlay_upserted = Arc::new(ups);
         let mut blocked_paths = PathArenaSet::default();
         let mut deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
         let mut seen: std::collections::HashSet<FileKey> =
@@ -138,88 +134,24 @@ impl TieredIndex {
             results.push(meta);
         });
 
-        if use_db {
-            let db = self.delta_buffer.lock();
-            for ev in db.live_records() {
-                let path = match &ev.event_type {
-                    EventType::Create | EventType::Modify | EventType::Rename { .. } => ev.best_path(),
-                    EventType::Delete => continue,
-                };
-                let Some(path) = path else { continue };
-                let path = super::normalize_path(path);
-                let path_bytes = path.as_os_str().as_encoded_bytes();
-                if blocked_paths.contains(path_bytes)
-                    || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
-                {
-                    continue;
-                }
-                let _ = blocked_paths.insert(path_bytes);
-                results.push(FileMeta {
-                    file_key: FileKey {
-                        dev: 0,
-                        ino: 0,
-                        generation: 0,
-                    },
-                    path,
-                    size: 0,
-                    mtime: None,
-                    ctime: None,
-                    atime: None,
-                });
-            }
-        } else {
-            let pending = self.pending_events.lock();
-            for ev in pending.iter() {
-                let path = match &ev.event_type {
-                    EventType::Create | EventType::Modify | EventType::Rename { .. } => ev.best_path(),
-                    EventType::Delete => continue,
-                };
-                let Some(path) = path else { continue };
-                let path = super::normalize_path(path);
-                let path_bytes = path.as_os_str().as_encoded_bytes();
-                if blocked_paths.contains(path_bytes)
-                    || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
-                {
-                    continue;
-                }
-                let _ = blocked_paths.insert(path_bytes);
-                results.push(FileMeta {
-                    file_key: FileKey {
-                        dev: 0,
-                        ino: 0,
-                        generation: 0,
-                    },
-                    path,
-                    size: 0,
-                    mtime: None,
-                    ctime: None,
-                    atime: None,
-                });
-            }
-        }
-
         results
     }
 
     fn execute_query_plan(&self, plan: &QueryPlan, limit: usize) -> Vec<FileMeta> {
         let l2 = self.l2.load_full();
         let layers = self.disk_layers.read().clone();
-        let use_db = std::env::var("USE_DELTA_BUFFER").is_ok();
-        let (overlay_deleted, overlay_upserted) = if use_db {
-            let db = self.delta_buffer.lock();
-            let mut del = PathArenaSet::default();
-            for p in db.deleted_paths() {
-                let _ = del.insert(p);
-            }
-            let mut ups = PathArenaSet::default();
-            for p in db.upserted_paths() {
-                let _ = ups.insert(p);
-            }
-            (Arc::new(del), Arc::new(ups))
-        } else {
-            let ov = self.overlay_state.lock();
-            (ov.deleted_paths.clone(), ov.upserted_paths.clone())
-        };
+        let db = self.delta_buffer.lock();
+        let mut del = PathArenaSet::default();
+        for p in db.deleted_paths() {
+            let _ = del.insert(p);
+        }
+        let mut ups = PathArenaSet::default();
+        for p in db.upserted_paths() {
+            let _ = ups.insert(p);
+        }
+        drop(db);
+        let overlay_deleted = Arc::new(del);
+        let overlay_upserted = Arc::new(ups);
         let mut blocked_paths = PathArenaSet::default();
         let mut deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
         let mut seen: std::collections::HashSet<FileKey> =
@@ -295,91 +227,6 @@ impl TieredIndex {
                     results.push(meta);
                 }
             });
-        }
-
-        // Scan pending_events for files not yet applied to L2
-        if results.len() < limit {
-            if use_db {
-                let db = self.delta_buffer.lock();
-                for ev in db.live_records() {
-                    if results.len() >= limit {
-                        break;
-                    }
-                    let path = match &ev.event_type {
-                        EventType::Create | EventType::Modify | EventType::Rename { .. } => {
-                            ev.best_path()
-                        }
-                        EventType::Delete => continue,
-                    };
-                    let Some(path) = path else { continue };
-                    let path = super::normalize_path(path);
-                    let path_bytes = path.as_os_str().as_encoded_bytes();
-                    if blocked_paths.contains(path_bytes) {
-                        continue;
-                    }
-                    let path_str = path.to_string_lossy();
-                    let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
-                    if !matches_anchor {
-                        continue;
-                    }
-                    let meta = FileMeta {
-                        file_key: FileKey {
-                            dev: 0,
-                            ino: 0,
-                            generation: 0,
-                        },
-                        path: path.to_path_buf(),
-                        size: 0,
-                        mtime: None,
-                        ctime: None,
-                        atime: None,
-                    };
-                    if plan.matches(&meta) {
-                        let _ = blocked_paths.insert(path_bytes);
-                        results.push(meta);
-                    }
-                }
-            } else {
-                let pending = self.pending_events.lock();
-                for ev in pending.iter() {
-                    if results.len() >= limit {
-                        break;
-                    }
-                    let path = match &ev.event_type {
-                        EventType::Create | EventType::Modify | EventType::Rename { .. } => {
-                            ev.best_path()
-                        }
-                        EventType::Delete => continue,
-                    };
-                    let Some(path) = path else { continue };
-                    let path = super::normalize_path(path);
-                    let path_bytes = path.as_os_str().as_encoded_bytes();
-                    if blocked_paths.contains(path_bytes) {
-                        continue;
-                    }
-                    let path_str = path.to_string_lossy();
-                    let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
-                    if !matches_anchor {
-                        continue;
-                    }
-                    let meta = FileMeta {
-                        file_key: FileKey {
-                            dev: 0,
-                            ino: 0,
-                            generation: 0,
-                        },
-                        path: path.to_path_buf(),
-                        size: 0,
-                        mtime: None,
-                        ctime: None,
-                        atime: None,
-                    };
-                    if plan.matches(&meta) {
-                        let _ = blocked_paths.insert(path_bytes);
-                        results.push(meta);
-                    }
-                }
-            }
         }
 
         results

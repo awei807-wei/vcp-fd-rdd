@@ -21,14 +21,13 @@ use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Notify;
 
-use crate::core::{AdaptiveScheduler, EventRecord};
+use crate::core::AdaptiveScheduler;
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::storage::traits::WriteAheadLog;
 
 use self::disk_layer::DiskLayer;
-use self::events::OverlayState;
 use self::rebuild::RebuildState;
 
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
@@ -55,7 +54,6 @@ pub struct TieredIndex {
     pub(self) wal: Mutex<Option<Arc<dyn WriteAheadLog + Send + Sync>>>,
     pub event_seq: AtomicU64,
     pub(self) rebuild_state: Mutex<RebuildState>,
-    pub(self) overlay_state: Mutex<OverlayState>,
     pub(self) delta_buffer: Mutex<crate::index::delta_buffer::DeltaBuffer>,
     pub(self) apply_gate: RwLock<()>,
     pub(self) flush_requested: AtomicBool,
@@ -67,7 +65,6 @@ pub struct TieredIndex {
     pub(self) pending_flush_events: AtomicU64,
     pub(self) pending_flush_bytes: AtomicU64,
     pub(self) last_snapshot_time: AtomicU64,
-    pub(self) pending_events: Mutex<Vec<EventRecord>>,
     pub roots: Vec<PathBuf>,
     pub include_hidden: bool,
     pub ignore_enabled: bool,
