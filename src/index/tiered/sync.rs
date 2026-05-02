@@ -129,34 +129,6 @@ pub(crate) struct FastSyncReport {
 }
 
 impl TieredIndex {
-    /// 启动阶段对 roots 做一次 best-effort 离线变更补偿。
-    ///
-    /// 用途：
-    /// - 守护进程停机期间新增/删除的文件不会经过 watcher/WAL；
-    /// - 对已有索引做一次全 roots fast-sync，可在不清空索引的前提下补齐新增并对齐删除。
-    #[deprecated = "将在后续阶段删除，已被基准测试框架替代"]
-    pub fn startup_reconcile(&self, ignore_prefixes: &[PathBuf]) -> (usize, usize, usize) {
-        let report = self.fast_sync(
-            DirtyScope::Dirs {
-                cutoff_ns: 0,
-                dirs: self.roots.clone(),
-            },
-            ignore_prefixes,
-        );
-        maybe_trim_rss();
-        tracing::info!(
-            "Startup reconcile complete: dirs={} upserts={} deletes={}",
-            report.dirs_scanned,
-            report.upsert_events,
-            report.delete_events
-        );
-        (
-            report.dirs_scanned,
-            report.upsert_events,
-            report.delete_events,
-        )
-    }
-
     pub(super) fn try_start_rebuild_force(&self) -> bool {
         let mut st = self.rebuild_state.lock();
         if st.in_progress {
@@ -203,7 +175,6 @@ impl TieredIndex {
                 st.requested = false;
                 st.scheduled = false;
                 st.last_started_at = Some(now);
-                return true;
             }
         }
 
@@ -211,10 +182,13 @@ impl TieredIndex {
             let idx = self.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(wait);
-                idx.spawn_rebuild("cooldown elapsed (merged)");
+                let _ = idx.try_start_rebuild_with_cooldown("cooldown elapsed (merged)");
             });
+            false
+        } else {
+            self.run_rebuild_background(reason);
+            true
         }
-        false
     }
 
     pub(super) fn finish_rebuild(self: &Arc<Self>, new_l2: Arc<PersistentIndex>) -> bool {
@@ -261,6 +235,37 @@ impl TieredIndex {
         }
     }
 
+    fn run_rebuild_background(self: &Arc<Self>, reason: &'static str) {
+        let idx = self.clone();
+        std::thread::spawn(move || {
+            let strategy = {
+                let mut sched = idx.scheduler.lock();
+                sched.adjust_parallelism();
+                sched.select_strategy(&Task::ColdBuild {
+                    total_dirs: idx.roots.len(),
+                })
+            };
+
+            tracing::warn!(
+                "Starting background rebuild: {} (strategy={:?})",
+                reason,
+                strategy
+            );
+            let new_l2 = Arc::new(PersistentIndex::new_with_roots(idx.roots.clone()));
+            idx.l3.full_build_with_strategy(&new_l2, strategy);
+            let again = idx.finish_rebuild(new_l2.clone());
+            tracing::warn!("Rebuild complete, triggering manual RSS trim...");
+            maybe_trim_rss();
+            tracing::warn!(
+                "Background rebuild complete: {} files",
+                idx.l2.load_full().file_count()
+            );
+            if again {
+                let _ = idx.try_start_rebuild_with_cooldown("merged rebuild request after rebuild");
+            }
+        });
+    }
+
     /// 后台全量构建
     pub fn spawn_full_build(self: &Arc<Self>) {
         if !self.try_start_rebuild_force() {
@@ -292,48 +297,12 @@ impl TieredIndex {
                 idx.l2.load_full().file_count()
             );
             if again {
-                idx.spawn_rebuild("merged rebuild request after full build");
+                let _ = idx.try_start_rebuild_with_cooldown("merged rebuild request after full build");
             }
         });
     }
 
-    /// overflow / watcher 异常时的兜底：清空索引并后台全量重建，避免索引长期漂移。
-    #[deprecated = "将在后续阶段删除，已被基准测试框架替代"]
-    pub fn spawn_rebuild(self: &Arc<Self>, reason: &'static str) {
-        if !self.try_start_rebuild_with_cooldown(reason) {
-            // 冷却/合并：不立即执行
-            return;
-        }
 
-        let idx = self.clone();
-        std::thread::spawn(move || {
-            let strategy = {
-                let mut sched = idx.scheduler.lock();
-                sched.adjust_parallelism();
-                sched.select_strategy(&Task::ColdBuild {
-                    total_dirs: idx.roots.len(),
-                })
-            };
-
-            tracing::warn!(
-                "Starting background rebuild: {} (strategy={:?})",
-                reason,
-                strategy
-            );
-            let new_l2 = Arc::new(PersistentIndex::new_with_roots(idx.roots.clone()));
-            idx.l3.full_build_with_strategy(&new_l2, strategy);
-            let again = idx.finish_rebuild(new_l2.clone());
-            tracing::warn!("Rebuild complete, triggering manual RSS trim...");
-            maybe_trim_rss();
-            tracing::warn!(
-                "Background rebuild complete: {} files",
-                idx.l2.load_full().file_count()
-            );
-            if again {
-                idx.spawn_rebuild("merged rebuild request after rebuild");
-            }
-        });
-    }
 
     /// overflow 兜底：dirty region + cooldown/max-staleness 触发后执行一次 fast-sync（best-effort）。
     ///
@@ -507,44 +476,23 @@ impl TieredIndex {
         // 3) 删除对齐：只对齐"被标记 dirty 的目录"下的条目（但对文件做轻量存在性检查，避免构建巨大的 names set）。
         let mut delete_events: Vec<EventRecord> = Vec::new();
 
-        if std::env::var("USE_PARENT_INDEX").is_ok() {
-            // 新路径: 使用 ParentIndex
-            let l2 = self.l2.load_full();
-            // 如果 ParentIndex 未构建，先构建
-            l2.rebuild_parent_index();
-            let to_delete = l2.delete_alignment_with_parent_index(&dirty_dirs);
-            for (_doc_id, path) in to_delete {
-                match std::fs::symlink_metadata(&path) {
-                    Ok(_) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => continue,
-                };
-                seq = seq.wrapping_add(1);
-                delete_events.push(EventRecord {
-                    seq,
-                    timestamp: std::time::SystemTime::now(),
-                    event_type: EventType::Delete,
-                    id: FileIdentifier::Path(path),
-                    path_hint: None,
-                });
-            }
-        } else {
-            // 旧路径: 保留原有 for_each_live_meta_in_dirs
-            let l2 = self.l2.load_full();
-            l2.for_each_live_meta_in_dirs(&dirty_dirs, |m| {
-                match std::fs::symlink_metadata(&m.path) {
-                    Ok(_) => return,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => return,
-                };
-                seq = seq.wrapping_add(1);
-                delete_events.push(EventRecord {
-                    seq,
-                    timestamp: std::time::SystemTime::now(),
-                    event_type: EventType::Delete,
-                    id: FileIdentifier::Path(m.path),
-                    path_hint: None,
-                });
+        let l2 = self.l2.load_full();
+        // ParentIndex 可能是空的，需要在 fast_sync 时重建
+        l2.rebuild_parent_index();
+        let to_delete = l2.delete_alignment_with_parent_index(&dirty_dirs);
+        for (_doc_id, path) in to_delete {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => continue,
+            };
+            seq = seq.wrapping_add(1);
+            delete_events.push(EventRecord {
+                seq,
+                timestamp: std::time::SystemTime::now(),
+                event_type: EventType::Delete,
+                id: FileIdentifier::Path(path),
+                path_hint: None,
             });
         }
 

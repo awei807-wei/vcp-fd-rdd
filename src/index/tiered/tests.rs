@@ -836,39 +836,3 @@ async fn lsm_offline_dir_mtime_change_skips_disk_segments() {
     assert_eq!(idx.disk_layers.read().len(), 0);
 }
 
-#[tokio::test]
-async fn startup_reconcile_recovers_offline_add_and_delete() {
-    let root = unique_tmp_dir("startup-reconcile");
-    std::fs::create_dir_all(&root).unwrap();
-
-    let a = root.join("online_keep.txt");
-    let b = root.join("online_delete.txt");
-    std::fs::write(&a, b"a").unwrap();
-    std::fs::write(&b, b"b").unwrap();
-
-    let idx = TieredIndex::empty(vec![root.clone()]);
-    idx.apply_events(&[
-        mk_event(1, EventType::Create, a.clone()),
-        mk_event(2, EventType::Create, b.clone()),
-    ]);
-    assert!(!idx.query("online_keep").is_empty());
-    assert!(!idx.query("online_delete").is_empty());
-
-    // 模拟停机期间的离线变化
-    std::fs::remove_file(&b).unwrap();
-    let c = root.join("offline_new.txt");
-    std::fs::write(&c, b"c").unwrap();
-
-    let (dirs, upserts, deletes) = idx.startup_reconcile(&[]);
-    assert!(dirs >= 1);
-    assert!(upserts >= 1);
-    // 同上：inode 复用时 offline add/delete 可能收敛为一次路径 reconcile。
-    assert!(
-        deletes >= 1 || upserts >= 2,
-        "expected a delete event or a same-FileKey reconcile: dirs={dirs} upserts={upserts} deletes={deletes}"
-    );
-
-    assert!(!idx.query("online_keep").is_empty());
-    assert!(idx.query("online_delete").is_empty());
-
-}

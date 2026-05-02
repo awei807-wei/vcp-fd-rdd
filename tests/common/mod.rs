@@ -123,7 +123,7 @@ pub fn wait_for_index_stable(
     let mut last_change = start;
 
     loop {
-        // 跳过 rebuild 进行中的状态：full_build/spawn_rebuild 期间
+        // 跳过 rebuild 进行中的状态：full_build 期间
         // file_count() 可能不变（正构建新索引），不应视为"稳定"。
         if fd_rdd_client::is_rebuilding(port).unwrap_or(false) {
             last_change = std::time::Instant::now();

@@ -886,43 +886,6 @@ impl PersistentIndex {
         }
     }
 
-    /// Iterate live metas whose path's parent is in `dirs`.
-    pub fn for_each_live_meta_in_dirs<F>(
-        &self,
-        dirs: &std::collections::HashSet<PathBuf>,
-        mut callback: F,
-    ) where
-        F: FnMut(FileMeta),
-    {
-        let metas = self.metas.read();
-        let arena = self.arena.read();
-        let tombstones = self.tombstones.read();
-        for (i, m) in metas.iter().enumerate() {
-            let docid = i as DocId;
-            if tombstones.contains(docid) {
-                continue;
-            }
-            let rel = match arena.get_bytes(m.path_off, m.path_len) {
-                Some(r) => r,
-                None => continue,
-            };
-            let abs = compose_abs_path_bytes(root_bytes_for_id(&self.roots_bytes, m.root_id), rel);
-            let path = pathbuf_from_encoded_vec(abs.to_vec());
-            if let Some(parent) = path.parent() {
-                if dirs.contains(parent) {
-                    callback(FileMeta {
-                        file_key: m.file_key,
-                        path,
-                        size: m.size,
-                        mtime: mtime_from_ns(m.mtime_ns),
-                        ctime: None,
-                        atime: None,
-                    });
-                }
-            }
-        }
-    }
-
     /// 构建/重建 ParentIndex
     pub fn rebuild_parent_index(&self) {
         let mut dir_to_files: HashMap<Vec<u8>, RoaringTreemap> = HashMap::new();
@@ -955,8 +918,7 @@ impl PersistentIndex {
         *self.parent_index.write() = Some(new_index);
     }
 
-    /// 使用 ParentIndex 的删除对齐（替代 for_each_live_meta_in_dirs）
-    #[allow(dead_code)]
+    /// 使用 ParentIndex 的删除对齐
     pub fn delete_alignment_with_parent_index(
         &self,
         dirty_dirs: &std::collections::HashSet<PathBuf>,

@@ -193,12 +193,6 @@ async fn main() -> anyhow::Result<()> {
     );
     pipeline.start().await?;
 
-    // 5.5) 启动阶段 best-effort 补偿停机期间的离线变更。
-    // 仅在已有索引内容时执行，避免与空索引冷启动 full_build 重复做全量工作。
-    if index.file_count() > 0 {
-        let _ = index.startup_reconcile(&startup_ignore_paths);
-    }
-
     // 6) 启动 HTTP 查询服务
     let health_provider = {
         let index = index.clone();

@@ -223,6 +223,10 @@ impl TieredIndex {
             );
             idx.attach_wal(store)?;
             idx.replay_wal_if_any(lsm.wal_seal_id);
+            {
+                let l2 = idx.l2.load_full();
+                l2.rebuild_parent_index();
+            }
             return Ok(idx);
         }
 
@@ -249,6 +253,10 @@ impl TieredIndex {
             idx.attach_wal(store)?;
             // legacy v6 没有 LSM manifest checkpoint：保守回放全部 WAL（如果存在）。
             idx.replay_wal_if_any(0);
+            {
+                let l2 = idx.l2.load_full();
+                l2.rebuild_parent_index();
+            }
             return Ok(idx);
         }
 
@@ -276,6 +284,10 @@ impl TieredIndex {
         );
         idx.attach_wal(store)?;
         idx.replay_wal_if_any(0);
+        {
+            let l2 = idx.l2.load_full();
+            l2.rebuild_parent_index();
+        }
         Ok(idx)
     }
 
