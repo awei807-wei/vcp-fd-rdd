@@ -6,8 +6,6 @@ use crate::core::{EventRecord, EventType};
 pub struct DeltaBuffer {
     /// 路径(bytes) → 最新增量状态（按路径去重）
     entries: HashMap<Vec<u8>, DeltaState>,
-    /// 容量上限（默认 262_144 = 256K）
-    capacity: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -22,7 +20,6 @@ impl DeltaBuffer {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(cap.min(1024)),
-            capacity: cap,
         }
     }
 

@@ -10,7 +10,13 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-当前 tests 分支发布版本为 v0.6.8（DeltaBuffer 默认启用 + 旧增量缓冲区清理）。
+当前 tests 分支发布版本为 v0.6.9（ParentIndex 查询加速 + 死代码清理）。
+
+## v0.6.9 更新（Phase 6: ParentIndex 查询加速 + 死代码清理）
+
+- 集成 ParentIndex 到查询路径：`parent:`/`infolder:` 过滤器现在利用预构建的父目录索引预过滤 L2 候选
+- 减少 parent 过滤查询中的锚点扫描和元数据查找次数
+- 清理 accumulated dead_code 警告：`DiskLayer.id`、`fill_from_compaction`、`PathArenaSet` 未使用方法、`DeltaBuffer.capacity`
 
 ## v0.6.8 更新（Phase 5: DeltaBuffer 默认启用）
 

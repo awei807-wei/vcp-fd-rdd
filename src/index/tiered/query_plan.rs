@@ -39,4 +39,11 @@ impl QueryPlan {
             QueryEvaluator::Compiled(compiled) => compiled.matches(meta),
         }
     }
+
+    pub(super) fn parent_filter(&self) -> Option<String> {
+        match &self.evaluator {
+            QueryEvaluator::Compiled(compiled) => compiled.extract_parent_filter(),
+            QueryEvaluator::Legacy(_) => None,
+        }
+    }
 }

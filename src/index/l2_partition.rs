@@ -945,6 +945,27 @@ impl PersistentIndex {
         }
     }
 
+    /// 使用 ParentIndex 查询某目录下的文件候选（Query 加速）
+    pub fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
+        let parent_idx = self.parent_index.read();
+        let Some(index) = parent_idx.as_ref() else {
+            return Vec::new();
+        };
+        let parent_pathbuf = PathBuf::from(parent_path);
+        let Some(bitmap) = index.files_in_dir(&parent_pathbuf) else {
+            return Vec::new();
+        };
+
+        let metas = self.metas.read();
+        let mut keys = Vec::with_capacity(bitmap.len() as usize);
+        for doc_id in bitmap.iter() {
+            if let Some(meta) = metas.get(doc_id as usize) {
+                keys.push(meta.file_key);
+            }
+        }
+        keys
+    }
+
     /// 批量应用事件
     pub fn apply_events(&self, events: &[EventRecord]) {
         for ev in events {
@@ -1979,80 +2000,6 @@ fn normalize_roots_with_fallback(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
     out.push(slash);
     out.extend(roots);
     out
-}
-
-impl PersistentIndex {
-    /// Fast-path bulk fill used by compaction dimension reduction.
-    /// Directly replaces metas, arena, trigram_index, and derived maps.
-    /// Paths are taken from `metas` (full FileMeta with absolute paths).
-    /// `trigrams` contains pre-merged DocId posting lists (DocId matches index in `metas`).
-    pub(crate) fn fill_from_compaction(
-        &self,
-        _roots: Vec<PathBuf>,
-        metas: Vec<FileMeta>,
-        trigrams: std::collections::HashMap<[u8; 3], roaring::RoaringTreemap>,
-    ) {
-        // Reset internal state
-        {
-            *self.metas.write() = Vec::new();
-            *self.arena.write() = PathArena::new();
-            *self.filekey_to_docid.write() = HashMap::new();
-            *self.path_hash_to_id.write() = HashMap::new();
-            *self.trigram_index.write() = HashMap::new();
-            *self.short_component_index.write() = HashMap::new();
-            *self.tombstones.write() = RoaringTreemap::new();
-            self.dirty.store(true, std::sync::atomic::Ordering::Release);
-        }
-
-        let mut new_metas = Vec::with_capacity(metas.len());
-        let mut new_arena = PathArena::new();
-        let mut new_filekey_to_docid = HashMap::new();
-        let mut new_path_hash_to_id = HashMap::new();
-        let mut new_short_component_index: HashMap<u16, RoaringTreemap> = HashMap::new();
-
-        for (docid, meta) in metas.into_iter().enumerate() {
-            let docid = docid as DocId;
-            let (root_id, rel_bytes) = self.split_root_relative_bytes(&meta.path);
-
-            let Some((off, len)) = new_arena.push_bytes(&rel_bytes) else {
-                continue;
-            };
-
-            new_metas.push(CompactMeta {
-                file_key: meta.file_key,
-                root_id,
-                path_off: off,
-                path_len: len,
-                size: meta.size,
-                mtime_ns: mtime_to_ns(meta.mtime),
-            });
-
-            new_filekey_to_docid.insert(meta.file_key, docid);
-
-            let bytes = meta.path.as_os_str().as_encoded_bytes();
-            let h = path_hash_bytes(bytes);
-            new_path_hash_to_id
-                .entry(h)
-                .and_modify(|v: &mut OneOrManyDocId| v.insert(docid))
-                .or_insert(OneOrManyDocId::One(docid));
-
-            for_each_short_component(meta.path.as_path(), |component| {
-                new_short_component_index
-                    .entry(component)
-                    .or_default()
-                    .insert(docid);
-            });
-        }
-
-        {
-            *self.metas.write() = new_metas;
-            *self.arena.write() = new_arena;
-            *self.filekey_to_docid.write() = new_filekey_to_docid;
-            *self.path_hash_to_id.write() = new_path_hash_to_id;
-            *self.trigram_index.write() = trigrams;
-            *self.short_component_index.write() = new_short_component_index;
-        }
-    }
 }
 
 #[cfg(test)]

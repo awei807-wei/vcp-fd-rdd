@@ -7,7 +7,6 @@ use super::arena::PathArenaSet;
 
 #[derive(Clone)]
 pub(super) struct DiskLayer {
-    pub(super) id: u64,
     pub(super) idx: Arc<MmapIndex>,
     pub(super) deleted_paths: Arc<PathArenaSet>,
     pub(super) deleted_paths_count: usize,

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.9] - 2026-05-01
+
+### Phase 6: ParentIndex query acceleration + dead code cleanup
+
+- Integrate ParentIndex into query path for `parent:`/`infolder:` filters
+- Add `extract_parent_filter()` to `CompiledQuery`
+- Add `parent_candidates()` to `PersistentIndex`
+- Clean up dead_code warnings (DiskLayer.id, fill_from_compaction, PathArenaSet methods, DeltaBuffer.capacity)
+
 ## [0.6.8] - 2026-05-01
 
 ### Phase 5: DeltaBuffer Default Enable

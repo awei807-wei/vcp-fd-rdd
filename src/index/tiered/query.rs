@@ -158,6 +158,32 @@ impl TieredIndex {
             std::collections::HashSet::with_capacity(l2.file_count().saturating_add(256));
         let mut results: Vec<FileMeta> = Vec::with_capacity(limit.min(128));
 
+        // ParentIndex fast path: if query has a parent filter, get exact candidates from L2
+        if let Some(ref parent_path) = plan.parent_filter() {
+            let candidates = l2.parent_candidates(parent_path);
+            for key in candidates {
+                if !seen.insert(key) {
+                    continue;
+                }
+                let Some(meta) = l2.get_meta(key) else {
+                    continue;
+                };
+                let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+                if blocked_paths.contains(path_bytes)
+                    || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
+                {
+                    continue;
+                }
+                let _ = blocked_paths.insert(path_bytes);
+                if plan.matches(&meta) {
+                    results.push(meta);
+                    if results.len() >= limit {
+                        return results;
+                    }
+                }
+            }
+        }
+
         if self.query_layer(
             plan,
             l2.as_ref(),

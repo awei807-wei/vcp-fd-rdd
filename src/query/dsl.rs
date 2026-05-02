@@ -116,6 +116,20 @@ impl CompiledQuery {
         }
         true
     }
+
+    pub fn extract_parent_filter(&self) -> Option<String> {
+        Self::find_parent_in_expr(&self.include)
+    }
+
+    fn find_parent_in_expr(expr: &CompiledExpr) -> Option<String> {
+        match expr {
+            CompiledExpr::Filter(Filter::Parent(p)) => Some(p.clone()),
+            CompiledExpr::And(v) | CompiledExpr::Or(v) => {
+                v.iter().find_map(|e| Self::find_parent_in_expr(e))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]

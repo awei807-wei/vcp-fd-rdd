@@ -187,7 +187,6 @@ impl TieredIndex {
                 let deleted_paths = Arc::new(path_arena_set_from_paths(b.deleted_paths));
                 let (cnt, bytes, est) = deleted_paths_stats(deleted_paths.as_ref());
                 layers.push(DiskLayer {
-                    id: b.id,
                     idx: Arc::new(MmapIndex::new(b.snap)),
                     deleted_paths,
                     deleted_paths_count: cnt,
@@ -199,7 +198,6 @@ impl TieredIndex {
                 let deleted_paths = Arc::new(path_arena_set_from_paths(d.deleted_paths));
                 let (cnt, bytes, est) = deleted_paths_stats(deleted_paths.as_ref());
                 layers.push(DiskLayer {
-                    id: d.id,
                     idx: Arc::new(MmapIndex::new(d.snap)),
                     deleted_paths,
                     deleted_paths_count: cnt,
@@ -230,7 +228,6 @@ impl TieredIndex {
         // 兼容：legacy v6 单文件（mmap + lazy decode），作为长期 base 使用（不再 hydration）。
         if let Ok(Some(snap)) = store.load_v6_mmap_if_valid(&roots) {
             let base = DiskLayer {
-                id: 0,
                 idx: Arc::new(MmapIndex::new(snap)),
                 deleted_paths: Arc::new(PathArenaSet::default()),
                 deleted_paths_count: 0,

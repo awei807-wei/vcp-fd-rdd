@@ -133,7 +133,6 @@ impl TieredIndex {
             let deleted_paths = Arc::new(path_arena_set_from_paths(base_deleted_paths));
             let (cnt, bytes, est) = deleted_paths_stats(deleted_paths.as_ref());
             let new_layer = DiskLayer {
-                id: base.id,
                 idx: Arc::new(MmapIndex::new(base.snap)),
                 deleted_paths,
                 deleted_paths_count: cnt,
@@ -169,7 +168,6 @@ impl TieredIndex {
         let deleted_paths = Arc::new(path_arena_set_from_paths(seg_deleted_paths));
         let (cnt, bytes, est) = deleted_paths_stats(deleted_paths.as_ref());
         self.disk_layers.write().push(DiskLayer {
-            id: seg.id,
             idx: Arc::new(MmapIndex::new(seg.snap)),
             deleted_paths,
             deleted_paths_count: cnt,

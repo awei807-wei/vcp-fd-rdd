@@ -58,8 +58,6 @@ pub(crate) struct PathArenaSet {
 }
 
 impl PathArenaSet {
-    const ARENA_KEEP_BYTES: usize = 256 * 1024;
-    const MAP_KEEP_CAP: usize = 1024;
 
     pub(crate) fn len_paths(&self) -> usize {
         self.paths_len
@@ -67,22 +65,6 @@ impl PathArenaSet {
 
     pub(crate) fn active_bytes(&self) -> u64 {
         self.active_bytes
-    }
-
-    pub(crate) fn arena_len(&self) -> usize {
-        self.arena.len()
-    }
-
-    pub(crate) fn arena_cap(&self) -> usize {
-        self.arena.capacity()
-    }
-
-    pub(crate) fn map_len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub(crate) fn map_cap(&self) -> usize {
-        self.map.capacity()
     }
 
     fn bytes_at(&self, span: Span) -> Option<&[u8]> {
@@ -138,58 +120,6 @@ impl PathArenaSet {
         true
     }
 
-    /// 返回 true 表示存在并移除
-    pub(crate) fn remove(&mut self, bytes: &[u8]) -> bool {
-        let h = hash_bytes64(bytes);
-        let arena: &[u8] = &self.arena;
-
-        let span_eq = |s: Span, bytes: &[u8]| -> bool {
-            let r = s.range();
-            arena.get(r).is_some_and(|b| b == bytes)
-        };
-
-        let mut removed = false;
-        let mut drop_key = false;
-        {
-            let Some(v) = self.map.get_mut(&h) else {
-                return false;
-            };
-            match v {
-                OneOrManySpan::One(s) => {
-                    if span_eq(*s, bytes) {
-                        removed = true;
-                        drop_key = true;
-                    }
-                }
-                OneOrManySpan::Many(vs) => {
-                    if let Some(i) = vs.iter().position(|s| span_eq(*s, bytes)) {
-                        vs.swap_remove(i);
-                        removed = true;
-                    }
-                    if removed {
-                        if vs.is_empty() {
-                            drop_key = true;
-                        } else if vs.len() == 1 {
-                            let only = vs[0];
-                            *v = OneOrManySpan::One(only);
-                        }
-                    }
-                }
-            }
-        }
-
-        if !removed {
-            return false;
-        }
-        if drop_key {
-            self.map.remove(&h);
-        }
-
-        self.paths_len = self.paths_len.saturating_sub(1);
-        self.active_bytes = self.active_bytes.saturating_sub(bytes.len() as u64);
-        true
-    }
-
     pub(crate) fn for_each_bytes(&self, mut f: impl FnMut(&[u8])) {
         for v in self.map.values() {
             for s in v.iter() {
@@ -205,16 +135,6 @@ impl PathArenaSet {
         self.arena.clear();
         self.paths_len = 0;
         self.active_bytes = 0;
-    }
-
-    /// flush/rebuild 后按阈值回收容量，避免历史高水位长期常驻。
-    pub(crate) fn maybe_shrink_after_clear(&mut self) {
-        if self.arena.capacity() > Self::ARENA_KEEP_BYTES * 2 {
-            self.arena.shrink_to(Self::ARENA_KEEP_BYTES);
-        }
-        if self.map.capacity() > Self::MAP_KEEP_CAP * 2 {
-            self.map.shrink_to(Self::MAP_KEEP_CAP);
-        }
     }
 
     /// 估算 overlay 堆占用（粗估、偏保守）：arena + HashMap 桶 + collision Vec 容量。
