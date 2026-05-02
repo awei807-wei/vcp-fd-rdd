@@ -44,6 +44,8 @@ pub struct EventPipeline {
     ignore_filter: Option<IgnoreFilter>,
     /// Directory names that are never indexed.
     exclude_dirs: Vec<String>,
+    /// Optional watch root override used by budgeted watcher modes.
+    watch_roots: Option<Vec<PathBuf>>,
     /// 共享计数器：累计处理事件数
     pub total_events: Arc<AtomicU64>,
     /// 共享计数器：最近批次大小
@@ -75,6 +77,7 @@ impl EventPipeline {
             ignore_paths: Vec::new(),
             ignore_filter: None,
             exclude_dirs: Vec::new(),
+            watch_roots: None,
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -96,6 +99,7 @@ impl EventPipeline {
             ignore_paths: Vec::new(),
             ignore_filter: None,
             exclude_dirs: Vec::new(),
+            watch_roots: None,
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -122,6 +126,7 @@ impl EventPipeline {
             ignore_paths,
             ignore_filter: None,
             exclude_dirs: Vec::new(),
+            watch_roots: None,
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -146,6 +151,11 @@ impl EventPipeline {
         self
     }
 
+    pub fn with_watch_roots(mut self, watch_roots: Vec<PathBuf>) -> Self {
+        self.watch_roots = Some(watch_roots);
+        self
+    }
+
     /// 获取事件管道统计
     pub fn stats(&self) -> EventPipelineStats {
         EventPipelineStats {
@@ -164,7 +174,10 @@ impl EventPipeline {
 
     /// 启动事件管道
     pub async fn start(&self) -> anyhow::Result<()> {
-        let roots = self.index.roots.clone();
+        let roots = self
+            .watch_roots
+            .clone()
+            .unwrap_or_else(|| self.index.roots.clone());
         let overflow_drops = self.overflow_drops.clone();
         let rescan_signals = self.rescan_signals.clone();
         let keep_cap = self.channel_size.max(256);

@@ -126,9 +126,13 @@
 - 补齐 RSS 回吐触发点：memory report loop 在 heap high-water suspected 时执行 trim；事件批处理结束并进入 idle 后对本轮事件高水位做一次 trim；HTTP 新增 `/trim` 手动触发端点。
 - ParentIndex 运行时表示从每目录 `RoaringBitmap` 改为排序 `Vec<u32>` 直属文件列表；v7 父索引段仍按旧 Roaring 编码读写兼容，但加载后不再常驻大量小 Roaring 对象。
 - 新增 `watch_enabled` / `--no-watch` 静态模式，用于验证 watcher 在大 `$HOME` 场景下的常驻 RSS，并支持只读快照查询 + 手动 `/scan`。
+- 新增 `watch_mode = "recursive" | "tiered" | "off"` 和 `--watch-mode`；默认保持 recursive，tiered 作为预算受控热点监听预览模式，先按 XDG 热点目录和 `max_watch_dirs` 准入 L0。
+- HTTP 新增 `/watch-state`，输出 watcher 模式、L0/L1/L2/L3 数量、估算 watch 目录预算、扫描 backlog 和 tiered 调度说明。
+- tiered 模式下未准入 L0 的热点候选进入有界 warm-scan loop，按 `l1_scan_interval_secs` 和 `scan_items_per_sec` 分批浅扫，避免直接回到全递归 watcher RSS。
 
 仍保留 / 后续处理：
 
 - `spawn_full_build` 仍作为无 v7 快照时的 fallback。
 - legacy v6 snapshot 底层 API 仍存在，但不再由 `TieredIndex` 加载热路径使用。
 - `refresh_base()` 仍是全量 materialize；仅应作为 snapshot/rebuild/测试兼容入口使用，不能重新放回普通事件批次或查询常规路径。
+- tiered watcher 当前仍是第一阶段控制面和 L1 warm scan 骨架，尚未实现动态事件评分、L0 替换、L1/L2/L3 迟滞降级和 fanotify 后端。

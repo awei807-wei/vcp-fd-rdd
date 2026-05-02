@@ -153,8 +153,79 @@ pub struct Config {
     pub follow_symlinks: bool,
     /// Enable filesystem watcher for incremental updates.
     pub watch_enabled: bool,
+    /// Watcher operating mode. `watch_enabled = false` is treated as `off` for legacy configs.
+    pub watch_mode: WatchMode,
+    /// Budgeted tiered watcher configuration.
+    pub tiered_watch: TieredWatchConfig,
     /// Directory names that are never indexed, regardless of .gitignore rules.
     pub exclude_dirs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WatchMode {
+    Recursive,
+    Tiered,
+    Off,
+}
+
+impl Default for WatchMode {
+    fn default() -> Self {
+        Self::Recursive
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TieredWatchConfig {
+    /// Upper bound for estimated recursive inotify watches admitted into L0.
+    pub max_watch_dirs: usize,
+    /// Token budget for L1/L2 scan work. First tiered implementation uses this as diagnostics.
+    pub scan_items_per_sec: usize,
+    /// Maximum scan wall time per scheduler tick.
+    pub scan_ms_per_tick: u64,
+    /// L0 idle TTL before demotion is considered.
+    pub l0_idle_ttl_secs: u64,
+    /// Warm verification interval.
+    pub l1_scan_interval_secs: u64,
+    /// Cold verification interval.
+    pub l2_scan_interval_secs: u64,
+    /// Empty L1 scans before demotion to L2.
+    pub l1_empty_scans_to_l2: u32,
+    /// Empty L2 scans before demotion to L3.
+    pub l2_empty_scans_to_l3: u32,
+    /// Initial hot directory candidates. `~` is expanded during config load.
+    pub hot_dirs: Vec<PathBuf>,
+}
+
+impl Default for TieredWatchConfig {
+    fn default() -> Self {
+        Self {
+            max_watch_dirs: 8_192,
+            scan_items_per_sec: 5_000,
+            scan_ms_per_tick: 20,
+            l0_idle_ttl_secs: 7_200,
+            l1_scan_interval_secs: 30,
+            l2_scan_interval_secs: 300,
+            l1_empty_scans_to_l2: 5,
+            l2_empty_scans_to_l3: 3,
+            hot_dirs: default_hot_dirs(),
+        }
+    }
+}
+
+fn default_hot_dirs() -> Vec<PathBuf> {
+    [
+        "~/Downloads",
+        "~/Documents",
+        "~/Desktop",
+        "~/Music",
+        "~/Pictures",
+        "~/Videos",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
 }
 
 impl Default for Config {
@@ -169,6 +240,8 @@ impl Default for Config {
             include_hidden: false,
             follow_symlinks: false,
             watch_enabled: true,
+            watch_mode: WatchMode::Recursive,
+            tiered_watch: TieredWatchConfig::default(),
             exclude_dirs: default_exclude_dirs(),
         }
     }
@@ -202,6 +275,12 @@ impl Config {
             append_missing_exclude_dirs(path, &text, &cfg.exclude_dirs)?;
         }
         cfg.roots = cfg.roots.into_iter().map(expand_tilde_path).collect();
+        cfg.tiered_watch.hot_dirs = cfg
+            .tiered_watch
+            .hot_dirs
+            .into_iter()
+            .map(expand_tilde_path)
+            .collect();
         if let Some(socket) = cfg.socket_path.take() {
             cfg.socket_path = Some(expand_tilde_path(socket));
         }

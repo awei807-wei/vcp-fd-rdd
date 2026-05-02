@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added automatic high-water RSS trimming in the memory report loop, a one-shot idle trim after event bursts, and `GET/POST /trim` for manual allocator collection.
 - Replaced runtime `ParentIndex` per-directory `RoaringBitmap` storage with sorted `Vec<u32>` direct-child doc IDs, keeping v7 parent segment compatibility while reducing many small heap allocations.
 - Added `watch_enabled` config and `--no-watch` to run in static snapshot/manual-scan mode, allowing watcher memory attribution and low-RSS read-only operation.
+- Added `watch_mode = "recursive" | "tiered" | "off"` plus `--watch-mode`; tiered mode admits only budgeted hot directory candidates into L0 and scans rejected candidates with a bounded warm-scan loop.
+- Added `GET /watch-state` to expose watcher mode, L0/L1 counts, estimated watch budget use, scan backlog, and tiered scheduler notes.
 
 ### PersistentIndex storage migration
 

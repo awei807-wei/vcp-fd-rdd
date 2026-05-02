@@ -162,6 +162,28 @@ pub struct EventPipelineStats {
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct WatchStateReport {
+    pub mode: String,
+    pub backend: String,
+    pub l0_dirs: usize,
+    pub l1_dirs: usize,
+    pub l2_dirs: usize,
+    pub l3_dirs: usize,
+    pub watched_dirs_estimated: usize,
+    pub max_watch_dirs: usize,
+    pub l0_candidates: usize,
+    pub l0_admitted: usize,
+    pub l0_rejected: usize,
+    pub scan_backlog: usize,
+    pub scan_items_per_sec: usize,
+    pub scan_ms_per_tick: u64,
+    pub promotions: u64,
+    pub demotions: u64,
+    pub last_adjustment_unix_secs: u64,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct OverlayStats {
     pub deleted_paths: usize,
     pub upserted_paths: usize,

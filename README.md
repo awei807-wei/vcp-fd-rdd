@@ -25,6 +25,8 @@
 - **RSS 回吐补齐**：内存报告循环发现 heap high-water 时会主动 trim，事件风暴结束进入 idle 后会做一次 trim，并提供 `GET/POST /trim` 手动触发。
 - **ParentIndex 轻量化**：运行时目录反查索引从每目录 `RoaringBitmap` 改为排序 `Vec<u32>`，保留精确 `parent:` / `infolder:` 和 fast-sync 删除对齐能力，减少小对象堆碎片。
 - **Watcher 可关闭**：新增配置 `watch_enabled` 与 CLI `--no-watch`，支持只加载快照/手动 `/scan` 的静态模式，用于大 `$HOME` 场景下验证和降低 watcher 常驻开销。
+- **Tiered watcher 预览**：新增 `watch_mode = "recursive" | "tiered" | "off"` 与 `--watch-mode`；`tiered` 先把 XDG 热点目录按 `max_watch_dirs` 预算准入 L0，未准入候选进入有界 warm scan。
+- **Watcher 诊断端点**：新增 `GET /watch-state`，返回当前 watcher 模式、L0/L1 数量、估算 watch 预算、扫描 backlog 和调度说明。
 - **验证**：`cargo test -q` 全量通过。
 
 ## v0.6.12 更新（收尾稳定化）
@@ -466,6 +468,7 @@ cargo build --release --no-default-features
 - 默认会读取 `.gitignore`、`.ignore`、`.git/info/exclude` 和全局 gitignore；如需关闭这套规则，可显式传入 `--no-ignore`。
 - 默认还会在索引入口硬排除常见依赖、构建和缓存目录：`.git`、`.cache`、`.cargo`、`.npm`、`.pnpm-store`、`.yarn`、`node_modules`、`target`、`dist`、`build`、`vendor`。这些路径不会进入索引；现有配置缺少 `exclude_dirs` 时，fd-rdd 会在启动时把默认列表追加写入 `config.toml`，之后以用户手动编辑后的列表为准。也可重复传入 `--exclude-dir dir_name` 临时增补。
 - 如需验证 watcher 常驻内存或运行只读查询模式，可传入 `--no-watch`；此时索引不会自动响应文件事件，需使用 `POST /scan` 或重建来更新。
+- 如需试运行预算受控热点监听，可传入 `--watch-mode tiered` 或在配置中设置 `watch_mode = "tiered"`；默认仍为 `recursive`，`--no-watch` 等价于关闭 watcher。
 
 查询：
 
@@ -495,11 +498,13 @@ UDS 流式查询（推荐用于大结果集；边收边输出，不聚合）：
 
 ```bash
 curl "http://127.0.0.1:6060/health"
+curl "http://127.0.0.1:6060/watch-state"
 ```
 
 说明：
 
 - `/health` 会额外返回 `index_health`、`last_snapshot_time`、`watch_failures`、`watcher_degraded`、`degraded_roots`、`overflow_drops`、`rescan_signals` 与 `issues`，便于判断索引是否处于降级轮询或尚未写出首个快照。
+- `/watch-state` 用于解释 watcher 控制面：`recursive` 表示现有全递归监听，`off` 表示静态模式，`tiered` 表示只将预算内热点候选放入 L0，剩余候选进入 warm scan backlog。
 
 ## 内存与长期运行（如何判断"好用"）
 

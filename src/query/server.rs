@@ -1,7 +1,7 @@
 use crate::index::TieredIndex;
 use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
 use crate::query::{execute_query, QueryMode, SortColumn, SortOrder};
-use crate::stats::{EventPipelineStats, MemoryReport, StatsReport};
+use crate::stats::{EventPipelineStats, MemoryReport, StatsReport, WatchStateReport};
 use crate::util::maybe_trim_rss;
 use axum::{
     extract::{Query, State},
@@ -112,6 +112,7 @@ struct QueryServerState {
     start_time: Instant,
     health_provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync>,
     stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync>,
+    watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
 }
 
 pub struct QueryServer {
@@ -119,6 +120,7 @@ pub struct QueryServer {
     config: QueryServerConfig,
     health_provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync>,
     stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync>,
+    watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
 }
 
 impl QueryServer {
@@ -128,6 +130,7 @@ impl QueryServer {
             config: QueryServerConfig::default(),
             health_provider: Arc::new(HealthTelemetry::default),
             stats_provider: Arc::new(EventPipelineStats::default),
+            watch_state_provider: Arc::new(WatchStateReport::default),
         }
     }
 
@@ -147,6 +150,14 @@ impl QueryServer {
         self
     }
 
+    pub fn with_watch_state_provider(
+        mut self,
+        provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
+    ) -> Self {
+        self.watch_state_provider = provider;
+        self
+    }
+
     pub async fn run(self, port: u16) -> anyhow::Result<()> {
         let state = QueryServerState {
             index: self.index,
@@ -154,12 +165,14 @@ impl QueryServer {
             start_time: Instant::now(),
             health_provider: self.health_provider,
             stats_provider: self.stats_provider,
+            watch_state_provider: self.watch_state_provider,
         };
         let app = Router::new()
             .route("/search", get(search_handler))
             .route("/status", get(status_handler))
             .route("/health", get(health_handler))
             .route("/memory", get(memory_handler))
+            .route("/watch-state", get(watch_state_handler))
             .route("/trim", get(trim_handler).post(trim_handler))
             .route("/metrics", get(metrics_handler))
             .route("/scan", post(scan_handler))
@@ -308,6 +321,10 @@ async fn metrics_handler(State(_state): State<QueryServerState>) -> impl IntoRes
 
 async fn memory_handler(State(state): State<QueryServerState>) -> Json<MemoryReport> {
     Json(state.index.memory_report((state.stats_provider)()))
+}
+
+async fn watch_state_handler(State(state): State<QueryServerState>) -> Json<WatchStateReport> {
+    Json((state.watch_state_provider)())
 }
 
 async fn trim_handler() -> Json<TrimResponse> {
