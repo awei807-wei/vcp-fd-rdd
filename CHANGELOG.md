@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.11] - 2026-05-01
+
+### Phase 8: DeltaBuffer 硬容量上限 + PathTable 内存优化 + Hybrid Crawler 清理
+
+- **DeltaBuffer 硬容量上限**：默认 `max_capacity = 256 * 1024`，`insert`/`apply_events` 返回 `bool` 表示是否因容量限制丢弃
+- **容量满自动 flush**：`TieredEvents::apply_tiered_events` 在检测到 `apply_events` 返回 `false` 时自动触发 flush
+- **PathTable + FileEntry**：新增 `PathTable`（`path_to_id`/`id_to_path` 双射表），`FileEntry` 用 `PathId: u32` 替代 `PathBuf`，目标节省约 75% 内存（800MB → 200MB）
+- **Hybrid Crawler 清理**：删除 `startup_reconcile`、`spawn_rebuild`、`reconcile_degraded_root`、overflow recovery loop、`DirtyTracker`；`spawn_fast_sync`/`spawn_repair` 签名简化，移除定时器驱动，改为纯事件驱动
+- **编译/测试验证**：`cargo check` 0 errors 0 warnings；`cargo test --lib` 145 passed；`cargo test --test '*'` 2 passed；`cargo build --release` 成功
+
 ## [0.6.10] - 2026-05-01
 
 ### Phase 7: ParentIndex 增量维护正确性修复 + 死代码清理

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::event::recovery::DirtyTracker;
+
 
 /// Heuristic check for ENOSPC / NoStorageSpace errors from notify/inotify.
 fn is_enospc_error(e: &notify::Error) -> bool {
@@ -46,7 +46,6 @@ fn handle_notify_result(
     priority_tx: &mpsc::Sender<notify::Event>,
     normal_tx: &mpsc::Sender<notify::Event>,
     channel_size: usize,
-    dirty: Option<&DirtyTracker>,
     rescan_signals: &AtomicU64,
     res: notify::Result<notify::Event>,
 ) {
@@ -55,9 +54,6 @@ fn handle_notify_result(
             // inotify 队列溢出（Q_OVERFLOW）会被 notify 标记为 Rescan：无 path，需要全局 dirty。
             if event.need_rescan() {
                 rescan_signals.fetch_add(1, Ordering::Relaxed);
-                if let Some(d) = dirty {
-                    d.mark_dirty_all();
-                }
             }
 
             // 分级队列：Create 事件走快速路径
@@ -83,9 +79,6 @@ fn handle_notify_result(
                     "inotify watch limit exceeded (ENOSPC): {} — marking all dirty for fallback reconciliation",
                     e
                 );
-                if let Some(d) = dirty {
-                    d.mark_dirty_all();
-                }
             } else {
                 tracing::debug!("notify error (non-fatal): {}", e);
             }
@@ -113,14 +106,12 @@ impl EventWatcher {
         channel_size: usize,
         _overflow_drops: Arc<AtomicU64>,
         rescan_signals: Arc<AtomicU64>,
-        dirty: Option<Arc<DirtyTracker>>,
     ) -> anyhow::Result<WatcherBundle> {
         if channel_size == 0 {
             anyhow::bail!("event channel_size must be >= 1");
         }
         let (priority_tx, priority_rx) = mpsc::channel(channel_size);
         let (normal_tx, normal_rx) = mpsc::channel(channel_size);
-        let dirty = dirty.clone();
 
         let priority_tx_clone = priority_tx.clone();
         let normal_tx_clone = normal_tx.clone();
@@ -131,7 +122,6 @@ impl EventWatcher {
                     &priority_tx,
                     &normal_tx,
                     channel_size,
-                    dirty.as_deref(),
                     rescan_signals.as_ref(),
                     res,
                 );
@@ -193,6 +183,7 @@ pub fn watch_roots(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 /// Roughly estimate the number of inotify watches a root will need.
 /// Capped at `max_depth` to avoid expensive traversal on huge trees.
 fn estimate_watch_count(path: &std::path::Path, max_depth: usize) -> u64 {
@@ -217,6 +208,7 @@ fn estimate_watch_count(path: &std::path::Path, max_depth: usize) -> u64 {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn read_inotify_limit() -> Option<u64> {
     std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
         .ok()?
@@ -234,17 +226,8 @@ fn read_inotify_limit() -> Option<u64> {
 pub fn watch_roots_enhanced(
     watcher: &mut notify::RecommendedWatcher,
     roots: &[std::path::PathBuf],
-    dirty: Option<&DirtyTracker>,
-) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+) -> Vec<std::path::PathBuf> {
     let mut failed_roots = Vec::new();
-    #[allow(unused_mut)]
-    let mut degraded_roots = Vec::new();
-
-    // Silence unused warning on non-Linux; used inside Linux cfg block below.
-    let _ = dirty;
-
-    #[cfg(target_os = "linux")]
-    let limit = read_inotify_limit();
 
     for root in roots {
         if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
@@ -254,10 +237,7 @@ pub fn watch_roots_enhanced(
                     root,
                     e
                 );
-                if let Some(d) = dirty {
-                    d.mark_dirty_all();
-                }
-                degraded_roots.push(root.clone());
+                failed_roots.push(root.clone());
             } else {
                 tracing::warn!(
                     "Failed to watch {:?}: {} — will fallback to polling",
@@ -266,62 +246,38 @@ pub fn watch_roots_enhanced(
                 );
                 failed_roots.push(root.clone());
             }
-        } else {
-            #[cfg(target_os = "linux")]
-            if let Some(limit_val) = limit {
-                let estimated = estimate_watch_count(root, 3);
-                let safety_margin = estimated.max(100);
-                if limit_val < estimated.saturating_add(safety_margin) {
-                    tracing::warn!(
-                        "inotify limit tight for {:?}: limit={}, estimated_need={}+{}, marking degraded",
-                        root, limit_val, estimated, safety_margin
-                    );
-                    if let Some(d) = dirty {
-                        let path = root.clone();
-                        d.record_overflow_paths(&[path]);
-                    }
-                    degraded_roots.push(root.clone());
-                }
-            }
         }
     }
-    (failed_roots, degraded_roots)
+    failed_roots
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::recovery::DirtyScope;
 
     #[test]
     fn reject_zero_channel_size() {
         let drops = Arc::new(AtomicU64::new(0));
         let rescans = Arc::new(AtomicU64::new(0));
         let roots: Vec<std::path::PathBuf> = Vec::new();
-        let res = EventWatcher::start(&roots, 0, drops, rescans, None);
+        let res = EventWatcher::start(&roots, 0, drops, rescans);
         assert!(res.is_err());
     }
 
     #[test]
-    fn rescan_event_marks_dirty_all() {
-        let _drops = AtomicU64::new(0);
+    fn rescan_event_increments_rescan_signals() {
         let rescans = AtomicU64::new(0);
         let (priority_tx, _priority_rx) = mpsc::channel(16);
         let (normal_tx, _normal_rx) = mpsc::channel(16);
-        let dirty = DirtyTracker::new(16, vec![]);
 
         let ev = notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
         handle_notify_result(
             &priority_tx,
             &normal_tx,
             16,
-            Some(dirty.as_ref()),
             &rescans,
             Ok(ev),
         );
         assert_eq!(rescans.load(Ordering::Relaxed), 1);
-
-        let scope = dirty.try_begin_sync(0, 0, 0);
-        assert!(matches!(scope, Some(DirtyScope::All { .. })));
     }
 }

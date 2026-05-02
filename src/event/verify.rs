@@ -1,5 +1,5 @@
 use crate::core::EventRecord;
-use crate::event::recovery::{DirtyScope, DirtyTracker};
+use crate::event::recovery::DirtyScope;
 use crate::index::TieredIndex;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -128,7 +128,7 @@ impl ElasticVerifier {
         }
     }
 
-    pub fn spawn_repair(self: &Arc<Self>, scope: DirtyScope, tracker: Arc<DirtyTracker>) {
+    pub fn spawn_repair(self: &Arc<Self>, scope: DirtyScope) {
         let verifier = self.clone();
         std::thread::spawn(move || {
             let report = verifier.repair_scope(scope.clone());
@@ -139,7 +139,6 @@ impl ElasticVerifier {
                 report.upsert_events,
                 report.delete_events
             );
-            tracker.finish_sync();
         });
     }
 

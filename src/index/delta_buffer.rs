@@ -6,6 +6,8 @@ use crate::core::{EventRecord, EventType};
 pub struct DeltaBuffer {
     /// 路径(bytes) → 最新增量状态（按路径去重）
     entries: HashMap<Vec<u8>, DeltaState>,
+    /// 硬容量上限（默认 256K 条）
+    max_capacity: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -20,41 +22,80 @@ impl DeltaBuffer {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(cap.min(1024)),
+            max_capacity: 256 * 1024,
         }
     }
 
-    /// 应用一批事件，按路径去重保留最新状态
-    pub fn apply_events(&mut self, events: &[EventRecord]) {
+    #[cfg(test)]
+    fn with_capacity_and_limit(cap: usize, max_capacity: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(cap.min(1024)),
+            max_capacity,
+        }
+    }
+
+    /// 应用一批事件，按路径去重保留最新状态。
+    /// 返回 `true` 表示所有事件均已应用；`false` 表示容量已满，后续事件被丢弃。
+    pub fn apply_events(&mut self, events: &[EventRecord]) -> bool {
         for ev in events {
-            self.insert(ev.clone());
+            if !self.insert(ev.clone()) {
+                return false;
+            }
         }
+        true
     }
 
-    /// 单个事件插入（内部去重逻辑）
-    fn insert(&mut self, event: EventRecord) {
+    /// 单个事件插入（内部去重逻辑）。
+    /// 返回 `true` 表示已插入/更新；`false` 表示容量已满且为新路径，无法插入。
+    fn insert(&mut self, event: EventRecord) -> bool {
         let Some(path) = event.best_path() else {
             // FID-only 且无路径：保守跳过 overlay 更新（后续 fanotify 反查完善）。
-            return;
+            return true;
         };
         let path_bytes = path.as_os_str().as_encoded_bytes().to_vec();
 
         match &event.event_type {
             EventType::Delete => {
+                if self.entries.len() >= self.max_capacity && !self.entries.contains_key(&path_bytes) {
+                    return false;
+                }
                 self.entries.insert(path_bytes, DeltaState::Deleted);
+                true
             }
             EventType::Create | EventType::Modify => {
+                if self.entries.len() >= self.max_capacity && !self.entries.contains_key(&path_bytes) {
+                    return false;
+                }
                 self.entries.insert(path_bytes, DeltaState::Live(event));
+                true
             }
             EventType::Rename {
                 from,
                 from_path_hint,
             } => {
                 let from_best = from_path_hint.as_deref().or_else(|| from.as_path());
-                if let Some(from_path) = from_best {
-                    let from_bytes = from_path.as_os_str().as_encoded_bytes().to_vec();
-                    self.entries.insert(from_bytes, DeltaState::Deleted);
+                let from_bytes = from_best.map(|p| p.as_os_str().as_encoded_bytes().to_vec());
+
+                // 计算本次 Rename 事件是否会净增新条目。
+                let mut net_new = 0usize;
+                if let Some(ref fb) = from_bytes {
+                    if !self.entries.contains_key(fb) {
+                        net_new += 1;
+                    }
+                }
+                if !self.entries.contains_key(&path_bytes) {
+                    net_new += 1;
+                }
+
+                if self.entries.len().saturating_add(net_new) > self.max_capacity {
+                    return false;
+                }
+
+                if let Some(fb) = from_bytes {
+                    self.entries.insert(fb, DeltaState::Deleted);
                 }
                 self.entries.insert(path_bytes, DeltaState::Live(event));
+                true
             }
         }
     }
@@ -203,15 +244,50 @@ mod tests {
 
     #[test]
     fn test_capacity_bound() {
-        let mut db = DeltaBuffer::with_capacity(2);
-        db.apply_events(&[
+        let mut db = DeltaBuffer::with_capacity_and_limit(2, 2);
+        assert!(db.apply_events(&[
             make_event(1, EventType::Create, "/tmp/a"),
             make_event(2, EventType::Create, "/tmp/b"),
-        ]);
+        ]));
         assert_eq!(db.len(), 2);
-        // 容量超限仍允许插入（由调用方触发 flush）
-        db.apply_events(&[make_event(3, EventType::Create, "/tmp/c")]);
-        assert_eq!(db.len(), 3);
+        // 容量超限拒绝新路径
+        assert!(!db.apply_events(&[make_event(3, EventType::Create, "/tmp/c")]));
+        assert_eq!(db.len(), 2);
+        // 更新已有路径仍允许
+        assert!(db.apply_events(&[make_event(4, EventType::Modify, "/tmp/a")]));
+        assert_eq!(db.len(), 2);
+        // 删除已有路径仍允许
+        assert!(db.apply_events(&[make_event(5, EventType::Delete, "/tmp/a")]));
+        assert_eq!(db.len(), 2);
+        assert!(db.is_deleted(b"/tmp/a"));
+        // clear 后腾出空间
+        db.clear();
+        assert!(db.apply_events(&[make_event(6, EventType::Create, "/tmp/c")]));
+        assert_eq!(db.len(), 1);
+    }
+
+    #[test]
+    fn test_hard_capacity_limit_256k() {
+        let mut db = DeltaBuffer::with_capacity(1024);
+        for i in 0..(256 * 1024) {
+            let path = format!("/tmp/file_{}", i);
+            assert!(
+                db.apply_events(&[make_event(i as u64, EventType::Create, &path)]),
+                "Failed at iteration {}",
+                i
+            );
+        }
+        assert_eq!(db.len(), 256 * 1024);
+
+        // 第 256K+1 条被拒绝
+        assert!(!db.apply_events(&[make_event(999_999, EventType::Create, "/tmp/overflow")]));
+        assert_eq!(db.len(), 256 * 1024);
+
+        // drain_deleted_for_flush 后（内部调用 clear）可以重新插入
+        let _ = db.drain_deleted_for_flush();
+        assert!(db.is_empty());
+        assert!(db.apply_events(&[make_event(1, EventType::Create, "/tmp/after_clear")]));
+        assert_eq!(db.len(), 1);
     }
 
     #[test]

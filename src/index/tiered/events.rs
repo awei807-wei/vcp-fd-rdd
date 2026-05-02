@@ -214,10 +214,16 @@ impl TieredIndex {
         // 避免切换窗口导致"事件已缓冲但应用到了新索引"而重复回放。
         let (l2, rebuild_in_progress) = self.capture_l2_for_apply(events);
         let mut db = self.delta_buffer.lock();
-        db.apply_events(events);
+        let all_applied = db.apply_events(events);
         let overlay_paths = db.len();
         let overlay_arena_bytes = db.estimated_bytes() as u64;
         drop(db);
+        if !all_applied {
+            // 硬容量上限已满，强制触发 flush
+            if !self.flush_requested.swap(true, Ordering::AcqRel) {
+                self.flush_notify.notify_one();
+            }
+        }
         self.maybe_request_flush(overlay_paths, overlay_arena_bytes);
         self.note_pending_flush_batch(events);
         self.invalidate_l1_for_events(events);

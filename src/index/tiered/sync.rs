@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Task};
-use crate::event::recovery::{DirtyScope, DirtyTracker};
+use crate::event::recovery::DirtyScope;
 use crate::index::l2_partition::PersistentIndex;
 use crate::util::maybe_trim_rss;
 
@@ -308,13 +308,11 @@ impl TieredIndex {
         self: &Arc<Self>,
         scope: DirtyScope,
         ignore_prefixes: Vec<PathBuf>,
-        tracker: Arc<DirtyTracker>,
     ) {
         let permit = match self.fast_sync_semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
                 tracing::debug!("Fast-sync already in progress, skipping duplicate spawn");
-                tracker.rollback_sync(scope);
                 return;
             }
         };
@@ -331,7 +329,6 @@ impl TieredIndex {
             );
             tracing::warn!("Fast-sync complete, triggering manual RSS trim...");
             maybe_trim_rss();
-            tracker.finish_sync();
         });
     }
 
