@@ -187,8 +187,6 @@ impl TieredIndex {
         self.record_snapshot_success();
         self.reset_pending_flush_batch();
 
-        // compaction：段数达到阈值后后台合并
-        self.maybe_spawn_compaction(store);
         // snapshot/flush 是临时分配大户；完成后尝试回吐。
         maybe_trim_rss();
         Ok(())

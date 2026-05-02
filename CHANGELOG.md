@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4] - 2026-05-01
+
+### Added
+
+- **Benchmark Framework (Phase 0)**: Comprehensive benchmarking and profiling infrastructure.
+  - `scripts/bench.sh`: Automated benchmark suite covering compilation time, startup latency, baseline RSS/CPU, query latency (warm/cold), and event-storm throughput.
+  - `scripts/profile.sh`: Performance profiling harness for `perf` (flamegraph) and `dhat` (heap allocation).
+  - `src/stats/mod.rs`: `StatsCollector` runtime metrics collection (RSS, CPU, query latency, event throughput).
+  - `src/query/server.rs`: `/metrics` HTTP endpoint exposing Prometheus-compatible stats.
+  - `BENCHMARK.md`: Baseline documentation for reproducible benchmarks.
+  - `.github/workflows/bench.yml`: CI integration for automated regression detection.
+
+### Removed
+
+- **Dead Code Cleanup (Phase 1)**: Minimal cleanup targeting code that conflicts with the "low-footprint, long-running" positioning.
+  - Deleted `src/index/tiered/compaction.rs` (~383 lines). Fast compaction path remains inline; legacy slow path removed.
+  - Deleted polling functions from `src/index/recovery.rs`.
+  - Deleted RSS trim loop and associated CLI arguments (`--rss-trim-interval`, `--malloc-trim`).
+  - Deleted `dyn_walk_and_enqueue` and related dynamic walk helpers.
+  - Marked rebuild/recovery functions in `src/sync.rs` as `#[deprecated]` (to be removed in v0.7.0).
+  - Simplified CLI argument surface by removing unused tuning knobs.
+
 ## [0.6.3] - 2026-04-26
 
 ### Changed

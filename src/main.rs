@@ -28,18 +28,6 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     snapshot_path: Option<PathBuf>,
 
-    /// 启动时忽略快照（即使 snapshot_path 存在），从空索引启动
-    #[arg(long)]
-    no_snapshot: bool,
-
-    /// 禁用 watcher（只启动查询服务/快照循环；适合做“仅加载快照”对照实验）
-    #[arg(long)]
-    no_watch: bool,
-
-    /// 禁用后台全量构建（索引为空时也不自动 full_build）
-    #[arg(long)]
-    no_build: bool,
-
     /// 将 `.` 开头的文件/目录纳入冷启动全扫、后台重建与增量补扫
     #[arg(long)]
     include_hidden: bool,
@@ -59,14 +47,6 @@ struct Args {
     /// 内存报告间隔（秒）
     #[arg(long, default_value_t = 60)]
     report_interval_secs: u64,
-
-    /// RSS trim 检查间隔（秒，0=禁用）
-    #[arg(long, default_value_t = 300)]
-    trim_interval_secs: u64,
-
-    /// 触发 trim 的 Private_Dirty 阈值（MB，0=禁用）
-    #[arg(long, default_value_t = 128)]
-    trim_pd_threshold_mb: u64,
 
     /// watcher 事件 channel 容量（越大越不容易 overflow，但会占用更多内存）
     /// 默认 65536，足以应对 git clone 等批量操作；降低此值可减少内存占用但可能丢失事件。
@@ -179,23 +159,14 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(SnapshotStore::new(snapshot_path));
 
     // 3) 从快照加载或空索引启动
-    let index = if args.no_snapshot {
-        Arc::new(TieredIndex::empty_with_options(
-            roots,
-            args.include_hidden,
-            ignore_enabled,
-        ))
-    } else {
-        TieredIndex::load_with_options(store.as_ref(), roots, args.include_hidden, ignore_enabled)
-            .await?
-    };
+    let index = TieredIndex::load_with_options(store.as_ref(), roots, args.include_hidden, ignore_enabled)
+        .await?;
     index.set_auto_flush_limits(args.auto_flush_overlay_paths, args.auto_flush_overlay_bytes);
     index.set_periodic_flush_batch_limits(args.batch_flush_min_events, args.batch_flush_min_bytes);
-    // WAL：即使 --no_snapshot，也允许记录后续事件（仅不回放历史）。
     let _ = index.attach_wal(store.as_ref());
 
     // 4) 若索引为空，后台全量构建
-    if index.file_count() == 0 && !args.no_build {
+    if index.file_count() == 0 {
         index.spawn_full_build();
     }
 
@@ -209,23 +180,18 @@ async fn main() -> anyhow::Result<()> {
     startup_ignore_paths.push(store.derived_lsm_dir_path());
 
     // 5) 启动事件管道（bounded + debounce）
-    let pipeline = if args.no_watch {
-        None
-    } else {
-        // 默认忽略索引自身的 snapshot/segment 写入路径，避免 watcher 反馈循环。
-        // 额外忽略项可通过 --ignore-path 传入（例如将日志重定向到了被 watch 的目录下）。
-        let pipeline = Arc::new(
-            EventPipeline::new_with_config_and_ignores(
-                index.clone(),
-                args.debounce_ms,
-                args.event_channel_size,
-                startup_ignore_paths.clone(),
-            )
-            .with_ignore_filter(ignore_filter.clone()),
-        );
-        pipeline.start().await?;
-        Some(pipeline)
-    };
+    // 默认忽略索引自身的 snapshot/segment 写入路径，避免 watcher 反馈循环。
+    // 额外忽略项可通过 --ignore-path 传入（例如将日志重定向到了被 watch 的目录下）。
+    let pipeline = Arc::new(
+        EventPipeline::new_with_config_and_ignores(
+            index.clone(),
+            args.debounce_ms,
+            args.event_channel_size,
+            startup_ignore_paths.clone(),
+        )
+        .with_ignore_filter(ignore_filter.clone()),
+    );
+    pipeline.start().await?;
 
     // 5.5) 启动阶段 best-effort 补偿停机期间的离线变更。
     // 仅在已有索引内容时执行，避免与空索引冷启动 full_build 重复做全量工作。
@@ -238,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
         let index = index.clone();
         let pipeline = pipeline.clone();
         Arc::new(move || {
-            let stats = pipeline.as_ref().map(|p| p.stats()).unwrap_or_default();
+            let stats = pipeline.stats();
             HealthTelemetry {
                 last_snapshot_time: index.last_snapshot_time(),
                 watch_failures: stats.watch_failures,
@@ -288,28 +254,12 @@ async fn main() -> anyhow::Result<()> {
         let report_interval_secs = args.report_interval_secs;
 
         let stats_fn = Arc::new(move || {
-            if let Some(p) = pipeline.as_ref() {
-                p.stats()
-            } else {
-                fd_rdd::stats::EventPipelineStats::default()
-            }
+            pipeline.stats()
         });
 
         tokio::spawn(async move {
             report_index
                 .memory_report_loop(stats_fn, report_interval_secs)
-                .await;
-        });
-    }
-
-    // 8.5) 启动条件性 RSS trim 循环（按 smaps Private_Dirty 阈值触发）
-    {
-        let trim_index = index.clone();
-        let trim_interval_secs = args.trim_interval_secs;
-        let trim_pd_threshold_mb = args.trim_pd_threshold_mb;
-        tokio::spawn(async move {
-            trim_index
-                .rss_trim_loop(trim_interval_secs, trim_pd_threshold_mb)
                 .await;
         });
     }

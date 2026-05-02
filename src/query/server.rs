@@ -1,9 +1,11 @@
 use crate::index::TieredIndex;
 use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
 use crate::query::{execute_query, QueryMode, SortColumn, SortOrder};
+use crate::stats::StatsReport;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -135,6 +137,7 @@ impl QueryServer {
             .route("/search", get(search_handler))
             .route("/status", get(status_handler))
             .route("/health", get(health_handler))
+            .route("/metrics", get(metrics_handler))
             .route("/scan", post(scan_handler))
             .with_state(state);
 
@@ -267,6 +270,12 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         rescan_signals: health.rescan_signals,
         issues,
     })
+}
+
+#[allow(dead_code)]
+async fn metrics_handler(State(_state): State<QueryServerState>) -> impl IntoResponse {
+    // TODO: wire to TieredIndex stats collector once it has one
+    Json(StatsReport::default())
 }
 
 async fn scan_handler(

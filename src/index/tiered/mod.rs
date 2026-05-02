@@ -1,5 +1,4 @@
 pub(crate) mod arena;
-mod compaction;
 mod disk_layer;
 pub(crate) mod events;
 mod load;
@@ -16,7 +15,7 @@ mod tests;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
@@ -33,12 +32,6 @@ use self::events::OverlayState;
 use self::rebuild::RebuildState;
 
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
-// 更激进的合并阈值：用于百万文件后的"瘦身期"，加速 delta 段收敛。
-const COMPACTION_DELTA_THRESHOLD: usize = 8;
-// 每次 compaction 最多合并多少个 delta（避免"delta 很多时一次合并过重"导致常驻/临时分配抖动）。
-const COMPACTION_MAX_DELTAS_PER_RUN: usize = 4;
-// 防抖：避免 flush 高频阶段反复启动 compaction 造成临时大分配抖动。
-const COMPACTION_COOLDOWN: Duration = Duration::from_secs(300);
 
 pub(crate) fn pathbuf_from_bytes(bytes: impl AsRef<[u8]>) -> PathBuf {
     use unicode_normalization::UnicodeNormalization;
@@ -64,8 +57,6 @@ pub struct TieredIndex {
     pub(self) rebuild_state: Mutex<RebuildState>,
     pub(self) overlay_state: Mutex<OverlayState>,
     pub(self) apply_gate: RwLock<()>,
-    pub(self) compaction_in_progress: AtomicBool,
-    pub(self) compaction_last_started_at: Mutex<Option<Instant>>,
     pub(self) flush_requested: AtomicBool,
     pub(self) flush_notify: Notify,
     pub(self) auto_flush_overlay_paths: AtomicU64,

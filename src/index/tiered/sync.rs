@@ -134,6 +134,7 @@ impl TieredIndex {
     /// 用途：
     /// - 守护进程停机期间新增/删除的文件不会经过 watcher/WAL；
     /// - 对已有索引做一次全 roots fast-sync，可在不清空索引的前提下补齐新增并对齐删除。
+    #[deprecated = "将在后续阶段删除，已被基准测试框架替代"]
     pub fn startup_reconcile(&self, ignore_prefixes: &[PathBuf]) -> (usize, usize, usize) {
         let report = self.fast_sync(
             DirtyScope::Dirs {
@@ -297,6 +298,7 @@ impl TieredIndex {
     }
 
     /// overflow / watcher 异常时的兜底：清空索引并后台全量重建，避免索引长期漂移。
+    #[deprecated = "将在后续阶段删除，已被基准测试框架替代"]
     pub fn spawn_rebuild(self: &Arc<Self>, reason: &'static str) {
         if !self.try_start_rebuild_with_cooldown(reason) {
             // 冷却/合并：不立即执行

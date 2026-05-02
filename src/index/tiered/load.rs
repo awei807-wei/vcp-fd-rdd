@@ -44,8 +44,6 @@ impl TieredIndex {
             rebuild_state: Mutex::new(RebuildState::default()),
             overlay_state: Mutex::new(OverlayState::default()),
             apply_gate: RwLock::new(()),
-            compaction_in_progress: AtomicBool::new(false),
-            compaction_last_started_at: Mutex::new(None),
             flush_requested: AtomicBool::new(false),
             flush_notify: Notify::new(),
             auto_flush_overlay_paths: AtomicU64::new(250_000),

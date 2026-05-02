@@ -31,40 +31,7 @@ where
     false
 }
 
-/// 动态 watch 辅助：递归遍历新目录，将已有文件以合成 Create 事件入队，
-/// 弥补 watch 注册时间窗口内的 inotify 事件丢失。
-/// 使用 spawn_blocking 避免阻塞事件循环（新目录可能包含大量文件）。
-fn dyn_walk_and_enqueue(tx: tokio::sync::mpsc::Sender<notify::Event>, dir: std::path::PathBuf) {
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = walk_dir_send(&tx, &dir) {
-            tracing::debug!("dyn_walk {:?} error: {}", dir, e);
-        }
-    });
-}
 
-fn walk_dir_send(
-    tx: &tokio::sync::mpsc::Sender<notify::Event>,
-    dir: &std::path::Path,
-) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            walk_dir_send(tx, &path)?;
-        } else if ft.is_file() {
-            let ev = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
-                .add_path(path);
-            // 使用 blocking_send 避免静默丢弃：spawn_blocking 中阻塞线程是安全的。
-            if let Err(e) = tx.blocking_send(ev) {
-                tracing::warn!("walk_dir_send: channel closed, dropping event: {:?}", e);
-            }
-        }
-    }
-    Ok(())
-}
-
-use crate::util::maybe_trim_rss;
 
 /// 事件管道：bounded channel + debounce/合并 + 批量应用
 pub struct EventPipeline {
@@ -253,7 +220,7 @@ impl EventPipeline {
         tokio::spawn(async move {
             // 保持 watcher 存活，并用于动态注册新目录监控
             let mut watcher = watcher;
-            let priority_tx = priority_tx;
+            let _priority_tx = priority_tx;
             let _normal_tx = normal_tx;
             let mut seq: u64 = 0;
             let mut raw_events: Vec<notify::Event> = Vec::with_capacity(256);
@@ -291,7 +258,7 @@ impl EventPipeline {
                                 raw_events_capacity.store(raw_events.capacity() as u64, Ordering::Relaxed);
                                 merged_map_capacity.store(merge_scratch.merged.capacity() as u64, Ordering::Relaxed);
                                 records_capacity.store(merge_scratch.records.capacity() as u64, Ordering::Relaxed);
-                                maybe_trim_rss();
+
                             }
                             last_idle_trim = tokio::time::Instant::now();
                         }
@@ -351,8 +318,7 @@ impl EventPipeline {
                                     e
                                 );
                             }
-                            // 扫描新目录中可能已在 watch 注册前创建的文件
-                            dyn_walk_and_enqueue(priority_tx.clone(), path.clone());
+
                         }
                     }
                 }
