@@ -10,9 +10,9 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-当前 tests 分支发布版本为 v0.6.13（PersistentIndex 主存储迁移 + 收尾稳定化）。
+当前 tests 分支发布版本为 v0.6.14（低 RSS tiered watcher 预览 + 0.6.13 收尾稳定化）。
 
-## v0.6.13 更新（PersistentIndex 主存储迁移）
+## v0.6.14 更新（低 RSS tiered watcher 预览）
 
 - **运行时主存储切换**：`PersistentIndex` 不再以 `CompactMeta + PathArena` 作为热路径主表，改为 `FileEntry + Vec<Vec<u8>>` 绝对路径字节表。
 - **导出期构建只读索引**：`PathTableV2 + FileEntryIndex` 仅在 `BaseIndexData` / v7 快照导出时批量构建，避免事件热路径维护 front-encoding 压缩表。
@@ -27,6 +27,8 @@
 - **Watcher 可关闭**：新增配置 `watch_enabled` 与 CLI `--no-watch`，支持只加载快照/手动 `/scan` 的静态模式，用于大 `$HOME` 场景下验证和降低 watcher 常驻开销。
 - **Tiered watcher 预览**：新增 `watch_mode = "recursive" | "tiered" | "off"` 与 `--watch-mode`；`tiered` 先把 XDG 热点目录按 `max_watch_dirs` 预算准入 L0，未准入候选进入有界 warm scan。
 - **Watcher 诊断端点**：新增 `GET /watch-state`，返回当前 watcher 模式、L0/L1 数量、估算 watch 预算、扫描 backlog 和调度说明。
+- **小批 snapshot 保护**：周期 snapshot 增加默认批量门槛，少量事件先保留在 WAL/DeltaBuffer，避免 44 万级 base 因几个事件周期性全量 materialize。
+- **真机验证**：`--watch-mode tiered` 在约 44.5 万文件索引上，启动后 RSS 约 97MB，运行一段时间后仍约 98MB，`non_index_private_dirty` 约 14MB。
 - **验证**：`cargo test -q` 全量通过。
 
 ## v0.6.12 更新（收尾稳定化）

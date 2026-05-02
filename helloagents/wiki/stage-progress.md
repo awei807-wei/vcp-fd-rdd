@@ -102,7 +102,7 @@
 
 - fanotify：暂不做（后续结合 watcher 架构与段式/LSM 一起评估）
 
-## 阶段 G（2026-05-02 收尾稳定化）
+## 阶段 G（2026-05-02 收尾稳定化 / v0.6.14）
 
 已完成：
 
@@ -130,6 +130,7 @@
 - HTTP 新增 `/watch-state`，输出 watcher 模式、L0/L1/L2/L3 数量、估算 watch 目录预算、扫描 backlog 和 tiered 调度说明。
 - tiered 模式下未准入 L0 的热点候选进入有界 warm-scan loop，按 `l1_scan_interval_secs` 和 `scan_items_per_sec` 分批浅扫，避免直接回到全递归 watcher RSS。
 - 周期 snapshot 默认增加小批量门槛：少量事件先留在 WAL/DeltaBuffer，不再每个 snapshot interval 都全量 materialize 44 万级 base，避免 watcher 测试中出现非索引 RSS 高水位。
+- 真机验证：`--watch-mode tiered` 在约 44.5 万文件索引下，启动 RSS 约 96-97MB，运行一段时间后约 97-98MB，`non_index_private_dirty` 保持约 14MB，明显低于 recursive watcher 的 260MB+ 常驻区间。
 
 仍保留 / 后续处理：
 
