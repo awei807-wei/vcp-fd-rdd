@@ -431,7 +431,11 @@ jobs:
         if: always()
         run: |
           kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
-          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+          wait $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          sleep 1
+          for i in $(seq 1 5); do
+            rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* 2>/dev/null && break || sleep 1
+          done
 
   # ───────────────────────────────────────────────────────────────────────────
   # Job 4: 并发中间状态 + 物理删除原子性 + 事件风暴
