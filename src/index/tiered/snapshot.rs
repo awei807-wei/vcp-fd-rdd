@@ -2,6 +2,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::storage::snapshot::{
+    write_recovery_runtime_state, write_stable_v7_atomic, RecoveryRuntimeState,
+};
 use crate::storage::snapshot_v7::write_v7_snapshot_atomic;
 use crate::storage::traits::StorageBackend;
 use crate::util::maybe_trim_rss;
@@ -17,6 +20,7 @@ impl TieredIndex {
         S: StorageBackend + 'static,
     {
         let idx = self.clone();
+        let store_for_sync = store.clone();
         let result = tokio::task::spawn_blocking(move || {
             let delta = idx.l2.load_full();
             let delta_dirty = delta.is_dirty();
@@ -52,7 +56,7 @@ impl TieredIndex {
             // update the delta path only, so the full visible BaseIndex is
             // rebuilt on this cold path and then written as v7.
             let base = idx.materialize_snapshot_base();
-            let v7_path = store.path().with_extension("v7");
+            let v7_path = store_for_sync.path().with_extension("v7");
 
             // delta_buffer has been cleared by materialize_snapshot_base after
             // its content was folded into base.
@@ -76,6 +80,24 @@ impl TieredIndex {
             tracing::warn!("v7 snapshot write failed: {}", e);
         } else {
             tracing::info!("v7 snapshot written to {:?}", v7_path);
+        }
+
+        if self.stable_snapshot_enabled.load(Ordering::Relaxed) {
+            if let Err(e) = write_stable_v7_atomic(store.path(), &base) {
+                tracing::warn!("stable v7 snapshot write failed: {}", e);
+            } else {
+                let state = RecoveryRuntimeState {
+                    last_clean_shutdown: false,
+                    last_snapshot_unix_secs: unix_secs(),
+                    last_wal_seal_id: wal_seal_id,
+                    last_startup_source: self.recovery_status().report.snapshot_source,
+                    last_recovery_mode: "snapshot".to_string(),
+                };
+                if let Err(e) = write_recovery_runtime_state(store.path(), &state) {
+                    tracing::warn!("recovery runtime state write failed: {}", e);
+                }
+                tracing::info!("stable v7 snapshot written for recovery");
+            }
         }
 
         self.l1.clear();
@@ -173,4 +195,11 @@ impl TieredIndex {
             .unwrap_or(0);
         self.last_snapshot_time.store(ts, Ordering::Relaxed);
     }
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

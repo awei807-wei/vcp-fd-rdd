@@ -5,10 +5,13 @@ use crate::index::base_index::BaseIndexData;
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
+use crate::storage::snapshot::{
+    read_recovery_runtime_state, stable_prev_v7_path_for, stable_v7_path_for,
+};
 use crate::storage::traits::StorageBackend;
 use crate::util::maybe_trim_rss;
 
-use super::TieredIndex;
+use super::{StartupRecoveryReport, TieredIndex};
 
 impl TieredIndex {
     #[allow(dead_code, clippy::too_many_arguments)]
@@ -110,6 +113,8 @@ impl TieredIndex {
             follow_symlinks,
             exclude_dirs,
             fast_sync_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            recovery_status: Mutex::new(super::RecoveryStatus::default()),
+            stable_snapshot_enabled: AtomicBool::new(true),
         }
     }
 
@@ -319,37 +324,61 @@ impl TieredIndex {
             exclude_dirs.clone(),
         );
 
-        // 阶段 A：优先加载 v7 单文件快照（最快路径，<1s mmap + 反序列化）。
-        let v7_path = store.path().with_extension("v7");
-        match crate::storage::snapshot_v7::try_load_v7(&v7_path) {
-            Ok(Some(v7_data)) => {
-                tracing::info!(
-                    "v7 snapshot loaded directly into base: {} entries, {} trigrams",
-                    v7_data.entries_by_key.len(),
-                    v7_data.trigram_index.len()
-                );
-                let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
-                let idx = Self::new_with_base(
-                    l1,
-                    l2,
-                    l3,
-                    roots,
-                    include_hidden,
-                    ignore_enabled,
-                    follow_symlinks,
-                    exclude_dirs,
-                    Some(v7_data),
-                );
-                idx.attach_wal(store)?;
-                idx.replay_wal_if_any(0);
-                maybe_trim_rss();
-                return Ok(idx);
+        let runtime_state = read_recovery_runtime_state(store.path()).unwrap_or_else(|e| {
+            tracing::warn!("recovery runtime state read failed: {}", e);
+            Default::default()
+        });
+
+        // 优先加载 stable.v7 / stable.prev.v7，再回退到 legacy v7 单文件快照。
+        let stable_path = stable_v7_path_for(store.path());
+        let stable_prev_path = stable_prev_v7_path_for(store.path());
+        let legacy_v7_path = store.path().with_extension("v7");
+        let snapshot_candidates = [
+            ("stable", stable_path.as_path()),
+            ("stable-prev", stable_prev_path.as_path()),
+            ("legacy-v7", legacy_v7_path.as_path()),
+        ];
+
+        for (source, path) in snapshot_candidates {
+            match crate::storage::snapshot_v7::try_load_v7(path) {
+                Ok(Some(v7_data)) => {
+                    tracing::info!(
+                        "{} snapshot loaded directly into base: {} entries, {} trigrams",
+                        source,
+                        v7_data.entries_by_key.len(),
+                        v7_data.trigram_index.len()
+                    );
+                    let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
+                    let idx = Self::new_with_base(
+                        l1,
+                        l2,
+                        l3,
+                        roots,
+                        include_hidden,
+                        ignore_enabled,
+                        follow_symlinks,
+                        exclude_dirs,
+                        Some(v7_data),
+                    );
+                    idx.attach_wal(store)?;
+                    let replay = idx.replay_wal_if_any(0);
+                    idx.set_startup_recovery_report(StartupRecoveryReport {
+                        snapshot_source: source.to_string(),
+                        wal_events_replayed: replay.events_replayed,
+                        wal_truncated_tail_records: replay.truncated_tail_records,
+                        requires_repair: !runtime_state.last_clean_shutdown
+                            || replay.truncated_tail_records > 0,
+                        previous_clean_shutdown: runtime_state.last_clean_shutdown,
+                    });
+                    maybe_trim_rss();
+                    return Ok(idx);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("{} load failed: {}", source, e),
             }
-            Ok(None) => {}
-            Err(e) => tracing::warn!("v7 load failed: {}", e),
         }
 
-        // 无 v7 快照：回退到空索引启动（由上层触发 rebuild）。
+        // 无可用快照：回退到空索引启动（由上层触发 rebuild）。
         let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
         let idx = Self::new_with_excludes(
             l1,
@@ -362,7 +391,14 @@ impl TieredIndex {
             exclude_dirs,
         );
         idx.attach_wal(store)?;
-        idx.replay_wal_if_any(0);
+        let replay = idx.replay_wal_if_any(0);
+        idx.set_startup_recovery_report(StartupRecoveryReport {
+            snapshot_source: "empty".to_string(),
+            wal_events_replayed: replay.events_replayed,
+            wal_truncated_tail_records: replay.truncated_tail_records,
+            requires_repair: true,
+            previous_clean_shutdown: runtime_state.last_clean_shutdown,
+        });
         Ok(idx)
     }
 
@@ -375,11 +411,17 @@ impl TieredIndex {
         Ok(())
     }
 
-    fn replay_wal_if_any(&self, checkpoint_seal_id: u64) {
+    fn replay_wal_if_any(&self, checkpoint_seal_id: u64) -> WalReplaySummary {
         let wal = { self.wal.lock().clone() };
-        let Some(wal) = wal else { return };
+        let Some(wal) = wal else {
+            return WalReplaySummary::default();
+        };
         match wal.replay_since_seal(checkpoint_seal_id) {
             Ok(r) => {
+                let summary = WalReplaySummary {
+                    events_replayed: r.events.len(),
+                    truncated_tail_records: r.truncated_tail_records,
+                };
                 if !r.events.is_empty() {
                     tracing::info!(
                         "WAL replay: events={} sealed_used={} truncated_tail={}",
@@ -389,10 +431,21 @@ impl TieredIndex {
                     );
                     self.apply_events_inner(&r.events, false);
                 }
+                summary
             }
             Err(e) => {
                 tracing::warn!("WAL replay failed, ignoring: {}", e);
+                WalReplaySummary {
+                    events_replayed: 0,
+                    truncated_tail_records: 1,
+                }
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WalReplaySummary {
+    events_replayed: usize,
+    truncated_tail_records: usize,
 }

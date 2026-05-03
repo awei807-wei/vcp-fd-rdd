@@ -130,6 +130,39 @@ fn wal_crash_recovery_replays_events() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn wal_truncated_tail_sets_repair_signal() {
+    let dir = unique_tmp_dir("truncated-tail");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let wal = WalStore::open_in_dir(dir.clone()).unwrap();
+    let p = dir.join("before-tail.txt");
+    wal.append(&[EventRecord {
+        seq: 1,
+        timestamp: std::time::SystemTime::now(),
+        event_type: EventType::Create,
+        id: FileIdentifier::Path(p.clone()),
+        path_hint: Some(p),
+    }])
+    .unwrap();
+    drop(wal);
+
+    let wal_path = dir.join("events.wal");
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&wal_path)
+        .unwrap();
+    f.write_all(&1234u32.to_le_bytes()).unwrap();
+    f.flush().unwrap();
+
+    let wal2 = WalStore::open_in_dir(dir.clone()).unwrap();
+    let result = wal2.replay_since_seal(0).unwrap();
+    assert_eq!(result.events.len(), 1);
+    assert!(result.truncated_tail_records > 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 16. 版本兼容：v1 WAL 正确加载（升级到 v3）
 #[test]
 fn wal_v1_compat_loads_after_upgrade() {

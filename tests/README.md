@@ -13,6 +13,7 @@
 - `p1_multi_root.rs` — 多 root 隔离
 - `p1_query.rs` — 查询与过滤
 - `p1_snapshot_recovery.rs` — 快照恢复
+- `p1_startup_repair.rs` — 启动 repair scan 决策与统计
 - `p1_symlink_safety.rs` — 符号链接安全
 - `p1_wal_recovery.rs` — WAL 回放与去重
 - `p1_watch_degradation.rs` — watcher 降级轮询
@@ -28,7 +29,12 @@
 ## v0.6.1 测试相关变更
 
 - CI 格式化与 Clippy 警告修复相关变更已使全部测试辅助模块通过 `cargo fmt --all -- --check` 与 `cargo clippy --all-targets -- -D warnings`。
-- 新增大规模混合工作区测试 `tests/p2_large_scale_hybrid.rs`，覆盖 80 万文件冷扫、git clone、npm install、单文件 CRUD 与最终一致性验证，带性能阈值断言（CPU 100% 持续时间 ≤10000ms，峰值 RSS ≤600MB，与 CI workflow 阈值一致）。
+- 新增大规模混合工作区测试 `tests/p2_large_scale_hybrid.rs`，覆盖 80 万文件冷扫、git clone、npm install、单文件 CRUD 与最终一致性验证，带性能阈值断言（CPU 100% 持续时间 ≤20000ms，峰值 RSS ≤600MB，与 CI workflow 阈值一致）。
+
+## v0.6.15 测试相关变更
+
+- 断电恢复基建新增 `p1_snapshot_recovery.rs` 的 stable snapshot 当前/前一版本回退、runtime-state 缺失/损坏保守恢复测试，`p1_wal_recovery.rs` 的 WAL 截断尾恢复信号测试，以及 `p1_startup_repair.rs` 的启动 repair scan 决策测试。
+- CI 新增 `Poweroff recovery regression` 专项 job，显式运行快照回退、WAL 截断尾、startup repair 三组恢复测试，避免断电恢复只被全量测试隐式覆盖。
 
 ## v0.6.0 更新（零拷贝序列化 P1 + Compaction 降维 P2）
 

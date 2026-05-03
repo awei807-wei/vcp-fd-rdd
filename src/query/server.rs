@@ -29,6 +29,14 @@ pub struct HealthTelemetry {
     pub degraded_roots: usize,
     pub overflow_drops: u64,
     pub rescan_signals: u64,
+    pub snapshot_source: String,
+    pub wal_events_replayed: usize,
+    pub wal_truncated_tail_records: usize,
+    pub startup_repair_ran: bool,
+    pub startup_repair_escalated: bool,
+    pub startup_repair_scanned: usize,
+    pub startup_repair_changed: usize,
+    pub last_clean_shutdown: bool,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +86,14 @@ pub struct HealthResponse {
     pub degraded_roots: usize,
     pub overflow_drops: u64,
     pub rescan_signals: u64,
+    pub snapshot_source: String,
+    pub wal_events_replayed: usize,
+    pub wal_truncated_tail_records: usize,
+    pub startup_repair_ran: bool,
+    pub startup_repair_escalated: bool,
+    pub startup_repair_scanned: usize,
+    pub startup_repair_changed: usize,
+    pub last_clean_shutdown: bool,
     pub issues: Vec<String>,
 }
 
@@ -285,6 +301,15 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
             health.overflow_drops, health.rescan_signals
         ));
     }
+    if health.wal_truncated_tail_records > 0 {
+        issues.push(format!(
+            "wal_recovery: truncated_tail_records={}",
+            health.wal_truncated_tail_records
+        ));
+    }
+    if health.startup_repair_escalated {
+        issues.push("startup_repair: escalated to rebuild policy".to_string());
+    }
     if health.last_snapshot_time == 0 {
         issues.push("snapshot_not_written_yet".to_string());
     }
@@ -310,6 +335,14 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         degraded_roots: health.degraded_roots,
         overflow_drops: health.overflow_drops,
         rescan_signals: health.rescan_signals,
+        snapshot_source: health.snapshot_source,
+        wal_events_replayed: health.wal_events_replayed,
+        wal_truncated_tail_records: health.wal_truncated_tail_records,
+        startup_repair_ran: health.startup_repair_ran,
+        startup_repair_escalated: health.startup_repair_escalated,
+        startup_repair_scanned: health.startup_repair_scanned,
+        startup_repair_changed: health.startup_repair_changed,
+        last_clean_shutdown: health.last_clean_shutdown,
         issues,
     })
 }

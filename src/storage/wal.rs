@@ -141,6 +141,13 @@ pub struct WalReplayResult {
     pub truncated_tail_records: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WalDurability {
+    #[default]
+    FlushOnly,
+    SyncDataAlways,
+}
+
 /// Append-only 事件日志（WAL）。
 ///
 /// - current: events.wal
@@ -149,6 +156,7 @@ pub struct WalStore {
     dir: PathBuf,
     current: PathBuf,
     file: Mutex<File>,
+    durability: Mutex<WalDurability>,
 }
 
 impl WalStore {
@@ -160,6 +168,7 @@ impl WalStore {
             dir,
             current,
             file: Mutex::new(f),
+            durability: Mutex::new(WalDurability::FlushOnly),
         })
     }
 
@@ -181,7 +190,16 @@ impl WalStore {
             f.write_all(&payload[..len as usize])?;
         }
         f.flush()?;
+        if *self.durability.lock().unwrap_or_else(|e| e.into_inner())
+            == WalDurability::SyncDataAlways
+        {
+            f.sync_data()?;
+        }
         Ok(())
+    }
+
+    pub fn set_durability(&self, durability: WalDurability) {
+        *self.durability.lock().unwrap_or_else(|e| e.into_inner()) = durability;
     }
 
     /// seal：把当前 WAL rename 成 sealed 文件，并创建新的空 WAL。
@@ -451,7 +469,9 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, usize)> {
     loop {
         let mut lb = [0u8; 8];
         if f.read_exact(&mut lb).is_err() {
-            // EOF or truncated header: normal end of file
+            if pos < file_len {
+                truncated_tail += 1;
+            }
             break;
         }
         pos = pos.saturating_add(8);

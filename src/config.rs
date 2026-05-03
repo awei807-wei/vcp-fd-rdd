@@ -157,6 +157,18 @@ pub struct Config {
     pub watch_mode: WatchMode,
     /// Budgeted tiered watcher configuration.
     pub tiered_watch: TieredWatchConfig,
+    /// Enable stable v7 snapshot rotation (`stable.v7` / `stable.prev.v7`).
+    pub stable_snapshot_enabled: bool,
+    /// Enable startup repair when previous shutdown or WAL replay is untrusted.
+    pub startup_repair_enabled: bool,
+    /// Startup repair mode: `dirty-only`, `always`, or `never`.
+    pub startup_repair_mode: String,
+    /// Maximum roots repaired during startup.
+    pub startup_repair_max_dirs: usize,
+    /// Soft startup repair budget in milliseconds. First phase records this as policy.
+    pub startup_repair_budget_ms: u64,
+    /// If repair failure ratio exceeds this value, full rebuild may be scheduled.
+    pub startup_repair_force_rebuild_ratio: f32,
     /// Directory names that are never indexed, regardless of .gitignore rules.
     pub exclude_dirs: Vec<String>,
 }
@@ -237,6 +249,12 @@ impl Default for Config {
             watch_enabled: true,
             watch_mode: WatchMode::Recursive,
             tiered_watch: TieredWatchConfig::default(),
+            stable_snapshot_enabled: true,
+            startup_repair_enabled: true,
+            startup_repair_mode: "dirty-only".to_string(),
+            startup_repair_max_dirs: 16,
+            startup_repair_budget_ms: 10_000,
+            startup_repair_force_rebuild_ratio: 0.25,
             exclude_dirs: default_exclude_dirs(),
         }
     }

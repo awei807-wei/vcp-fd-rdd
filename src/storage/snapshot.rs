@@ -1,3 +1,4 @@
+use crate::index::base_index::BaseIndexData;
 use crate::index::l2_partition::IndexSnapshotV2;
 use crate::index::l2_partition::IndexSnapshotV3;
 use crate::index::l2_partition::IndexSnapshotV4;
@@ -5,6 +6,7 @@ use crate::index::l2_partition::IndexSnapshotV5;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l2_partition::V6Segments;
 use memmap2::Mmap;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::Seek;
 use std::io::SeekFrom;
@@ -46,6 +48,110 @@ const MAX_V6_ROOTS_SEGMENT_BYTES: u64 = 1024 * 1024; // 1 MiB
 /// - 加载时校验 magic + version + data_len + checksum，任何不一致都拒绝
 pub struct SnapshotStore {
     path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecoveryRuntimeState {
+    pub last_clean_shutdown: bool,
+    pub last_snapshot_unix_secs: u64,
+    pub last_wal_seal_id: u64,
+    pub last_startup_source: String,
+    pub last_recovery_mode: String,
+}
+
+impl Default for RecoveryRuntimeState {
+    fn default() -> Self {
+        Self {
+            last_clean_shutdown: false,
+            last_snapshot_unix_secs: 0,
+            last_wal_seal_id: 0,
+            last_startup_source: "unknown".to_string(),
+            last_recovery_mode: "unknown".to_string(),
+        }
+    }
+}
+
+pub fn stable_snapshot_dir_for(snapshot_path: &Path) -> PathBuf {
+    if snapshot_path.extension().and_then(|s| s.to_str()) == Some("d") || snapshot_path.is_dir() {
+        snapshot_path.to_path_buf()
+    } else {
+        snapshot_path.with_extension("d")
+    }
+}
+
+pub fn stable_v7_path_for(snapshot_path: &Path) -> PathBuf {
+    stable_snapshot_dir_for(snapshot_path).join("stable.v7")
+}
+
+pub fn stable_prev_v7_path_for(snapshot_path: &Path) -> PathBuf {
+    stable_snapshot_dir_for(snapshot_path).join("stable.prev.v7")
+}
+
+pub fn stable_next_v7_path_for(snapshot_path: &Path) -> PathBuf {
+    stable_snapshot_dir_for(snapshot_path).join("stable.next.v7")
+}
+
+pub fn runtime_state_path_for(snapshot_path: &Path) -> PathBuf {
+    stable_snapshot_dir_for(snapshot_path).join("runtime-state.json")
+}
+
+pub fn repair_meta_path_for(snapshot_path: &Path) -> PathBuf {
+    stable_snapshot_dir_for(snapshot_path).join("repair-meta.json")
+}
+
+pub fn read_recovery_runtime_state(snapshot_path: &Path) -> anyhow::Result<RecoveryRuntimeState> {
+    let path = runtime_state_path_for(snapshot_path);
+    if !path.exists() {
+        return Ok(RecoveryRuntimeState::default());
+    }
+    let bytes = std::fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+pub fn write_recovery_runtime_state(
+    snapshot_path: &Path,
+    state: &RecoveryRuntimeState,
+) -> anyhow::Result<()> {
+    let dir = stable_snapshot_dir_for(snapshot_path);
+    std::fs::create_dir_all(&dir)?;
+    let path = runtime_state_path_for(snapshot_path);
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        serde_json::to_writer_pretty(&mut file, state)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    if let Ok(dir_file) = std::fs::File::open(&dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
+pub fn write_stable_v7_atomic(snapshot_path: &Path, base: &BaseIndexData) -> anyhow::Result<()> {
+    let dir = stable_snapshot_dir_for(snapshot_path);
+    std::fs::create_dir_all(&dir)?;
+    let next = stable_next_v7_path_for(snapshot_path);
+    let stable = stable_v7_path_for(snapshot_path);
+    let prev = stable_prev_v7_path_for(snapshot_path);
+
+    crate::storage::snapshot_v7::write_v7_snapshot_atomic(&next, base)?;
+    if crate::storage::snapshot_v7::try_load_v7(&next)?.is_none() {
+        anyhow::bail!("stable.next.v7 validation failed");
+    }
+
+    if stable.exists() {
+        if prev.exists() {
+            let _ = std::fs::remove_file(&prev);
+        }
+        std::fs::rename(&stable, &prev)?;
+    }
+    std::fs::rename(&next, &stable)?;
+    if let Ok(dir_file) = std::fs::File::open(&dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

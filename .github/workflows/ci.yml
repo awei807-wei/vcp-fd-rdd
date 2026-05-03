@@ -81,6 +81,26 @@ jobs:
       - name: cargo test --no-default-features
         run: cargo test --no-default-features --locked -- --test-threads=1
 
+  poweroff-recovery:
+    name: Poweroff recovery regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Stable snapshot fallback tests
+        run: cargo test --locked --test p1_snapshot_recovery -- --test-threads=1 --nocapture
+
+      - name: WAL truncated-tail recovery tests
+        run: cargo test --locked --test p1_wal_recovery -- --test-threads=1 --nocapture
+
+      - name: Startup repair decision tests
+        run: cargo test --locked --test p1_startup_repair -- --test-threads=1 --nocapture
+
   test-multi-thread:
     name: Test multi-threaded (may expose flaky concurrency bugs)
     runs-on: ubuntu-latest

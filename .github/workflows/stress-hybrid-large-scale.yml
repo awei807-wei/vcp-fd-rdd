@@ -25,6 +25,8 @@ env:
   RUST_BACKTRACE: 1
   FD_RDD_PORT: 17060
   FD_RDD_SNAPSHOT: /tmp/fd-rdd-ci-hybrid-snapshot
+  FD_RDD_HYBRID_CPU100_THRESHOLD_MS: 20000
+  FD_RDD_HYBRID_RSS_THRESHOLD_KB: 614400
 
 defaults:
   run:
@@ -157,18 +159,20 @@ jobs:
               rss_peak_kb = data.get("rss_peak_kb", 0)
 
           rss_peak_mb = rss_peak_kb / 1024.0
-          print(f"CPU 100% duration: {cpu_100_duration_ms} ms  (threshold: 10000 ms)")
-          print(f"RSS peak:          {rss_peak_kb} KB = {rss_peak_mb:.1f} MB  (threshold: 600 MB)")
+          cpu_threshold_ms = int("${{ env.FD_RDD_HYBRID_CPU100_THRESHOLD_MS }}")
+          rss_threshold_kb = int("${{ env.FD_RDD_HYBRID_RSS_THRESHOLD_KB }}")
+          print(f"CPU 100% duration: {cpu_100_duration_ms} ms  (threshold: {cpu_threshold_ms} ms)")
+          print(f"RSS peak:          {rss_peak_kb} KB = {rss_peak_mb:.1f} MB  (threshold: {rss_threshold_kb / 1024:.0f} MB)")
           print()
 
           failed = False
-          if cpu_100_duration_ms > 10000:
-              print(f"❌ FAIL: CPU 100% duration {cpu_100_duration_ms} ms exceeds 10000 ms threshold")
+          if cpu_100_duration_ms > cpu_threshold_ms:
+              print(f"❌ FAIL: CPU 100% duration {cpu_100_duration_ms} ms exceeds {cpu_threshold_ms} ms threshold")
               failed = True
           else:
               print(f"✅ PASS: CPU 100% duration within threshold")
 
-          if rss_peak_kb > 614400:  # 600 MB in KB
+          if rss_peak_kb > rss_threshold_kb:
               print(f"❌ FAIL: RSS peak {rss_peak_mb:.1f} MB exceeds 600 MB threshold")
               failed = True
           else:

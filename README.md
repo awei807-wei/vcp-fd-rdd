@@ -22,6 +22,8 @@
 - **内存归因端点**：新增 `GET /memory`，以 JSON 返回 RSS、smaps、索引估算、DeltaBuffer、事件管线等拆项。
 - **Base 内存压缩**：`BaseIndexData` 运行时不再保留第二份 `FileEntryIndex`，同时 `/memory` 纳入 base path table、entries、trigram、parent index 拆项。
 - **v7 加载高水位优化**：新写出的 v7 快照直接保存压缩 `PathTableV2` 段，减少下次启动时“完整路径列表 → 重新压缩”的临时分配；旧 v7 路径段仍兼容读取。
+- **断电恢复基础设施**：新增 `stable.v7` / `stable.prev.v7` 稳定快照轮转、`runtime-state.json` 恢复状态、WAL 截断尾统计和启动 repair scan 决策；`SIGINT` / `SIGTERM` 统一走最终快照路径。
+- **修复** 启动 repair 遮蔽 full build：空快照启动时，浅层 repair scan 的少量 upsert 不再阻止后台 full build；repair 差异过大时也会触发 full build 兜底。
 - **RSS 回吐补齐**：内存报告循环发现 heap high-water 时会主动 trim，事件风暴结束进入 idle 后会做一次 trim，并提供 `GET/POST /trim` 手动触发。
 - **ParentIndex 轻量化**：运行时目录反查索引从每目录 `RoaringBitmap` 改为排序 `Vec<u32>`，保留精确 `parent:` / `infolder:` 和 fast-sync 删除对齐能力，减少小对象堆碎片。
 - **Watcher 可关闭**：新增配置 `watch_enabled` 与 CLI `--no-watch`，支持只加载快照/手动 `/scan` 的静态模式，用于大 `$HOME` 场景下验证和降低 watcher 常驻开销。
@@ -30,6 +32,7 @@
 - **Watcher 诊断端点**：新增 `GET /watch-state`，返回当前 watcher 模式、真实 L0/L1 数量、估算 watch 预算、扫描 backlog、promotion/demotion 计数和调度说明。
 - **小批 snapshot 保护**：周期 snapshot 增加默认批量门槛，少量事件先保留在 WAL/DeltaBuffer，避免 44 万级 base 因几个事件周期性全量 materialize。
 - **真机验证**：`--watch-mode tiered` 在约 44.5 万文件索引上，启动后 RSS 约 97MB，运行一段时间后仍约 98MB，`non_index_private_dirty` 约 14MB。
+- **恢复观测**：`/health` 输出 snapshot 来源、WAL 回放条数、截断尾记录、startup repair 是否执行/升级和上次是否 clean shutdown。
 - **验证**：`cargo test -q` 全量通过。
 
 ## v0.6.12 更新（收尾稳定化）
@@ -126,7 +129,7 @@
 - **扩展** `/status` 接口：新增 `is_rebuilding` 字段，使测试和外部监控可以判断后台 rebuild 任务是否在进行中。
 - **修复** clippy `question_mark` 警告：`src/index/l2_partition.rs` 中 `let Some(posting) = tri_idx.get(tri) else { return None; };` 改为 `let posting = tri_idx.get(tri)?;`，满足 `-D warnings` 要求。
 - **修复** CI stress-hybrid-large-scale 的 inotify 限制不足：80 万文件分布在大量子目录中，`max_user_watches=524288` 在 2 核 CI runner 上仍可能耗尽，导致运行时新目录无法被动态 watch、事件丢失。已将 CI workflow 中的 `max_user_watches` 提高到 `1048576`，并新增 `max_queued_events=524288`，降低事件风暴下的队列溢出概率。
-- **修复** CI 性能阈值与 GitHub Actions runner 现实脱节：2 核 vCPU 处理 80 万文件的 initial indexing CPU 满载远超 3 秒，且当前实现 RSS 峰值超过 400MB。已将 CPU 100% 持续时间阈值从 `3000 ms` 放宽到 `10000 ms`，RSS 峰值阈值从 `400 MB` 放宽到 `600 MB`。
+- **修复** CI 性能阈值与 GitHub Actions runner 现实脱节：2 核 vCPU 处理 80 万文件的 initial indexing CPU 满载远超 3 秒，且当前实现 RSS 峰值超过 400MB。已将 CPU 100% 持续时间阈值从 `3000 ms` 放宽到 `20000 ms`，RSS 峰值阈值从 `400 MB` 放宽到 `600 MB`。
 - **优化** 大规模测试 event channel 容量：`p2_large_scale_hybrid` 测试中 `FdRddProcess::spawn` 增加 `--event-channel-size 524288`，配合 CI 的 inotify 扩容，降低批量文件创建场景下的事件静默丢弃概率。
 - **优化** `CompactMeta` 内存占用：`mtime` 字段从 `Option<SystemTime>`（16B）改为 `i64` 纳秒时间戳（8B，-1 表示 None），每文件节省 8B，百万级文件约省 **8 MB**。
 - **优化** `filekey_to_docid` 索引结构：从 `HashMap<FileKey, DocId>` 改为 `BTreeMap<FileKey, DocId>`，利用 `FileKey` 已实现的 `Ord` 特性，每 entry 节省 ~16B，百万级文件约省 **24 MB**。

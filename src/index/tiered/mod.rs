@@ -37,6 +37,30 @@ pub struct ScanOutcome {
     pub elapsed_ms: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct StartupRecoveryReport {
+    pub snapshot_source: String,
+    pub wal_events_replayed: usize,
+    pub wal_truncated_tail_records: usize,
+    pub requires_repair: bool,
+    pub previous_clean_shutdown: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StartupRepairStats {
+    pub ran: bool,
+    pub escalated: bool,
+    pub scanned: usize,
+    pub changed: usize,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RecoveryStatus {
+    pub report: StartupRecoveryReport,
+    pub repair: StartupRepairStats,
+}
+
 pub(crate) fn pathbuf_from_bytes(bytes: impl AsRef<[u8]>) -> PathBuf {
     use unicode_normalization::UnicodeNormalization;
     let s = String::from_utf8_lossy(bytes.as_ref());
@@ -75,11 +99,30 @@ pub struct TieredIndex {
     pub follow_symlinks: bool,
     pub exclude_dirs: Vec<String>,
     pub(self) fast_sync_semaphore: Arc<tokio::sync::Semaphore>,
+    pub(self) recovery_status: Mutex<RecoveryStatus>,
+    pub(self) stable_snapshot_enabled: AtomicBool,
 }
 
 impl TieredIndex {
     pub fn rebuild_in_progress(&self) -> bool {
         self.rebuild_state.lock().in_progress
+    }
+
+    pub fn recovery_status(&self) -> RecoveryStatus {
+        self.recovery_status.lock().clone()
+    }
+
+    pub(crate) fn set_startup_recovery_report(&self, report: StartupRecoveryReport) {
+        self.recovery_status.lock().report = report;
+    }
+
+    pub(crate) fn set_startup_repair_stats(&self, repair: StartupRepairStats) {
+        self.recovery_status.lock().repair = repair;
+    }
+
+    pub fn set_stable_snapshot_enabled(&self, enabled: bool) {
+        self.stable_snapshot_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

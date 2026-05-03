@@ -7,7 +7,9 @@ use fd_rdd::index::TieredIndex;
 use fd_rdd::query::SocketServer;
 use fd_rdd::query::{HealthTelemetry, QueryServer};
 use fd_rdd::stats::{EventPipelineStats, WatchStateReport};
-use fd_rdd::storage::snapshot::SnapshotStore;
+use fd_rdd::storage::snapshot::{
+    write_recovery_runtime_state, RecoveryRuntimeState, SnapshotStore,
+};
 use fd_rdd::util::normalize_exclude_dirs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -198,9 +200,35 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     let _ = index.attach_wal(store.as_ref());
+    index.set_stable_snapshot_enabled(cfg.stable_snapshot_enabled);
+    let loaded_from_empty_snapshot = index.recovery_status().report.snapshot_source == "empty";
+    let repair_stats = index.startup_repair_if_needed(
+        cfg.startup_repair_enabled,
+        &cfg.startup_repair_mode,
+        cfg.startup_repair_max_dirs,
+        cfg.startup_repair_budget_ms,
+        cfg.startup_repair_force_rebuild_ratio,
+    );
+    if repair_stats.ran {
+        tracing::info!(
+            "startup repair completed: scanned={} changed={} elapsed_ms={} escalated={}",
+            repair_stats.scanned,
+            repair_stats.changed,
+            repair_stats.elapsed_ms,
+            repair_stats.escalated
+        );
+    }
+    mark_runtime_state(
+        store.path(),
+        false,
+        &index.recovery_status().report.snapshot_source,
+        "running",
+    );
 
-    // 4) 若索引为空，后台全量构建
-    if index.file_count() == 0 {
+    // 4) 若没有可信快照，或启动 repair 判断差异过大，后台全量构建。
+    let needs_full_build =
+        loaded_from_empty_snapshot || repair_stats.escalated || index.file_count() == 0;
+    if needs_full_build && !index.rebuild_in_progress() {
         index.spawn_full_build();
     }
 
@@ -286,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .map(|runtime| runtime.report())
                 .unwrap_or_else(|| health_watch_state.as_ref().clone());
+            let recovery = index.recovery_status();
             HealthTelemetry {
                 last_snapshot_time: index.last_snapshot_time(),
                 watch_enabled,
@@ -298,6 +327,14 @@ async fn main() -> anyhow::Result<()> {
                     .saturating_add(watch_state.l3_dirs),
                 overflow_drops: stats.overflow_drops,
                 rescan_signals: stats.rescan_signals,
+                snapshot_source: recovery.report.snapshot_source,
+                wal_events_replayed: recovery.report.wal_events_replayed,
+                wal_truncated_tail_records: recovery.report.wal_truncated_tail_records,
+                startup_repair_ran: recovery.repair.ran,
+                startup_repair_escalated: recovery.repair.escalated,
+                startup_repair_scanned: recovery.repair.scanned,
+                startup_repair_changed: recovery.repair.changed,
+                last_clean_shutdown: recovery.report.previous_clean_shutdown,
             }
         })
     };
@@ -365,15 +402,66 @@ async fn main() -> anyhow::Result<()> {
         http_port
     );
 
-    // 9) 优雅退出：Ctrl+C → 最终快照
-    tokio::signal::ctrl_c().await?;
+    // 9) 优雅退出：SIGINT/SIGTERM → 最终快照
+    shutdown_signal().await?;
     info!("Shutting down, writing final snapshot...");
     if let Err(e) = index.snapshot_now(store.clone()).await {
         tracing::error!("Final snapshot failed: {}", e);
     }
+    mark_runtime_state(
+        store.path(),
+        true,
+        &index.recovery_status().report.snapshot_source,
+        "clean-shutdown",
+    );
     info!("Goodbye.");
 
     Ok(())
+}
+
+fn mark_runtime_state(
+    snapshot_path: &std::path::Path,
+    clean_shutdown: bool,
+    startup_source: &str,
+    recovery_mode: &str,
+) {
+    let state = RecoveryRuntimeState {
+        last_clean_shutdown: clean_shutdown,
+        last_snapshot_unix_secs: unix_secs(),
+        last_wal_seal_id: 0,
+        last_startup_source: startup_source.to_string(),
+        last_recovery_mode: recovery_mode.to_string(),
+    };
+    if let Err(e) = write_recovery_runtime_state(snapshot_path, &state) {
+        tracing::warn!("failed to write recovery runtime state: {}", e);
+    }
+}
+
+async fn shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(())
+    }
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug)]
@@ -540,14 +628,13 @@ fn spawn_tiered_scan_loop(
             tokio::time::sleep(interval).await;
 
             for path in runtime.expired_l0(tiered.l0_idle_ttl_secs) {
-                if runtime.mark_demotion_pending(path.as_path()) {
-                    if watch_command_tx
+                if runtime.mark_demotion_pending(path.as_path())
+                    && watch_command_tx
                         .send(WatchCommand::Remove(path.clone()))
                         .await
                         .is_err()
-                    {
-                        runtime.rollback_demote(path.as_path());
-                    }
+                {
+                    runtime.rollback_demote(path.as_path());
                 }
             }
 

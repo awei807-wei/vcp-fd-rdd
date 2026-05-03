@@ -9,7 +9,7 @@ use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
 use crate::index::PathFreshness;
 use crate::util::{maybe_trim_rss, path_has_excluded_component};
 
-use super::{pathbuf_from_bytes, ScanOutcome, TieredIndex, REBUILD_COOLDOWN};
+use super::{pathbuf_from_bytes, ScanOutcome, StartupRepairStats, TieredIndex, REBUILD_COOLDOWN};
 
 fn visit_dirs_since(
     roots: &[PathBuf],
@@ -655,5 +655,54 @@ impl TieredIndex {
         let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
         let outcome = self.scan_dirs_with_depth(&dirs, None, 50_000);
         (outcome.scanned, outcome.elapsed_ms)
+    }
+
+    pub fn startup_repair_if_needed(
+        &self,
+        enabled: bool,
+        mode: &str,
+        max_dirs: usize,
+        _budget_ms: u64,
+        force_rebuild_ratio: f32,
+    ) -> StartupRepairStats {
+        let report = self.recovery_status().report;
+        let should_run = enabled
+            && match mode {
+                "never" => false,
+                "always" => true,
+                "dirty-only" => report.requires_repair,
+                other => {
+                    tracing::warn!("unknown startup_repair_mode={}, using dirty-only", other);
+                    report.requires_repair
+                }
+            };
+
+        if !should_run {
+            let stats = StartupRepairStats::default();
+            self.set_startup_repair_stats(stats.clone());
+            return stats;
+        }
+
+        let roots = self
+            .roots
+            .iter()
+            .take(max_dirs.max(1))
+            .cloned()
+            .collect::<Vec<_>>();
+        let outcome = self.scan_dirs_immediate_outcome(&roots);
+        let changed_ratio = if outcome.scanned == 0 {
+            0.0
+        } else {
+            outcome.changed as f32 / outcome.scanned as f32
+        };
+        let stats = StartupRepairStats {
+            ran: true,
+            escalated: self.file_count() == 0 || changed_ratio > force_rebuild_ratio,
+            scanned: outcome.scanned,
+            changed: outcome.changed,
+            elapsed_ms: outcome.elapsed_ms,
+        };
+        self.set_startup_repair_stats(stats.clone());
+        stats
     }
 }

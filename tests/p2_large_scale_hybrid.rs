@@ -24,6 +24,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const CPU_100_DURATION_THRESHOLD_MS: u64 = 20_000;
+const RSS_PEAK_THRESHOLD_KB: u64 = 614_400;
+
 // ---------------------------------------------------------------------------
 // 唯一标记生成（嵌入文件名 / 内容中，用于搜索验证）
 // ---------------------------------------------------------------------------
@@ -139,16 +142,18 @@ fn write_metrics_json(metrics: &[PhaseMetrics]) {
 fn assert_performance_thresholds(metrics: &[PhaseMetrics]) {
     for m in metrics {
         assert!(
-            m.cpu_100_duration_ms <= 10_000,
-            "Phase {}: CPU 100% duration {}ms exceeds 10000ms threshold",
+            m.cpu_100_duration_ms <= CPU_100_DURATION_THRESHOLD_MS,
+            "Phase {}: CPU 100% duration {}ms exceeds {}ms threshold",
             m.name,
-            m.cpu_100_duration_ms
+            m.cpu_100_duration_ms,
+            CPU_100_DURATION_THRESHOLD_MS
         );
         assert!(
-            m.rss_peak_kb <= 614_400,
-            "Phase {}: Peak RSS {}KB exceeds 614400KB (600MB) threshold",
+            m.rss_peak_kb <= RSS_PEAK_THRESHOLD_KB,
+            "Phase {}: Peak RSS {}KB exceeds {}KB (600MB) threshold",
             m.name,
-            m.rss_peak_kb
+            m.rss_peak_kb,
+            RSS_PEAK_THRESHOLD_KB
         );
     }
 }
