@@ -217,8 +217,22 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
-          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+          set +e
+          if [ -f /tmp/fd-rdd.pid ]; then
+            DAEMON_PID=$(cat /tmp/fd-rdd.pid)
+            kill "$DAEMON_PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$DAEMON_PID" 2>/dev/null || break
+              sleep 0.2
+            done
+            kill -9 "$DAEMON_PID" 2>/dev/null || true
+          fi
+          fuser -k ${{ env.FD_RDD_PORT }}/tcp 2>/dev/null || true
+          for _ in $(seq 1 5); do
+            rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* && break
+            sleep 0.5
+          done
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* 2>/dev/null || true
 
   # ───────────────────────────────────────────────────────────────────────────
   # Job 3: 子目录 Rename 雪崩效应（P0 Bug 核心测试）
