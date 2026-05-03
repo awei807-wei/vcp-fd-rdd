@@ -8,6 +8,7 @@ use crate::core::{FileKey, FileMeta};
 pub use crate::index::file_entry_v2::{FileEntry, FileEntryIndex};
 use crate::index::parent_index::ParentIndex;
 use crate::index::path_table_v2::PathTableV2;
+use crate::index::PathFreshness;
 use crate::query::Matcher;
 use crate::stats::BaseStats;
 use crate::util::pathbuf_from_encoded_vec;
@@ -173,6 +174,28 @@ impl BaseIndexData {
         let entry = self.entries_by_key.get(docid as usize)?;
         let path_bytes = self.path_table.resolve(entry.path_idx)?;
         Some(entry_to_meta(entry, &path_bytes))
+    }
+
+    pub fn path_freshness(
+        &self,
+        path: &std::path::Path,
+        file_key: FileKey,
+        size: u64,
+        mtime_ns: i64,
+    ) -> PathFreshness {
+        let Some(meta) = self.get_meta(file_key) else {
+            return PathFreshness::Missing;
+        };
+        let old_mtime_ns = meta
+            .mtime
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_nanos()).ok())
+            .unwrap_or(-1);
+        if meta.path == path && meta.size == size && old_mtime_ns == mtime_ns {
+            PathFreshness::Unchanged
+        } else {
+            PathFreshness::Changed
+        }
     }
 
     pub fn delete_alignment_with_parent_index(

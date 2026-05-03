@@ -30,6 +30,13 @@ use self::rebuild::RebuildState;
 
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanOutcome {
+    pub scanned: usize,
+    pub changed: usize,
+    pub elapsed_ms: u64,
+}
+
 pub(crate) fn pathbuf_from_bytes(bytes: impl AsRef<[u8]>) -> PathBuf {
     use unicode_normalization::UnicodeNormalization;
     let s = String::from_utf8_lossy(bytes.as_ref());

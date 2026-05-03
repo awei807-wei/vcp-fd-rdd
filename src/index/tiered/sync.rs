@@ -5,10 +5,11 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Task};
 use crate::event::sync::DirtyScope;
-use crate::index::l2_partition::PersistentIndex;
+use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
+use crate::index::PathFreshness;
 use crate::util::{maybe_trim_rss, path_has_excluded_component};
 
-use super::{pathbuf_from_bytes, TieredIndex, REBUILD_COOLDOWN};
+use super::{pathbuf_from_bytes, ScanOutcome, TieredIndex, REBUILD_COOLDOWN};
 
 fn visit_dirs_since(
     roots: &[PathBuf],
@@ -510,12 +511,13 @@ impl TieredIndex {
         dirs: &[&PathBuf],
         max_depth: Option<usize>,
         max_entries_per_dir: usize,
-    ) -> (usize, u64) {
+    ) -> ScanOutcome {
         let start = Instant::now();
 
         let mut upsert_events: Vec<EventRecord> = Vec::new();
         let mut upsert_metas: Vec<FileMeta> = Vec::new();
         let mut scanned: usize = 0;
+        let mut changed: usize = 0;
         let mut seq: u64 = 0;
 
         for dir in dirs {
@@ -575,12 +577,19 @@ impl TieredIndex {
                 let Some(file_key) = FileKey::from_path_and_metadata(&path, &meta) else {
                     continue;
                 };
+                let mtime = meta.modified().ok();
+                let mtime_ns = mtime_to_ns(mtime);
+                if self.path_freshness(&path, file_key, meta.len(), mtime_ns)
+                    != PathFreshness::Unchanged
+                {
+                    changed += 1;
+                }
                 seq = seq.wrapping_add(1);
                 upsert_metas.push(FileMeta {
                     file_key,
                     path: path.clone(),
                     size: meta.len(),
-                    mtime: meta.modified().ok(),
+                    mtime,
                     ctime: meta.created().ok(),
                     atime: meta.accessed().ok(),
                 });
@@ -600,7 +609,27 @@ impl TieredIndex {
         }
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        (scanned, elapsed_ms)
+        ScanOutcome {
+            scanned,
+            changed,
+            elapsed_ms,
+        }
+    }
+
+    pub fn path_freshness(
+        &self,
+        path: &std::path::Path,
+        file_key: FileKey,
+        size: u64,
+        mtime_ns: i64,
+    ) -> PathFreshness {
+        match self.l2.load_full().path_freshness(path, size, mtime_ns) {
+            PathFreshness::Missing => self
+                .base
+                .load_full()
+                .path_freshness(path, file_key, size, mtime_ns),
+            known => known,
+        }
     }
 
     /// 即时扫描指定目录并更新索引（同步执行，不走 debounce/channel）。
@@ -608,6 +637,12 @@ impl TieredIndex {
     /// 限制：最多 10 个目录，每目录最多 10000 条目。
     /// 返回 (scanned_files, elapsed_ms)。
     pub fn scan_dirs_immediate(&self, dirs: &[PathBuf]) -> (usize, u64) {
+        let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
+        let outcome = self.scan_dirs_with_depth(&dirs, Some(1), 10_000);
+        (outcome.scanned, outcome.elapsed_ms)
+    }
+
+    pub fn scan_dirs_immediate_outcome(&self, dirs: &[PathBuf]) -> ScanOutcome {
         let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
         self.scan_dirs_with_depth(&dirs, Some(1), 10_000)
     }
@@ -618,6 +653,7 @@ impl TieredIndex {
     /// 返回 (scanned_files, elapsed_ms)。
     pub fn scan_dirs_immediate_deep(&self, dirs: &[PathBuf]) -> (usize, u64) {
         let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
-        self.scan_dirs_with_depth(&dirs, None, 50_000)
+        let outcome = self.scan_dirs_with_depth(&dirs, None, 50_000);
+        (outcome.scanned, outcome.elapsed_ms)
     }
 }

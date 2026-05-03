@@ -1,12 +1,13 @@
 use notify::Watcher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::event::ignore_filter::IgnoreFilter;
+use crate::event::tiered_watch::TieredWatchRuntime;
 use crate::event::watcher::{check_inotify_limit, watch_roots_enhanced, EventWatcher};
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
@@ -31,6 +32,19 @@ where
     false
 }
 
+#[derive(Clone, Debug)]
+pub enum WatchCommand {
+    Add(PathBuf),
+    Remove(PathBuf),
+}
+
+type WatchCommandRx = Arc<Mutex<Option<tokio::sync::mpsc::Receiver<WatchCommand>>>>;
+
+fn watch_command_pair() -> (tokio::sync::mpsc::Sender<WatchCommand>, WatchCommandRx) {
+    let (tx, rx) = tokio::sync::mpsc::channel(1024);
+    (tx, Arc::new(Mutex::new(Some(rx))))
+}
+
 /// 事件管道：bounded channel + debounce/合并 + 批量应用
 pub struct EventPipeline {
     index: Arc<TieredIndex>,
@@ -46,6 +60,9 @@ pub struct EventPipeline {
     exclude_dirs: Vec<String>,
     /// Optional watch root override used by budgeted watcher modes.
     watch_roots: Option<Vec<PathBuf>>,
+    watch_command_tx: tokio::sync::mpsc::Sender<WatchCommand>,
+    watch_command_rx: WatchCommandRx,
+    tiered_runtime: Option<Arc<TieredWatchRuntime>>,
     /// 共享计数器：累计处理事件数
     pub total_events: Arc<AtomicU64>,
     /// 共享计数器：最近批次大小
@@ -70,6 +87,7 @@ pub struct EventPipeline {
 
 impl EventPipeline {
     pub fn new(index: Arc<TieredIndex>) -> Self {
+        let (watch_command_tx, watch_command_rx) = watch_command_pair();
         Self {
             index,
             debounce_ms: 50,
@@ -78,6 +96,9 @@ impl EventPipeline {
             ignore_filter: None,
             exclude_dirs: Vec::new(),
             watch_roots: None,
+            watch_command_tx,
+            watch_command_rx,
+            tiered_runtime: None,
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -92,6 +113,7 @@ impl EventPipeline {
     }
 
     pub fn new_with_config(index: Arc<TieredIndex>, debounce_ms: u64, channel_size: usize) -> Self {
+        let (watch_command_tx, watch_command_rx) = watch_command_pair();
         Self {
             index,
             debounce_ms,
@@ -100,6 +122,9 @@ impl EventPipeline {
             ignore_filter: None,
             exclude_dirs: Vec::new(),
             watch_roots: None,
+            watch_command_tx,
+            watch_command_rx,
+            tiered_runtime: None,
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -119,6 +144,7 @@ impl EventPipeline {
         channel_size: usize,
         ignore_paths: Vec<PathBuf>,
     ) -> Self {
+        let (watch_command_tx, watch_command_rx) = watch_command_pair();
         Self {
             index,
             debounce_ms,
@@ -127,6 +153,9 @@ impl EventPipeline {
             ignore_filter: None,
             exclude_dirs: Vec::new(),
             watch_roots: None,
+            watch_command_tx,
+            watch_command_rx,
+            tiered_runtime: None,
             total_events: Arc::new(AtomicU64::new(0)),
             last_batch_size: Arc::new(AtomicU64::new(0)),
             overflow_drops: Arc::new(AtomicU64::new(0)),
@@ -156,6 +185,15 @@ impl EventPipeline {
         self
     }
 
+    pub fn with_tiered_runtime(mut self, runtime: Option<Arc<TieredWatchRuntime>>) -> Self {
+        self.tiered_runtime = runtime;
+        self
+    }
+
+    pub fn watch_command_sender(&self) -> tokio::sync::mpsc::Sender<WatchCommand> {
+        self.watch_command_tx.clone()
+    }
+
     /// 获取事件管道统计
     pub fn stats(&self) -> EventPipelineStats {
         EventPipelineStats {
@@ -174,6 +212,12 @@ impl EventPipeline {
 
     /// 启动事件管道
     pub async fn start(&self) -> anyhow::Result<()> {
+        let mut watch_command_rx = self
+            .watch_command_rx
+            .lock()
+            .map_err(|_| anyhow::anyhow!("watch command receiver lock poisoned"))?
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("event pipeline already started"))?;
         let roots = self
             .watch_roots
             .clone()
@@ -188,6 +232,7 @@ impl EventPipeline {
                 overflow_drops.clone(),
                 rescan_signals.clone(),
             )?;
+        let tiered_runtime = self.tiered_runtime.clone();
         // inotify watch 数兜底检查
         check_inotify_limit(roots.len());
         let failed_roots = watch_roots_enhanced(&mut watcher, &roots);
@@ -195,6 +240,11 @@ impl EventPipeline {
             .fetch_add(failed_roots.len() as u64, Ordering::Relaxed);
         self.watcher_degraded
             .store(!failed_roots.is_empty(), Ordering::Relaxed);
+        if let Some(runtime) = tiered_runtime.as_ref() {
+            for root in &failed_roots {
+                runtime.confirm_demoted(root.as_path());
+            }
+        }
 
         let index = self.index.clone();
         let debounce_ms = self.debounce_ms;
@@ -204,6 +254,7 @@ impl EventPipeline {
         let ignore_paths = self.ignore_paths.clone();
         let ignore_filter = self.ignore_filter.clone();
         let exclude_dirs = self.exclude_dirs.clone();
+        let watch_failures = self.watch_failures.clone();
         let raw_events_capacity = self.raw_events_capacity.clone();
         let merged_map_capacity = self.merged_map_capacity.clone();
         let records_capacity = self.records_capacity.clone();
@@ -239,6 +290,7 @@ impl EventPipeline {
             let mut merge_scratch = MergeScratch::default();
             let mut last_idle_trim = tokio::time::Instant::now();
             let mut last_idle_trim_total_events = 0u64;
+            let mut dynamic_watches: HashSet<PathBuf> = HashSet::new();
             let pending_moves = pending_moves;
 
             loop {
@@ -249,6 +301,63 @@ impl EventPipeline {
                 // biased 模式下优先检查 priority_rx，Create 事件优先处理。
                 let (first_ev, is_priority) = tokio::select! {
                     biased;
+                    cmd = watch_command_rx.recv() => {
+                        match cmd {
+                            Some(WatchCommand::Add(path)) => {
+                                match watcher.watch(path.as_path(), notify::RecursiveMode::Recursive) {
+                                    Ok(()) => {
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.confirm_promoted(path.as_path());
+                                        }
+                                        let scan_index = index.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let _ = scan_index.scan_dirs_immediate_deep(&[path]);
+                                        });
+                                    }
+                                    Err(e) => {
+                                        watch_failures.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.rollback_promote(path.as_path());
+                                        }
+                                        tracing::warn!("tiered watcher add failed for {:?}: {}", path, e);
+                                    }
+                                }
+                            }
+                            Some(WatchCommand::Remove(path)) => {
+                                let child_watches = dynamic_watches
+                                    .iter()
+                                    .filter(|child| child.starts_with(&path))
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                for child in child_watches {
+                                    if let Err(e) = watcher.unwatch(child.as_path()) {
+                                        tracing::debug!(
+                                            "tiered watcher child remove failed for {:?}: {}",
+                                            child,
+                                            e
+                                        );
+                                    }
+                                    dynamic_watches.remove(&child);
+                                }
+                                match watcher.unwatch(path.as_path()) {
+                                    Ok(()) => {
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.confirm_demoted(path.as_path());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        watch_failures.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.rollback_demote(path.as_path());
+                                        }
+                                        tracing::warn!("tiered watcher remove failed for {:?}: {}", path, e);
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
+                        continue;
+                    },
                     ev = priority_rx.recv() => match ev {
                         Some(e) => (e, true),
                         None if normal_rx.is_closed() => break, // both closed
@@ -330,6 +439,9 @@ impl EventPipeline {
                 if raw_events.is_empty() {
                     continue;
                 }
+                if let Some(runtime) = tiered_runtime.as_ref() {
+                    runtime.record_event_paths(raw_events.iter().flat_map(|ev| ev.paths.iter()));
+                }
 
                 // 动态注册新目录的递归监控。
                 // RecursiveMode::Recursive 不会自动为新创建的目录添加 inotify watch，
@@ -369,6 +481,8 @@ impl EventPipeline {
                         }
                         if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
                             tracing::debug!("Failed to add dynamic watch for {:?}: {}", path, e);
+                        } else {
+                            dynamic_watches.insert(path.clone());
                         }
                         changed_dirs.push(path.clone());
                     }

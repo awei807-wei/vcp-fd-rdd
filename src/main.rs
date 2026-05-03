@@ -2,7 +2,7 @@ use clap::Parser;
 use fd_rdd::config::{default_snapshot_path, default_socket_path, Config, WatchMode};
 use fd_rdd::event::ignore_filter::IgnoreFilter;
 use fd_rdd::event::sync::DirtyScope;
-use fd_rdd::event::EventPipeline;
+use fd_rdd::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
 use fd_rdd::index::TieredIndex;
 use fd_rdd::query::SocketServer;
 use fd_rdd::query::{HealthTelemetry, QueryServer};
@@ -226,6 +226,17 @@ async fn main() -> anyhow::Result<()> {
         &cfg.tiered_watch,
         &exclude_dirs,
     );
+    let tiered_runtime = if effective_watch_mode == WatchMode::Tiered {
+        Some(Arc::new(TieredWatchRuntime::new(
+            watch_plan.l0_roots.clone(),
+            watch_plan.l1_roots.clone(),
+            cfg.tiered_watch.max_watch_dirs.max(1),
+            cfg.tiered_watch.scan_items_per_sec,
+            cfg.tiered_watch.scan_ms_per_tick,
+        )))
+    } else {
+        None
+    };
     let watch_state = Arc::new(watch_plan.state.clone());
 
     // 5) 启动事件管道（bounded + debounce）
@@ -238,11 +249,13 @@ async fn main() -> anyhow::Result<()> {
         startup_ignore_paths.clone(),
     )
     .with_ignore_filter(ignore_filter.clone())
-    .with_exclude_dirs(exclude_dirs.clone());
+    .with_exclude_dirs(exclude_dirs.clone())
+    .with_tiered_runtime(tiered_runtime.clone());
     if let Some(roots) = watch_plan.watch_roots.clone() {
         pipeline = pipeline.with_watch_roots(roots);
     }
     let pipeline = Arc::new(pipeline);
+    let watch_command_tx = pipeline.watch_command_sender();
     if watch_enabled {
         pipeline.start().await?;
     } else {
@@ -250,12 +263,15 @@ async fn main() -> anyhow::Result<()> {
             "Filesystem watcher disabled; index updates require manual /scan or rebuild"
         );
     }
-    if effective_watch_mode == WatchMode::Tiered && !watch_plan.scan_roots.is_empty() {
-        spawn_tiered_scan_loop(
-            index.clone(),
-            watch_plan.scan_roots.clone(),
-            cfg.tiered_watch.clone(),
-        );
+    if effective_watch_mode == WatchMode::Tiered {
+        if let Some(runtime) = tiered_runtime.clone() {
+            spawn_tiered_scan_loop(
+                index.clone(),
+                runtime,
+                watch_command_tx,
+                cfg.tiered_watch.clone(),
+            );
+        }
     }
 
     // 6) 启动 HTTP 查询服务
@@ -263,18 +279,23 @@ async fn main() -> anyhow::Result<()> {
         let index = index.clone();
         let pipeline = pipeline.clone();
         let health_watch_state = watch_state.clone();
+        let health_tiered_runtime = tiered_runtime.clone();
         Arc::new(move || {
             let stats = pipeline.stats();
+            let watch_state = health_tiered_runtime
+                .as_ref()
+                .map(|runtime| runtime.report())
+                .unwrap_or_else(|| health_watch_state.as_ref().clone());
             HealthTelemetry {
                 last_snapshot_time: index.last_snapshot_time(),
                 watch_enabled,
                 watch_failures: stats.watch_failures,
-                watcher_degraded: stats.watcher_degraded || health_watch_state.l0_rejected > 0,
+                watcher_degraded: stats.watcher_degraded || watch_state.l0_rejected > 0,
                 degraded_roots: stats
                     .degraded_roots
-                    .saturating_add(health_watch_state.l1_dirs)
-                    .saturating_add(health_watch_state.l2_dirs)
-                    .saturating_add(health_watch_state.l3_dirs),
+                    .saturating_add(watch_state.l1_dirs)
+                    .saturating_add(watch_state.l2_dirs)
+                    .saturating_add(watch_state.l3_dirs),
                 overflow_drops: stats.overflow_drops,
                 rescan_signals: stats.rescan_signals,
             }
@@ -286,7 +307,13 @@ async fn main() -> anyhow::Result<()> {
     };
     let watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync> = {
         let watch_state = watch_state.clone();
-        Arc::new(move || watch_state.as_ref().clone())
+        let tiered_runtime = tiered_runtime.clone();
+        Arc::new(move || {
+            tiered_runtime
+                .as_ref()
+                .map(|runtime| runtime.report())
+                .unwrap_or_else(|| watch_state.as_ref().clone())
+        })
     };
     let query_server = QueryServer::new(index.clone())
         .with_health_provider(health_provider)
@@ -352,7 +379,8 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Clone, Debug)]
 struct WatchPlan {
     watch_roots: Option<Vec<PathBuf>>,
-    scan_roots: Vec<PathBuf>,
+    l0_roots: Vec<(PathBuf, usize)>,
+    l1_roots: Vec<(PathBuf, usize)>,
     state: WatchStateReport,
 }
 
@@ -401,7 +429,8 @@ fn build_watch_plan(
     match mode {
         WatchMode::Recursive => WatchPlan {
             watch_roots: None,
-            scan_roots: Vec::new(),
+            l0_roots: Vec::new(),
+            l1_roots: Vec::new(),
             state: WatchStateReport {
                 mode: watch_mode_label(mode).to_string(),
                 backend: "notify".to_string(),
@@ -413,7 +442,8 @@ fn build_watch_plan(
         },
         WatchMode::Off => WatchPlan {
             watch_roots: Some(Vec::new()),
-            scan_roots: Vec::new(),
+            l0_roots: Vec::new(),
+            l1_roots: Vec::new(),
             state: WatchStateReport {
                 mode: watch_mode_label(mode).to_string(),
                 backend: "none".to_string(),
@@ -447,10 +477,10 @@ fn build_tiered_watch_plan(
         let estimated = estimate_recursive_dir_count(candidate, max_watch_dirs, exclude_dirs);
         if estimated_total.saturating_add(estimated) <= max_watch_dirs {
             estimated_total = estimated_total.saturating_add(estimated);
-            admitted.push(candidate.clone());
+            admitted.push((candidate.clone(), estimated));
         } else {
             rejected = rejected.saturating_add(1);
-            scan_roots.push(candidate.clone());
+            scan_roots.push((candidate.clone(), estimated));
         }
     }
 
@@ -466,9 +496,14 @@ fn build_tiered_watch_plan(
         notes.push("no L0 directories admitted under current budget".to_string());
     }
 
+    let watch_roots = admitted
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
     WatchPlan {
-        watch_roots: Some(admitted.clone()),
-        scan_roots,
+        watch_roots: Some(watch_roots.clone()),
+        l0_roots: admitted.clone(),
+        l1_roots: scan_roots.clone(),
         state: WatchStateReport {
             mode: watch_mode_label(WatchMode::Tiered).to_string(),
             backend: "notify".to_string(),
@@ -493,35 +528,75 @@ fn build_tiered_watch_plan(
 
 fn spawn_tiered_scan_loop(
     index: Arc<TieredIndex>,
-    scan_roots: Vec<PathBuf>,
+    runtime: Arc<TieredWatchRuntime>,
+    watch_command_tx: tokio::sync::mpsc::Sender<WatchCommand>,
     tiered: fd_rdd::config::TieredWatchConfig,
 ) {
     tokio::spawn(async move {
         let interval = Duration::from_secs(tiered.l1_scan_interval_secs.max(1));
         let max_dirs_per_tick = (tiered.scan_items_per_sec / 500).clamp(1, 10);
-        let mut cursor = 0usize;
 
         loop {
             tokio::time::sleep(interval).await;
-            if scan_roots.is_empty() {
+
+            for path in runtime.expired_l0(tiered.l0_idle_ttl_secs) {
+                if runtime.mark_demotion_pending(path.as_path()) {
+                    if watch_command_tx
+                        .send(WatchCommand::Remove(path.clone()))
+                        .await
+                        .is_err()
+                    {
+                        runtime.rollback_demote(path.as_path());
+                    }
+                }
+            }
+
+            let batch = runtime.l1_batch(max_dirs_per_tick);
+            if batch.is_empty() {
                 continue;
             }
 
-            let mut batch = Vec::with_capacity(max_dirs_per_tick);
-            for _ in 0..max_dirs_per_tick {
-                let idx = cursor % scan_roots.len();
-                cursor = cursor.wrapping_add(1);
-                batch.push(scan_roots[idx].clone());
-            }
-
             let index = index.clone();
-            let dirs_len = batch.len();
-            match tokio::task::spawn_blocking(move || index.scan_dirs_immediate(&batch)).await {
-                Ok((scanned, elapsed_ms)) => {
+            match tokio::task::spawn_blocking(move || {
+                batch
+                    .into_iter()
+                    .map(|dir| {
+                        let outcome = index.scan_dirs_immediate_outcome(std::slice::from_ref(&dir));
+                        (dir, outcome)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            {
+                Ok(results) => {
+                    let mut scanned = 0usize;
+                    let mut changed = 0usize;
+                    let mut elapsed_ms = 0u64;
+                    for (dir, outcome) in results {
+                        runtime.record_scan(dir.as_path(), outcome);
+                        scanned = scanned.saturating_add(outcome.scanned);
+                        changed = changed.saturating_add(outcome.changed);
+                        elapsed_ms = elapsed_ms.saturating_add(outcome.elapsed_ms);
+                        if outcome.changed > 0 {
+                            match runtime.try_reserve_promotion(dir.as_path()) {
+                                fd_rdd::event::tiered_watch::PromotionDecision::SendAdd => {
+                                    if watch_command_tx
+                                        .send(WatchCommand::Add(dir.clone()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        runtime.rollback_promote(dir.as_path());
+                                    }
+                                }
+                                fd_rdd::event::tiered_watch::PromotionDecision::BudgetBlocked
+                                | fd_rdd::event::tiered_watch::PromotionDecision::NotEligible => {}
+                            }
+                        }
+                    }
                     tracing::debug!(
-                        "tiered warm scan complete: dirs={} files={} elapsed_ms={}",
-                        dirs_len,
+                        "tiered warm scan complete: files={} changed={} elapsed_ms={}",
                         scanned,
+                        changed,
                         elapsed_ms
                     );
                 }

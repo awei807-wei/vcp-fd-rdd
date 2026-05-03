@@ -26,7 +26,8 @@
 - **ParentIndex 轻量化**：运行时目录反查索引从每目录 `RoaringBitmap` 改为排序 `Vec<u32>`，保留精确 `parent:` / `infolder:` 和 fast-sync 删除对齐能力，减少小对象堆碎片。
 - **Watcher 可关闭**：新增配置 `watch_enabled` 与 CLI `--no-watch`，支持只加载快照/手动 `/scan` 的静态模式，用于大 `$HOME` 场景下验证和降低 watcher 常驻开销。
 - **Tiered watcher 预览**：新增 `watch_mode = "recursive" | "tiered" | "off"` 与 `--watch-mode`；`tiered` 先把 XDG 热点目录按 `max_watch_dirs` 预算准入 L0，未准入候选进入有界 warm scan。
-- **Watcher 诊断端点**：新增 `GET /watch-state`，返回当前 watcher 模式、L0/L1 数量、估算 watch 预算、扫描 backlog 和调度说明。
+- **Tiered watcher L0/L1 动态闭环**：`tiered` 模式下 L0 空闲超过 `l0_idle_ttl_secs` 后会通过 watcher control channel 释放 watch 并回到 L1；L1 补扫发现真实变化后会在预算允许时重新注册 watcher，注册成功后再 deep scan 补齐窗口期。
+- **Watcher 诊断端点**：新增 `GET /watch-state`，返回当前 watcher 模式、真实 L0/L1 数量、估算 watch 预算、扫描 backlog、promotion/demotion 计数和调度说明。
 - **小批 snapshot 保护**：周期 snapshot 增加默认批量门槛，少量事件先保留在 WAL/DeltaBuffer，避免 44 万级 base 因几个事件周期性全量 materialize。
 - **真机验证**：`--watch-mode tiered` 在约 44.5 万文件索引上，启动后 RSS 约 97MB，运行一段时间后仍约 98MB，`non_index_private_dirty` 约 14MB。
 - **验证**：`cargo test -q` 全量通过。

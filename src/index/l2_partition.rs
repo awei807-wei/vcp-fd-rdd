@@ -12,7 +12,7 @@ use crate::core::FileKeyEntry;
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta};
 use crate::index::file_entry_v2::FileEntry;
 use crate::index::parent_index::PathTable as PathTableTrait;
-use crate::index::IndexLayer;
+use crate::index::{IndexLayer, PathFreshness};
 use crate::query::matcher::Matcher;
 use crate::stats::L2Stats;
 use crate::util::{compose_abs_path_bytes, pathbuf_from_encoded_vec, root_bytes_for_id};
@@ -63,7 +63,7 @@ struct ResolvedFsMeta {
     mtime: Option<std::time::SystemTime>,
 }
 
-fn mtime_to_ns(mtime: Option<std::time::SystemTime>) -> i64 {
+pub(crate) fn mtime_to_ns(mtime: Option<std::time::SystemTime>) -> i64 {
     mtime
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|d| i64::try_from(d.as_nanos()).ok())
@@ -782,6 +782,23 @@ impl PersistentIndex {
             if let Some(k) = file_key {
                 self.mark_deleted(k);
             }
+        }
+    }
+
+    pub fn path_freshness(&self, path: &Path, size: u64, mtime_ns: i64) -> PathFreshness {
+        let Some(docid) = self.lookup_docid_by_path(path) else {
+            return PathFreshness::Missing;
+        };
+        if self.tombstones.read().contains(docid) {
+            return PathFreshness::Missing;
+        }
+        let Some((old_size, old_mtime_ns)) = self.entry_size_mtime(docid) else {
+            return PathFreshness::Changed;
+        };
+        if old_size == size && old_mtime_ns == mtime_ns {
+            PathFreshness::Unchanged
+        } else {
+            PathFreshness::Changed
         }
     }
 

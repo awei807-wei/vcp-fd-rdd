@@ -14,6 +14,13 @@ pub mod tiered;
 use crate::core::{FileKey, FileMeta};
 use crate::query::Matcher;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathFreshness {
+    Missing,
+    Unchanged,
+    Changed,
+}
+
 /// L2/L3 索引层抽象：为 MergedView 与 mmap/rkyv layer 预留。
 ///
 /// ## 契约（重要）
