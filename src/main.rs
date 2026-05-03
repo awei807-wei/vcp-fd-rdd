@@ -335,6 +335,11 @@ async fn main() -> anyhow::Result<()> {
                 startup_repair_scanned: recovery.repair.scanned,
                 startup_repair_changed: recovery.repair.changed,
                 last_clean_shutdown: recovery.report.previous_clean_shutdown,
+                l1_dirs: watch_state.l1_dirs,
+                l2_dirs: watch_state.l2_dirs,
+                l3_dirs: watch_state.l3_dirs,
+                watch_budget_utilization_pct: watch_state.watch_budget_utilization_pct,
+                promotion_budget_blocked: watch_state.promotion_budget_blocked,
             }
         })
     };

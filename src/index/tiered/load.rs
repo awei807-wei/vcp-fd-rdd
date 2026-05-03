@@ -115,6 +115,7 @@ impl TieredIndex {
             fast_sync_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             recovery_status: Mutex::new(super::RecoveryStatus::default()),
             stable_snapshot_enabled: AtomicBool::new(true),
+            stats: Arc::new(crate::stats::StatsCollector::new()),
         }
     }
 

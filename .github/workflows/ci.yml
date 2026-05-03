@@ -101,6 +101,9 @@ jobs:
       - name: Startup repair decision tests
         run: cargo test --locked --test p1_startup_repair -- --test-threads=1 --nocapture
 
+      - name: SIGTERM final snapshot resume test
+        run: cargo test --locked --test p1_poweroff_resume -- --test-threads=1 --nocapture
+
   test-multi-thread:
     name: Test multi-threaded (may expose flaky concurrency bugs)
     runs-on: ubuntu-latest

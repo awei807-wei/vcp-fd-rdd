@@ -134,6 +134,10 @@ impl TieredWatchRuntime {
         }
     }
 
+    pub fn max_watch_dirs(&self) -> usize {
+        self.max_watch_dirs as usize
+    }
+
     pub fn expired_l0(&self, idle_ttl_secs: u64) -> Vec<PathBuf> {
         let now = unix_secs();
         let dirs = self.dirs.read();
@@ -198,7 +202,11 @@ impl TieredWatchRuntime {
             state.demotion_pending.store(false, Ordering::Release);
             state.empty_scan_count.store(0, Ordering::Relaxed);
             let cost = state.watch_cost.load(Ordering::Relaxed);
-            self.current_watch_cost.fetch_sub(cost, Ordering::AcqRel);
+            let _ = self.current_watch_cost.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(cost)),
+            );
             self.demotions.fetch_add(1, Ordering::Relaxed);
             self.last_adjustment_unix_secs
                 .store(unix_secs(), Ordering::Relaxed);
@@ -209,6 +217,33 @@ impl TieredWatchRuntime {
         if let Some(state) = self.state(path) {
             state.demotion_pending.store(false, Ordering::Release);
         }
+    }
+
+    pub fn register_dynamic_candidate(
+        &self,
+        path: PathBuf,
+        watch_cost: usize,
+    ) -> PromotionDecision {
+        let now = unix_secs();
+        let state = {
+            let mut dirs = self.dirs.write();
+            dirs.entry(path.clone())
+                .or_insert_with(|| Arc::new(DirState::new(WatchTier::L1, watch_cost, now)))
+                .clone()
+        };
+
+        state.last_event_unix_secs.store(now, Ordering::Relaxed);
+
+        if state.tier() != WatchTier::L1 {
+            return PromotionDecision::NotEligible;
+        }
+        if state.promotion_pending.load(Ordering::Relaxed) {
+            return PromotionDecision::NotEligible;
+        }
+
+        state.watch_cost.store(watch_cost as u64, Ordering::Relaxed);
+
+        self.try_reserve_promotion(path.as_path())
     }
 
     pub fn record_scan(&self, path: &Path, outcome: ScanOutcome) {
@@ -277,7 +312,11 @@ impl TieredWatchRuntime {
     pub fn rollback_promote(&self, path: &Path) {
         if let Some(state) = self.state(path) {
             let cost = state.watch_cost.load(Ordering::Relaxed);
-            self.current_watch_cost.fetch_sub(cost, Ordering::AcqRel);
+            let _ = self.current_watch_cost.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(cost)),
+            );
             state.promotion_pending.store(false, Ordering::Release);
             state.tier.store(WatchTier::L1.as_u8(), Ordering::Release);
         }
@@ -320,6 +359,16 @@ impl TieredWatchRuntime {
                 blocked
             ));
         }
+        let watched_dirs_estimated = self.current_watch_cost.load(Ordering::Relaxed) as usize;
+        let watch_budget_utilization_pct = if self.max_watch_dirs == 0 {
+            0
+        } else {
+            ((watched_dirs_estimated as u64)
+                .saturating_mul(100)
+                .checked_div(self.max_watch_dirs)
+                .unwrap_or(0))
+            .min(100) as u8
+        };
 
         WatchStateReport {
             mode: "tiered".to_string(),
@@ -328,7 +377,7 @@ impl TieredWatchRuntime {
             l1_dirs,
             l2_dirs,
             l3_dirs,
-            watched_dirs_estimated: self.current_watch_cost.load(Ordering::Relaxed) as usize,
+            watched_dirs_estimated,
             max_watch_dirs: self.max_watch_dirs as usize,
             l0_candidates: dirs.len(),
             l0_admitted: l0_dirs,
@@ -338,6 +387,8 @@ impl TieredWatchRuntime {
             scan_ms_per_tick: self.scan_ms_per_tick,
             promotions: self.promotions.load(Ordering::Relaxed),
             demotions: self.demotions.load(Ordering::Relaxed),
+            promotion_budget_blocked: blocked,
+            watch_budget_utilization_pct,
             last_adjustment_unix_secs: self.last_adjustment_unix_secs.load(Ordering::Relaxed),
             notes,
         }
@@ -436,5 +487,44 @@ mod tests {
         assert_eq!(report.l1_dirs, 2);
         assert_eq!(report.watched_dirs_estimated, 0);
         assert_eq!(report.demotions, 1);
+    }
+
+    #[test]
+    fn dynamic_candidate_reserves_budget_and_promotes() {
+        let rt = runtime();
+        let dynamic = PathBuf::from("/tmp/hot/new-child");
+
+        assert_eq!(
+            rt.register_dynamic_candidate(dynamic.clone(), 1),
+            PromotionDecision::SendAdd
+        );
+        let reserved = rt.report();
+        assert_eq!(reserved.watched_dirs_estimated, 3);
+        assert_eq!(reserved.l1_dirs, 2);
+
+        rt.confirm_promoted(dynamic.as_path());
+        let promoted = rt.report();
+        assert_eq!(promoted.l0_dirs, 2);
+        assert_eq!(promoted.l1_dirs, 1);
+        assert_eq!(promoted.promotions, 1);
+    }
+
+    #[test]
+    fn dynamic_candidate_stays_l1_when_budget_blocked() {
+        let rt = runtime();
+        let dynamic = PathBuf::from("/tmp/hot/too-large-child");
+
+        assert_eq!(
+            rt.register_dynamic_candidate(dynamic, 4),
+            PromotionDecision::BudgetBlocked
+        );
+        let report = rt.report();
+        assert_eq!(report.watched_dirs_estimated, 2);
+        assert_eq!(report.l0_dirs, 1);
+        assert_eq!(report.l1_dirs, 2);
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("blocked by watch budget")));
     }
 }

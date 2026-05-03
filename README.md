@@ -10,7 +10,17 @@
 - 可恢复：任何快照/段损坏都能被识别并隔离（坏段跳过/拒绝加载），必要时走重建兜底
 - 长期运行稳定：LSM（base+delta）控制段数增长；compaction 做物理回收；监控可量化触页与 RSS 组成
 
-当前 tests 分支发布版本为 v0.6.14（低 RSS tiered watcher 预览 + 0.6.13 收尾稳定化）。
+当前 tests 分支发布版本为 v0.6.15（tiered watcher 预算闭环 + 指标/恢复/CI 收尾）。
+
+## v0.6.15 更新（tiered watcher 预算闭环 + 指标/恢复收尾）
+
+- **动态新目录预算闭环**：`watch_mode = "tiered"` 下，`Create(Folder)` / rename-in 产生的新目录不再绕过 `max_watch_dirs` 直接注册 watcher，而是先进入 `TieredWatchRuntime` 作为 L1 候选并按递归目录估算 cost 申请 L0。
+- **预算回滚与释放**：动态目录 watch 注册失败会释放预留预算；父级 L0 降级时同步释放动态子目录状态，避免 `/watch-state` 与底层 watcher 脑裂。
+- **watch-state / health 可观测性**：`/watch-state` 增加 `promotion_budget_blocked` 与 `watch_budget_utilization_pct`；`/health` 增加 L1/L2/L3、watch 预算使用率和预算阻塞 issue。
+- **/metrics 接入真实运行态**：`TieredIndex` 持有 `StatsCollector`，HTTP 查询、事件应用、snapshot、fast-sync 开始写入运行计数，`GET /metrics` 不再返回默认空值。
+- **断点恢复 CI 覆盖**：新增 `p1_poweroff_resume`，覆盖 SIGTERM final snapshot、`runtime-state.json` clean shutdown 标记和重启后增量文件可查询；CI `Poweroff recovery regression` 显式执行该测试。
+- **Stress CI 降噪**：`test-visibility-and-query-edge` 与 `test-io-pressure` 将固定 sleep 改为轮询等待，I/O pressure 恢复验证增加手动 `/scan` 兜底，降低事件延迟导致的误报。
+- **仓库清理**：`helloagents` 从 git 跟踪中移除，仅保留本地工作知识库，不再推送到远程仓库。
 
 ## v0.6.14 更新（低 RSS tiered watcher 预览）
 
@@ -33,6 +43,14 @@
 - **小批 snapshot 保护**：周期 snapshot 增加默认批量门槛，少量事件先保留在 WAL/DeltaBuffer，避免 44 万级 base 因几个事件周期性全量 materialize。
 - **真机验证**：`--watch-mode tiered` 在约 44.5 万文件索引上，启动后 RSS 约 97MB，运行一段时间后仍约 98MB，`non_index_private_dirty` 约 14MB。
 - **恢复观测**：`/health` 输出 snapshot 来源、WAL 回放条数、截断尾记录、startup repair 是否执行/升级和上次是否 clean shutdown。
+- **验证**：`cargo test -q` 全量通过。
+
+## v0.6.13 更新（PersistentIndex 主存储迁移）
+
+- **运行时主存储切换**：`PersistentIndex` 不再以 `CompactMeta + PathArena` 作为热路径主表，改为 `FileEntry + Vec<Vec<u8>>` 绝对路径字节表。
+- **导出期构建只读索引**：`PathTableV2 + FileEntryIndex` 仅在 `BaseIndexData` / v7 快照导出时批量构建，避免事件热路径维护 front-encoding 压缩表。
+- **legacy 格式降级为兼容层**：v4/v5 快照读取时转换到新主存储，v5/v6 导出时临时构造 `CompactMeta + PathArena`。
+- **超长路径语义更新**：运行时 paths store 可索引超过 legacy `u16 path_len` 限制的路径。
 - **验证**：`cargo test -q` 全量通过。
 
 ## v0.6.12 更新（收尾稳定化）

@@ -383,6 +383,7 @@ impl TieredIndex {
         dirs.dedup();
 
         if dirs.is_empty() {
+            self.stats.record_fast_sync();
             return report;
         }
 
@@ -503,6 +504,7 @@ impl TieredIndex {
             self.apply_events(chunk);
         }
 
+        self.stats.record_fast_sync();
         report
     }
 

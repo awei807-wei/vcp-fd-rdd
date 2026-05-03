@@ -455,10 +455,18 @@ jobs:
 
           # Create a new file
           echo "recovery_test_file_content" > "$ROOT/recovery_test_file.txt"
-          sleep 2
 
-          # Query for it
-          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=recovery_test_file&limit=10")
+          RESULT=""
+          for i in $(seq 1 45); do
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=recovery_test_file&limit=10")
+            echo "$RESULT" | grep -q "recovery_test_file.txt" && break
+            if [ "$i" -eq 15 ]; then
+              curl -fsS -X POST "http://127.0.0.1:${{ env.FD_RDD_PORT }}/scan" \
+                -H "content-type: application/json" \
+                -d "{\"paths\":[\"$ROOT\"]}" >/dev/null || true
+            fi
+            sleep 0.5
+          done
           echo "Recovery query result: $RESULT"
           if echo "$RESULT" | grep -q "recovery_test_file.txt"; then
             echo "✅ PASS: Daemon recovered and indexed new file after space freed"

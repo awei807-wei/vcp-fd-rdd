@@ -37,6 +37,11 @@ pub struct HealthTelemetry {
     pub startup_repair_scanned: usize,
     pub startup_repair_changed: usize,
     pub last_clean_shutdown: bool,
+    pub l1_dirs: usize,
+    pub l2_dirs: usize,
+    pub l3_dirs: usize,
+    pub watch_budget_utilization_pct: u8,
+    pub promotion_budget_blocked: u64,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +99,11 @@ pub struct HealthResponse {
     pub startup_repair_scanned: usize,
     pub startup_repair_changed: usize,
     pub last_clean_shutdown: bool,
+    pub l1_dirs: usize,
+    pub l2_dirs: usize,
+    pub l3_dirs: usize,
+    pub watch_budget_utilization_pct: u8,
+    pub promotion_budget_blocked: u64,
     pub issues: Vec<String>,
 }
 
@@ -222,6 +232,7 @@ async fn search_handler(
     let keyword = params.q;
     let index = state.index.clone();
 
+    let query_started = Instant::now();
     let kw_clone = keyword.clone();
     let sort = SortColumn::parse(params.sort.as_deref());
     let order = SortOrder::parse(params.order.as_deref());
@@ -253,6 +264,9 @@ async fn search_handler(
             ));
         }
     };
+    state
+        .index
+        .record_query_metric(query_started.elapsed().as_micros() as u64);
 
     let config = ScoreConfig::from_query(&keyword);
     let response = results
@@ -301,6 +315,18 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
             health.overflow_drops, health.rescan_signals
         ));
     }
+    if health.promotion_budget_blocked > 0 {
+        issues.push(format!(
+            "watch_budget: {} promotion attempt(s) blocked",
+            health.promotion_budget_blocked
+        ));
+    }
+    if health.watch_budget_utilization_pct >= 90 {
+        issues.push(format!(
+            "watch_budget: utilization={}%",
+            health.watch_budget_utilization_pct
+        ));
+    }
     if health.wal_truncated_tail_records > 0 {
         issues.push(format!(
             "wal_recovery: truncated_tail_records={}",
@@ -343,13 +369,22 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         startup_repair_scanned: health.startup_repair_scanned,
         startup_repair_changed: health.startup_repair_changed,
         last_clean_shutdown: health.last_clean_shutdown,
+        l1_dirs: health.l1_dirs,
+        l2_dirs: health.l2_dirs,
+        l3_dirs: health.l3_dirs,
+        watch_budget_utilization_pct: health.watch_budget_utilization_pct,
+        promotion_budget_blocked: health.promotion_budget_blocked,
         issues,
     })
 }
 
-async fn metrics_handler(State(_state): State<QueryServerState>) -> impl IntoResponse {
-    // TODO: wire to TieredIndex stats collector once it has one
-    Json(StatsReport::default())
+async fn metrics_handler(State(state): State<QueryServerState>) -> impl IntoResponse {
+    let mut report: StatsReport = state.index.stats_report();
+    let pipeline = (state.stats_provider)();
+    report.events_dropped = report
+        .events_dropped
+        .saturating_add(pipeline.overflow_drops);
+    Json(report)
 }
 
 async fn memory_handler(State(state): State<QueryServerState>) -> Json<MemoryReport> {

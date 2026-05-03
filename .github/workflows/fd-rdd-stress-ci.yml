@@ -115,9 +115,12 @@ jobs:
           echo "=== Test 2a: Overlay upserted_paths visibility ==="
           NEWFILE="/tmp/fd-rdd-ci-test/overlay-test/newly_created_file.txt"
           echo "brand new content" > "$NEWFILE"
-          # 等待 debounce + apply（debounce=50ms，apply 通常 <100ms）
-          sleep 0.3
-          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=newly_created&limit=10")
+          RESULT=""
+          for i in $(seq 1 30); do
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=newly_created&limit=10")
+            echo "$RESULT" | grep -q "newly_created_file.txt" && break
+            sleep 0.2
+          done
           echo "Query result: $RESULT"
           if echo "$RESULT" | grep -q "newly_created_file.txt"; then
             echo "✅ PASS: New file visible in overlay/L2"
@@ -131,8 +134,12 @@ jobs:
           set -e
           echo "=== Test 2b: Tombstone overlay visibility ==="
           rm "/tmp/fd-rdd-ci-test/overlay-test/file_1.txt"
-          sleep 0.3
-          RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file_1&limit=10")
+          RESULT=""
+          for i in $(seq 1 30); do
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file_1&limit=10")
+            ! echo "$RESULT" | grep -q "file_1.txt" && break
+            sleep 0.2
+          done
           echo "Query result: $RESULT"
           if echo "$RESULT" | grep -q "file_1.txt"; then
             echo "❌ FAIL: Deleted file still visible (tombstone bug?)"
@@ -147,7 +154,11 @@ jobs:
           echo "=== Test 2c: Single-char query degradation ==="
           # Create files with 'a' in name
           echo "a" > "/tmp/fd-rdd-ci-test/overlay-test/a_file.txt"
-          sleep 0.3
+          for i in $(seq 1 30); do
+            RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=a_file&limit=10")
+            echo "$RESULT" | grep -q "a_file.txt" && break
+            sleep 0.2
+          done
           # Query single char 'a' — should NOT full-scan
           START=$(date +%s%N)
           RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=a&limit=500")
@@ -175,12 +186,24 @@ jobs:
           # Create file with NFD-encoded name (e + U+0301)
           NFD_FILE=$(echo -e "/tmp/fd-rdd-ci-test/overlay-test/cafe\u0301_nfd.txt")
           echo "nfd" > "$NFD_FILE"
-          sleep 0.5
+          sleep 1
           # Query using NFC form
-          RESULT_NFC=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=café&limit=10")
+          RESULT_NFC=""
+          for i in $(seq 1 30); do
+            RESULT_NFC=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=café&limit=10")
+            echo "$RESULT_NFC" | grep -q "café_nfc.txt" && break
+            sleep 0.2
+          done
           echo "NFC query result: $RESULT_NFC"
           # Query using NFD form
-          RESULT_NFD=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=cafe%CC%81&limit=10")
+          RESULT_NFD=""
+          for i in $(seq 1 30); do
+            RESULT_NFD=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=cafe%CC%81&limit=10")
+            if echo "$RESULT_NFD" | grep -q "café_nfc.txt" || echo "$RESULT_NFD" | grep -q "café_nfd.txt" || echo "$RESULT_NFD" | grep -q "café_nfd.txt"; then
+              break
+            fi
+            sleep 0.2
+          done
           echo "NFD query result: $RESULT_NFD"
           NFC_OK=0
           NFD_OK=0

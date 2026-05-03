@@ -223,6 +223,7 @@ impl TieredIndex {
         batch.l2.apply_events(events);
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
+        self.stats.record_events_applied(batch.event_count as u64);
     }
 
     pub(super) fn apply_events_inner_drain(&self, events: &mut Vec<EventRecord>, log_to_wal: bool) {
@@ -233,6 +234,7 @@ impl TieredIndex {
         events.clear();
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
+        self.stats.record_events_applied(batch.event_count as u64);
     }
 
     pub(super) fn apply_upserted_metas_inner(
@@ -253,6 +255,7 @@ impl TieredIndex {
         metas.clear();
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
+        self.stats.record_events_applied(batch.event_count as u64);
     }
 }
 

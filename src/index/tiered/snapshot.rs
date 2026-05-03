@@ -194,6 +194,7 @@ impl TieredIndex {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         self.last_snapshot_time.store(ts, Ordering::Relaxed);
+        self.stats.record_snapshot();
     }
 }
 

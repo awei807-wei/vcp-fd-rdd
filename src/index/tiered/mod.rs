@@ -24,6 +24,7 @@ use crate::core::AdaptiveScheduler;
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
+use crate::stats::{StatsCollector, StatsReport};
 use crate::storage::traits::WriteAheadLog;
 
 use self::rebuild::RebuildState;
@@ -101,6 +102,7 @@ pub struct TieredIndex {
     pub(self) fast_sync_semaphore: Arc<tokio::sync::Semaphore>,
     pub(self) recovery_status: Mutex<RecoveryStatus>,
     pub(self) stable_snapshot_enabled: AtomicBool,
+    pub(self) stats: Arc<StatsCollector>,
 }
 
 impl TieredIndex {
@@ -123,6 +125,14 @@ impl TieredIndex {
     pub fn set_stable_snapshot_enabled(&self, enabled: bool) {
         self.stable_snapshot_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_query_metric(&self, elapsed_us: u64) {
+        self.stats.record_query(elapsed_us);
+    }
+
+    pub fn stats_report(&self) -> StatsReport {
+        self.stats.report()
     }
 }
 

@@ -179,6 +179,8 @@ pub struct WatchStateReport {
     pub scan_ms_per_tick: u64,
     pub promotions: u64,
     pub demotions: u64,
+    pub promotion_budget_blocked: u64,
+    pub watch_budget_utilization_pct: u8,
     pub last_adjustment_unix_secs: u64,
     pub notes: Vec<String>,
 }
@@ -664,7 +666,7 @@ impl StatsCollector {
 
 #[cfg(test)]
 mod tests {
-    use super::infer_heap_high_water;
+    use super::{infer_heap_high_water, StatsCollector};
 
     #[test]
     fn heap_high_water_detects_large_non_index_dirty() {
@@ -681,5 +683,24 @@ mod tests {
         let idx = 80 * 1024 * 1024;
         let (_non, suspected) = infer_heap_high_water(pd, idx);
         assert!(!suspected);
+    }
+
+    #[test]
+    fn stats_collector_reports_runtime_counters() {
+        let stats = StatsCollector::new();
+        stats.record_query(10);
+        stats.record_query(30);
+        stats.record_events_applied(7);
+        stats.record_events_dropped(2);
+        stats.record_snapshot();
+        stats.record_fast_sync();
+
+        let report = stats.report();
+        assert_eq!(report.queries_total, 2);
+        assert_eq!(report.queries_avg_us, 20);
+        assert_eq!(report.events_applied, 7);
+        assert_eq!(report.events_dropped, 2);
+        assert_eq!(report.snapshot_count, 1);
+        assert_eq!(report.fast_sync_count, 1);
     }
 }
