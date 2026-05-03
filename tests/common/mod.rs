@@ -91,10 +91,22 @@ impl FdRddProcess {
     #[cfg(unix)]
     #[allow(dead_code)]
     pub fn terminate(mut self) {
+        // sanitizers (TSan / ASan / MSan) can make graceful shutdown
+        // (final snapshot + runtime-state write) several times slower,
+        // so we give the child extra time when running under a sanitizer.
+        //
+        // We check TSAN_OPTIONS rather than RUSTFLAGS because cargo does
+        // not forward RUSTFLAGS to the test binary's runtime environment.
+        let sanitized = std::env::var("TSAN_OPTIONS")
+            .or_else(|_| std::env::var("ASAN_OPTIONS"))
+            .or_else(|_| std::env::var("MSAN_OPTIONS"))
+            .is_ok();
+        let max_attempts = if sanitized { 1200 } else { 150 };
+
         unsafe {
             libc::kill(self.child.id() as i32, libc::SIGTERM);
         }
-        for _ in 0..100 {
+        for _ in 0..max_attempts {
             match self.child.try_wait() {
                 Ok(Some(_)) => return,
                 Ok(None) => std::thread::sleep(Duration::from_millis(100)),

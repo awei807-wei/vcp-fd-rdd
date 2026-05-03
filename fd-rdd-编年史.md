@@ -1,6 +1,8 @@
-# fd-rdd 编年史（立项 -> 2026-04-12）
+# fd-rdd 编年史（立项 -> 2026-05-04）
 
-> 目的：把“为什么这么做、先后顺序、关键分歧与落地结果”按时间线写清楚，便于对外讨论。
+> 目的：把”为什么这么做、先后顺序、关键分歧与落地结果”按时间线写清楚，便于对外讨论。
+>
+> 本文档由 `helloagents/` 目录下的项目开发历史记录（task + why + how）汇总而成。
 
 ## 0. 立项（目标与约束）
 
@@ -197,3 +199,82 @@
 - 安全收口（2026-04-12）：HTTP 默认监听改为 `127.0.0.1`；`--root` 改为必传并移除默认遍历 `$HOME`；`fd-rdd-query --spawn` 透传 root，避免 daemon 无 root 误扫。
 - 评分体系重构（2026-04-12）：从“深度主导”升级为多维启发式（match quality × basename 乘子 + 边界感知 + Smart dot-file + node_modules 动态隔离，深度降级为 tiebreaker），解决深层项目中“浅层无关结果抢榜”的常见失败。
 - 工程结构：将超大单文件 `tiered.rs` 拆分为 13 个子模块，职责分离，降低后续改动成本与回归风险。
+
+## 10. 2026-04-17：代码质量清理
+
+无功能变更，纯工程债务清理：
+
+- 大文件拆分：`snapshot.rs`（1867 行）、`dsl.rs`（1262 行）按职责分割。
+- DRY 去重：`EventPipeline` 3 个构造函数合并为 `new_with_config_and_ignores`。
+- 死代码消除：`DAGScheduler` 移除、未使用的 Filter 变体删除、`#[allow(dead_code)]` 消除。
+- 跨平台兼容：`local_date_range` 补 non-Unix 支持、4K 页大小硬编码改为动态查询。
+- 测试工具统一：`unique_tmp_dir` 在 5+ 文件中重复定义 → 统一到 `tests/common/`。
+
+## 11. 2026-04-23：v0.6.0 核心重构
+
+v0.5.8 积累的 P0 问题促成了这一轮大重构：
+
+- **snapshot 可见性窗口**：`snapshot_now` 中先 swap L2 再写 disk_layers，中间态查询漏数据。修复：在 `apply_gate.write()` 锁内先序列化再 swap。
+- **compaction 过频**：2 delta / 30s 冷却导致百万级文件场景下 CPU/RAM 尖峰。上调为 8 delta / 4 max / 300s 冷却。
+- **event channel 溢出**：4096 默认值在 git clone/npm install 下静默丢事件。提升到 262144，并增加 >80% 水位 sleep 背压。
+- **fast-sync 太慢**：5s 冷却 + 30s 最大延迟 → 感知上等很久。压缩为 1s 冷却 + 5s 最大延迟。
+- **跨批次 rename 丢失**：PendingMoveMap 撮合 From/To 成对事件，解决 rename 后文件消失。
+- **inode 复用幽灵文件**：引入 `FS_IOC_GETVERSION` 获取 `i_generation`，彻底识别 inode 复用。
+- **query overlay 不可见**：overlay upserted_paths 合并进查询计划，新文件实时可见。
+- Unicode NFC 规范化：全路径统一 NFC，消除编码陷阱。
+- CI 压力测试：系统化覆盖 overlay 可见性、rename 雪崩、并发中间态、mmap 安全、trigram 倾斜。
+
+## 12. 2026-04-24~25：v0.6.0 后修与 v0.6.1 发布
+
+- musl 构建修复：`reqwest` 改用 `rustls-tls`，CI 增加 `musl-tools`。
+- 中文高亮 panic 修复：`abs_pos + 1` → `abs_pos + matched_len`。
+- `snapshot_now` 改为 `spawn_blocking` 避免阻塞异步运行时。
+- `apply_gate` 写饥饿：`.write()` → `.try_write()`。
+- 离线变更恢复：WAL 回放自动识别 crash 窗口期变更。
+- v0.6.1 发布：补自动配置保存（首次启动 `--root` 后 persist 到 `config.toml`）、fmt/clippy 全通过。
+
+## 13. 2026-04-25：ENOSPC + Hybrid Crawler + v0.6.2~v0.6.3
+
+- ENOSPC 主动捕获：notify error code 28 不再被静默吞掉。
+- Hybrid Crawler：degraded root 的后台周期性修复任务（60s fast-sync + 30s 调和循环），DFS 遍历对比 mtime。
+- v0.6.2：修复 6 个查询正确性 bug——空 trigram bitmap 短路阻断回退、upsert 竞态窗口、pending_events apply 顺序、query_limit 跳过 pending、`file_count()` 快照期间不一致。
+- v0.6.3 内存优化：`BTreeMap` → `HashMap`（省 ~48MB）、`short_component_index` 键从 `Box<[u8]>` 改为栈上 `u16`（省 ~3MB）、FAST_COMPACTION 默认启用、L1 `path_index` O(1) 快速路径、新目录动态监控修复。
+
+## 14. 2026-05-01~02：v0.6.4 到 v0.6.14 —— 收尾稳定化
+
+这是最密集的一轮连续迭代，主题是：把 v0.6.0 打开的所有分支收口到一个可长期运行的稳定基线。
+
+- **Phase 0/1（v0.6.4）**：benchmark 框架 + 死代码清理（-578 行），移除 compaction 旧路径、RSS trim loop、deprecated CLI 参数。
+- **Phase 2/3/4（v0.6.5~v0.6.7）**：ParentIndex 引入 → 默认启用，`parent:`/`infolder:` 查询从 O(N) 全扫降为 O(D) 脏目录扫描；DeltaBuffer 统一替代 overlay_state + pending_events。
+- **Phase 5/6（v0.6.8~v0.6.9）**：DeltaBuffer 默认启用，移除双轨增量维护；ParentIndex 接入查询路径预过滤。
+- **Phase 7/8（v0.6.10~v0.6.11）**：ParentIndex rebuild 正确性修复；DeltaBuffer 硬容量上限（256K）防 OOM；Hybrid Crawler 清理。
+- **v0.6.12**：收尾——恢复 tests 分支编译、删除 `disk_layers` 热路径状态、v7 snapshot 启动路径收敛、v6 mmap 不再带回查询热路径、删除目录 rename 事件中的同步深度扫描、WAL 回放修复。
+- **v0.6.13**：PersistentIndex 运行时主存储从 `CompactMeta + PathArena` 迁移到 `FileEntry + Vec<Vec<u8>>` 绝对路径字节表；`PathTableV2 + FileEntryIndex` 仅在 BaseIndexData / v7 快照导出时构建。
+- **v0.6.14**：Base 内存压缩（运行时不再保留第二份 FileEntryIndex）；v7 加载高水位优化（直接保存压缩 PathTableV2）；断电恢复基础设施（stable.v7 轮转、runtime-state.json、WAL 截断尾统计）；RSS 回吐补齐（heap high-water 主动 trim + `/trim` 端点）；ParentIndex 轻量化（`Vec<u32>` 替代 `RoaringBitmap`）；Watcher 可关闭（`--no-watch`）；Tiered watcher 预览（预算受控热点监听）；索引入口硬排除（默认跳过 `.git`、`node_modules` 等）；小批 snapshot 保护（周期 snapshot 增加最小事件门槛）。
+
+## 15. 2026-05-03：v0.6.15 —— 断电恢复 + Tiered Watcher 闭环
+
+当前版本。主题：把 v0.6.14 的"预览"推进到"CI 覆盖可验证"的完成态。
+
+- **稳定快照恢复**：`stable.v7` / `stable.prev.v7` / `stable.next.v7` 三文件轮转协议 + fsync + 加载验证；`runtime-state.json` 记录 clean shutdown 标记；`repair-meta.json` 记录 repair scan 元数据；startup recovery 决策链：snapshot → WAL replay → repair scan → rebuild fallback。
+- **Tiered watcher 预算闭环**：`Create(Folder)` / rename-in 产生的新目录不再绕过 `max_watch_dirs` 直接注册 watcher，而是先进入 TieredWatchRuntime 按递归目录估算 cost 申请 L0；watch 注册失败释放预留预算；父级 L0 降级同步释放动态子目录状态。
+- **可观测性补齐**：`/watch-state` 增加 `promotion_budget_blocked` 与 `watch_budget_utilization_pct`；`/health` 增加 L1/L2/L3、watch 预算使用率和预算阻塞 issue；`GET /metrics` 接入真实运行态数据。
+- **CI 覆盖扩展**：新增 `p1_poweroff_resume` 测试覆盖 SIGTERM final snapshot + clean shutdown 标记 + 重启增量可见；CI `Poweroff recovery regression` job 显式执行四组恢复测试；Stress CI 降噪（轮询替代固定 sleep）。
+- **仓库清理**：`helloagents` 从 git 跟踪中移除，仅保留本地工作知识库。
+
+## 16. 截至 2026-05-04 的系统形态
+
+- **查询链路**：L1 cache → DeltaBuffer（按路径去重）→ BaseIndexData（mmap PathTableV2 + Trigram + ParentIndex）
+- **一致性闭环**：notify watcher → bounded channel + debounce → 事件应用；溢出 → fast-sync 增量修复；必要时 → rebuild 兜底
+- **持久化**：v7 stable snapshot（CRC32C + 轮转） + events.wal + runtime-state.json
+- **Watcher**：tiered 模式——L0 预算受控热点监听 + L1 有界 warm scan + 动态升降级
+- **内存模型**：Base mmap（OS 按需触页）+ DeltaBuffer（硬容量上限）+ heap high-water 主动 trim
+- **对外接口**：HTTP `/search` + UDS 流式协议 + `/scan` + `/health` + `/metrics` + `/memory` + `/watch-state` + `/trim`
+
+## 17. 仍待推进的方向
+
+- **段级过滤（Bloom/bitset）**：减少无效段触页，降低 page fault 与 CPU
+- **更工业化 compaction**：leveled/代际策略平滑写放大与合并抖动
+- **更强 WAL 语义**：fsync 策略、序列号去重、gap verify、与 watcher 边界精确定义
+- **Benchmark 持续追踪**：当前 BENCHMARK.md 数据多为 TBD，需要 CI 自动化采集
+- **多平台支持**：Linux 为主，macOS 实验性，尚无 Windows 计划

@@ -137,7 +137,11 @@ jobs:
           RUSTDOCFLAGS: "-Z sanitizer=thread"
           TSAN_OPTIONS: "suppressions=.tsan-supp"
           CARGO_INCREMENTAL: "0"
-        run: cargo -Zbuild-std test --locked --target x86_64-unknown-linux-gnu --no-default-features --lib --tests -- --test-threads=1 --nocapture
+        # --lib only: integration tests spawn TSAN-instrumented child processes
+        # that are pathologically slow and don't benefit from TSAN (races in child
+        # processes are invisible to the test harness). Real concurrency paths
+        # (lock ordering, ArcSwap, channels) live in src/ unit tests.
+        run: cargo -Zbuild-std test --locked --target x86_64-unknown-linux-gnu --no-default-features --lib -- --test-threads=1 --nocapture
 
   doc:
     name: Documentation check
