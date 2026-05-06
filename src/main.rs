@@ -643,7 +643,7 @@ fn spawn_tiered_scan_loop(
                 }
             }
 
-            let batch = runtime.l1_batch(max_dirs_per_tick);
+            let batch = runtime.scan_batch(max_dirs_per_tick);
             if batch.is_empty() {
                 continue;
             }
@@ -669,6 +669,13 @@ fn spawn_tiered_scan_loop(
                         scanned = scanned.saturating_add(outcome.scanned);
                         changed = changed.saturating_add(outcome.changed);
                         elapsed_ms = elapsed_ms.saturating_add(outcome.elapsed_ms);
+                        runtime.apply_scan_policy(
+                            dir.as_path(),
+                            tiered.l1_scan_interval_secs,
+                            tiered.l2_scan_interval_secs,
+                            tiered.l1_empty_scans_to_l2,
+                            tiered.l2_empty_scans_to_l3,
+                        );
                         if outcome.changed > 0 {
                             match runtime.try_reserve_promotion(dir.as_path()) {
                                 fd_rdd::event::tiered_watch::PromotionDecision::SendAdd => {
@@ -678,6 +685,23 @@ fn spawn_tiered_scan_loop(
                                         .is_err()
                                     {
                                         runtime.rollback_promote(dir.as_path());
+                                    }
+                                }
+                                fd_rdd::event::tiered_watch::PromotionDecision::Replace {
+                                    demote,
+                                    promote,
+                                } => {
+                                    let demote_path = demote.clone();
+                                    let promote_path = promote.clone();
+                                    if watch_command_tx
+                                        .send(WatchCommand::Replace { demote, promote })
+                                        .await
+                                        .is_err()
+                                    {
+                                        runtime.rollback_replacement(
+                                            demote_path.as_path(),
+                                            promote_path.as_path(),
+                                        );
                                     }
                                 }
                                 fd_rdd::event::tiered_watch::PromotionDecision::BudgetBlocked

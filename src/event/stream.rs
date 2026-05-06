@@ -36,6 +36,7 @@ where
 pub enum WatchCommand {
     Add(PathBuf),
     Remove(PathBuf),
+    Replace { demote: PathBuf, promote: PathBuf },
 }
 
 type WatchCommandRx = Arc<Mutex<Option<tokio::sync::mpsc::Receiver<WatchCommand>>>>;
@@ -309,6 +310,7 @@ impl EventPipeline {
                                         if let Some(runtime) = tiered_runtime.as_ref() {
                                             runtime.confirm_promoted(path.as_path());
                                         }
+                                        dynamic_watches.insert(path.clone());
                                         let scan_index = index.clone();
                                         tokio::task::spawn_blocking(move || {
                                             let _ = scan_index.scan_dirs_immediate_deep(&[path]);
@@ -355,6 +357,82 @@ impl EventPipeline {
                                             runtime.rollback_demote(path.as_path());
                                         }
                                         tracing::warn!("tiered watcher remove failed for {:?}: {}", path, e);
+                                    }
+                                }
+                            }
+                            Some(WatchCommand::Replace { demote, promote }) => {
+                                let child_watches = dynamic_watches
+                                    .iter()
+                                    .filter(|child| child.as_path() != demote.as_path() && child.starts_with(&demote))
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                for child in child_watches {
+                                    if let Err(e) = watcher.unwatch(child.as_path()) {
+                                        tracing::debug!(
+                                            "tiered watcher replacement child remove failed for {:?}: {}",
+                                            child,
+                                            e
+                                        );
+                                    }
+                                    dynamic_watches.remove(&child);
+                                    if let Some(runtime) = tiered_runtime.as_ref() {
+                                        runtime.confirm_demoted(child.as_path());
+                                    }
+                                }
+
+                                match watcher.unwatch(demote.as_path()) {
+                                    Ok(()) => {
+                                        dynamic_watches.remove(&demote);
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.confirm_demoted(demote.as_path());
+                                            if !runtime.reserve_pending_promotion(promote.as_path()) {
+                                                runtime.cancel_pending_promotion(promote.as_path());
+                                                tracing::warn!(
+                                                    "tiered watcher replacement could not reserve promoted budget for {:?}",
+                                                    promote
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        watch_failures.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.rollback_replacement(
+                                                demote.as_path(),
+                                                promote.as_path(),
+                                            );
+                                        }
+                                        tracing::warn!(
+                                            "tiered watcher replacement remove failed for {:?}: {}",
+                                            demote,
+                                            e
+                                        );
+                                        continue;
+                                    }
+                                }
+
+                                match watcher.watch(promote.as_path(), notify::RecursiveMode::Recursive) {
+                                    Ok(()) => {
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.confirm_promoted(promote.as_path());
+                                        }
+                                        dynamic_watches.insert(promote.clone());
+                                        let scan_index = index.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let _ = scan_index.scan_dirs_immediate_deep(&[promote]);
+                                        });
+                                    }
+                                    Err(e) => {
+                                        watch_failures.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.rollback_promote(promote.as_path());
+                                        }
+                                        tracing::warn!(
+                                            "tiered watcher replacement add failed for {:?}: {}",
+                                            promote,
+                                            e
+                                        );
                                     }
                                 }
                             }
@@ -502,6 +580,74 @@ impl EventPipeline {
                                             tracing::warn!(
                                                 "tiered dynamic watcher add failed for {:?}: {}",
                                                 path,
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                crate::event::tiered_watch::PromotionDecision::Replace {
+                                    demote,
+                                    promote,
+                                } => {
+                                    let child_watches = dynamic_watches
+                                        .iter()
+                                        .filter(|child| {
+                                            child.as_path() != demote.as_path()
+                                                && child.starts_with(&demote)
+                                        })
+                                        .cloned()
+                                        .collect::<Vec<_>>();
+                                    for child in child_watches {
+                                        if let Err(e) = watcher.unwatch(child.as_path()) {
+                                            tracing::debug!(
+                                                "tiered dynamic replacement child remove failed for {:?}: {}",
+                                                child,
+                                                e
+                                            );
+                                        }
+                                        dynamic_watches.remove(&child);
+                                        runtime.confirm_demoted(child.as_path());
+                                    }
+                                    match watcher.unwatch(demote.as_path()) {
+                                        Ok(()) => {
+                                            dynamic_watches.remove(&demote);
+                                            runtime.confirm_demoted(demote.as_path());
+                                            if !runtime.reserve_pending_promotion(promote.as_path())
+                                            {
+                                                runtime.cancel_pending_promotion(promote.as_path());
+                                                tracing::warn!(
+                                                    "tiered dynamic replacement could not reserve promoted budget for {:?}",
+                                                    promote
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            runtime.rollback_replacement(
+                                                demote.as_path(),
+                                                promote.as_path(),
+                                            );
+                                            tracing::warn!(
+                                                "tiered dynamic replacement remove failed for {:?}: {}",
+                                                demote,
+                                                e
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    match watcher
+                                        .watch(promote.as_path(), notify::RecursiveMode::Recursive)
+                                    {
+                                        Ok(()) => {
+                                            runtime.confirm_promoted(promote.as_path());
+                                            dynamic_watches.insert(promote.clone());
+                                        }
+                                        Err(e) => {
+                                            watch_failures.fetch_add(1, Ordering::Relaxed);
+                                            runtime.rollback_promote(promote.as_path());
+                                            tracing::warn!(
+                                                "tiered dynamic replacement add failed for {:?}: {}",
+                                                promote,
                                                 e
                                             );
                                         }

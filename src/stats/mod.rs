@@ -179,9 +179,12 @@ pub struct WatchStateReport {
     pub scan_ms_per_tick: u64,
     pub promotions: u64,
     pub demotions: u64,
+    pub l0_replacements: u64,
     pub promotion_budget_blocked: u64,
     pub watch_budget_utilization_pct: u8,
     pub last_adjustment_unix_secs: u64,
+    pub next_scan_unix_secs: u64,
+    pub event_score_total: u64,
     pub notes: Vec<String>,
 }
 
