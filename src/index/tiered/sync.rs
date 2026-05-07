@@ -581,7 +581,7 @@ impl TieredIndex {
                 };
                 let mtime = meta.modified().ok();
                 let mtime_ns = mtime_to_ns(mtime);
-                if self.path_freshness(&path, file_key, meta.len(), mtime_ns)
+                if self.path_freshness(&path, file_key, mtime_ns)
                     != PathFreshness::Unchanged
                 {
                     changed += 1;
@@ -622,14 +622,13 @@ impl TieredIndex {
         &self,
         path: &std::path::Path,
         file_key: FileKey,
-        size: u64,
         mtime_ns: i64,
     ) -> PathFreshness {
-        match self.l2.load_full().path_freshness(path, size, mtime_ns) {
+        match self.l2.load_full().path_freshness(path, mtime_ns) {
             PathFreshness::Missing => self
                 .base
                 .load_full()
-                .path_freshness(path, file_key, size, mtime_ns),
+                .path_freshness(path, file_key, mtime_ns),
             known => known,
         }
     }

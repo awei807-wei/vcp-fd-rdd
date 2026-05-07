@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(feature = "rkyv")]
@@ -19,13 +19,6 @@ use crate::util::{compose_abs_path_bytes, pathbuf_from_encoded_vec, root_bytes_f
 
 /// Trigram：3 字节子串，用于倒排索引加速查询
 type Trigram = [u8; 3];
-
-/// 将 1-2 字节的短路径组件编码为 u16（大端序，零填充高位）。
-/// 1 字节: `[b]` → `[b, 0x00]`；2 字节: `[b0, b1]` → `[b0, b1]`。
-#[inline]
-fn encode_short_component(bytes: &[u8]) -> u16 {
-    u16::from_be_bytes([bytes[0], bytes.get(1).copied().unwrap_or(0)])
-}
 
 fn normalize_short_hint(hint: &[u8]) -> Option<Vec<u8>> {
     let normalized = String::from_utf8_lossy(hint).to_lowercase().into_bytes();
@@ -44,22 +37,9 @@ fn trigram_matches_short_hint(tri: Trigram, hint: &[u8]) -> bool {
     }
 }
 
-fn short_component_matches(encoded: u16, hint: &[u8]) -> bool {
-    if hint.is_empty() || hint.len() > 2 {
-        return false;
-    }
-    let bytes = encoded.to_be_bytes();
-    if hint.len() == 1 {
-        bytes[0] == hint[0] || bytes[1] == hint[0]
-    } else {
-        bytes == hint
-    }
-}
-
 #[derive(Clone, Copy)]
 struct ResolvedFsMeta {
     file_key: FileKey,
-    size: u64,
     mtime: Option<std::time::SystemTime>,
 }
 
@@ -94,36 +74,21 @@ fn query_trigrams(query: &str) -> Vec<Trigram> {
     tris
 }
 
-/// 从路径的所有“洁净组件”（`Component::Normal`）中枚举 trigram（可能重复）。
+/// 从路径的 basename（`path.file_name()`）中枚举 trigram（可能重复）。
 ///
 /// - 标准化：lossy UTF-8 + to_lowercase
-/// - 目的：让 trigram 候选集成为 Segment/contains 等精确匹配的严格超集（避免假阴性）
-fn for_each_component_trigram(path: &Path, mut f: impl FnMut(Trigram)) {
-    for c in path.components() {
-        let Component::Normal(os) = c else {
-            continue;
-        };
-        let lower = os.to_string_lossy().to_lowercase();
-        let bytes = lower.as_bytes();
-        if bytes.len() < 3 {
-            continue;
-        }
-        for w in bytes.windows(3) {
-            f([w[0], w[1], w[2]]);
-        }
+/// - 目的：让 trigram 候选集成为 basename 精确匹配的严格超集（避免假阴性）
+fn for_each_basename_trigram(path: &Path, mut f: impl FnMut(Trigram)) {
+    let Some(os) = path.file_name() else {
+        return;
+    };
+    let lower = os.to_string_lossy().to_lowercase();
+    let bytes = lower.as_bytes();
+    if bytes.len() < 3 {
+        return;
     }
-}
-
-fn for_each_short_component(path: &Path, mut f: impl FnMut(u16)) {
-    for c in path.components() {
-        let Component::Normal(os) = c else {
-            continue;
-        };
-        let lower = os.to_string_lossy().to_lowercase();
-        let bytes = lower.as_bytes();
-        if (1..=2).contains(&bytes.len()) {
-            f(encode_short_component(bytes));
-        }
+    for w in bytes.windows(3) {
+        f([w[0], w[1], w[2]]);
     }
 }
 
@@ -216,7 +181,6 @@ pub struct CompactMeta {
     pub root_id: u16,
     pub path_off: u32,
     pub path_len: u16,
-    pub size: u64,
     pub mtime_ns: i64,
 }
 
@@ -386,8 +350,6 @@ pub struct PersistentIndex {
 
     /// Trigram 倒排索引：trigram -> RoaringTreemap(DocId)
     trigram_index: RwLock<HashMap<Trigram, RoaringTreemap>>,
-    /// 短组件索引：长度 1-2 的标准化路径组件 -> RoaringTreemap(DocId)
-    short_component_index: RwLock<HashMap<u16, RoaringTreemap>>,
 
     /// 墓碑标记（DocId）
     tombstones: RwLock<RoaringTreemap>,
@@ -480,7 +442,6 @@ impl PersistentIndex {
             filekey_to_docid: RwLock::new(HashMap::new()),
             path_hash_to_id: RwLock::new(HashMap::new()),
             trigram_index: RwLock::new(HashMap::new()),
-            short_component_index: RwLock::new(HashMap::new()),
             tombstones: RwLock::new(RoaringTreemap::new()),
             dirty: std::sync::atomic::AtomicBool::new(false),
             parent_index: RwLock::new(None),
@@ -518,7 +479,6 @@ impl PersistentIndex {
                 entries.push(FileEntry::from_file_key(
                     meta.file_key,
                     docid,
-                    meta.size,
                     meta.mtime_ns,
                 ));
                 paths.push(abs_bytes);
@@ -555,7 +515,7 @@ impl PersistentIndex {
             let docid = entries.len() as u32;
             let mtime_ns = mtime_to_ns(m.mtime);
             entries.push(FileEntry::from_file_key(
-                m.file_key, docid, m.size, mtime_ns,
+                m.file_key, docid, mtime_ns,
             ));
             paths.push(abs_path.as_os_str().as_encoded_bytes().to_vec());
         }
@@ -597,12 +557,10 @@ impl PersistentIndex {
         let mut filekey_to_docid = self.filekey_to_docid.write();
         let mut path_hash_to_id = self.path_hash_to_id.write();
         let mut trigram_index = self.trigram_index.write();
-        let mut short_component_index = self.short_component_index.write();
 
         filekey_to_docid.clear();
         path_hash_to_id.clear();
         trigram_index.clear();
-        short_component_index.clear();
 
         for (docid_usize, entry) in entries.iter().enumerate() {
             let docid: DocId = docid_usize as DocId;
@@ -624,14 +582,8 @@ impl PersistentIndex {
                     .or_insert(OneOrManyDocId::One(docid));
 
                 let abs_path = pathbuf_from_encoded_vec(abs_bytes.clone());
-                for_each_component_trigram(abs_path.as_path(), |tri| {
+                for_each_basename_trigram(abs_path.as_path(), |tri| {
                     trigram_index.entry(tri).or_default().insert(docid);
-                });
-                for_each_short_component(abs_path.as_path(), |component| {
-                    short_component_index
-                        .entry(component)
-                        .or_default()
-                        .insert(docid);
                 });
             }
         }
@@ -671,7 +623,7 @@ impl PersistentIndex {
 
             if same_path {
                 // 同路径重复上报：只更新元数据，避免 posting 重复写入
-                self.update_entry_metadata(docid, meta.size, new_mtime_ns);
+                self.update_entry_metadata(docid, new_mtime_ns);
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
             }
@@ -693,7 +645,7 @@ impl PersistentIndex {
             // 路径不同：hardlink、rename，或旧路径已消失后的 reconcile
             if !force_path_update && !old_path_missing {
                 // hardlink/重复发现：保留旧路径，仅更新元数据
-                self.update_entry_metadata(docid, meta.size, new_mtime_ns);
+                self.update_entry_metadata(docid, new_mtime_ns);
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
             }
@@ -709,10 +661,10 @@ impl PersistentIndex {
             self.insert_trigrams(docid, meta.path.as_path());
             self.insert_path_hash(docid, meta.path.as_path());
 
-            if !self.update_entry_path(docid, &new_abs_bytes, meta.size, new_mtime_ns) {
+            if !self.update_entry_path(docid, &new_abs_bytes, new_mtime_ns) {
                 // 极端情况：docid 槽位不存在，降级为 append
                 if let Some(docid_new) =
-                    self.alloc_docid(fkey, &new_abs_bytes, meta.size, new_mtime_ns)
+                    self.alloc_docid(fkey, &new_abs_bytes, new_mtime_ns)
                 {
                     self.insert_trigrams(docid_new, meta.path.as_path());
                     self.insert_path_hash(docid_new, meta.path.as_path());
@@ -726,7 +678,7 @@ impl PersistentIndex {
         }
 
         // 新文件：分配 docid 并写入
-        let Some(docid) = self.alloc_docid(fkey, &new_abs_bytes, meta.size, new_mtime_ns) else {
+        let Some(docid) = self.alloc_docid(fkey, &new_abs_bytes, new_mtime_ns) else {
             return;
         };
         self.insert_trigrams(docid, meta.path.as_path());
@@ -738,13 +690,12 @@ impl PersistentIndex {
         &self,
         file_key: FileKey,
         abs_path_bytes: &[u8],
-        size: u64,
         mtime_ns: i64,
     ) -> Option<DocId> {
         let mut entries = self.entries.write();
         let docid: DocId = entries.len() as DocId;
         let path_idx: u32 = docid.try_into().ok()?;
-        entries.push(FileEntry::from_file_key(file_key, path_idx, size, mtime_ns));
+        entries.push(FileEntry::from_file_key(file_key, path_idx, mtime_ns));
         self.paths.write().push(abs_path_bytes.to_vec());
 
         self.filekey_to_docid.write().insert(file_key, docid);
@@ -785,17 +736,17 @@ impl PersistentIndex {
         }
     }
 
-    pub fn path_freshness(&self, path: &Path, size: u64, mtime_ns: i64) -> PathFreshness {
+    pub fn path_freshness(&self, path: &Path, mtime_ns: i64) -> PathFreshness {
         let Some(docid) = self.lookup_docid_by_path(path) else {
             return PathFreshness::Missing;
         };
         if self.tombstones.read().contains(docid) {
             return PathFreshness::Missing;
         }
-        let Some((old_size, old_mtime_ns)) = self.entry_size_mtime(docid) else {
+        let Some(old_mtime_ns) = self.entry_mtime(docid) else {
             return PathFreshness::Changed;
         };
-        if old_size == size && old_mtime_ns == mtime_ns {
+        if old_mtime_ns == mtime_ns {
             PathFreshness::Unchanged
         } else {
             PathFreshness::Changed
@@ -1003,7 +954,6 @@ impl PersistentIndex {
         let meta = std::fs::metadata(path).ok()?;
         Some(ResolvedFsMeta {
             file_key: FileKey::from_path_and_metadata(path, &meta)?,
-            size: meta.len(),
             mtime: meta.modified().ok(),
         })
     }
@@ -1105,7 +1055,7 @@ impl PersistentIndex {
             self.upsert(FileMeta {
                 file_key: meta.file_key,
                 path: path.into_owned(),
-                size: meta.size,
+                size: 0,
                 mtime: meta.mtime,
                 ctime: None,
                 atime: None,
@@ -1125,7 +1075,7 @@ impl PersistentIndex {
             self.upsert(FileMeta {
                 file_key: fk,
                 path,
-                size: meta.size,
+                size: 0,
                 mtime: meta.mtime,
                 ctime: None,
                 atime: None,
@@ -1175,17 +1125,17 @@ impl PersistentIndex {
 
             if let Some(ref to_path) = to_path {
                 let to_path_owned = to_path.clone();
-                let (size, mtime_ns) = if let Some(meta) = to_meta {
-                    (meta.size, mtime_to_ns(meta.mtime))
+                let mtime_ns = if let Some(meta) = to_meta {
+                    mtime_to_ns(meta.mtime)
                 } else {
-                    self.entry_size_mtime(docid).unwrap_or((0, -1))
+                    self.entry_mtime(docid).unwrap_or(-1)
                 };
                 self.insert_trigrams(docid, &to_path_owned);
                 self.insert_path_hash(docid, &to_path_owned);
                 let abs_path_bytes = to_path_owned.as_os_str().as_encoded_bytes().to_vec();
-                self.update_entry_path(docid, &abs_path_bytes, size, mtime_ns);
+                self.update_entry_path(docid, &abs_path_bytes, mtime_ns);
             } else if let Some(meta) = fallback_meta {
-                self.update_entry_metadata(docid, meta.size, mtime_to_ns(meta.mtime));
+                self.update_entry_metadata(docid, mtime_to_ns(meta.mtime));
                 if let Some(old_path) = self.path_buf_for_docid(docid) {
                     self.insert_trigrams(docid, &old_path);
                     self.insert_path_hash(docid, &old_path);
@@ -1210,7 +1160,7 @@ impl PersistentIndex {
             self.upsert(FileMeta {
                 file_key: meta.file_key,
                 path: to_path.into_owned(),
-                size: meta.size,
+                size: 0,
                 mtime: meta.mtime,
                 ctime: None,
                 atime: None,
@@ -1270,16 +1220,14 @@ impl PersistentIndex {
         //   root_id u16
         //   path_off u32
         //   path_len u16
-        //   size u64
         //   mtime_unix_ns i64 (-1 表示 None)
-        let mut metas_bytes = Vec::with_capacity(metas.len() * 40);
+        let mut metas_bytes = Vec::with_capacity(metas.len() * 32);
         for m in metas.iter() {
             metas_bytes.extend_from_slice(&m.file_key.dev.to_le_bytes());
             metas_bytes.extend_from_slice(&m.file_key.ino.to_le_bytes());
             metas_bytes.extend_from_slice(&m.root_id.to_le_bytes());
             metas_bytes.extend_from_slice(&m.path_off.to_le_bytes());
             metas_bytes.extend_from_slice(&m.path_len.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.size.to_le_bytes());
             metas_bytes.extend_from_slice(&m.mtime_ns.to_le_bytes());
         }
 
@@ -1436,14 +1384,13 @@ impl PersistentIndex {
         Self::write_segment(writer, arena.data.as_ref())?;
 
         // Metas 段：按 DocId 顺序顺排，固定记录大小（little-endian）
-        let mut metas_bytes = Vec::with_capacity(metas.len() * 40);
+        let mut metas_bytes = Vec::with_capacity(metas.len() * 32);
         for m in metas.iter() {
             metas_bytes.extend_from_slice(&m.file_key.dev.to_le_bytes());
             metas_bytes.extend_from_slice(&m.file_key.ino.to_le_bytes());
             metas_bytes.extend_from_slice(&m.root_id.to_le_bytes());
             metas_bytes.extend_from_slice(&m.path_off.to_le_bytes());
             metas_bytes.extend_from_slice(&m.path_len.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.size.to_le_bytes());
             metas_bytes.extend_from_slice(&m.mtime_ns.to_le_bytes());
         }
         Self::write_segment(writer, &metas_bytes)?;
@@ -1575,7 +1522,6 @@ impl PersistentIndex {
         let filekey_to_docid = self.filekey_to_docid.read();
         let path_hash_to_id = self.path_hash_to_id.read();
         let trigram_index = self.trigram_index.read();
-        let short_component_index = self.short_component_index.read();
         let tombstones = self.tombstones.read();
 
         let total_docs = entries.len();
@@ -1632,21 +1578,7 @@ impl PersistentIndex {
         let trigram_entry_bytes = size_of::<(Trigram, RoaringTreemap)>() as u64;
         let trigram_map_bytes = trigram_index.capacity() as u64 * (trigram_entry_bytes + 1)
             + size_of::<HashMap<Trigram, RoaringTreemap>>() as u64;
-        let short_component_entry_bytes = size_of::<(u16, RoaringTreemap)>() as u64;
-        let mut short_component_heap_bytes: u64 = 0;
-        for (component, posting) in short_component_index.iter() {
-            short_component_heap_bytes += if component.to_be_bytes()[1] == 0 {
-                1
-            } else {
-                2
-            };
-            short_component_heap_bytes += posting.serialized_size() as u64;
-        }
-        let short_component_bytes = short_component_index.capacity() as u64
-            * (short_component_entry_bytes + 1)
-            + size_of::<HashMap<u16, RoaringTreemap>>() as u64
-            + short_component_heap_bytes;
-        let trigram_bytes = trigram_map_bytes + trigram_heap_bytes + short_component_bytes;
+        let trigram_bytes = trigram_map_bytes + trigram_heap_bytes;
 
         // tombstones：RoaringTreemap
         let tomb_bytes = size_of::<RoaringTreemap>() as u64 + tombstones.serialized_size() as u64;
@@ -1694,7 +1626,6 @@ impl PersistentIndex {
     pub fn reset(&self) {
         // 统一按固定顺序清理，避免读写并发下出现锁顺序反转。
         self.trigram_index.write().clear();
-        self.short_component_index.write().clear();
         self.path_hash_to_id.write().clear();
         self.filekey_to_docid.write().clear();
         self.tombstones.write().clear();
@@ -1752,7 +1683,7 @@ impl PersistentIndex {
         FileMeta {
             file_key: entry.file_key(),
             path: pathbuf_from_encoded_vec(path_bytes.to_vec()),
-            size: entry.size,
+            size: 0,
             mtime: mtime_from_ns(entry.mtime_ns),
             ctime: None,
             atime: None,
@@ -1766,18 +1697,17 @@ impl PersistentIndex {
             .map(|bytes| pathbuf_from_encoded_vec(bytes.clone()))
     }
 
-    fn entry_size_mtime(&self, docid: DocId) -> Option<(u64, i64)> {
+    fn entry_mtime(&self, docid: DocId) -> Option<i64> {
         let entries = self.entries.read();
         let entry = entries.get(docid as usize)?;
-        Some((entry.size, entry.mtime_ns))
+        Some(entry.mtime_ns)
     }
 
-    fn update_entry_metadata(&self, docid: DocId, size: u64, mtime_ns: i64) -> bool {
+    fn update_entry_metadata(&self, docid: DocId, mtime_ns: i64) -> bool {
         let mut entries = self.entries.write();
         let Some(entry) = entries.get_mut(docid as usize) else {
             return false;
         };
-        entry.size = size;
         entry.mtime_ns = mtime_ns;
         true
     }
@@ -1786,7 +1716,6 @@ impl PersistentIndex {
         &self,
         docid: DocId,
         abs_path_bytes: &[u8],
-        size: u64,
         mtime_ns: i64,
     ) -> bool {
         {
@@ -1798,7 +1727,6 @@ impl PersistentIndex {
                 Ok(path_idx) => path_idx,
                 Err(_) => return false,
             };
-            entry.size = size;
             entry.mtime_ns = mtime_ns;
         }
         let mut paths = self.paths.write();
@@ -1831,7 +1759,6 @@ impl PersistentIndex {
                 root_id,
                 path_off,
                 path_len,
-                size: entry.size,
                 mtime_ns: entry.mtime_ns,
             });
         }
@@ -1841,8 +1768,7 @@ impl PersistentIndex {
 
     fn remove_trigrams(&self, docid: DocId, path: &Path) {
         let mut tri_idx = self.trigram_index.write();
-        let mut short_idx = self.short_component_index.write();
-        for_each_component_trigram(path, |tri| {
+        for_each_basename_trigram(path, |tri| {
             if let Some(posting) = tri_idx.get_mut(&tri) {
                 posting.remove(docid);
                 if posting.is_empty() {
@@ -1850,24 +1776,12 @@ impl PersistentIndex {
                 }
             }
         });
-        for_each_short_component(path, |component| {
-            if let Some(posting) = short_idx.get_mut(&component) {
-                posting.remove(docid);
-                if posting.is_empty() {
-                    short_idx.remove(&component);
-                }
-            }
-        });
     }
 
     fn insert_trigrams(&self, docid: DocId, path: &Path) {
         let mut tri_idx = self.trigram_index.write();
-        let mut short_idx = self.short_component_index.write();
-        for_each_component_trigram(path, |tri| {
+        for_each_basename_trigram(path, |tri| {
             tri_idx.entry(tri).or_default().insert(docid);
-        });
-        for_each_short_component(path, |component| {
-            short_idx.entry(component).or_default().insert(docid);
         });
     }
 
@@ -1947,17 +1861,10 @@ impl PersistentIndex {
     fn short_hint_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringTreemap> {
         let hint = normalize_short_hint(matcher.literal_hint()?)?;
         let tri_idx = self.trigram_index.read();
-        let short_idx = self.short_component_index.read();
         let mut acc = RoaringTreemap::new();
 
         for (tri, posting) in tri_idx.iter() {
             if trigram_matches_short_hint(*tri, &hint) {
-                acc |= posting.clone();
-            }
-        }
-
-        for (component, posting) in short_idx.iter() {
-            if short_component_matches(*component, &hint) {
                 acc |= posting.clone();
             }
         }
@@ -2006,7 +1913,6 @@ impl PersistentIndex {
             let new_entry = crate::index::file_entry_v2::FileEntry::from_file_key(
                 entry.file_key(),
                 path_idx,
-                entry.size,
                 entry.mtime_ns,
             );
             entry_index.push(new_entry);
@@ -2230,11 +2136,11 @@ mod tests {
 
         let m = create_matcher("ab", true);
         let r = idx.query(m.as_ref(), 100);
-        assert_eq!(r.len(), 2);
+        assert_eq!(r.len(), 1);
 
         let m = create_matcher("a", true);
         let r = idx.query(m.as_ref(), 100);
-        assert_eq!(r.len(), 2);
+        assert_eq!(r.len(), 1);
     }
 
     #[test]

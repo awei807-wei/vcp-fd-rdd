@@ -1,18 +1,17 @@
-//! FileEntry v2: fixed-size 40-byte struct + file-key lookup index.
+//! FileEntry v2: fixed-size 32-byte struct + file-key lookup index.
 
 use crate::core::FileKey;
 
-/// Fixed-size file metadata entry (40 bytes).
+/// Fixed-size file metadata entry (32 bytes).
 ///
 /// Layout:
 /// - dev:      8 bytes
 /// - ino:      8 bytes
 /// - generation: 4 bytes
 /// - path_idx: 4 bytes
-/// - size:     8 bytes
 /// - mtime_ns: 8 bytes
 ///
-/// Total: 40 bytes
+/// Total: 32 bytes
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileEntry {
@@ -20,13 +19,12 @@ pub struct FileEntry {
     pub ino: u64,
     pub generation: u32,
     pub path_idx: u32,
-    pub size: u64,
     pub mtime_ns: i64,
 }
 
 // Assert size at compile time.
 #[cfg(target_pointer_width = "64")]
-const _: [(); 1] = [(); (std::mem::size_of::<FileEntry>() == 40) as usize];
+const _: [(); 1] = [(); (std::mem::size_of::<FileEntry>() == 32) as usize];
 
 impl FileEntry {
     pub fn file_key(&self) -> FileKey {
@@ -37,13 +35,12 @@ impl FileEntry {
         }
     }
 
-    pub fn from_file_key(file_key: FileKey, path_idx: u32, size: u64, mtime_ns: i64) -> Self {
+    pub fn from_file_key(file_key: FileKey, path_idx: u32, mtime_ns: i64) -> Self {
         Self {
             dev: file_key.dev,
             ino: file_key.ino,
             generation: file_key.generation,
             path_idx,
-            size,
             mtime_ns,
         }
     }
@@ -198,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_file_entry_size() {
-        assert_eq!(std::mem::size_of::<FileEntry>(), 40);
+        assert_eq!(std::mem::size_of::<FileEntry>(), 32);
     }
 
     #[test]
@@ -207,26 +204,22 @@ mod tests {
         index.push(FileEntry::from_file_key(
             make_key(1, 100),
             0,
-            1024,
             1_000_000,
         ));
         index.push(FileEntry::from_file_key(
             make_key(1, 200),
             1,
-            2048,
             2_000_000,
         ));
         index.push(FileEntry::from_file_key(
             make_key(2, 100),
             2,
-            512,
             3_000_000,
         ));
         let index = index.build();
 
         let r = index.lookup_by_filekey(make_key(1, 200)).unwrap();
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].size, 2048);
 
         assert!(index.lookup_by_filekey(make_key(99, 99)).is_none());
     }
@@ -239,7 +232,6 @@ mod tests {
                 FileEntry::from_file_key(
                     make_key(i as u64 % 100, i as u64),
                     i,
-                    i as u64 * 16,
                     i as i64 * 1_000_000,
                 )
             })

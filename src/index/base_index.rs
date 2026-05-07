@@ -180,7 +180,6 @@ impl BaseIndexData {
         &self,
         path: &std::path::Path,
         file_key: FileKey,
-        size: u64,
         mtime_ns: i64,
     ) -> PathFreshness {
         let Some(meta) = self.get_meta(file_key) else {
@@ -191,7 +190,7 @@ impl BaseIndexData {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .and_then(|d| i64::try_from(d.as_nanos()).ok())
             .unwrap_or(-1);
-        if meta.path == path && meta.size == size && old_mtime_ns == mtime_ns {
+        if meta.path == path && old_mtime_ns == mtime_ns {
             PathFreshness::Unchanged
         } else {
             PathFreshness::Changed
@@ -287,7 +286,7 @@ fn entry_to_meta(entry: &FileEntry, path_bytes: &[u8]) -> FileMeta {
     FileMeta {
         file_key: entry.file_key(),
         path: pathbuf_from_encoded_vec(path_bytes.to_vec()),
-        size: entry.size,
+        size: 0,
         mtime: if entry.mtime_ns >= 0 {
             Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(entry.mtime_ns as u64))
         } else {
@@ -379,7 +378,6 @@ mod tests {
                 generation: 0,
             },
             0,
-            1024,
             -1,
         ));
 

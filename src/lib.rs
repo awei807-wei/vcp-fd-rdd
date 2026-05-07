@@ -14,6 +14,7 @@ pub mod core;
 pub mod event;
 pub mod index;
 pub mod query;
+pub mod sim;
 pub mod stats;
 pub mod storage;
 pub mod util;

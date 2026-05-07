@@ -44,8 +44,6 @@ pub enum Atom {
     DateCreated(DateRange),
     /// da:today / da:YYYY-MM-DD (date accessed / atime)
     DateAccessed(DateRange),
-    /// size:>10mb
-    Size(SizeFilter),
     /// parent:/home/user  (parent directory equals path)
     Parent(String),
     /// depth:3 / depth:>2 (path separator count)
@@ -78,12 +76,6 @@ pub enum CmpOp {
     Eq,
     Ge,
     Gt,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct SizeFilter {
-    pub op: CmpOp,
-    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,7 +154,6 @@ impl CompiledExpr {
 #[derive(Debug, Clone)]
 enum Filter {
     ExtAny(Vec<Vec<u8>>),
-    Size(SizeFilter),
     DateModified(DateRange),
     DateCreated(DateRange),
     DateAccessed(DateRange),
@@ -184,7 +175,6 @@ impl Filter {
                 let ext_lc = ascii_lower_bytes(ext.as_bytes());
                 exts.contains(&ext_lc)
             }
-            Filter::Size(sf) => apply_cmp(sf.op, meta.size, sf.bytes),
             Filter::DateModified(dr) => {
                 let Some(t) = meta.mtime else {
                     return false;
@@ -249,7 +239,6 @@ fn is_path_initials_query(input: &str) -> bool {
         || input.starts_with("dm:")
         || input.starts_with("dc:")
         || input.starts_with("da:")
-        || input.starts_with("size:")
         || input.starts_with("parent:")
         || input.starts_with("infolder:")
         || input.starts_with("depth:")
@@ -372,7 +361,6 @@ fn compile_atom(atom: &Atom, case_sensitive: bool) -> Result<CompiledExpr, Query
         Atom::DateModified(dr) => Ok(CompiledExpr::Filter(Filter::DateModified(*dr))),
         Atom::DateCreated(dr) => Ok(CompiledExpr::Filter(Filter::DateCreated(*dr))),
         Atom::DateAccessed(dr) => Ok(CompiledExpr::Filter(Filter::DateAccessed(*dr))),
-        Atom::Size(sf) => Ok(CompiledExpr::Filter(Filter::Size(*sf))),
         Atom::Parent(p) => Ok(CompiledExpr::Filter(Filter::Parent(p.clone()))),
         Atom::Depth(op, n) => Ok(CompiledExpr::Filter(Filter::Depth(*op, *n))),
         Atom::NameLen(op, n) => Ok(CompiledExpr::Filter(Filter::NameLen(*op, *n))),
@@ -499,7 +487,6 @@ fn best_anchor_for_atom(
         Atom::DateModified(_)
         | Atom::DateCreated(_)
         | Atom::DateAccessed(_)
-        | Atom::Size(_)
         | Atom::Parent(_)
         | Atom::Depth(_, _)
         | Atom::NameLen(_, _)
@@ -672,11 +659,6 @@ fn parse_atom_expr(word: &str, case_sensitive: &mut bool) -> Result<Expr, QueryC
             let v = unquote(tail)?;
             let dr = parse_dm(&v)?;
             Ok(Expr::Atom(Atom::DateAccessed(dr)))
-        }
-        Some("size") => {
-            let v = unquote(tail)?;
-            let sf = parse_size(&v)?;
-            Ok(Expr::Atom(Atom::Size(sf)))
         }
         Some("parent") | Some("infolder") => {
             let v = unquote(tail)?;
@@ -980,79 +962,6 @@ fn parse_cmp_usize(s: &str) -> Result<(CmpOp, usize), QueryCompileError> {
     Ok((op, n))
 }
 
-fn parse_size(s: &str) -> Result<SizeFilter, QueryCompileError> {
-    let raw = s.trim();
-    if raw.is_empty() {
-        return Err(QueryCompileError::Filter("size: empty".into()));
-    }
-
-    let (op, rest) = if let Some(r) = raw.strip_prefix(">=") {
-        (CmpOp::Ge, r)
-    } else if let Some(r) = raw.strip_prefix("<=") {
-        (CmpOp::Le, r)
-    } else if let Some(r) = raw.strip_prefix(">") {
-        (CmpOp::Gt, r)
-    } else if let Some(r) = raw.strip_prefix("<") {
-        (CmpOp::Lt, r)
-    } else if let Some(r) = raw.strip_prefix("=") {
-        (CmpOp::Eq, r)
-    } else {
-        (CmpOp::Ge, raw)
-    };
-
-    let rest = rest.trim();
-    let bytes = parse_human_bytes(rest)?;
-    Ok(SizeFilter { op, bytes })
-}
-
-fn parse_human_bytes(s: &str) -> Result<u64, QueryCompileError> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(QueryCompileError::Filter("size: empty value".into()));
-    }
-
-    let mut num = String::new();
-    let mut unit = String::new();
-    for c in s.chars() {
-        if c.is_ascii_digit() || c == '.' {
-            if !unit.is_empty() {
-                // "10mb20" 这类输入
-                return Err(QueryCompileError::Filter(format!("size: invalid '{}'", s)));
-            }
-            num.push(c);
-        } else if !c.is_whitespace() {
-            unit.push(c);
-        }
-    }
-
-    let v: f64 = num
-        .parse()
-        .map_err(|_| QueryCompileError::Filter(format!("size: invalid number '{}'", s)))?;
-    if v.is_sign_negative() {
-        return Err(QueryCompileError::Filter("size: negative".into()));
-    }
-    let unit = unit.to_ascii_lowercase();
-    let mul: f64 = match unit.as_str() {
-        "" | "b" | "byte" | "bytes" => 1.0,
-        "k" | "kb" | "kib" => 1024.0,
-        "m" | "mb" | "mib" => 1024.0 * 1024.0,
-        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
-        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => {
-            return Err(QueryCompileError::Filter(format!(
-                "size: unknown unit '{}'",
-                unit
-            )))
-        }
-    };
-
-    let bytes = (v * mul).round();
-    if bytes.is_nan() || bytes.is_infinite() || bytes < 0.0 {
-        return Err(QueryCompileError::Filter(format!("size: invalid '{}'", s)));
-    }
-    Ok(bytes.min(u64::MAX as f64) as u64)
-}
-
 fn parse_dm(s: &str) -> Result<DateRange, QueryCompileError> {
     let v = s.trim();
     if v.is_empty() {
@@ -1236,15 +1145,6 @@ mod tests {
         let m1 = meta("/a/十一.jpg", 1, None);
         assert!(q.matches(&m1));
         let m2 = meta("/a/十一.txt", 1, None);
-        assert!(!q.matches(&m2));
-    }
-
-    #[test]
-    fn size_filter_basic() {
-        let q = compile_query("size:<10b").unwrap();
-        let m1 = meta("/a/x.txt", 9, None);
-        let m2 = meta("/a/y.txt", 10, None);
-        assert!(q.matches(&m1));
         assert!(!q.matches(&m2));
     }
 

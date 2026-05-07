@@ -9,9 +9,10 @@ use std::cmp::Ordering;
 /// Index into the path table.
 pub type PathIdx = u32;
 
-/// A single encoded entry in the path table.
+/// A single slot in the path table, combining entry metadata with reverse index.
+#[repr(C)]
 #[derive(Clone, Debug)]
-struct EncodedEntry {
+struct PathTableSlot {
     /// Byte offset into `suffix_bytes` where this entry's suffix starts.
     suffix_offset: u32,
     /// For anchor entries (every 256th) this is 0.
@@ -19,6 +20,8 @@ struct EncodedEntry {
     shared_len: u16,
     /// Length of the suffix stored in `suffix_bytes`.
     suffix_len: u16,
+    /// Original PathIdx for this sorted position.
+    orig_idx: u32,
 }
 
 /// Builder used to construct a `PathTableV2` from unsorted paths.
@@ -68,34 +71,27 @@ const ANCHOR_INTERVAL: usize = 256;
 /// Delta-compressed path table.
 #[derive(Clone, Debug, Default)]
 pub struct PathTableV2 {
-    /// Encoded entries in sorted order.
-    entries: Vec<EncodedEntry>,
+    /// Slots in sorted order (entry metadata + original PathIdx).
+    slots: Vec<PathTableSlot>,
     /// All suffix bytes concatenated (including full paths for anchors).
     suffix_bytes: Vec<u8>,
-    /// Anchor entry indices (every ANCHOR_INTERVAL entries).
-    anchors: Vec<u32>,
-    /// Map from original PathIdx -> position in sorted `entries`.
+    /// Map from original PathIdx -> position in sorted `slots`.
     idx_to_sorted: Vec<u32>,
-    /// Map from sorted position -> original PathIdx.
-    sorted_to_idx: Vec<u32>,
 }
 
 impl PathTableV2 {
     fn from_sorted_paths(sorted: Vec<(PathIdx, Vec<u8>)>) -> Self {
         let n = sorted.len();
-        let mut entries = Vec::with_capacity(n);
+        let mut slots = Vec::with_capacity(n);
         let mut suffix_bytes = Vec::new();
-        let mut anchors = Vec::with_capacity(n / ANCHOR_INTERVAL + 1);
         let max_orig_idx = sorted.iter().map(|(idx, _)| *idx).max().unwrap_or(0);
         let mut idx_to_sorted = vec![0u32; max_orig_idx as usize + 1];
-        let mut sorted_to_idx = Vec::with_capacity(n);
 
         let mut prev_path: Vec<u8> = Vec::new();
 
         for (sorted_pos, (orig_idx, path)) in sorted.into_iter().enumerate() {
             let sorted_pos_u32 = sorted_pos as u32;
             idx_to_sorted[orig_idx as usize] = sorted_pos_u32;
-            sorted_to_idx.push(orig_idx);
 
             let is_anchor = sorted_pos % ANCHOR_INTERVAL == 0;
             let shared_len = if is_anchor {
@@ -108,31 +104,24 @@ impl PathTableV2 {
             let suffix_offset = suffix_bytes.len() as u32;
             suffix_bytes.extend_from_slice(suffix);
 
-            if is_anchor {
-                anchors.push(sorted_pos_u32);
-            }
-
-            entries.push(EncodedEntry {
-                shared_len: shared_len as u16,
+            slots.push(PathTableSlot {
                 suffix_offset,
+                shared_len: shared_len as u16,
                 suffix_len: suffix.len() as u16,
+                orig_idx,
             });
 
             prev_path = path;
         }
 
-        entries.shrink_to_fit();
+        slots.shrink_to_fit();
         suffix_bytes.shrink_to_fit();
-        anchors.shrink_to_fit();
         idx_to_sorted.shrink_to_fit();
-        sorted_to_idx.shrink_to_fit();
 
         Self {
-            entries,
+            slots,
             suffix_bytes,
-            anchors,
             idx_to_sorted,
-            sorted_to_idx,
         }
     }
 
@@ -148,44 +137,37 @@ impl PathTableV2 {
 
     /// Number of stored paths.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.slots.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.slots.is_empty()
     }
 
     /// Total bytes occupied by this structure (approximate).
     pub fn allocated_bytes(&self) -> usize {
-        self.entries.capacity() * std::mem::size_of::<EncodedEntry>()
+        self.slots.capacity() * std::mem::size_of::<PathTableSlot>()
             + self.suffix_bytes.capacity()
-            + self.anchors.capacity() * std::mem::size_of::<u32>()
             + self.idx_to_sorted.capacity() * std::mem::size_of::<u32>()
-            + self.sorted_to_idx.capacity() * std::mem::size_of::<u32>()
     }
 
     pub fn encode_raw(&self) -> Vec<u8> {
         const MAGIC: &[u8; 8] = b"PTV2raw\0";
-        let mut out = Vec::with_capacity(8 + 5 * 4 + self.allocated_bytes());
+        let mut out = Vec::with_capacity(8 + 4 * 4 + self.allocated_bytes());
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.slots.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.suffix_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.anchors.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.idx_to_sorted.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.sorted_to_idx.len() as u32).to_le_bytes());
-        for entry in &self.entries {
-            out.extend_from_slice(&entry.suffix_offset.to_le_bytes());
-            out.extend_from_slice(&entry.shared_len.to_le_bytes());
-            out.extend_from_slice(&entry.suffix_len.to_le_bytes());
+        // Padding for old anchors_len field; kept for header-size compatibility.
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for slot in &self.slots {
+            out.extend_from_slice(&slot.suffix_offset.to_le_bytes());
+            out.extend_from_slice(&slot.shared_len.to_le_bytes());
+            out.extend_from_slice(&slot.suffix_len.to_le_bytes());
+            out.extend_from_slice(&slot.orig_idx.to_le_bytes());
         }
         out.extend_from_slice(&self.suffix_bytes);
-        for v in &self.anchors {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
         for v in &self.idx_to_sorted {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        for v in &self.sorted_to_idx {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out
@@ -193,7 +175,7 @@ impl PathTableV2 {
 
     pub fn decode_raw(bytes: &[u8]) -> Option<Self> {
         const MAGIC: &[u8; 8] = b"PTV2raw\0";
-        if bytes.len() < 8 + 5 * 4 || &bytes[..8] != MAGIC {
+        if bytes.len() < 8 + 4 * 4 || &bytes[..8] != MAGIC {
             return None;
         }
         let mut off = 8usize;
@@ -202,67 +184,56 @@ impl PathTableV2 {
             *off += 4;
             Some(v)
         };
-        let entries_len = read_u32(bytes, &mut off)? as usize;
+        let slots_len = read_u32(bytes, &mut off)? as usize;
         let suffix_len = read_u32(bytes, &mut off)? as usize;
-        let anchors_len = read_u32(bytes, &mut off)? as usize;
         let idx_len = read_u32(bytes, &mut off)? as usize;
-        let sorted_len = read_u32(bytes, &mut off)? as usize;
+        // Skip the old anchors_len field (4 bytes) for backward compatibility.
+        let _anchors_len = read_u32(bytes, &mut off)? as usize;
 
-        let entries_bytes = entries_len.checked_mul(8)?;
-        let suffix_end = off.checked_add(entries_bytes)?.checked_add(suffix_len)?;
-        let anchors_bytes = anchors_len.checked_mul(4)?;
+        let slots_bytes = slots_len.checked_mul(12)?;
+        let suffix_end = off.checked_add(slots_bytes)?.checked_add(suffix_len)?;
         let idx_bytes = idx_len.checked_mul(4)?;
-        let sorted_bytes = sorted_len.checked_mul(4)?;
-        let total = suffix_end
-            .checked_add(anchors_bytes)?
-            .checked_add(idx_bytes)?
-            .checked_add(sorted_bytes)?;
+        let total = suffix_end.checked_add(idx_bytes)?;
         if total > bytes.len() {
             return None;
         }
 
-        let mut entries = Vec::with_capacity(entries_len);
-        for _ in 0..entries_len {
+        let mut slots = Vec::with_capacity(slots_len);
+        for _ in 0..slots_len {
             let suffix_offset = read_u32(bytes, &mut off)?;
             let shared_len = u16::from_le_bytes(bytes.get(off..off + 2)?.try_into().ok()?);
             off += 2;
             let suffix_len = u16::from_le_bytes(bytes.get(off..off + 2)?.try_into().ok()?);
             off += 2;
-            entries.push(EncodedEntry {
+            let orig_idx = read_u32(bytes, &mut off)?;
+            slots.push(PathTableSlot {
                 suffix_offset,
                 shared_len,
                 suffix_len,
+                orig_idx,
             });
         }
 
         let suffix_bytes = bytes.get(off..off + suffix_len)?.to_vec();
         off += suffix_len;
 
-        let read_u32_vec = |bytes: &[u8], off: &mut usize, len: usize| -> Option<Vec<u32>> {
-            let mut out = Vec::with_capacity(len);
-            for _ in 0..len {
-                out.push(u32::from_le_bytes(
-                    bytes.get(*off..*off + 4)?.try_into().ok()?,
-                ));
-                *off += 4;
-            }
-            Some(out)
-        };
-        let anchors = read_u32_vec(bytes, &mut off, anchors_len)?;
-        let idx_to_sorted = read_u32_vec(bytes, &mut off, idx_len)?;
-        let sorted_to_idx = read_u32_vec(bytes, &mut off, sorted_len)?;
+        let mut idx_to_sorted = Vec::with_capacity(idx_len);
+        for _ in 0..idx_len {
+            idx_to_sorted.push(u32::from_le_bytes(
+                bytes.get(off..off + 4)?.try_into().ok()?,
+            ));
+            off += 4;
+        }
 
         Some(Self {
-            entries,
+            slots,
             suffix_bytes,
-            anchors,
             idx_to_sorted,
-            sorted_to_idx,
         })
     }
 
     fn get_suffix(&self, pos: usize) -> &[u8] {
-        let e = &self.entries[pos];
+        let e = &self.slots[pos];
         &self.suffix_bytes
             [e.suffix_offset as usize..(e.suffix_offset as usize + e.suffix_len as usize)]
     }
@@ -272,7 +243,7 @@ impl PathTableV2 {
         let anchor_pos = (sorted_pos / ANCHOR_INTERVAL) * ANCHOR_INTERVAL;
         let mut path = self.get_suffix(anchor_pos).to_vec();
         for k in (anchor_pos + 1)..=sorted_pos {
-            let e = &self.entries[k];
+            let e = &self.slots[k];
             path.truncate(e.shared_len as usize);
             path.extend_from_slice(self.get_suffix(k));
         }
@@ -300,19 +271,19 @@ impl PathTableV2 {
         };
         let parent_path = &path[..parent_len];
         self.find_exact(parent_path)
-            .map(|sorted| self.sorted_to_idx[sorted])
+            .map(|sorted| self.slots[sorted].orig_idx)
     }
 
     /// Lookup a path by its bytes, returning the original `PathIdx`.
     pub fn lookup(&self, target: &[u8]) -> Option<PathIdx> {
         self.find_exact(target)
-            .map(|sorted| self.sorted_to_idx[sorted])
+            .map(|sorted| self.slots[sorted].orig_idx)
     }
 
     /// Find the exact path by binary search, returning its sorted position.
     fn find_exact(&self, target: &[u8]) -> Option<usize> {
         let mut left = 0usize;
-        let mut right = self.entries.len();
+        let mut right = self.slots.len();
         while left < right {
             let mid = (left + right) / 2;
             let mid_path = self.resolve_sorted(mid);
@@ -328,13 +299,13 @@ impl PathTableV2 {
     /// Find the range of entries whose paths start with `prefix`.
     /// Returns `(start_sorted, end_sorted)` where `end_sorted` is exclusive.
     pub fn find_prefix_range(&self, prefix: &[u8]) -> Option<(usize, usize)> {
-        if self.entries.is_empty() {
+        if self.slots.is_empty() {
             return None;
         }
 
         // Binary search for the first entry >= prefix.
         let mut left = 0usize;
-        let mut right = self.entries.len();
+        let mut right = self.slots.len();
         while left < right {
             let mid = (left + right) / 2;
             let mid_path = self.resolve_sorted(mid);
@@ -345,7 +316,7 @@ impl PathTableV2 {
             }
         }
         let start = left;
-        if start >= self.entries.len() {
+        if start >= self.slots.len() {
             return None;
         }
         let start_path = self.resolve_sorted(start);
@@ -355,7 +326,7 @@ impl PathTableV2 {
 
         // Find the upper bound: first entry that does NOT start with prefix.
         let mut left = start;
-        let mut right = self.entries.len();
+        let mut right = self.slots.len();
         while left < right {
             let mid = (left + right) / 2;
             let mid_path = self.resolve_sorted(mid);
@@ -415,7 +386,7 @@ mod tests {
         }
         let table = builder.build();
         assert_eq!(table.len(), 600);
-        assert_eq!(table.anchors.len(), 3); // 0, 256, 512
+        assert_eq!(table.slots.len(), 600);
 
         for (i, expected) in paths.iter().enumerate() {
             let resolved = table.resolve(i as PathIdx).unwrap();

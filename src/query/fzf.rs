@@ -39,7 +39,6 @@ pub enum SortColumn {
     Score,
     Name,
     Path,
-    Size,
     Ext,
     DateModified,
     DateCreated,
@@ -51,7 +50,6 @@ impl SortColumn {
         match s.map(str::trim).filter(|v| !v.is_empty()) {
             Some("name") => Self::Name,
             Some("path") => Self::Path,
-            Some("size") => Self::Size,
             Some("ext" | "extension") => Self::Ext,
             Some("date_modified" | "dm" | "modified") => Self::DateModified,
             Some("date_created" | "dc" | "created") => Self::DateCreated,
@@ -118,7 +116,6 @@ fn sort_results(results: &mut [FileMeta], keyword: &str, sort: SortColumn, order
                 na.cmp(&nb).then_with(|| a.path.cmp(&b.path))
             }
             SortColumn::Path => a.path.cmp(&b.path),
-            SortColumn::Size => a.size.cmp(&b.size).then_with(|| a.path.cmp(&b.path)),
             SortColumn::Ext => {
                 let ea = a
                     .path

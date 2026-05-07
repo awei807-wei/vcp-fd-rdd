@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added `fd-rdd-sim`, a synthetic tiered watcher policy benchmark CLI with continuous `optimize`, single-run baseline, grid-search, genetic-search, and adversarial robustness modes.
+- Added `src/sim/*` world, policy, simulator, metrics, and optimizer modules for deterministic workload generation and JSON report output.
+- Added `policies/tiered-default.toml` as a baseline simulation policy.
+
 ## [0.6.14] - 2026-05-02
 
 ### Runtime footprint hardening

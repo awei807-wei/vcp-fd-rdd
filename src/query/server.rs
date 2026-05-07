@@ -56,7 +56,6 @@ pub struct SearchParams {
 #[derive(Serialize)]
 pub struct SearchResult {
     pub path: String,
-    pub size: u64,
     pub score: i64,
     pub highlights: Vec<[usize; 2]>,
 }
@@ -277,7 +276,6 @@ async fn search_handler(
             let highlights = compute_highlights(&path_str, &keyword);
             SearchResult {
                 path: path_str,
-                size: m.size,
                 score,
                 highlights,
             }

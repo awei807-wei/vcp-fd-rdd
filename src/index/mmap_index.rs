@@ -1,7 +1,6 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{collections::HashMap, path::Component};
 
 use roaring::RoaringTreemap;
 
@@ -16,8 +15,8 @@ use crate::util::{compose_abs_path_buf, compose_abs_path_bytes, root_bytes_for_i
 #[cfg(feature = "rkyv")]
 use std::sync::OnceLock;
 
-// MetaRecordV6：与 PersistentIndex::export_segments_v6 的编码保持一致（LE，40B）
-const META_REC_SIZE: usize = 40;
+// MetaRecordV6：与 PersistentIndex::export_segments_v6 的编码保持一致（LE，32B）
+const META_REC_SIZE: usize = 32;
 // TrigramEntryV6：3 + 1 + 4 + 4 = 12B
 const TRI_REC_SIZE: usize = 12;
 // FileKeyMap：dev(8) + ino(8) + generation(4) + docid(4) = 24B（v6+ 兼容）
@@ -28,14 +27,7 @@ const FILEKEY_MAP_REC_SIZE_OLD: usize = 20;
 const FKM_MAGIC: [u8; 4] = *b"FKM\0";
 const FKM_HDR_SIZE: usize = 8;
 const FKM_FLAG_LEGACY: u16 = 0;
-
-type ShortComponentCache = parking_lot::Mutex<Option<Arc<HashMap<u16, RoaringTreemap>>>>;
 const FKM_FLAG_RKYV: u16 = 1;
-
-#[inline]
-fn encode_short_component(bytes: &[u8]) -> u16 {
-    u16::from_be_bytes([bytes[0], bytes.get(1).copied().unwrap_or(0)])
-}
 
 fn normalize_short_hint(hint: &[u8]) -> Option<Vec<u8>> {
     let normalized = String::from_utf8_lossy(hint).to_lowercase().into_bytes();
@@ -54,37 +46,11 @@ fn trigram_matches_short_hint(tri: [u8; 3], hint: &[u8]) -> bool {
     }
 }
 
-fn short_component_matches(encoded: u16, hint: &[u8]) -> bool {
-    if hint.is_empty() || hint.len() > 2 {
-        return false;
-    }
-    let bytes = encoded.to_be_bytes();
-    if hint.len() == 1 {
-        bytes[0] == hint[0] || bytes[1] == hint[0]
-    } else {
-        bytes == hint
-    }
-}
-
-fn for_each_short_component(path: &Path, mut f: impl FnMut(u16)) {
-    for component in path.components() {
-        let Component::Normal(os) = component else {
-            continue;
-        };
-        let lower = os.to_string_lossy().to_lowercase();
-        let bytes = lower.as_bytes();
-        if (1..=2).contains(&bytes.len()) {
-            f(encode_short_component(bytes));
-        }
-    }
-}
-
 pub struct MmapIndex {
     snap: Arc<MmapSnapshotV6>,
     tomb_cache: parking_lot::Mutex<Option<RoaringTreemap>>,
     // 兼容旧段：若缺少 mmap 内的 file_key_map 段，则按需构建一次排序 map（以 bytes 形式存储，便于二分查找）。
     filekey_map_cache: parking_lot::Mutex<Option<Arc<Vec<u8>>>>,
-    short_component_cache: ShortComponentCache,
     #[cfg(feature = "rkyv")]
     validated_rkyv: OnceLock<anyhow::Result<()>>,
 }
@@ -95,7 +61,6 @@ impl MmapIndex {
             snap: Arc::new(snap),
             tomb_cache: parking_lot::Mutex::new(None),
             filekey_map_cache: parking_lot::Mutex::new(None),
-            short_component_cache: parking_lot::Mutex::new(None),
             #[cfg(feature = "rkyv")]
             validated_rkyv: OnceLock::new(),
         }
@@ -132,7 +97,7 @@ impl MmapIndex {
     fn meta_at(
         &self,
         docid: u64,
-    ) -> Option<(FileKey, u16, u32, u16, u64, Option<std::time::SystemTime>)> {
+    ) -> Option<(FileKey, u16, u32, u16, Option<std::time::SystemTime>)> {
         let bytes = self.snap.metas_bytes();
         let i = (docid as usize).checked_mul(META_REC_SIZE)?;
         let rec = bytes.get(i..i + META_REC_SIZE)?;
@@ -142,8 +107,7 @@ impl MmapIndex {
         let root_id = u16::from_le_bytes(rec[16..18].try_into().ok()?);
         let path_off = u32::from_le_bytes(rec[18..22].try_into().ok()?);
         let path_len = u16::from_le_bytes(rec[22..24].try_into().ok()?);
-        let size = u64::from_le_bytes(rec[24..32].try_into().ok()?);
-        let mtime_ns = i64::from_le_bytes(rec[32..40].try_into().ok()?);
+        let mtime_ns = i64::from_le_bytes(rec[24..32].try_into().ok()?);
 
         let mtime = if mtime_ns < 0 {
             None
@@ -161,7 +125,6 @@ impl MmapIndex {
             root_id,
             path_off,
             path_len,
-            size,
             mtime,
         ))
     }
@@ -505,45 +468,12 @@ impl MmapIndex {
         }
         Some(acc)
     }
-    fn short_component_cache(&self) -> Arc<HashMap<u16, RoaringTreemap>> {
-        if let Some(cache) = self.short_component_cache.lock().clone() {
-            return cache;
-        }
-
-        let tomb = self.tombstones();
-        let arena = self.snap.path_arena_bytes();
-        let n = (self.snap.metas_bytes().len() / META_REC_SIZE) as u64;
-        let mut cache: HashMap<u16, RoaringTreemap> = HashMap::new();
-
-        for docid in 0..n {
-            if tomb.contains(docid) {
-                continue;
-            }
-            let Some((_, root_id, path_off, path_len, ..)) = self.meta_at(docid) else {
-                continue;
-            };
-            let start = path_off as usize;
-            let end = start.saturating_add(path_len as usize);
-            let Some(rel) = arena.get(start..end) else {
-                continue;
-            };
-            let path = compose_abs_path_buf(root_bytes_for_id(&self.snap.roots, root_id), rel);
-            for_each_short_component(path.as_path(), |component| {
-                cache.entry(component).or_default().insert(docid);
-            });
-        }
-
-        let cache = Arc::new(cache);
-        *self.short_component_cache.lock() = Some(cache.clone());
-        cache
-    }
     fn short_hint_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringTreemap> {
         if !self.has_trigram_sentinel() {
             return None;
         }
 
         let hint = normalize_short_hint(matcher.literal_hint()?)?;
-        let cache = self.short_component_cache();
         let table = self.snap.trigram_table_bytes();
         let n = table.len() / TRI_REC_SIZE;
         let mut acc = RoaringTreemap::new();
@@ -560,12 +490,11 @@ impl MmapIndex {
             }
         }
 
-        for (component, posting) in cache.iter() {
-            if short_component_matches(*component, &hint) {
-                acc |= posting.clone();
-            }
+        if acc.is_empty() {
+            None
+        } else {
+            Some(acc)
         }
-        Some(acc)
     }
     pub fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
         // 能力感知：无哨兵视为旧段（trigram 不覆盖目录组件），禁用预过滤避免假阴性。
@@ -638,7 +567,7 @@ impl MmapIndex {
         }
 
         let arena = self.snap.path_arena_bytes();
-        let (file_key, root_id, path_off, path_len, size, mtime) = self.meta_at(docid)?;
+        let (file_key, root_id, path_off, path_len, mtime) = self.meta_at(docid)?;
         let start = path_off as usize;
         let end = start.saturating_add(path_len as usize);
         let rel = arena.get(start..end)?;
@@ -646,7 +575,7 @@ impl MmapIndex {
         Some(FileMeta {
             file_key,
             path,
-            size,
+            size: 0,
             mtime,
             ctime: None,
             atime: None,
@@ -672,7 +601,7 @@ impl MmapIndex {
                 if tomb.contains(docid) {
                     continue;
                 }
-                let Some((file_key, root_id, path_off, path_len, size, mtime)) =
+                let Some((file_key, root_id, path_off, path_len, mtime)) =
                     self.meta_at(docid)
                 else {
                     continue;
@@ -693,7 +622,7 @@ impl MmapIndex {
                 out.push(FileMeta {
                     file_key,
                     path,
-                    size,
+                    size: 0,
                     mtime,
                     ctime: None,
                     atime: None,
@@ -707,7 +636,7 @@ impl MmapIndex {
             if tomb.contains(docid) {
                 continue;
             }
-            let Some((file_key, root_id, path_off, path_len, size, mtime)) = self.meta_at(docid)
+            let Some((file_key, root_id, path_off, path_len, mtime)) = self.meta_at(docid)
             else {
                 continue;
             };
@@ -724,7 +653,7 @@ impl MmapIndex {
             out.push(FileMeta {
                 file_key,
                 path,
-                size,
+                size: 0,
                 mtime,
                 ctime: None,
                 atime: None,
@@ -742,7 +671,7 @@ impl MmapIndex {
             if tomb.contains(docid) {
                 continue;
             }
-            let Some((file_key, root_id, path_off, path_len, size, mtime)) = self.meta_at(docid)
+            let Some((file_key, root_id, path_off, path_len, mtime)) = self.meta_at(docid)
             else {
                 continue;
             };
@@ -755,7 +684,7 @@ impl MmapIndex {
             f(FileMeta {
                 file_key,
                 path,
-                size,
+                size: 0,
                 mtime,
                 ctime: None,
                 atime: None,
@@ -1043,10 +972,10 @@ mod tests {
 
         let matcher = create_matcher("ab", true);
         let results = mmap_idx.query(matcher.as_ref());
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 1);
 
         let matcher = create_matcher("a", true);
         let results = mmap_idx.query(matcher.as_ref());
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 1);
     }
 }

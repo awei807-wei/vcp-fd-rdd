@@ -109,7 +109,6 @@ fn encode_file_entry_index(fei: &FileEntryIndex) -> Vec<u8> {
             out.extend_from_slice(&e.ino.to_le_bytes());
             out.extend_from_slice(&e.generation.to_le_bytes());
             out.extend_from_slice(&e.path_idx.to_le_bytes());
-            out.extend_from_slice(&e.size.to_le_bytes());
             out.extend_from_slice(&e.mtime_ns.to_le_bytes());
         }
     }
@@ -121,7 +120,7 @@ fn decode_file_entry_index(bytes: &[u8]) -> anyhow::Result<FileEntryIndex> {
         anyhow::bail!("file entry index too small");
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
-    const REC_SIZE: usize = 8 + 8 + 4 + 4 + 8 + 8; // dev+ino+generation+path_idx+size+mtime_ns
+    const REC_SIZE: usize = 8 + 8 + 4 + 4 + 8; // dev+ino+generation+path_idx+mtime_ns
     let expected = 4 + count * REC_SIZE;
     if bytes.len() < expected {
         anyhow::bail!("file entry index truncated");
@@ -133,8 +132,7 @@ fn decode_file_entry_index(bytes: &[u8]) -> anyhow::Result<FileEntryIndex> {
         let ino = u64::from_le_bytes(bytes[off + 8..off + 16].try_into()?);
         let generation = u32::from_le_bytes(bytes[off + 16..off + 20].try_into()?);
         let path_idx = u32::from_le_bytes(bytes[off + 20..off + 24].try_into()?);
-        let size = u64::from_le_bytes(bytes[off + 24..off + 32].try_into()?);
-        let mtime_ns = i64::from_le_bytes(bytes[off + 32..off + 40].try_into()?);
+        let mtime_ns = i64::from_le_bytes(bytes[off + 24..off + 32].try_into()?);
         off += REC_SIZE;
 
         fei.push(FileEntry::from_file_key(
@@ -144,7 +142,6 @@ fn decode_file_entry_index(bytes: &[u8]) -> anyhow::Result<FileEntryIndex> {
                 generation,
             },
             path_idx,
-            size,
             mtime_ns,
         ));
     }
@@ -803,7 +800,6 @@ mod tests {
                 generation: 0,
             },
             0,
-            1024,
             -1,
         ));
         data.tombstones.insert(42);

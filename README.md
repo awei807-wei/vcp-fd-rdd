@@ -183,6 +183,67 @@ curl "http://127.0.0.1:6060/search?q=mdt&mode=fuzzy&limit=20"
 fd-rdd-query --limit 2000 "*.rs"
 ```
 
+## fd-rdd-sim 压测框架
+
+`fd-rdd-sim` 是 tiered watcher 参数的 synthetic 竞技场，用来在不触碰真实文件系统 watcher 的情况下持续试错，收敛出 L0/L1/L2/L3 分层策略参数。它会生成热点聚集、突发写入、长眠目录或对抗性 workload，让候选策略反复竞争，并输出 SLA、发现延迟、watch/scan 成本、收敛轨迹和可回填到 `tiered_watch` 的推荐配置。
+
+```bash
+# 持续试错，跨 developer/burst/dormant/adversarial workload 收敛推荐参数
+cargo run --bin fd-rdd-sim -- optimize \
+  --dirs 3000 \
+  --events 30000 \
+  --generations 60 \
+  --population 64 \
+  --patience 10 \
+  --checkpoint reports/optimized-tiered-watch.checkpoint.json \
+  --output reports/optimized-tiered-watch.json
+
+# 单策略基线诊断，不代表最优
+cargo run --bin fd-rdd-sim -- single --profile developer --dirs 1000 --events 10000
+
+# 参数网格搜索 baseline
+cargo run --bin fd-rdd-sim -- grid --profile burst --top-n 5
+
+# 遗传搜索单 workload baseline
+cargo run --bin fd-rdd-sim -- evolve --generations 16 --population 32
+
+# 对抗鲁棒性测试并保存 JSON 报告
+cargo run --bin fd-rdd-sim -- adversarial --output reports/adversarial.json
+```
+
+可通过 `--policy policies/tiered-default.toml` 读取策略基线；CLI 里显式传入的预算、TTL、扫描周期参数会作为本次运行的覆盖值。`optimize` 报告中的 `convergence.phase` / `current_generation` / `current_generation_trials` 显示当前进度，`convergence.trace` 记录每代试错轨迹，`recommendation` 字段给出推荐的 `watch_mode = "tiered"`、`max_watch_dirs`、扫描周期和 TTL。
+
+长时间运行可用 `Ctrl-C` 中断；checkpoint 会在每代结束后原子写入。继续迭代时把同一个文件传给 `--resume` 和 `--checkpoint`：
+
+```bash
+cargo run --release --bin fd-rdd-sim -- optimize \
+  --policy policies/tiered-default.toml \
+  --dirs 3000 \
+  --events 30000 \
+  --duration-secs 7200 \
+  --seed 42 \
+  --generations 120 \
+  --population 96 \
+  --patience 20 \
+  --top-n 20 \
+  --resume reports/optimized-tiered-watch.checkpoint.json \
+  --checkpoint reports/optimized-tiered-watch.checkpoint.json \
+  --output reports/optimized-tiered-watch.json
+```
+
+运行中查看进度：
+
+```bash
+jq '{
+  phase: .convergence.phase,
+  generation: .convergence.current_generation,
+  generation_trials: .convergence.current_generation_trials,
+  total_trials: .convergence.trials,
+  latest_finished_generation: .convergence.generations_completed,
+  best_score: .convergence.best_score
+}' reports/optimized-tiered-watch.checkpoint.json
+```
+
 ## 配置 / Configuration
 
 `~/.config/fd-rdd/config.toml`（首次启动自动生成）：
