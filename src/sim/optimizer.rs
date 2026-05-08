@@ -188,6 +188,19 @@ pub fn evolve_report(config: OptimizerConfig) -> BenchmarkReport {
 }
 
 pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkReport> {
+    let profile_multiplier = if config.robust_profiles { 4 } else { 1 };
+    let total_expected = config.generations.saturating_mul(config.population).saturating_mul(profile_multiplier);
+    tracing::info!(
+        "optimize_report starting | total_expected={} | generations={} | population={} | profiles={} | workload: dirs={} events={} duration_secs={}",
+        total_expected,
+        config.generations,
+        config.population,
+        profile_multiplier,
+        config.workload.dirs,
+        config.workload.events,
+        config.workload.duration_secs,
+    );
+
     let summary_world = generate_world(config.workload.clone());
     let resumed = match &config.resume_path {
         Some(path) => Some(read_checkpoint(path)?),
@@ -257,19 +270,6 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
     let mut converged = false;
     let start_generation = trace.len();
     let mut population = resume_population(&config, &baseline.policy, &best_seen, &mut rng);
-
-    let profile_multiplier = if config.robust_profiles { 4 } else { 1 };
-    let total_expected = config.generations.saturating_mul(config.population).saturating_mul(profile_multiplier);
-    tracing::info!(
-        "optimize_report starting | total_expected={} | generations={} | population={} | profiles={} | workload: dirs={} events={} duration_secs={}",
-        total_expected,
-        config.generations,
-        config.population,
-        profile_multiplier,
-        config.workload.dirs,
-        config.workload.events,
-        config.workload.duration_secs,
-    );
 
     let start_time = Instant::now();
 
