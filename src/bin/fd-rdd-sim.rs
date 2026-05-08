@@ -1,0 +1,277 @@
+use std::fs;
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand, ValueEnum};
+use fd_rdd::sim::{
+    adversarial_report, evolve_report, grid_report, optimize_report, single_report,
+    OptimizerConfig, PolicyParams, WorkloadConfig, WorkloadProfile,
+};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "fd-rdd-sim",
+    version,
+    about = "Synthetic tiered watcher policy benchmark for fd-rdd"
+)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Keep trying policy candidates until convergence or trial budget exhaustion.
+    Optimize(OptimizeArgs),
+    /// Run one policy against one synthetic world.
+    Single(CommonArgs),
+    /// Run a deterministic parameter grid.
+    Grid(CommonArgs),
+    /// Run a simple genetic search.
+    Evolve(EvolveArgs),
+    /// Run grid candidates against multiple hostile workload profiles.
+    Adversarial(CommonArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+struct CommonArgs {
+    /// Workload profile.
+    #[arg(long, default_value = "developer")]
+    profile: ProfileArg,
+
+    /// Number of synthetic directories.
+    #[arg(long, default_value_t = 1_000)]
+    dirs: usize,
+
+    /// Number of synthetic new-file events.
+    #[arg(long, default_value_t = 10_000)]
+    events: usize,
+
+    /// Simulated duration in seconds.
+    #[arg(long, default_value_t = 3_600)]
+    duration_secs: u64,
+
+    /// Deterministic seed.
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+
+    /// Target discovery SLA in seconds.
+    #[arg(long)]
+    sla_secs: Option<u64>,
+
+    /// Max estimated L0 recursive watch directory cost.
+    #[arg(long)]
+    max_watch_dirs: Option<u32>,
+
+    /// L0 idle TTL before demotion.
+    #[arg(long)]
+    l0_idle_ttl_secs: Option<u64>,
+
+    /// L1 warm scan interval.
+    #[arg(long)]
+    l1_scan_interval_secs: Option<u64>,
+
+    /// L2 cold scan interval.
+    #[arg(long)]
+    l2_scan_interval_secs: Option<u64>,
+
+    /// Max directories scanned per tick.
+    #[arg(long)]
+    per_round_max_dirs: Option<usize>,
+
+    /// Max synthetic files scanned per tick.
+    #[arg(long)]
+    per_round_max_files: Option<u64>,
+
+    /// Number of best runs kept in grid/adversarial output.
+    #[arg(long, default_value_t = 10)]
+    top_n: usize,
+
+    /// Optional JSON/TOML policy file. CLI flags still set workload fields.
+    #[arg(long)]
+    policy: Option<PathBuf>,
+
+    /// Optional output report path. Stdout is always written when omitted.
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug, Clone)]
+struct EvolveArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Number of generations.
+    #[arg(long, default_value_t = 12)]
+    generations: usize,
+
+    /// Population size.
+    #[arg(long, default_value_t = 24)]
+    population: usize,
+}
+
+#[derive(Parser, Debug, Clone)]
+struct OptimizeArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Maximum search generations.
+    #[arg(long, default_value_t = 40)]
+    generations: usize,
+
+    /// Candidate policies per generation.
+    #[arg(long, default_value_t = 48)]
+    population: usize,
+
+    /// Stop after this many generations without meaningful improvement.
+    #[arg(long, default_value_t = 8)]
+    patience: usize,
+
+    /// Minimum objective improvement needed to reset patience.
+    #[arg(long, default_value_t = 0.5)]
+    min_delta: f64,
+
+    /// Optimize against developer/burst/dormant/adversarial profiles together.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    robust_profiles: bool,
+
+    /// Write current best report after every generation.
+    #[arg(long)]
+    checkpoint: Option<PathBuf>,
+
+    /// Resume from a previous checkpoint report.
+    #[arg(long)]
+    resume: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ProfileArg {
+    Developer,
+    Burst,
+    Dormant,
+    Adversarial,
+}
+
+impl From<ProfileArg> for WorkloadProfile {
+    fn from(value: ProfileArg) -> Self {
+        match value {
+            ProfileArg::Developer => Self::Developer,
+            ProfileArg::Burst => Self::Burst,
+            ProfileArg::Dormant => Self::Dormant,
+            ProfileArg::Adversarial => Self::Adversarial,
+        }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let (report, output) = match args.command {
+        Command::Optimize(args) => {
+            let output = args.common.output.clone();
+            let mut config = config_from_common(args.common)?;
+            config.generations = args.generations;
+            config.population = args.population;
+            config.patience = args.patience;
+            config.min_delta = args.min_delta;
+            config.robust_profiles = args.robust_profiles;
+            config.checkpoint_path = args.checkpoint;
+            config.resume_path = args.resume;
+
+            eprintln!(
+                "fd-rdd-sim optimize: {} generations × {} candidates ({} total trials)",
+                args.generations,
+                args.population,
+                args.generations * args.population,
+            );
+            if config.workload.duration_secs >= 1800 {
+                eprintln!(
+                    "warning: duration_secs={} may result in very long run times; consider --duration-secs 600 for a quick test",
+                    config.workload.duration_secs,
+                );
+            }
+
+            (optimize_report(config)?, output)
+        }
+        Command::Single(common) => {
+            let output = common.output.clone();
+            (single_report(config_from_common(common)?), output)
+        }
+        Command::Grid(common) => {
+            let output = common.output.clone();
+            (grid_report(config_from_common(common)?), output)
+        }
+        Command::Evolve(args) => {
+            let output = args.common.output.clone();
+            let mut config = config_from_common(args.common)?;
+            config.generations = args.generations;
+            config.population = args.population;
+            (evolve_report(config), output)
+        }
+        Command::Adversarial(common) => {
+            let output = common.output.clone();
+            (adversarial_report(config_from_common(common)?), output)
+        }
+    };
+
+    let json = serde_json::to_string_pretty(&report)?;
+    if let Some(path) = output {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, json)?;
+    } else {
+        println!("{json}");
+    }
+    Ok(())
+}
+
+fn config_from_common(args: CommonArgs) -> anyhow::Result<OptimizerConfig> {
+    let mut policy = if let Some(path) = &args.policy {
+        load_policy(path)?
+    } else {
+        PolicyParams::default()
+    };
+    if let Some(value) = args.sla_secs {
+        policy.sla_secs = value;
+    }
+    if let Some(value) = args.max_watch_dirs {
+        policy.max_watch_dirs = value;
+    }
+    if let Some(value) = args.l0_idle_ttl_secs {
+        policy.l0_idle_ttl_secs = value;
+    }
+    if let Some(value) = args.l1_scan_interval_secs {
+        policy.l1_scan_interval_secs = value;
+    }
+    if let Some(value) = args.l2_scan_interval_secs {
+        policy.l2_scan_interval_secs = value;
+    }
+    if let Some(value) = args.per_round_max_dirs {
+        policy.per_round_max_dirs = value;
+    }
+    if let Some(value) = args.per_round_max_files {
+        policy.per_round_max_files = value;
+    }
+
+    Ok(OptimizerConfig {
+        workload: WorkloadConfig {
+            profile: args.profile.into(),
+            dirs: args.dirs,
+            events: args.events,
+            duration_secs: args.duration_secs,
+            seed: args.seed,
+        },
+        policy,
+        top_n: args.top_n,
+        ..OptimizerConfig::default()
+    })
+}
+
+fn load_policy(path: &PathBuf) -> anyhow::Result<PolicyParams> {
+    let text = fs::read_to_string(path)?;
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("json") => Ok(serde_json::from_str(&text)?),
+        Some("toml") => Ok(toml::from_str(&text)?),
+        Some(other) => anyhow::bail!("unsupported policy file extension: {other}"),
+        None => anyhow::bail!("policy file must end in .json or .toml"),
+    }
+}

@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -257,28 +256,8 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
     let start_generation = trace.len();
     let mut population = resume_population(&config, &baseline.policy, &best_seen, &mut rng);
 
-    let profile_multiplier = if config.robust_profiles { 4 } else { 1 };
-    let total_expected = config.generations.saturating_mul(config.population).saturating_mul(profile_multiplier);
-    tracing::info!(
-        "optimize_report starting | total_expected={} | generations={} | population={} | profiles={} | workload: dirs={} events={} duration_secs={}",
-        total_expected,
-        config.generations,
-        config.population,
-        profile_multiplier,
-        config.workload.dirs,
-        config.workload.events,
-        config.workload.duration_secs,
-    );
-
-    let start_time = Instant::now();
-
     for step in 1..=config.generations.max(1) {
         let generation = start_generation + step;
-        tracing::info!(
-            "Generation {}/{} starting...",
-            generation,
-            config.generations
-        );
         let generation_population = population;
         let generation_total = generation_population.len();
         let mut generation_runs = Vec::with_capacity(generation_total);
@@ -303,27 +282,6 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
             }
             let metrics = evaluate_policy(&config, &policy);
             trials += 1;
-
-            let elapsed = start_time.elapsed();
-            let elapsed_secs = elapsed.as_secs();
-            let eta_secs = if trials > 0 {
-                let per_trial = elapsed.as_secs_f64() / trials as f64;
-                let remaining = total_expected.saturating_sub(trials);
-                (per_trial * remaining as f64).round() as u64
-            } else {
-                0
-            };
-            tracing::info!(
-                "trial {}/{} gen {}/{} | best_score={:.2} | elapsed={}s | eta={}s",
-                trials,
-                total_expected,
-                generation,
-                config.generations,
-                best_score,
-                elapsed_secs,
-                eta_secs
-            );
-
             generation_runs.push(RunReport {
                 rank: 0,
                 policy,
@@ -398,14 +356,9 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
             });
             write_checkpoint(path, &report)?;
         }
-if stale_generations >= config.patience.max(1) {
+
+        if stale_generations >= config.patience.max(1) {
             converged = true;
-            tracing::info!(
-                "Convergence reached after {} generations (stale_generations={} >= patience={})",
-                generation,
-                stale_generations,
-                config.patience.max(1)
-            );
             break;
         }
 
