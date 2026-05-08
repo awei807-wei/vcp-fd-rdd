@@ -3,6 +3,7 @@ use fd_rdd::config::{default_snapshot_path, default_socket_path, Config, WatchMo
 use fd_rdd::event::ignore_filter::IgnoreFilter;
 use fd_rdd::event::sync::DirtyScope;
 use fd_rdd::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
+use fd_rdd::event::tiered_watch::{TieredWatchDebugDump, TieredWatchDebugSummary};
 use fd_rdd::index::TieredIndex;
 use fd_rdd::query::SocketServer;
 use fd_rdd::query::{HealthTelemetry, QueryServer};
@@ -357,10 +358,29 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| watch_state.as_ref().clone())
         })
     };
+    let tiered_watch_debug_provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync> = {
+        let tiered_runtime = tiered_runtime.clone();
+        Arc::new(move |root_filter| {
+            tiered_runtime
+                .as_ref()
+                .map(|rt| rt.debug_dump(root_filter.as_deref()))
+                .unwrap_or_else(|| TieredWatchDebugDump {
+                    dirs: vec![],
+                    summary: TieredWatchDebugSummary {
+                        l0_dirs: 0,
+                        l1_dirs: 0,
+                        l2_dirs: 0,
+                        l3_dirs: 0,
+                        total_event_score: 0,
+                    },
+                })
+        })
+    };
     let query_server = QueryServer::new(index.clone())
         .with_health_provider(health_provider)
         .with_stats_provider(stats_provider.clone())
-        .with_watch_state_provider(watch_state_provider);
+        .with_watch_state_provider(watch_state_provider)
+        .with_tiered_watch_debug_provider(tiered_watch_debug_provider);
     tokio::spawn(async move {
         if let Err(e) = query_server.run(http_port).await {
             tracing::error!("Query server error: {}", e);

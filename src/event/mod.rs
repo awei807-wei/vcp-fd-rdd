@@ -5,4 +5,4 @@ pub mod tiered_watch;
 pub mod watcher;
 
 pub use stream::{EventPipeline, WatchCommand};
-pub use tiered_watch::TieredWatchRuntime;
+pub use tiered_watch::{Freshness, IndexResidency, TieredWatchRuntime};

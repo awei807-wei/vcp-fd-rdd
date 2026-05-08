@@ -1,6 +1,7 @@
 use crate::index::TieredIndex;
 use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
 use crate::query::{execute_query, QueryMode, SortColumn, SortOrder};
+use crate::event::tiered_watch::TieredWatchDebugDump;
 use crate::stats::{EventPipelineStats, MemoryReport, StatsReport, WatchStateReport};
 use crate::util::maybe_trim_rss;
 use axum::{
@@ -138,6 +139,7 @@ struct QueryServerState {
     health_provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync>,
     stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync>,
     watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
+    tiered_watch_debug_provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync>,
 }
 
 pub struct QueryServer {
@@ -146,6 +148,7 @@ pub struct QueryServer {
     health_provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync>,
     stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync>,
     watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
+    tiered_watch_debug_provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync>,
 }
 
 impl QueryServer {
@@ -156,6 +159,7 @@ impl QueryServer {
             health_provider: Arc::new(HealthTelemetry::default),
             stats_provider: Arc::new(EventPipelineStats::default),
             watch_state_provider: Arc::new(WatchStateReport::default),
+            tiered_watch_debug_provider: Arc::new(|_| TieredWatchDebugDump::default()),
         }
     }
 
@@ -183,6 +187,14 @@ impl QueryServer {
         self
     }
 
+    pub fn with_tiered_watch_debug_provider(
+        mut self,
+        provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync>,
+    ) -> Self {
+        self.tiered_watch_debug_provider = provider;
+        self
+    }
+
     pub async fn run(self, port: u16) -> anyhow::Result<()> {
         let state = QueryServerState {
             index: self.index,
@@ -191,6 +203,7 @@ impl QueryServer {
             health_provider: self.health_provider,
             stats_provider: self.stats_provider,
             watch_state_provider: self.watch_state_provider,
+            tiered_watch_debug_provider: self.tiered_watch_debug_provider,
         };
         let app = Router::new()
             .route("/search", get(search_handler))
@@ -201,6 +214,7 @@ impl QueryServer {
             .route("/trim", get(trim_handler).post(trim_handler))
             .route("/metrics", get(metrics_handler))
             .route("/scan", post(scan_handler))
+            .route("/debug/tiered-watch", get(debug_tiered_watch_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
@@ -427,6 +441,18 @@ async fn scan_handler(
         scanned,
         elapsed_ms,
     }))
+}
+
+#[derive(Deserialize)]
+pub struct DebugTieredWatchParams {
+    pub root: Option<String>,
+}
+
+async fn debug_tiered_watch_handler(
+    Query(params): Query<DebugTieredWatchParams>,
+    State(state): State<QueryServerState>,
+) -> Json<TieredWatchDebugDump> {
+    Json((state.tiered_watch_debug_provider)(params.root))
 }
 
 #[cfg(test)]

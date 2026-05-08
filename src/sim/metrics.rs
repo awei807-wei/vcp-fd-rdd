@@ -25,6 +25,16 @@ pub struct RunMetrics {
     pub cpu_budget_hit: bool,
     pub io_budget_hit: bool,
     pub objective_score: f64,
+    pub l0_dirs: u64,
+    pub l1_dirs: u64,
+    pub l2_dirs: u64,
+    pub l3_dirs: u64,
+    pub promotion_count: u64,
+    pub replacement_count: u64,
+    pub budget_blocked_count: u64,
+    pub query_hits: u64,
+    pub query_stale_hits: u64,
+    pub query_misses: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +52,13 @@ pub fn summarize(
     scan_rounds: u64,
     scanned_dirs: u64,
     scanned_files: u64,
+    tier_counts: (u64, u64, u64, u64),
+    promotion_count: u64,
+    replacement_count: u64,
+    budget_blocked_count: u64,
+    query_hits: u64,
+    query_stale_hits: u64,
+    query_misses: u64,
 ) -> RunMetrics {
     let mut latencies = detected_latencies.to_vec();
     latencies.sort_unstable();
@@ -114,6 +131,16 @@ pub fn summarize(
         cpu_budget_hit,
         io_budget_hit,
         objective_score,
+        l0_dirs: tier_counts.0,
+        l1_dirs: tier_counts.1,
+        l2_dirs: tier_counts.2,
+        l3_dirs: tier_counts.3,
+        promotion_count,
+        replacement_count,
+        budget_blocked_count,
+        query_hits,
+        query_stale_hits,
+        query_misses,
     }
 }
 

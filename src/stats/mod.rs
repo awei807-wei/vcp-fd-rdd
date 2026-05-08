@@ -185,7 +185,23 @@ pub struct WatchStateReport {
     pub last_adjustment_unix_secs: u64,
     pub next_scan_unix_secs: u64,
     pub event_score_total: u64,
+    pub fresh_dirs: usize,
+    pub stale_dirs: usize,
+    pub dirty_dirs: usize,
+    pub unknown_dirs: usize,
+    pub hot_memory_dirs: usize,
+    pub warm_memory_dirs: usize,
+    pub cold_mmap_dirs: usize,
+    pub frozen_manifest_dirs: usize,
     pub notes: Vec<String>,
+    pub l0_watch_cost: u64,
+    pub l1_watch_cost: u64,
+    pub l2_watch_cost: u64,
+    pub l3_watch_cost: u64,
+    pub scan_backlog_by_tier: [usize; 4],
+    pub dirty_queue_len: usize,
+    pub cold_validate_count: u64,
+    pub query_stale_hit_count: u64,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]

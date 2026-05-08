@@ -78,10 +78,19 @@ pub struct FileEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryEvent {
+    pub id: usize,
+    pub dir: usize,
+    pub at_secs: u64,
+    pub query_depth: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct World {
     pub config: WorkloadConfig,
     pub dirs: Vec<DirNode>,
     pub events: Vec<FileEvent>,
+    pub queries: Vec<QueryEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,10 +189,17 @@ pub fn generate_world(config: WorkloadConfig) -> World {
         event.id = idx;
     }
 
+    let mut queries = generate_queries(&config, &dirs, &mut rng);
+    queries.sort_by_key(|query| (query.at_secs, query.id));
+    for (idx, query) in queries.iter_mut().enumerate() {
+        query.id = idx;
+    }
+
     World {
         config,
         dirs,
         events,
+        queries,
     }
 }
 
@@ -307,6 +323,36 @@ fn generate_events(config: &WorkloadConfig, dirs: &[DirNode], rng: &mut Rng64) -
     }
 
     events
+}
+
+fn generate_queries(config: &WorkloadConfig, dirs: &[DirNode], rng: &mut Rng64) -> Vec<QueryEvent> {
+    let query_count = config.events.saturating_mul(2);
+    let mut queries = Vec::with_capacity(query_count);
+
+    let cumulative = importance_weights(dirs);
+
+    for id in 0..query_count {
+        let dir = sample_weighted(&cumulative, rng.next_f64());
+        let at_secs = rng.u64_range(0, config.duration_secs.max(1));
+        let max_depth = dirs[dir].depth.saturating_add(1);
+        let query_depth = rng.u64_range(1, max_depth as u64 + 1) as u16;
+        queries.push(QueryEvent { id, dir, at_secs, query_depth });
+    }
+
+    queries
+}
+
+fn importance_weights(dirs: &[DirNode]) -> Vec<f64> {
+    let mut total = 0.0;
+    let mut cumulative = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        total += dir.importance.max(0.0);
+        cumulative.push(total);
+    }
+    if total <= f64::EPSILON {
+        return (1..=dirs.len()).map(|v| v as f64).collect();
+    }
+    cumulative
 }
 
 fn cumulative_weights(profile: WorkloadProfile, dirs: &[DirNode]) -> Vec<f64> {

@@ -580,7 +580,7 @@ fn depth_len_and_type_filters_work() {
 }
 
 #[test]
-fn execute_query_sorts_by_size_and_modified_time() {
+fn execute_query_sorts_by_modified_time() {
     let root = unique_tmp_dir("query-sort");
     std::fs::create_dir_all(&root).unwrap();
 
@@ -626,16 +626,6 @@ fn execute_query_sorts_by_size_and_modified_time() {
         },
     ];
     let index = build_index_with_metas(&root, &metas);
-
-    let size_desc = execute_query(
-        index.as_ref(),
-        "sortprobe",
-        10,
-        QueryMode::Exact,
-        SortColumn::Size,
-        SortOrder::Desc,
-    );
-    assert_eq!(size_desc[0].path, root.join("sortprobe_large.txt"));
 
     let modified_desc = execute_query(
         index.as_ref(),

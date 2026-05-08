@@ -1,0 +1,22 @@
+name = "tiered-default"
+max_watch_dirs = 192
+sla_secs = 30
+l0_idle_ttl_secs = 600
+l1_scan_interval_secs = 20
+l2_scan_interval_secs = 180
+l1_empty_scans_to_l2 = 4
+l2_empty_scans_to_l3 = 3
+per_round_max_dirs = 16
+per_round_max_files = 4000
+per_round_max_ms = 20
+memory_budget_units = 256
+cpu_budget_units = 50000
+io_budget_units = 250000
+
+[weights]
+recent_event_count = 1.0
+event_recency_decay = 0.85
+importance = 2.0
+miss_penalty = 1.4
+watch_cost = 0.025
+scan_cost = 0.004
