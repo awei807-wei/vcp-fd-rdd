@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -88,7 +87,6 @@ pub struct TieredWatchRecommendation {
     pub l0_idle_ttl_secs: u64,
     pub l1_scan_interval_secs: u64,
     pub l2_scan_interval_secs: u64,
-    pub l3_scan_interval_secs: u64,
     pub l1_empty_scans_to_l2: u32,
     pub l2_empty_scans_to_l3: u32,
 }
@@ -188,19 +186,6 @@ pub fn evolve_report(config: OptimizerConfig) -> BenchmarkReport {
 }
 
 pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkReport> {
-    let profile_multiplier = if config.robust_profiles { 4 } else { 1 };
-    let total_expected = config.generations.saturating_mul(config.population).saturating_mul(profile_multiplier);
-    tracing::info!(
-        "optimize_report starting | total_expected={} | generations={} | population={} | profiles={} | workload: dirs={} events={} duration_secs={}",
-        total_expected,
-        config.generations,
-        config.population,
-        profile_multiplier,
-        config.workload.dirs,
-        config.workload.events,
-        config.workload.duration_secs,
-    );
-
     let summary_world = generate_world(config.workload.clone());
     let resumed = match &config.resume_path {
         Some(path) => Some(read_checkpoint(path)?),
@@ -271,15 +256,8 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
     let start_generation = trace.len();
     let mut population = resume_population(&config, &baseline.policy, &best_seen, &mut rng);
 
-    let start_time = Instant::now();
-
     for step in 1..=config.generations.max(1) {
         let generation = start_generation + step;
-        tracing::info!(
-            "Generation {}/{} starting...",
-            generation,
-            config.generations
-        );
         let generation_population = population;
         let generation_total = generation_population.len();
         let mut generation_runs = Vec::with_capacity(generation_total);
@@ -304,27 +282,6 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
             }
             let metrics = evaluate_policy(&config, &policy);
             trials += 1;
-
-            let elapsed = start_time.elapsed();
-            let elapsed_secs = elapsed.as_secs();
-            let eta_secs = if trials > 0 {
-                let per_trial = elapsed.as_secs_f64() / trials as f64;
-                let remaining = total_expected.saturating_sub(trials);
-                (per_trial * remaining as f64).round() as u64
-            } else {
-                0
-            };
-            tracing::info!(
-                "trial {}/{} gen {}/{} | best_score={:.2} | elapsed={}s | eta={}s",
-                trials,
-                total_expected,
-                generation,
-                config.generations,
-                best_score,
-                elapsed_secs,
-                eta_secs
-            );
-
             generation_runs.push(RunReport {
                 rank: 0,
                 policy,
@@ -402,12 +359,6 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
 
         if stale_generations >= config.patience.max(1) {
             converged = true;
-            tracing::info!(
-                "Convergence reached after {} generations (stale_generations={} >= patience={})",
-                generation,
-                stale_generations,
-                config.patience.max(1)
-            );
             break;
         }
 
@@ -722,7 +673,6 @@ fn recommendation_from_policy(policy: &PolicyParams) -> TieredWatchRecommendatio
         l0_idle_ttl_secs: policy.l0_idle_ttl_secs,
         l1_scan_interval_secs: policy.l1_scan_interval_secs,
         l2_scan_interval_secs: policy.l2_scan_interval_secs,
-        l3_scan_interval_secs: policy.l3_scan_interval_secs,
         l1_empty_scans_to_l2: policy.l1_empty_scans_to_l2,
         l2_empty_scans_to_l3: policy.l2_empty_scans_to_l3,
     }
@@ -765,12 +715,6 @@ fn mutate_policy(parent: &PolicyParams, rng: &mut Rng64) -> PolicyParams {
         7_200,
         0.50 + rng.next_f64() * 1.8,
     );
-    policy.l3_scan_interval_secs = mutate_u64(
-        policy.l3_scan_interval_secs,
-        60,
-        14_400,
-        0.50 + rng.next_f64() * 1.5,
-    );
     policy.per_round_max_dirs = mutate_usize(
         policy.per_round_max_dirs,
         1,
@@ -783,23 +727,6 @@ fn mutate_policy(parent: &PolicyParams, rng: &mut Rng64) -> PolicyParams {
         200_000,
         0.55 + rng.next_f64() * 1.5,
     );
-    if rng.next_f64() < 0.5 {
-        policy.max_budget_blocked_before_escalation = policy.max_budget_blocked_before_escalation.saturating_sub(1).max(1);
-    } else {
-        policy.max_budget_blocked_before_escalation = policy.max_budget_blocked_before_escalation.saturating_add(1).min(10);
-    }
-    policy.query_validate_interval_secs = mutate_u64(
-        policy.query_validate_interval_secs,
-        10,
-        300,
-        0.50 + rng.next_f64() * 1.5,
-    );
-    policy.event_score_decay *= 0.95 + rng.next_f64() * 0.10;
-    policy.event_score_decay = policy.event_score_decay.clamp(0.5, 1.0);
-    policy.promotion_threshold *= 0.50 + rng.next_f64() * 1.5;
-    policy.promotion_threshold = policy.promotion_threshold.max(1.0);
-    policy.replacement_threshold_ratio *= 0.80 + rng.next_f64() * 0.70;
-    policy.replacement_threshold_ratio = policy.replacement_threshold_ratio.max(1.0);
     policy.weights.recent_event_count *= 0.7 + rng.next_f64() * 0.8;
     policy.weights.event_recency_decay *= 0.7 + rng.next_f64() * 0.8;
     policy.weights.importance *= 0.7 + rng.next_f64() * 0.8;

@@ -17,7 +17,7 @@ impl SimTier {
             Self::L0 => u64::MAX,
             Self::L1 => policy.l1_scan_interval_secs,
             Self::L2 => policy.l2_scan_interval_secs,
-            Self::L3 => policy.l3_scan_interval_secs,
+            Self::L3 => policy.l2_scan_interval_secs.saturating_mul(2).max(1),
         }
     }
 }
@@ -55,7 +55,6 @@ pub struct PolicyParams {
     pub l0_idle_ttl_secs: u64,
     pub l1_scan_interval_secs: u64,
     pub l2_scan_interval_secs: u64,
-    pub l3_scan_interval_secs: u64,
     pub l1_empty_scans_to_l2: u32,
     pub l2_empty_scans_to_l3: u32,
     pub per_round_max_dirs: usize,
@@ -64,11 +63,6 @@ pub struct PolicyParams {
     pub memory_budget_units: u64,
     pub cpu_budget_units: u64,
     pub io_budget_units: u64,
-    pub max_budget_blocked_before_escalation: u32,
-    pub query_validate_interval_secs: u64,
-    pub event_score_decay: f64,
-    pub promotion_threshold: f64,
-    pub replacement_threshold_ratio: f64,
     pub weights: ScoreWeights,
 }
 
@@ -81,7 +75,6 @@ impl Default for PolicyParams {
             l0_idle_ttl_secs: 600,
             l1_scan_interval_secs: 20,
             l2_scan_interval_secs: 180,
-            l3_scan_interval_secs: 600,
             l1_empty_scans_to_l2: 4,
             l2_empty_scans_to_l3: 3,
             per_round_max_dirs: 16,
@@ -90,11 +83,6 @@ impl Default for PolicyParams {
             memory_budget_units: 256,
             cpu_budget_units: 50_000,
             io_budget_units: 250_000,
-            max_budget_blocked_before_escalation: 3,
-            query_validate_interval_secs: 60,
-            event_score_decay: 0.95,
-            promotion_threshold: 20.0,
-            replacement_threshold_ratio: 1.2,
             weights: ScoreWeights::default(),
         }
     }
@@ -109,9 +97,6 @@ impl PolicyParams {
         self.l2_scan_interval_secs = self
             .l2_scan_interval_secs
             .max(self.l1_scan_interval_secs.saturating_add(1));
-        self.l3_scan_interval_secs = self
-            .l3_scan_interval_secs
-            .max(self.l2_scan_interval_secs.saturating_mul(2));
         self.l1_empty_scans_to_l2 = self.l1_empty_scans_to_l2.max(1);
         self.l2_empty_scans_to_l3 = self.l2_empty_scans_to_l3.max(1);
         self.per_round_max_dirs = self.per_round_max_dirs.max(1);
@@ -120,11 +105,6 @@ impl PolicyParams {
         self.memory_budget_units = self.memory_budget_units.max(1);
         self.cpu_budget_units = self.cpu_budget_units.max(1);
         self.io_budget_units = self.io_budget_units.max(1);
-        self.max_budget_blocked_before_escalation = self.max_budget_blocked_before_escalation.max(1);
-        self.query_validate_interval_secs = self.query_validate_interval_secs.max(1);
-        self.event_score_decay = self.event_score_decay.clamp(0.5, 1.0);
-        self.promotion_threshold = self.promotion_threshold.max(1.0);
-        self.replacement_threshold_ratio = self.replacement_threshold_ratio.max(1.0);
         self
     }
 
@@ -136,7 +116,7 @@ impl PolicyParams {
             (-age / self.l0_idle_ttl_secs.max(1) as f64).exp()
         };
         let miss_penalty = (dir.importance * dir.base_event_rate * self.sla_secs as f64).sqrt();
-        self.weights.recent_event_count * (state.recent_events as f64 + state.event_score)
+        self.weights.recent_event_count * state.recent_events as f64
             + self.weights.event_recency_decay * recency
             + self.weights.importance * dir.importance
             + self.weights.miss_penalty * miss_penalty
@@ -145,12 +125,11 @@ impl PolicyParams {
     }
 
     pub fn initial_score(&self, dir: &DirNode) -> f64 {
-        let miss_penalty = (dir.importance * dir.base_event_rate * self.sla_secs as f64).sqrt();
-        self.weights.importance * dir.importance
-            + self.weights.recent_event_count * dir.base_event_rate
-            + self.weights.miss_penalty * miss_penalty
-            - self.weights.watch_cost * dir.watch_cost as f64
-            - self.weights.scan_cost * dir.scan_cost as f64
+        let state = DirPolicyState {
+            recent_events: 0,
+            last_event_at: 0,
+        };
+        self.score_dir(dir, &state, 0)
     }
 }
 
@@ -158,7 +137,6 @@ impl PolicyParams {
 pub struct DirPolicyState {
     pub recent_events: u32,
     pub last_event_at: u64,
-    pub event_score: f64,
 }
 
 pub fn initial_l0_candidates(world: &World, policy: &PolicyParams) -> Vec<usize> {

@@ -9,8 +9,6 @@ struct DirRuntime {
     last_event_at: u64,
     next_scan_at: u64,
     empty_scans: u32,
-    event_score: f64,
-    budget_blocked_count: u32,
 }
 
 impl DirRuntime {
@@ -38,8 +36,6 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
             last_event_at: 0,
             next_scan_at: 0,
             empty_scans: 0,
-            event_score: 0.0,
-            budget_blocked_count: 0,
         };
         world.dirs.len()
     ];
@@ -56,10 +52,6 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
             current_watch_cost = current_watch_cost.saturating_add(cost);
             watch_cost_peak = watch_cost_peak.max(current_watch_cost);
         }
-    }
-
-    for (id, state) in dirs.iter_mut().enumerate() {
-        state.event_score = policy.initial_score(&world.dirs[id]);
     }
 
     for (id, state) in dirs.iter_mut().enumerate() {
@@ -81,11 +73,6 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
             tracing::debug!("simulation progress: {}s / {}s", now, duration);
         }
 
-        for state in dirs.iter_mut() {
-            state.event_score *= policy.weights.event_recency_decay;
-            state.event_score = state.event_score.max(0.0).min(10000.0);
-        }
-
         while cursor < world.events.len() && world.events[cursor].at_secs <= now {
             let event = &world.events[cursor];
             if let Some(root) = covering_l0(world, &dirs, event.dir) {
@@ -93,22 +80,10 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
                 dirs[root].last_event_at = now;
                 dirs[root].recent_events = dirs[root].recent_events.saturating_add(1).min(10_000);
                 dirs[root].empty_scans = 0;
-                dirs[root].event_score += 8.0;
-                dirs[root].event_score = dirs[root].event_score.min(10000.0);
             } else {
                 unresolved.push(event.id);
             }
             cursor += 1;
-        }
-
-        if now % 60 == 0 {
-            for (id, state) in dirs.iter_mut().enumerate() {
-                if (state.tier == SimTier::L2 || state.tier == SimTier::L3)
-                    && (id % 7 == (now as usize % 7))
-                {
-                    state.next_scan_at = state.next_scan_at.min(now);
-                }
-            }
         }
 
         let demote = dirs
@@ -156,8 +131,6 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
                     .saturating_add(changed as u32)
                     .min(10_000);
                 dirs[dir_id].empty_scans = 0;
-                dirs[dir_id].event_score += 16.0 + changed as f64 * 4.0;
-                dirs[dir_id].event_score = dirs[dir_id].event_score.min(10000.0);
                 if promote_dir(
                     world,
                     &mut dirs,
@@ -171,21 +144,10 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
                     dirs[dir_id].tier = SimTier::L1;
                     dirs[dir_id].next_scan_at =
                         now.saturating_add(dirs[dir_id].tier.scan_interval_secs(&policy));
-                    let cost = world.dirs[dir_id].watch_cost as u64;
-                    let budget = policy.max_watch_dirs as u64;
-                    if cost <= budget {
-                        if dirs[dir_id].budget_blocked_count >= 3 {
-                            dirs[dir_id].next_scan_at = now;
-                        }
-                        dirs[dir_id].event_score += 2.0;
-                        dirs[dir_id].event_score = dirs[dir_id].event_score.min(10000.0);
-                    }
                 }
             } else {
                 dirs[dir_id].recent_events = (dirs[dir_id].recent_events as f64 * 0.82) as u32;
                 dirs[dir_id].empty_scans = dirs[dir_id].empty_scans.saturating_add(1);
-                dirs[dir_id].event_score -= 1.0;
-                dirs[dir_id].event_score = dirs[dir_id].event_score.max(0.0);
                 maybe_demote_empty(&mut dirs[dir_id], &policy);
                 dirs[dir_id].next_scan_at =
                     now.saturating_add(dirs[dir_id].tier.scan_interval_secs(&policy));
@@ -238,21 +200,17 @@ fn scan_batch(world: &World, dirs: &[DirRuntime], policy: &PolicyParams, now: u6
             {
                 return None;
             }
-            Some((
-                state.tier,
-                state.next_scan_at,
-                std::cmp::Reverse(ScoreKey(state.event_score)),
-                id,
-            ))
+            let score = policy.score_dir(&world.dirs[id], &state.policy_state(), now);
+            Some((state.tier, std::cmp::Reverse(ScoreKey(score)), id))
         })
         .collect::<Vec<_>>();
 
-    candidates.sort_by_key(|(tier, next_scan_at, score, id)| (tier_rank(*tier), *next_scan_at, *score, *id));
+    candidates.sort_by_key(|(tier, score, id)| (tier_rank(*tier), *score, *id));
     let mut out = Vec::new();
     let mut files = 0u64;
     let mut ms = 0u64;
 
-    for (_, _, _, id) in candidates {
+    for (_, _, id) in candidates {
         let scan_cost = world.dirs[id].scan_cost as u64;
         let scan_ms = (scan_cost / 200).max(1);
         if !out.is_empty()
@@ -289,10 +247,10 @@ impl Ord for ScoreKey {
 
 fn tier_rank(tier: SimTier) -> u8 {
     match tier {
-        SimTier::L0 => 0,
-        SimTier::L1 => 1,
-        SimTier::L2 => 2,
-        SimTier::L3 => 3,
+        SimTier::L1 => 0,
+        SimTier::L2 => 1,
+        SimTier::L3 => 2,
+        SimTier::L0 => 3,
     }
 }
 
@@ -331,73 +289,6 @@ fn maybe_demote_empty(state: &mut DirRuntime, policy: &PolicyParams) {
     }
 }
 
-fn try_replace_cold_l0_for_promotion(
-    dirs: &mut [DirRuntime],
-    world: &World,
-    candidate_id: usize,
-    policy: &PolicyParams,
-    now: u64,
-    current_watch_cost: &mut u64,
-) -> bool {
-    let candidate_cost = world.dirs[candidate_id].watch_cost as u64;
-    let budget = policy.max_watch_dirs as u64;
-
-    if current_watch_cost.saturating_add(candidate_cost) <= budget {
-        dirs[candidate_id].tier = SimTier::L0;
-        *current_watch_cost = current_watch_cost.saturating_add(candidate_cost);
-        return true;
-    }
-
-    let candidate_score = dirs[candidate_id].event_score;
-    let candidate_ancestors = world.ancestor_ids(candidate_id);
-    let mut victim: Option<usize> = None;
-
-    for (id, state) in dirs.iter().enumerate() {
-        if state.tier != SimTier::L0 {
-            continue;
-        }
-        if state.event_score >= candidate_score {
-            continue;
-        }
-        if candidate_ancestors.contains(&id) {
-            continue;
-        }
-
-        match victim {
-            Some(vid) if dirs[vid].event_score > state.event_score => {
-                victim = Some(id);
-            }
-            None => {
-                victim = Some(id);
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(victim_id) = victim {
-        let victim_cost = world.dirs[victim_id].watch_cost as u64;
-        if current_watch_cost
-            .saturating_sub(victim_cost)
-            .saturating_add(candidate_cost)
-            > budget
-        {
-            dirs[candidate_id].budget_blocked_count += 1;
-            return false;
-        }
-        dirs[victim_id].tier = SimTier::L1;
-        dirs[victim_id].next_scan_at = now;
-        dirs[victim_id].empty_scans = 0;
-        dirs[candidate_id].tier = SimTier::L0;
-        *current_watch_cost = current_watch_cost
-            .saturating_sub(victim_cost)
-            .saturating_add(candidate_cost);
-        true
-    } else {
-        dirs[candidate_id].budget_blocked_count += 1;
-        false
-    }
-}
-
 fn promote_dir(
     world: &World,
     dirs: &mut [DirRuntime],
@@ -416,7 +307,52 @@ fn promote_dir(
         return false;
     }
 
-    try_replace_cold_l0_for_promotion(dirs, world, dir_id, policy, now, current_watch_cost)
+    if current_watch_cost.saturating_add(cost) <= budget {
+        dirs[dir_id].tier = SimTier::L0;
+        *current_watch_cost = current_watch_cost.saturating_add(cost);
+        return true;
+    }
+
+    let candidate_score = policy.score_dir(&world.dirs[dir_id], &dirs[dir_id].policy_state(), now);
+    let replacement = dirs
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| state.tier == SimTier::L0)
+        .min_by(|(left_id, left), (right_id, right)| {
+            let left_score = policy.score_dir(&world.dirs[*left_id], &left.policy_state(), now);
+            let right_score = policy.score_dir(&world.dirs[*right_id], &right.policy_state(), now);
+            left_score
+                .total_cmp(&right_score)
+                .then_with(|| left_id.cmp(right_id))
+        })
+        .map(|(id, state)| {
+            (
+                id,
+                policy.score_dir(&world.dirs[id], &state.policy_state(), now),
+            )
+        });
+
+    let Some((replace_id, replace_score)) = replacement else {
+        return false;
+    };
+    let replace_cost = world.dirs[replace_id].watch_cost as u64;
+    if candidate_score <= replace_score
+        || current_watch_cost
+            .saturating_sub(replace_cost)
+            .saturating_add(cost)
+            > budget
+    {
+        return false;
+    }
+
+    dirs[replace_id].tier = SimTier::L1;
+    dirs[replace_id].next_scan_at = now;
+    dirs[replace_id].empty_scans = 0;
+    dirs[dir_id].tier = SimTier::L0;
+    *current_watch_cost = current_watch_cost
+        .saturating_sub(replace_cost)
+        .saturating_add(cost);
+    true
 }
 
 fn covering_l0(world: &World, dirs: &[DirRuntime], dir_id: usize) -> Option<usize> {

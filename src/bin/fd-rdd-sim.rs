@@ -163,9 +163,6 @@ impl From<ProfileArg> for WorkloadProfile {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
     let args = Args::parse();
     let (report, output) = match args.command {
         Command::Optimize(args) => {
