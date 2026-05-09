@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
+
 use serde::{Deserialize, Serialize};
 
 use super::metrics::{RunMetrics, RunReport};
@@ -91,6 +93,13 @@ pub struct TieredWatchRecommendation {
     pub l2_empty_scans_to_l3: u32,
 }
 
+pub const SIM_ONLY_IGNORED_FIELDS: &[&str] = &[
+    "weights",
+    "per_round_max_dirs",
+    "per_round_max_files",
+    "per_round_max_ms",
+];
+
 #[derive(Debug, Clone, Serialize)]
 struct TieredWatchConfigPatch {
     watch_mode: String,
@@ -112,7 +121,76 @@ struct TieredWatchConfigPatchTable {
 pub fn tiered_watch_config_patch_toml_from_report(
     report: &BenchmarkReport,
 ) -> anyhow::Result<String> {
-    let recommendation = report
+    let recommendation = tiered_watch_recommendation_from_report(report)?;
+
+    tiered_watch_config_patch_toml(&recommendation)
+}
+
+pub fn tiered_watch_config_patch_toml_from_reports(
+    reports: &[BenchmarkReport],
+) -> anyhow::Result<String> {
+    let recommendation = conservative_tiered_watch_recommendation_from_reports(reports)?;
+    tiered_watch_config_patch_toml(&recommendation)
+}
+
+pub fn conservative_tiered_watch_recommendation_from_reports(
+    reports: &[BenchmarkReport],
+) -> anyhow::Result<TieredWatchRecommendation> {
+    if reports.is_empty() {
+        anyhow::bail!("at least one benchmark report is required");
+    }
+
+    let mut recommendations = reports
+        .iter()
+        .map(tiered_watch_recommendation_from_report)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut aggregate = recommendations
+        .pop()
+        .expect("reports is non-empty, so recommendations is non-empty");
+
+    for recommendation in recommendations {
+        aggregate.watch_mode = "tiered".to_string();
+        aggregate.max_watch_dirs = aggregate
+            .max_watch_dirs
+            .min(recommendation.max_watch_dirs)
+            .max(1);
+        aggregate.scan_items_per_sec = aggregate
+            .scan_items_per_sec
+            .min(recommendation.scan_items_per_sec)
+            .max(1);
+        aggregate.scan_ms_per_tick = aggregate
+            .scan_ms_per_tick
+            .min(recommendation.scan_ms_per_tick)
+            .max(1);
+        aggregate.l0_idle_ttl_secs = aggregate
+            .l0_idle_ttl_secs
+            .min(recommendation.l0_idle_ttl_secs)
+            .max(1);
+        aggregate.l1_scan_interval_secs = aggregate
+            .l1_scan_interval_secs
+            .max(recommendation.l1_scan_interval_secs)
+            .max(1);
+        aggregate.l2_scan_interval_secs = aggregate
+            .l2_scan_interval_secs
+            .max(recommendation.l2_scan_interval_secs)
+            .max(aggregate.l1_scan_interval_secs.saturating_add(1));
+        aggregate.l1_empty_scans_to_l2 = aggregate
+            .l1_empty_scans_to_l2
+            .min(recommendation.l1_empty_scans_to_l2)
+            .max(1);
+        aggregate.l2_empty_scans_to_l3 = aggregate
+            .l2_empty_scans_to_l3
+            .min(recommendation.l2_empty_scans_to_l3)
+            .max(1);
+    }
+
+    Ok(aggregate)
+}
+
+pub fn tiered_watch_recommendation_from_report(
+    report: &BenchmarkReport,
+) -> anyhow::Result<TieredWatchRecommendation> {
+    report
         .recommendation
         .clone()
         .or_else(|| {
@@ -127,9 +205,7 @@ pub fn tiered_watch_config_patch_toml_from_report(
                 .as_ref()
                 .map(|run| recommendation_from_policy(&run.policy))
         })
-        .ok_or_else(|| anyhow::anyhow!("report has no recommendation, best run, or baseline"))?;
-
-    tiered_watch_config_patch_toml(&recommendation)
+        .ok_or_else(|| anyhow::anyhow!("report has no recommendation, best run, or baseline"))
 }
 
 pub fn tiered_watch_config_patch_toml(
@@ -148,7 +224,43 @@ pub fn tiered_watch_config_patch_toml(
             l2_empty_scans_to_l3: recommendation.l2_empty_scans_to_l3,
         },
     };
-    Ok(toml::to_string_pretty(&patch)?)
+    let ignored = SIM_ONLY_IGNORED_FIELDS.join(", ");
+    let mut text = String::new();
+    text.push_str("# fd-rdd-sim generated runtime config patch.\n");
+    text.push_str("# Review before merging into ~/.config/fd-rdd/config.toml.\n");
+    text.push_str(&format!("# Sim-only policy fields ignored: {ignored}.\n\n"));
+    text.push_str(&toml::to_string_pretty(&patch)?);
+    Ok(text)
+}
+
+pub fn write_existing_parent(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let metadata = fs::metadata(parent)
+            .with_context(|| format!("output directory does not exist: {}", parent.display()))?;
+        if !metadata.is_dir() {
+            anyhow::bail!("output parent is not a directory: {}", parent.display());
+        }
+        if !directory_has_write_bit(&metadata) {
+            anyhow::bail!("output directory is not writable: {}", parent.display());
+        }
+    }
+
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(unix)]
+fn directory_has_write_bit(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o222 != 0
+}
+
+#[cfg(not(unix))]
+fn directory_has_write_bit(metadata: &fs::Metadata) -> bool {
+    !metadata.permissions().readonly()
 }
 
 pub fn single_report(config: OptimizerConfig) -> BenchmarkReport {
@@ -866,6 +978,38 @@ fn mutate_usize(value: usize, min: usize, max: usize, factor: f64) -> usize {
 mod tests {
     use super::*;
 
+    fn sample_recommendation(max_watch_dirs: u32) -> TieredWatchRecommendation {
+        TieredWatchRecommendation {
+            watch_mode: "tiered".to_string(),
+            max_watch_dirs,
+            scan_items_per_sec: 4_000,
+            scan_ms_per_tick: 25,
+            l0_idle_ttl_secs: 900,
+            l1_scan_interval_secs: 15,
+            l2_scan_interval_secs: 180,
+            l1_empty_scans_to_l2: 3,
+            l2_empty_scans_to_l3: 2,
+        }
+    }
+
+    fn sample_report(recommendation: Option<TieredWatchRecommendation>) -> BenchmarkReport {
+        let world = generate_world(WorkloadConfig {
+            dirs: 4,
+            events: 8,
+            duration_secs: 60,
+            ..WorkloadConfig::default()
+        });
+        BenchmarkReport {
+            mode: "test".to_string(),
+            world: world.summary(),
+            best: None,
+            baseline: None,
+            convergence: None,
+            recommendation,
+            runs: Vec::new(),
+        }
+    }
+
     #[test]
     fn grid_report_returns_ranked_runs() {
         let config = OptimizerConfig {
@@ -955,17 +1099,7 @@ mod tests {
 
     #[test]
     fn config_patch_toml_contains_only_runtime_tiered_fields() {
-        let recommendation = TieredWatchRecommendation {
-            watch_mode: "tiered".to_string(),
-            max_watch_dirs: 128,
-            scan_items_per_sec: 4_000,
-            scan_ms_per_tick: 25,
-            l0_idle_ttl_secs: 900,
-            l1_scan_interval_secs: 15,
-            l2_scan_interval_secs: 180,
-            l1_empty_scans_to_l2: 3,
-            l2_empty_scans_to_l3: 2,
-        };
+        let recommendation = sample_recommendation(128);
 
         let patch = tiered_watch_config_patch_toml(&recommendation)
             .expect("recommendation should serialize as toml");
@@ -975,7 +1109,109 @@ mod tests {
         assert!(patch.contains("max_watch_dirs = 128"));
         assert!(patch.contains("scan_items_per_sec = 4000"));
         assert!(patch.contains("l2_empty_scans_to_l3 = 2"));
-        assert!(!patch.contains("weights"));
-        assert!(!patch.contains("per_round_max_files"));
+        assert!(patch.contains("Sim-only policy fields ignored: weights"));
+
+        let parsed: toml::Value = toml::from_str(&patch).expect("patch should remain valid TOML");
+        assert!(parsed.get("weights").is_none());
+        let tiered_watch = parsed
+            .get("tiered_watch")
+            .and_then(toml::Value::as_table)
+            .expect("tiered_watch table");
+        assert!(!tiered_watch.contains_key("per_round_max_dirs"));
+        assert!(!tiered_watch.contains_key("per_round_max_files"));
+        assert!(!tiered_watch.contains_key("per_round_max_ms"));
+    }
+
+    #[test]
+    fn config_patch_from_reports_uses_conservative_bounds() {
+        let mut first = sample_recommendation(256);
+        first.scan_items_per_sec = 8_000;
+        first.scan_ms_per_tick = 40;
+        first.l0_idle_ttl_secs = 1_200;
+        first.l1_scan_interval_secs = 20;
+        first.l2_scan_interval_secs = 200;
+        first.l1_empty_scans_to_l2 = 5;
+        first.l2_empty_scans_to_l3 = 4;
+
+        let mut second = sample_recommendation(128);
+        second.scan_items_per_sec = 3_000;
+        second.scan_ms_per_tick = 15;
+        second.l0_idle_ttl_secs = 600;
+        second.l1_scan_interval_secs = 45;
+        second.l2_scan_interval_secs = 400;
+        second.l1_empty_scans_to_l2 = 2;
+        second.l2_empty_scans_to_l3 = 2;
+
+        let aggregate = conservative_tiered_watch_recommendation_from_reports(&[
+            sample_report(Some(first)),
+            sample_report(Some(second)),
+        ])
+        .expect("reports should aggregate");
+
+        assert_eq!(aggregate.max_watch_dirs, 128);
+        assert_eq!(aggregate.scan_items_per_sec, 3_000);
+        assert_eq!(aggregate.scan_ms_per_tick, 15);
+        assert_eq!(aggregate.l0_idle_ttl_secs, 600);
+        assert_eq!(aggregate.l1_scan_interval_secs, 45);
+        assert_eq!(aggregate.l2_scan_interval_secs, 400);
+        assert_eq!(aggregate.l1_empty_scans_to_l2, 2);
+        assert_eq!(aggregate.l2_empty_scans_to_l3, 2);
+    }
+
+    #[test]
+    fn config_patch_errors_without_recommendation_best_or_baseline() {
+        let report = sample_report(None);
+        let err = tiered_watch_config_patch_toml_from_report(&report)
+            .expect_err("report without recommendation, best, or baseline should fail");
+
+        assert!(err
+            .to_string()
+            .contains("report has no recommendation, best run, or baseline"));
+    }
+
+    #[test]
+    fn malformed_json_report_is_rejected() {
+        let err = serde_json::from_str::<BenchmarkReport>("{not valid json")
+            .expect_err("malformed JSON should fail");
+
+        assert!(err.to_string().contains("key must be a string"));
+    }
+
+    #[test]
+    fn emit_config_output_requires_existing_parent_directory() {
+        let root =
+            std::env::temp_dir().join(format!("fd-rdd-sim-missing-parent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("missing").join("patch.toml");
+
+        let err = write_existing_parent(&path, "watch_mode = \"tiered\"\n")
+            .expect_err("missing output parent should fail");
+
+        assert!(err.to_string().contains("output directory does not exist"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emit_config_output_rejects_unwritable_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-sim-unwritable-parent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555))
+            .expect("make temp dir readonly");
+        let path = root.join("patch.toml");
+
+        let err = write_existing_parent(&path, "watch_mode = \"tiered\"\n")
+            .expect_err("readonly output parent should fail");
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+            .expect("restore temp dir permissions");
+        let _ = std::fs::remove_dir_all(root);
+        assert!(err.to_string().contains("output directory is not writable"));
     }
 }

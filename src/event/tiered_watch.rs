@@ -1361,6 +1361,76 @@ mod tests {
     }
 
     #[test]
+    fn sustained_l0_events_keep_hot_dir_from_being_replaced() {
+        let rt = TieredWatchRuntime::new(
+            vec![(PathBuf::from("/tmp/hot"), 1)],
+            vec![(PathBuf::from("/tmp/candidate"), 1)],
+            1,
+            5_000,
+            20,
+        );
+        let hot_event = PathBuf::from("/tmp/hot/file.txt");
+        let candidate = PathBuf::from("/tmp/candidate");
+
+        for _ in 0..12 {
+            rt.record_event_paths([&hot_event]);
+        }
+        rt.record_scan(
+            candidate.as_path(),
+            ScanOutcome {
+                scanned: 1,
+                changed: 2,
+                elapsed_ms: 1,
+            },
+        );
+
+        assert_eq!(
+            rt.try_reserve_promotion(candidate.as_path()),
+            PromotionDecision::BudgetBlocked,
+            "sustained L0 events should keep the hot directory ahead of a weaker replacement candidate; report={:?}",
+            rt.report()
+        );
+        let report = rt.report();
+        assert_eq!(report.l0_dirs, 1);
+        assert_eq!(report.watched_dirs_estimated, 1);
+        assert_eq!(report.l0_replacements, 0);
+        assert_eq!(report.promotion_budget_blocked, 1);
+    }
+
+    #[test]
+    fn replacement_candidate_cannot_evict_its_ancestor_l0() {
+        let rt = TieredWatchRuntime::new(
+            vec![(PathBuf::from("/workspace"), 3)],
+            vec![(PathBuf::from("/workspace/project"), 1)],
+            3,
+            5_000,
+            20,
+        );
+        let child = PathBuf::from("/workspace/project");
+
+        rt.record_scan(
+            child.as_path(),
+            ScanOutcome {
+                scanned: 10,
+                changed: 20,
+                elapsed_ms: 1,
+            },
+        );
+
+        assert_eq!(
+            rt.try_reserve_promotion(child.as_path()),
+            PromotionDecision::BudgetBlocked,
+            "a child candidate must not free budget by evicting its covering ancestor; report={:?}",
+            rt.report()
+        );
+        let report = rt.report();
+        assert_eq!(report.l0_dirs, 1);
+        assert_eq!(report.l1_dirs, 1);
+        assert_eq!(report.watched_dirs_estimated, 3);
+        assert_eq!(report.l0_replacements, 0);
+    }
+
+    #[test]
     fn freshness_roundtrip() {
         assert_eq!(
             Freshness::from_u8(Freshness::Fresh.as_u8()),

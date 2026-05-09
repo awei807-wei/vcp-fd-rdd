@@ -1,7 +1,7 @@
+use crate::event::tiered_watch::TieredWatchDebugDump;
 use crate::index::TieredIndex;
 use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
 use crate::query::{execute_query, QueryMode, SortColumn, SortOrder};
-use crate::event::tiered_watch::TieredWatchDebugDump;
 use crate::stats::{EventPipelineStats, MemoryReport, StatsReport, WatchStateReport};
 use crate::util::maybe_trim_rss;
 use axum::{

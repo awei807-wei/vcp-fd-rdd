@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `fd-rdd-sim emit-config` to turn benchmark report recommendations into reviewable `watch_mode = "tiered"` and `[tiered_watch]` TOML patches.
 - Added simulation strategy counters for promotions, demotions, L0 replacements, promotion budget blocks, and final L0/L1/L2/L3 distribution, with parity tests against the runtime replacement and empty-scan demotion shapes.
 - Added P0 observability closure for tiered watcher reports: richer `/debug/tiered-watch` per-directory fields, real `/watch-state` dirty/cold/stale counters, and runtime/sim report mapping documentation.
+- Added P1 runtime/sim parity hardening: hot L0 retention, high-priority BudgetBlocked ordering, ancestor-safe replacement, watch budget accounting, fixed-seed synthetic workload checks, and failure diagnostics that print runtime/sim strategy metrics.
+- Added P2 sim recommendation backfill hardening: multi-report conservative `emit-config`, sim-only ignored-field annotations, `apply --dry-run` full-config preview, and error-path tests for bad reports/output paths.
 
 ## [0.6.14] - 2026-05-02
 

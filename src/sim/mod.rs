@@ -9,9 +9,11 @@ pub mod world;
 
 pub use metrics::{RunMetrics, RunReport};
 pub use optimizer::{
-    adversarial_report, evolve_report, grid_report, optimize_report, single_report,
-    tiered_watch_config_patch_toml, tiered_watch_config_patch_toml_from_report, BenchmarkReport,
-    OptimizerConfig, TieredWatchRecommendation,
+    adversarial_report, conservative_tiered_watch_recommendation_from_reports, evolve_report,
+    grid_report, optimize_report, single_report, tiered_watch_config_patch_toml,
+    tiered_watch_config_patch_toml_from_report, tiered_watch_config_patch_toml_from_reports,
+    tiered_watch_recommendation_from_report, write_existing_parent, BenchmarkReport,
+    OptimizerConfig, TieredWatchRecommendation, SIM_ONLY_IGNORED_FIELDS,
 };
 pub use policy::{PolicyParams, ScoreWeights, SimTier};
 pub use simulator::run_simulation;

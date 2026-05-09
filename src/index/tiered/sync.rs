@@ -581,9 +581,7 @@ impl TieredIndex {
                 };
                 let mtime = meta.modified().ok();
                 let mtime_ns = mtime_to_ns(mtime);
-                if self.path_freshness(&path, file_key, mtime_ns)
-                    != PathFreshness::Unchanged
-                {
+                if self.path_freshness(&path, file_key, mtime_ns) != PathFreshness::Unchanged {
                     changed += 1;
                 }
                 seq = seq.wrapping_add(1);

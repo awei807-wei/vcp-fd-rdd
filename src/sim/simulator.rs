@@ -412,10 +412,61 @@ fn covered_by_l0(world: &World, dirs: &[DirRuntime], dir_id: usize) -> bool {
 mod tests {
     use super::*;
     use crate::event::tiered_watch::{PromotionDecision, TieredWatchRuntime};
+    use crate::sim::metrics::RunMetrics;
     use crate::sim::policy::ScoreWeights;
     use crate::sim::world::{generate_world, WorkloadConfig, WorkloadProfile};
     use crate::sim::world::{DirNode, FileEvent, World};
+    use crate::stats::WatchStateReport;
     use std::path::{Path, PathBuf};
+
+    fn sim_diag(metrics: &RunMetrics) -> String {
+        format!(
+            "sim metrics: events={}/{} missed={} sla_rate={:.3} p95={} watch_peak={} scanned_dirs={} scanned_files={} promotions={} demotions={} replacements={} budget_blocked={} final_tiers=L0:{} L1:{} L2:{} L3:{} objective={:.2}",
+            metrics.detected,
+            metrics.events_total,
+            metrics.missed,
+            metrics.sla_rate,
+            metrics.p95_detect_secs,
+            metrics.watch_cost_peak,
+            metrics.scanned_dirs,
+            metrics.scanned_files,
+            metrics.promotions,
+            metrics.demotions,
+            metrics.replacements,
+            metrics.promotion_budget_blocked,
+            metrics.final_l0_dirs,
+            metrics.final_l1_dirs,
+            metrics.final_l2_dirs,
+            metrics.final_l3_dirs,
+            metrics.objective_score,
+        )
+    }
+
+    fn runtime_diag(report: &WatchStateReport) -> String {
+        format!(
+            "runtime report: watched={}/{} util={} tiers=L0:{} L1:{} L2:{} L3:{} backlog={} backlog_by_tier={:?} promotions={} demotions={} replacements={} budget_blocked={} dirty={} cold_validate={} event_score_total={}",
+            report.watched_dirs_estimated,
+            report.max_watch_dirs,
+            report.watch_budget_utilization_pct,
+            report.l0_dirs,
+            report.l1_dirs,
+            report.l2_dirs,
+            report.l3_dirs,
+            report.scan_backlog,
+            report.scan_backlog_by_tier,
+            report.promotions,
+            report.demotions,
+            report.l0_replacements,
+            report.promotion_budget_blocked,
+            report.dirty_queue_len,
+            report.cold_validate_count,
+            report.event_score_total,
+        )
+    }
+
+    fn parity_diag(metrics: &RunMetrics, report: &WatchStateReport) -> String {
+        format!("{}\n{}", sim_diag(metrics), runtime_diag(report))
+    }
 
     #[test]
     fn larger_watch_budget_reduces_scan_work() {
@@ -438,9 +489,22 @@ mod tests {
         let tight_metrics = run_simulation(&world, &tight);
         let roomy_metrics = run_simulation(&world, &roomy);
 
-        assert!(roomy_metrics.watch_cost_peak <= roomy.max_watch_dirs as u64);
-        assert!(tight_metrics.watch_cost_peak <= tight.max_watch_dirs as u64);
-        assert!(roomy_metrics.scanned_dirs <= tight_metrics.scanned_dirs);
+        assert!(
+            roomy_metrics.watch_cost_peak <= roomy.max_watch_dirs as u64,
+            "{}",
+            sim_diag(&roomy_metrics)
+        );
+        assert!(
+            tight_metrics.watch_cost_peak <= tight.max_watch_dirs as u64,
+            "{}",
+            sim_diag(&tight_metrics)
+        );
+        assert!(
+            roomy_metrics.scanned_dirs <= tight_metrics.scanned_dirs,
+            "larger L0 budget should not require more scan work\nroomy: {}\ntight: {}",
+            sim_diag(&roomy_metrics),
+            sim_diag(&tight_metrics)
+        );
     }
 
     #[test]
@@ -510,10 +574,15 @@ mod tests {
         };
 
         let metrics = run_simulation(&world, &policy);
-        assert_eq!(metrics.replacements, 1);
-        assert_eq!(metrics.promotions, 1);
-        assert_eq!(metrics.promotion_budget_blocked, 0);
-        assert_eq!(metrics.final_l0_dirs, 1);
+        assert_eq!(metrics.replacements, 1, "{}", sim_diag(&metrics));
+        assert_eq!(metrics.promotions, 1, "{}", sim_diag(&metrics));
+        assert_eq!(
+            metrics.promotion_budget_blocked,
+            0,
+            "{}",
+            sim_diag(&metrics)
+        );
+        assert_eq!(metrics.final_l0_dirs, 1, "{}", sim_diag(&metrics));
 
         let runtime = TieredWatchRuntime::new(
             vec![(PathBuf::from("/cold"), 1)],
@@ -531,12 +600,16 @@ mod tests {
                 elapsed_ms: 1,
             },
         );
+        let decision = runtime.try_reserve_promotion(hotter.as_path());
+        let report = runtime.report();
         assert_eq!(
-            runtime.try_reserve_promotion(hotter.as_path()),
+            decision,
             PromotionDecision::Replace {
                 demote: PathBuf::from("/cold"),
                 promote: hotter,
-            }
+            },
+            "{}",
+            parity_diag(&metrics, &report)
         );
     }
 
@@ -597,7 +670,7 @@ mod tests {
         };
 
         let metrics = run_simulation(&world, &policy);
-        assert!(metrics.final_l3_dirs >= 1);
+        assert!(metrics.final_l3_dirs >= 1, "{}", sim_diag(&metrics));
 
         let runtime =
             TieredWatchRuntime::new(Vec::new(), vec![(PathBuf::from("/warm"), 1)], 1, 5_000, 20);
@@ -613,6 +686,149 @@ mod tests {
             );
             runtime.apply_scan_policy(warm, 1, 1, 1, 1);
         }
-        assert_eq!(runtime.report().l3_dirs, 1);
+        let report = runtime.report();
+        assert_eq!(report.l3_dirs, 1, "{}", parity_diag(&metrics, &report));
+    }
+
+    #[test]
+    fn fixed_seed_synthetic_workloads_preserve_budget_and_accounting() {
+        let policy = PolicyParams {
+            max_watch_dirs: 48,
+            l1_scan_interval_secs: 8,
+            l2_scan_interval_secs: 30,
+            l1_empty_scans_to_l2: 2,
+            l2_empty_scans_to_l3: 2,
+            per_round_max_dirs: 8,
+            per_round_max_files: 2_000,
+            per_round_max_ms: 16,
+            ..PolicyParams::default()
+        };
+        let cases = [
+            WorkloadConfig {
+                profile: WorkloadProfile::Developer,
+                dirs: 220,
+                events: 1_200,
+                duration_secs: 900,
+                seed: 42,
+            },
+            WorkloadConfig {
+                profile: WorkloadProfile::Burst,
+                dirs: 180,
+                events: 900,
+                duration_secs: 600,
+                seed: 99,
+            },
+            WorkloadConfig {
+                profile: WorkloadProfile::Dormant,
+                dirs: 160,
+                events: 360,
+                duration_secs: 1_200,
+                seed: 123,
+            },
+            WorkloadConfig {
+                profile: WorkloadProfile::Adversarial,
+                dirs: 140,
+                events: 420,
+                duration_secs: 900,
+                seed: 2_026,
+            },
+        ];
+
+        for config in cases {
+            let world = generate_world(config.clone());
+            let metrics = run_simulation(&world, &policy);
+            let final_dirs = metrics.final_l0_dirs
+                + metrics.final_l1_dirs
+                + metrics.final_l2_dirs
+                + metrics.final_l3_dirs;
+
+            assert!(
+                metrics.watch_cost_peak <= policy.max_watch_dirs as u64,
+                "watch budget exceeded for {:?} seed {}\n{}",
+                config.profile,
+                config.seed,
+                sim_diag(&metrics)
+            );
+            assert_eq!(
+                final_dirs,
+                world.dirs.len(),
+                "tier accounting drifted for {:?} seed {}\n{}",
+                config.profile,
+                config.seed,
+                sim_diag(&metrics)
+            );
+            assert_eq!(
+                metrics.detected + metrics.missed,
+                world.events.len(),
+                "event accounting drifted for {:?} seed {}\n{}",
+                config.profile,
+                config.seed,
+                sim_diag(&metrics)
+            );
+            assert!(
+                metrics.final_l0_dirs <= policy.max_watch_dirs as usize,
+                "L0 directory count cannot exceed unit-cost lower bound for {:?} seed {}\n{}",
+                config.profile,
+                config.seed,
+                sim_diag(&metrics)
+            );
+            assert!(
+                metrics.sla_met <= metrics.detected,
+                "SLA count cannot exceed detected events for {:?} seed {}\n{}",
+                config.profile,
+                config.seed,
+                sim_diag(&metrics)
+            );
+        }
+    }
+
+    #[test]
+    fn sim_distribution_moves_colder_with_aggressive_empty_scan_policy() {
+        let world = generate_world(WorkloadConfig {
+            profile: WorkloadProfile::Dormant,
+            dirs: 220,
+            events: 180,
+            duration_secs: 1_800,
+            seed: 7_777,
+        });
+        let conservative = PolicyParams {
+            max_watch_dirs: 48,
+            l1_scan_interval_secs: 12,
+            l2_scan_interval_secs: 120,
+            l1_empty_scans_to_l2: 8,
+            l2_empty_scans_to_l3: 8,
+            per_round_max_dirs: 12,
+            per_round_max_files: 4_000,
+            per_round_max_ms: 20,
+            ..PolicyParams::default()
+        };
+        let aggressive = PolicyParams {
+            max_watch_dirs: 48,
+            l1_scan_interval_secs: 12,
+            l2_scan_interval_secs: 30,
+            l1_empty_scans_to_l2: 1,
+            l2_empty_scans_to_l3: 1,
+            per_round_max_dirs: 12,
+            per_round_max_files: 4_000,
+            per_round_max_ms: 20,
+            ..PolicyParams::default()
+        };
+
+        let conservative_metrics = run_simulation(&world, &conservative);
+        let aggressive_metrics = run_simulation(&world, &aggressive);
+
+        assert!(
+            aggressive_metrics.final_l3_dirs >= conservative_metrics.final_l3_dirs,
+            "aggressive empty-scan policy should move at least as many dirs to L3\naggressive: {}\nconservative: {}",
+            sim_diag(&aggressive_metrics),
+            sim_diag(&conservative_metrics)
+        );
+        assert!(
+            aggressive_metrics.final_l1_dirs + aggressive_metrics.final_l2_dirs
+                <= conservative_metrics.final_l1_dirs + conservative_metrics.final_l2_dirs,
+            "aggressive empty-scan policy should leave fewer warm/cold-scan dirs\naggressive: {}\nconservative: {}",
+            sim_diag(&aggressive_metrics),
+            sim_diag(&conservative_metrics)
+        );
     }
 }

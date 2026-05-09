@@ -210,15 +210,22 @@ cargo run --bin fd-rdd-sim -- evolve --generations 16 --population 32
 # 对抗鲁棒性测试并保存 JSON 报告
 cargo run --bin fd-rdd-sim -- adversarial --output reports/adversarial.json
 
-# 从报告生成可审阅的 config.toml 片段
+# 从一个或多个报告生成可审阅的保守 config.toml 片段
 cargo run --bin fd-rdd-sim -- emit-config \
   --input reports/optimized-tiered-watch.json \
+  --input reports/adversarial.json \
   --output reports/optimized-tiered-watch.toml
+
+# 预览推荐参数合并到完整 config.toml 后的结果，不写入用户配置
+cargo run --bin fd-rdd-sim -- apply \
+  --input reports/optimized-tiered-watch.json \
+  --config ~/.config/fd-rdd/config.toml \
+  --dry-run
 ```
 
 可通过 `--policy policies/tiered-default.toml` 读取策略基线；CLI 里显式传入的预算、TTL、扫描周期参数会作为本次运行的覆盖值。`optimize` 报告中的 `convergence.phase` / `current_generation` / `current_generation_trials` 显示当前进度，`convergence.trace` 记录每代试错轨迹，`recommendation` 字段给出推荐的 `watch_mode = "tiered"`、`max_watch_dirs`、扫描周期和 TTL。
 
-`metrics` 除 SLA、发现延迟、watch/scan 成本外，也输出策略控制面指标：`promotions`、`demotions`、`replacements`、`promotion_budget_blocked` 以及最终 `final_l0_dirs` / `final_l1_dirs` / `final_l2_dirs` / `final_l3_dirs` 分布，用于和真实 runtime `/watch-state` 做趋势对照；字段映射维护在 `helloagents/wiki/runtime-sim-report-mapping.md`。`emit-config` 只生成当前 runtime 支持的 TOML patch，不写入用户配置文件；确认后再合并到 `~/.config/fd-rdd/config.toml`。
+`metrics` 除 SLA、发现延迟、watch/scan 成本外，也输出策略控制面指标：`promotions`、`demotions`、`replacements`、`promotion_budget_blocked` 以及最终 `final_l0_dirs` / `final_l1_dirs` / `final_l2_dirs` / `final_l3_dirs` 分布，用于和真实 runtime `/watch-state` 做趋势对照；字段映射维护在 `helloagents/wiki/runtime-sim-report-mapping.md`。P1 parity 回归已覆盖热 L0 保留、BudgetBlocked 高优先级扫描、祖先 L0 不被子候选驱逐、watch budget 不超限，以及 developer/burst/dormant/adversarial 固定 seed workload 的层级与事件计数稳定性；失败时会输出 runtime/sim 关键指标差异。`emit-config` 只生成当前 runtime 支持的 TOML patch，不写入用户配置文件；多个 `--input` 会按更低 watcher/scan 预算、更低 L0 TTL、更长冷层扫描周期和更快空扫降级生成保守汇总，输出会注释说明 `weights`、`per_round_max_dirs`、`per_round_max_files`、`per_round_max_ms` 等 sim-only 参数已忽略；`apply --dry-run` 只打印合并后的完整配置用于审阅。
 
 长时间运行可用 `Ctrl-C` 中断；checkpoint 会在每代结束后原子写入。继续迭代时把同一个文件传给 `--resume` 和 `--checkpoint`：
 

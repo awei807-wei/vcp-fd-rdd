@@ -601,8 +601,7 @@ impl MmapIndex {
                 if tomb.contains(docid) {
                     continue;
                 }
-                let Some((file_key, root_id, path_off, path_len, mtime)) =
-                    self.meta_at(docid)
+                let Some((file_key, root_id, path_off, path_len, mtime)) = self.meta_at(docid)
                 else {
                     continue;
                 };
@@ -636,8 +635,7 @@ impl MmapIndex {
             if tomb.contains(docid) {
                 continue;
             }
-            let Some((file_key, root_id, path_off, path_len, mtime)) = self.meta_at(docid)
-            else {
+            let Some((file_key, root_id, path_off, path_len, mtime)) = self.meta_at(docid) else {
                 continue;
             };
             let start = path_off as usize;
@@ -671,8 +669,7 @@ impl MmapIndex {
             if tomb.contains(docid) {
                 continue;
             }
-            let Some((file_key, root_id, path_off, path_len, mtime)) = self.meta_at(docid)
-            else {
+            let Some((file_key, root_id, path_off, path_len, mtime)) = self.meta_at(docid) else {
                 continue;
             };
             let start = path_off as usize;

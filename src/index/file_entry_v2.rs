@@ -201,21 +201,9 @@ mod tests {
     #[test]
     fn test_lookup_by_filekey() {
         let mut index = FileEntryIndex::new();
-        index.push(FileEntry::from_file_key(
-            make_key(1, 100),
-            0,
-            1_000_000,
-        ));
-        index.push(FileEntry::from_file_key(
-            make_key(1, 200),
-            1,
-            2_000_000,
-        ));
-        index.push(FileEntry::from_file_key(
-            make_key(2, 100),
-            2,
-            3_000_000,
-        ));
+        index.push(FileEntry::from_file_key(make_key(1, 100), 0, 1_000_000));
+        index.push(FileEntry::from_file_key(make_key(1, 200), 1, 2_000_000));
+        index.push(FileEntry::from_file_key(make_key(2, 100), 2, 3_000_000));
         let index = index.build();
 
         let r = index.lookup_by_filekey(make_key(1, 200)).unwrap();

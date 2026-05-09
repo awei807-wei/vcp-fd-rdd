@@ -514,9 +514,7 @@ impl PersistentIndex {
             };
             let docid = entries.len() as u32;
             let mtime_ns = mtime_to_ns(m.mtime);
-            entries.push(FileEntry::from_file_key(
-                m.file_key, docid, mtime_ns,
-            ));
+            entries.push(FileEntry::from_file_key(m.file_key, docid, mtime_ns));
             paths.push(abs_path.as_os_str().as_encoded_bytes().to_vec());
         }
 
@@ -663,9 +661,7 @@ impl PersistentIndex {
 
             if !self.update_entry_path(docid, &new_abs_bytes, new_mtime_ns) {
                 // 极端情况：docid 槽位不存在，降级为 append
-                if let Some(docid_new) =
-                    self.alloc_docid(fkey, &new_abs_bytes, new_mtime_ns)
-                {
+                if let Some(docid_new) = self.alloc_docid(fkey, &new_abs_bytes, new_mtime_ns) {
                     self.insert_trigrams(docid_new, meta.path.as_path());
                     self.insert_path_hash(docid_new, meta.path.as_path());
                 }
@@ -1712,12 +1708,7 @@ impl PersistentIndex {
         true
     }
 
-    fn update_entry_path(
-        &self,
-        docid: DocId,
-        abs_path_bytes: &[u8],
-        mtime_ns: i64,
-    ) -> bool {
+    fn update_entry_path(&self, docid: DocId, abs_path_bytes: &[u8], mtime_ns: i64) -> bool {
         {
             let mut entries = self.entries.write();
             let Some(entry) = entries.get_mut(docid as usize) else {
