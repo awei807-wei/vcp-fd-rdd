@@ -2,8 +2,8 @@ use clap::Parser;
 use fd_rdd::config::{default_snapshot_path, default_socket_path, Config, WatchMode};
 use fd_rdd::event::ignore_filter::IgnoreFilter;
 use fd_rdd::event::sync::DirtyScope;
-use fd_rdd::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
 use fd_rdd::event::tiered_watch::{TieredWatchDebugDump, TieredWatchDebugSummary};
+use fd_rdd::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
 use fd_rdd::index::TieredIndex;
 use fd_rdd::query::SocketServer;
 use fd_rdd::query::{HealthTelemetry, QueryServer};
@@ -349,16 +349,22 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(move || pipeline.stats())
     };
     let watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync> = {
+        let index = index.clone();
         let watch_state = watch_state.clone();
         let tiered_runtime = tiered_runtime.clone();
         Arc::new(move || {
-            tiered_runtime
+            let mut report = tiered_runtime
                 .as_ref()
                 .map(|runtime| runtime.report())
-                .unwrap_or_else(|| watch_state.as_ref().clone())
+                .unwrap_or_else(|| watch_state.as_ref().clone());
+            let stats = index.stats_report();
+            report.query_stale_hit_count = stats.query_stale_hit_count;
+            report
         })
     };
-    let tiered_watch_debug_provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync> = {
+    let tiered_watch_debug_provider: Arc<
+        dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync,
+    > = {
         let tiered_runtime = tiered_runtime.clone();
         Arc::new(move |root_filter| {
             tiered_runtime

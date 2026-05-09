@@ -19,6 +19,14 @@ pub struct RunMetrics {
     pub scan_rounds: u64,
     pub scanned_dirs: u64,
     pub scanned_files: u64,
+    pub promotions: u64,
+    pub demotions: u64,
+    pub replacements: u64,
+    pub promotion_budget_blocked: u64,
+    pub final_l0_dirs: usize,
+    pub final_l1_dirs: usize,
+    pub final_l2_dirs: usize,
+    pub final_l3_dirs: usize,
     pub cpu_units: u64,
     pub io_units: u64,
     pub memory_budget_hit: bool,
@@ -34,6 +42,18 @@ pub struct RunReport {
     pub metrics: RunMetrics,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StrategyCounters {
+    pub promotions: u64,
+    pub demotions: u64,
+    pub replacements: u64,
+    pub promotion_budget_blocked: u64,
+    pub final_l0_dirs: usize,
+    pub final_l1_dirs: usize,
+    pub final_l2_dirs: usize,
+    pub final_l3_dirs: usize,
+}
+
 pub fn summarize(
     policy: &PolicyParams,
     detected_latencies: &[u64],
@@ -42,6 +62,7 @@ pub fn summarize(
     scan_rounds: u64,
     scanned_dirs: u64,
     scanned_files: u64,
+    strategy: StrategyCounters,
 ) -> RunMetrics {
     let mut latencies = detected_latencies.to_vec();
     latencies.sort_unstable();
@@ -108,6 +129,14 @@ pub fn summarize(
         scan_rounds,
         scanned_dirs,
         scanned_files,
+        promotions: strategy.promotions,
+        demotions: strategy.demotions,
+        replacements: strategy.replacements,
+        promotion_budget_blocked: strategy.promotion_budget_blocked,
+        final_l0_dirs: strategy.final_l0_dirs,
+        final_l1_dirs: strategy.final_l1_dirs,
+        final_l2_dirs: strategy.final_l2_dirs,
+        final_l3_dirs: strategy.final_l3_dirs,
         cpu_units,
         io_units,
         memory_budget_hit,

@@ -246,9 +246,10 @@ impl TieredIndex {
                     continue;
                 };
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
-                if blocked_paths.contains(path_bytes)
-                    || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
-                {
+                let blocked = blocked_paths.contains(path_bytes)
+                    || path_deleted_by_any(path_bytes, deleted_sources.as_slice());
+                if blocked {
+                    self.stats.record_query_stale_hits(1);
                     continue;
                 }
                 let _ = blocked_paths.insert(path_bytes);
@@ -317,10 +318,11 @@ impl TieredIndex {
                     continue;
                 };
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
-                if blocked_paths.contains(path_bytes)
+                let blocked = blocked_paths.contains(path_bytes)
                     || layer_deleted.is_some_and(|paths| paths.contains(path_bytes))
-                    || path_deleted_by_any(path_bytes, deleted_sources)
-                {
+                    || path_deleted_by_any(path_bytes, deleted_sources);
+                if blocked {
+                    self.stats.record_query_stale_hits(1);
                     continue;
                 }
 

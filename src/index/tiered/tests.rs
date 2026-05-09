@@ -603,9 +603,11 @@ fn query_rename_from_tombstone_blocks_old_path() {
     assert_eq!(idx.query("new.txt").len(), 1);
 
     // Query wide pattern that would match both paths: old must remain blocked.
+    let stale_hits_before = idx.stats_report().query_stale_hit_count;
     let all = idx.query(".txt");
     assert_eq!(all.len(), 1);
     assert!(all[0].path.to_string_lossy().ends_with("new.txt"));
+    assert!(idx.stats_report().query_stale_hit_count > stale_hits_before);
 }
 
 #[test]

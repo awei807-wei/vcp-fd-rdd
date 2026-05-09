@@ -91,6 +91,66 @@ pub struct TieredWatchRecommendation {
     pub l2_empty_scans_to_l3: u32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct TieredWatchConfigPatch {
+    watch_mode: String,
+    tiered_watch: TieredWatchConfigPatchTable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TieredWatchConfigPatchTable {
+    max_watch_dirs: u32,
+    scan_items_per_sec: usize,
+    scan_ms_per_tick: u64,
+    l0_idle_ttl_secs: u64,
+    l1_scan_interval_secs: u64,
+    l2_scan_interval_secs: u64,
+    l1_empty_scans_to_l2: u32,
+    l2_empty_scans_to_l3: u32,
+}
+
+pub fn tiered_watch_config_patch_toml_from_report(
+    report: &BenchmarkReport,
+) -> anyhow::Result<String> {
+    let recommendation = report
+        .recommendation
+        .clone()
+        .or_else(|| {
+            report
+                .best
+                .as_ref()
+                .map(|run| recommendation_from_policy(&run.policy))
+        })
+        .or_else(|| {
+            report
+                .baseline
+                .as_ref()
+                .map(|run| recommendation_from_policy(&run.policy))
+        })
+        .ok_or_else(|| anyhow::anyhow!("report has no recommendation, best run, or baseline"))?;
+
+    tiered_watch_config_patch_toml(&recommendation)
+}
+
+pub fn tiered_watch_config_patch_toml(
+    recommendation: &TieredWatchRecommendation,
+) -> anyhow::Result<String> {
+    let patch = TieredWatchConfigPatch {
+        watch_mode: recommendation.watch_mode.clone(),
+        tiered_watch: TieredWatchConfigPatchTable {
+            max_watch_dirs: recommendation.max_watch_dirs,
+            scan_items_per_sec: recommendation.scan_items_per_sec,
+            scan_ms_per_tick: recommendation.scan_ms_per_tick,
+            l0_idle_ttl_secs: recommendation.l0_idle_ttl_secs,
+            l1_scan_interval_secs: recommendation.l1_scan_interval_secs,
+            l2_scan_interval_secs: recommendation.l2_scan_interval_secs,
+            l1_empty_scans_to_l2: recommendation.l1_empty_scans_to_l2,
+            l2_empty_scans_to_l3: recommendation.l2_empty_scans_to_l3,
+        },
+    };
+    Ok(toml::to_string_pretty(&patch)?)
+}
+
 pub fn single_report(config: OptimizerConfig) -> BenchmarkReport {
     let world = generate_world(config.workload);
     let policy = config.policy.sanitize();
@@ -621,6 +681,14 @@ fn combine_metrics(prev: RunMetrics, metrics: RunMetrics) -> RunMetrics {
         scan_rounds: prev.scan_rounds + metrics.scan_rounds,
         scanned_dirs: prev.scanned_dirs + metrics.scanned_dirs,
         scanned_files: prev.scanned_files + metrics.scanned_files,
+        promotions: prev.promotions + metrics.promotions,
+        demotions: prev.demotions + metrics.demotions,
+        replacements: prev.replacements + metrics.replacements,
+        promotion_budget_blocked: prev.promotion_budget_blocked + metrics.promotion_budget_blocked,
+        final_l0_dirs: prev.final_l0_dirs + metrics.final_l0_dirs,
+        final_l1_dirs: prev.final_l1_dirs + metrics.final_l1_dirs,
+        final_l2_dirs: prev.final_l2_dirs + metrics.final_l2_dirs,
+        final_l3_dirs: prev.final_l3_dirs + metrics.final_l3_dirs,
         cpu_units: prev.cpu_units + metrics.cpu_units,
         io_units: prev.io_units + metrics.io_units,
         memory_budget_hit: prev.memory_budget_hit || metrics.memory_budget_hit,
@@ -883,5 +951,31 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(checkpoint);
+    }
+
+    #[test]
+    fn config_patch_toml_contains_only_runtime_tiered_fields() {
+        let recommendation = TieredWatchRecommendation {
+            watch_mode: "tiered".to_string(),
+            max_watch_dirs: 128,
+            scan_items_per_sec: 4_000,
+            scan_ms_per_tick: 25,
+            l0_idle_ttl_secs: 900,
+            l1_scan_interval_secs: 15,
+            l2_scan_interval_secs: 180,
+            l1_empty_scans_to_l2: 3,
+            l2_empty_scans_to_l3: 2,
+        };
+
+        let patch = tiered_watch_config_patch_toml(&recommendation)
+            .expect("recommendation should serialize as toml");
+
+        assert!(patch.contains("watch_mode = \"tiered\""));
+        assert!(patch.contains("[tiered_watch]"));
+        assert!(patch.contains("max_watch_dirs = 128"));
+        assert!(patch.contains("scan_items_per_sec = 4000"));
+        assert!(patch.contains("l2_empty_scans_to_l3 = 2"));
+        assert!(!patch.contains("weights"));
+        assert!(!patch.contains("per_round_max_files"));
     }
 }

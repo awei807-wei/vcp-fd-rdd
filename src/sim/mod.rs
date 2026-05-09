@@ -10,7 +10,8 @@ pub mod world;
 pub use metrics::{RunMetrics, RunReport};
 pub use optimizer::{
     adversarial_report, evolve_report, grid_report, optimize_report, single_report,
-    BenchmarkReport, OptimizerConfig,
+    tiered_watch_config_patch_toml, tiered_watch_config_patch_toml_from_report, BenchmarkReport,
+    OptimizerConfig, TieredWatchRecommendation,
 };
 pub use policy::{PolicyParams, ScoreWeights, SimTier};
 pub use simulator::run_simulation;

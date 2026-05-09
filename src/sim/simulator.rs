@@ -1,4 +1,4 @@
-use super::metrics::{summarize, RunMetrics};
+use super::metrics::{summarize, RunMetrics, StrategyCounters};
 use super::policy::{initial_l0_candidates, DirPolicyState, PolicyParams, SimTier};
 use super::world::World;
 
@@ -66,6 +66,10 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
     let mut scan_rounds = 0u64;
     let mut scanned_dirs = 0u64;
     let mut scanned_files = 0u64;
+    let mut promotions = 0u64;
+    let mut demotions = 0u64;
+    let mut replacements = 0u64;
+    let mut promotion_budget_blocked = 0u64;
 
     let duration = world.config.duration_secs.max(1);
     for now in 0..=world.config.duration_secs {
@@ -104,6 +108,7 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
             dirs[id].tier = SimTier::L1;
             dirs[id].next_scan_at = now;
             dirs[id].empty_scans = 0;
+            demotions = demotions.saturating_add(1);
             current_watch_cost =
                 current_watch_cost.saturating_sub(world.dirs[id].watch_cost as u64);
         }
@@ -131,7 +136,7 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
                     .saturating_add(changed as u32)
                     .min(10_000);
                 dirs[dir_id].empty_scans = 0;
-                if promote_dir(
+                match promote_dir(
                     world,
                     &mut dirs,
                     &policy,
@@ -139,11 +144,23 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
                     now,
                     &mut current_watch_cost,
                 ) {
-                    watch_cost_peak = watch_cost_peak.max(current_watch_cost);
-                } else {
-                    dirs[dir_id].tier = SimTier::L1;
-                    dirs[dir_id].next_scan_at =
-                        now.saturating_add(dirs[dir_id].tier.scan_interval_secs(&policy));
+                    PromotionOutcome::Promoted => {
+                        promotions = promotions.saturating_add(1);
+                        watch_cost_peak = watch_cost_peak.max(current_watch_cost);
+                    }
+                    PromotionOutcome::Replaced => {
+                        promotions = promotions.saturating_add(1);
+                        replacements = replacements.saturating_add(1);
+                        demotions = demotions.saturating_add(1);
+                        watch_cost_peak = watch_cost_peak.max(current_watch_cost);
+                    }
+                    PromotionOutcome::AlreadyCovered => {}
+                    PromotionOutcome::BudgetBlocked => {
+                        promotion_budget_blocked = promotion_budget_blocked.saturating_add(1);
+                        dirs[dir_id].tier = SimTier::L1;
+                        dirs[dir_id].next_scan_at =
+                            now.saturating_add(dirs[dir_id].tier.scan_interval_secs(&policy));
+                    }
                 }
             } else {
                 dirs[dir_id].recent_events = (dirs[dir_id].recent_events as f64 * 0.82) as u32;
@@ -163,6 +180,22 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
         })
         .collect::<Vec<_>>();
 
+    let mut strategy = StrategyCounters {
+        promotions,
+        demotions,
+        replacements,
+        promotion_budget_blocked,
+        ..StrategyCounters::default()
+    };
+    for state in &dirs {
+        match state.tier {
+            SimTier::L0 => strategy.final_l0_dirs += 1,
+            SimTier::L1 => strategy.final_l1_dirs += 1,
+            SimTier::L2 => strategy.final_l2_dirs += 1,
+            SimTier::L3 => strategy.final_l3_dirs += 1,
+        }
+    }
+
     let metrics = summarize(
         &policy,
         &detected_latencies,
@@ -171,6 +204,7 @@ pub fn run_simulation(world: &World, policy: &PolicyParams) -> RunMetrics {
         scan_rounds,
         scanned_dirs,
         scanned_files,
+        strategy,
     );
 
     tracing::debug!(
@@ -289,6 +323,14 @@ fn maybe_demote_empty(state: &mut DirRuntime, policy: &PolicyParams) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromotionOutcome {
+    AlreadyCovered,
+    Promoted,
+    Replaced,
+    BudgetBlocked,
+}
+
 fn promote_dir(
     world: &World,
     dirs: &mut [DirRuntime],
@@ -296,21 +338,21 @@ fn promote_dir(
     dir_id: usize,
     now: u64,
     current_watch_cost: &mut u64,
-) -> bool {
+) -> PromotionOutcome {
     if dir_id == 0 || covered_by_l0(world, dirs, dir_id) {
-        return true;
+        return PromotionOutcome::AlreadyCovered;
     }
 
     let cost = world.dirs[dir_id].watch_cost as u64;
     let budget = policy.max_watch_dirs as u64;
     if cost > budget {
-        return false;
+        return PromotionOutcome::BudgetBlocked;
     }
 
     if current_watch_cost.saturating_add(cost) <= budget {
         dirs[dir_id].tier = SimTier::L0;
         *current_watch_cost = current_watch_cost.saturating_add(cost);
-        return true;
+        return PromotionOutcome::Promoted;
     }
 
     let candidate_score = policy.score_dir(&world.dirs[dir_id], &dirs[dir_id].policy_state(), now);
@@ -333,7 +375,7 @@ fn promote_dir(
         });
 
     let Some((replace_id, replace_score)) = replacement else {
-        return false;
+        return PromotionOutcome::BudgetBlocked;
     };
     let replace_cost = world.dirs[replace_id].watch_cost as u64;
     if candidate_score <= replace_score
@@ -342,7 +384,7 @@ fn promote_dir(
             .saturating_add(cost)
             > budget
     {
-        return false;
+        return PromotionOutcome::BudgetBlocked;
     }
 
     dirs[replace_id].tier = SimTier::L1;
@@ -352,7 +394,7 @@ fn promote_dir(
     *current_watch_cost = current_watch_cost
         .saturating_sub(replace_cost)
         .saturating_add(cost);
-    true
+    PromotionOutcome::Replaced
 }
 
 fn covering_l0(world: &World, dirs: &[DirRuntime], dir_id: usize) -> Option<usize> {
@@ -369,7 +411,11 @@ fn covered_by_l0(world: &World, dirs: &[DirRuntime], dir_id: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::tiered_watch::{PromotionDecision, TieredWatchRuntime};
+    use crate::sim::policy::ScoreWeights;
     use crate::sim::world::{generate_world, WorkloadConfig, WorkloadProfile};
+    use crate::sim::world::{DirNode, FileEvent, World};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn larger_watch_budget_reduces_scan_work() {
@@ -395,5 +441,178 @@ mod tests {
         assert!(roomy_metrics.watch_cost_peak <= roomy.max_watch_dirs as u64);
         assert!(tight_metrics.watch_cost_peak <= tight.max_watch_dirs as u64);
         assert!(roomy_metrics.scanned_dirs <= tight_metrics.scanned_dirs);
+    }
+
+    #[test]
+    fn sim_and_runtime_share_hot_replacement_shape() {
+        let world = World {
+            config: WorkloadConfig {
+                profile: WorkloadProfile::Developer,
+                dirs: 3,
+                events: 1,
+                duration_secs: 0,
+                seed: 1,
+            },
+            dirs: vec![
+                DirNode {
+                    id: 0,
+                    parent: None,
+                    depth: 0,
+                    importance: 0.0,
+                    base_event_rate: 0.0,
+                    scan_cost: 1,
+                    watch_cost: 1,
+                    children: vec![1, 2],
+                },
+                DirNode {
+                    id: 1,
+                    parent: Some(0),
+                    depth: 1,
+                    importance: 0.9,
+                    base_event_rate: 0.01,
+                    scan_cost: 1,
+                    watch_cost: 1,
+                    children: Vec::new(),
+                },
+                DirNode {
+                    id: 2,
+                    parent: Some(0),
+                    depth: 1,
+                    importance: 0.5,
+                    base_event_rate: 0.01,
+                    scan_cost: 1,
+                    watch_cost: 1,
+                    children: Vec::new(),
+                },
+            ],
+            events: vec![FileEvent {
+                id: 0,
+                dir: 2,
+                at_secs: 0,
+            }],
+        };
+        let policy = PolicyParams {
+            max_watch_dirs: 1,
+            l1_scan_interval_secs: 1,
+            l2_scan_interval_secs: 10,
+            per_round_max_dirs: 1,
+            per_round_max_files: 100,
+            per_round_max_ms: 20,
+            weights: ScoreWeights {
+                recent_event_count: 10.0,
+                event_recency_decay: 0.0,
+                importance: 1.0,
+                miss_penalty: 0.0,
+                watch_cost: 0.0,
+                scan_cost: 0.0,
+            },
+            ..PolicyParams::default()
+        };
+
+        let metrics = run_simulation(&world, &policy);
+        assert_eq!(metrics.replacements, 1);
+        assert_eq!(metrics.promotions, 1);
+        assert_eq!(metrics.promotion_budget_blocked, 0);
+        assert_eq!(metrics.final_l0_dirs, 1);
+
+        let runtime = TieredWatchRuntime::new(
+            vec![(PathBuf::from("/cold"), 1)],
+            vec![(PathBuf::from("/hotter"), 1)],
+            1,
+            5_000,
+            20,
+        );
+        let hotter = PathBuf::from("/hotter");
+        runtime.record_scan(
+            hotter.as_path(),
+            crate::index::tiered::ScanOutcome {
+                scanned: 1,
+                changed: 1,
+                elapsed_ms: 1,
+            },
+        );
+        assert_eq!(
+            runtime.try_reserve_promotion(hotter.as_path()),
+            PromotionDecision::Replace {
+                demote: PathBuf::from("/cold"),
+                promote: hotter,
+            }
+        );
+    }
+
+    #[test]
+    fn sim_and_runtime_share_empty_scan_l3_shape() {
+        let world = World {
+            config: WorkloadConfig {
+                profile: WorkloadProfile::Dormant,
+                dirs: 3,
+                events: 0,
+                duration_secs: 2,
+                seed: 2,
+            },
+            dirs: vec![
+                DirNode {
+                    id: 0,
+                    parent: None,
+                    depth: 0,
+                    importance: 0.0,
+                    base_event_rate: 0.0,
+                    scan_cost: 1,
+                    watch_cost: 1,
+                    children: vec![1, 2],
+                },
+                DirNode {
+                    id: 1,
+                    parent: Some(0),
+                    depth: 1,
+                    importance: 0.9,
+                    base_event_rate: 0.01,
+                    scan_cost: 1,
+                    watch_cost: 1,
+                    children: Vec::new(),
+                },
+                DirNode {
+                    id: 2,
+                    parent: Some(0),
+                    depth: 1,
+                    importance: 0.4,
+                    base_event_rate: 0.01,
+                    scan_cost: 1,
+                    watch_cost: 1,
+                    children: Vec::new(),
+                },
+            ],
+            events: Vec::new(),
+        };
+        let policy = PolicyParams {
+            max_watch_dirs: 1,
+            l1_scan_interval_secs: 1,
+            l2_scan_interval_secs: 1,
+            l1_empty_scans_to_l2: 1,
+            l2_empty_scans_to_l3: 1,
+            per_round_max_dirs: 2,
+            per_round_max_files: 100,
+            per_round_max_ms: 20,
+            ..PolicyParams::default()
+        };
+
+        let metrics = run_simulation(&world, &policy);
+        assert!(metrics.final_l3_dirs >= 1);
+
+        let runtime =
+            TieredWatchRuntime::new(Vec::new(), vec![(PathBuf::from("/warm"), 1)], 1, 5_000, 20);
+        let warm = Path::new("/warm");
+        for _ in 0..2 {
+            runtime.record_scan(
+                warm,
+                crate::index::tiered::ScanOutcome {
+                    scanned: 1,
+                    changed: 0,
+                    elapsed_ms: 1,
+                },
+            );
+            runtime.apply_scan_policy(warm, 1, 1, 1, 1);
+        }
+        assert_eq!(runtime.report().l3_dirs, 1);
     }
 }

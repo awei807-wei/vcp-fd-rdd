@@ -209,9 +209,16 @@ cargo run --bin fd-rdd-sim -- evolve --generations 16 --population 32
 
 # 对抗鲁棒性测试并保存 JSON 报告
 cargo run --bin fd-rdd-sim -- adversarial --output reports/adversarial.json
+
+# 从报告生成可审阅的 config.toml 片段
+cargo run --bin fd-rdd-sim -- emit-config \
+  --input reports/optimized-tiered-watch.json \
+  --output reports/optimized-tiered-watch.toml
 ```
 
 可通过 `--policy policies/tiered-default.toml` 读取策略基线；CLI 里显式传入的预算、TTL、扫描周期参数会作为本次运行的覆盖值。`optimize` 报告中的 `convergence.phase` / `current_generation` / `current_generation_trials` 显示当前进度，`convergence.trace` 记录每代试错轨迹，`recommendation` 字段给出推荐的 `watch_mode = "tiered"`、`max_watch_dirs`、扫描周期和 TTL。
+
+`metrics` 除 SLA、发现延迟、watch/scan 成本外，也输出策略控制面指标：`promotions`、`demotions`、`replacements`、`promotion_budget_blocked` 以及最终 `final_l0_dirs` / `final_l1_dirs` / `final_l2_dirs` / `final_l3_dirs` 分布，用于和真实 runtime `/watch-state` 做趋势对照；字段映射维护在 `helloagents/wiki/runtime-sim-report-mapping.md`。`emit-config` 只生成当前 runtime 支持的 TOML patch，不写入用户配置文件；确认后再合并到 `~/.config/fd-rdd/config.toml`。
 
 长时间运行可用 `Ctrl-C` 中断；checkpoint 会在每代结束后原子写入。继续迭代时把同一个文件传给 `--resume` 和 `--checkpoint`：
 
@@ -326,6 +333,7 @@ sort=score | name | path | size | ext | date_modified | date_created | date_acce
 | `/metrics` | GET | 运行计数（查询/事件/snapshot） |
 | `/memory` | GET | 内存归因（RSS/smaps/索引拆项） |
 | `/watch-state` | GET | Watcher 控制面状态 |
+| `/debug/tiered-watch` | GET | Tiered watcher 单目录调度状态 |
 | `/trim` | GET/POST | 手动触发内存 trim |
 
 ## 索引文档

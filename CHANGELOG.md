@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `fd-rdd-sim`, a synthetic tiered watcher policy benchmark CLI with continuous `optimize`, single-run baseline, grid-search, genetic-search, and adversarial robustness modes.
 - Added `src/sim/*` world, policy, simulator, metrics, and optimizer modules for deterministic workload generation and JSON report output.
 - Added `policies/tiered-default.toml` as a baseline simulation policy.
+- Added `fd-rdd-sim emit-config` to turn benchmark report recommendations into reviewable `watch_mode = "tiered"` and `[tiered_watch]` TOML patches.
+- Added simulation strategy counters for promotions, demotions, L0 replacements, promotion budget blocks, and final L0/L1/L2/L3 distribution, with parity tests against the runtime replacement and empty-scan demotion shapes.
+- Added P0 observability closure for tiered watcher reports: richer `/debug/tiered-watch` per-directory fields, real `/watch-state` dirty/cold/stale counters, and runtime/sim report mapping documentation.
 
 ## [0.6.14] - 2026-05-02
 

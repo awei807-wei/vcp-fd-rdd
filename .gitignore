@@ -6,6 +6,7 @@ __pycache__/
 
 # local scratch files
 /posting_list
+/TODO.md
 .github/workflows/release(1).yml
 
 # HelloAGENTS 知识库/方案包仅保留在本地，不纳入 Git 追踪

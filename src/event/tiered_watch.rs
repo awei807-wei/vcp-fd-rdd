@@ -186,6 +186,7 @@ pub struct TieredWatchRuntime {
     demotions: AtomicU64,
     replacements: AtomicU64,
     promotion_budget_blocked: AtomicU64,
+    cold_validate_count: AtomicU64,
     last_adjustment_unix_secs: AtomicU64,
 }
 
@@ -220,6 +221,7 @@ impl TieredWatchRuntime {
             demotions: AtomicU64::new(0),
             replacements: AtomicU64::new(0),
             promotion_budget_blocked: AtomicU64::new(0),
+            cold_validate_count: AtomicU64::new(0),
             last_adjustment_unix_secs: AtomicU64::new(now),
         }
     }
@@ -277,16 +279,10 @@ impl TieredWatchRuntime {
             .collect()
     }
 
-    pub fn decay_scores(&self,
-        now: u64,
-        decay_interval_secs: u64,
-        decay_amount: u64,
-    ) {
+    pub fn decay_scores(&self, now: u64, decay_interval_secs: u64, decay_amount: u64) {
         let dirs = self.dirs.read();
         for state in dirs.values() {
-            let last_update = state
-                .last_score_update_unix_secs
-                .load(Ordering::Relaxed);
+            let last_update = state.last_score_update_unix_secs.load(Ordering::Relaxed);
             if now.saturating_sub(last_update) >= decay_interval_secs {
                 state
                     .event_score
@@ -323,24 +319,20 @@ impl TieredWatchRuntime {
                 Some((
                     tier.as_u8(),
                     next_scan,
-                    std::cmp::Reverse(
-                        if state.high_priority_scan.load(Ordering::Relaxed) {
-                            1u8
-                        } else {
-                            0u8
-                        },
-                    ),
+                    std::cmp::Reverse(if state.high_priority_scan.load(Ordering::Relaxed) {
+                        1u8
+                    } else {
+                        0u8
+                    }),
                     std::cmp::Reverse(state.budget_blocked_count.load(Ordering::Relaxed)),
                     std::cmp::Reverse(state.event_score.load(Ordering::Relaxed)),
                     path.clone(),
                 ))
             })
             .collect::<Vec<_>>();
-        candidates.sort_by_key(
-            |(tier, next_scan, high_pri, blocked, score, path)| {
-                (*tier, *next_scan, *high_pri, *blocked, *score, path.clone())
-            },
-        );
+        candidates.sort_by_key(|(tier, next_scan, high_pri, blocked, score, path)| {
+            (*tier, *next_scan, *high_pri, *blocked, *score, path.clone())
+        });
         candidates
             .into_iter()
             .take(limit)
@@ -425,6 +417,9 @@ impl TieredWatchRuntime {
     pub fn record_scan(&self, path: &Path, outcome: ScanOutcome) {
         if let Some(state) = self.state(path) {
             let now = unix_secs();
+            if matches!(state.tier(), WatchTier::L2 | WatchTier::L3) {
+                self.cold_validate_count.fetch_add(1, Ordering::Relaxed);
+            }
             state.last_scan_unix_secs.store(now, Ordering::Relaxed);
             state
                 .last_changed_count
@@ -728,6 +723,7 @@ impl TieredWatchRuntime {
         let mut warm_memory_dirs = 0usize;
         let mut cold_mmap_dirs = 0usize;
         let mut frozen_manifest_dirs = 0usize;
+        let mut dirty_queue_len = 0usize;
 
         for state in dirs.values() {
             let tier = state.tier();
@@ -764,6 +760,9 @@ impl TieredWatchRuntime {
             }
             if state.promotion_pending.load(Ordering::Relaxed) {
                 pending_promotions += 1;
+            }
+            if state.dirty.load(Ordering::Relaxed) {
+                dirty_queue_len += 1;
             }
             if !matches!(tier, WatchTier::L0) {
                 let next_scan = state.next_scan_unix_secs.load(Ordering::Relaxed);
@@ -847,8 +846,8 @@ impl TieredWatchRuntime {
             l2_watch_cost,
             l3_watch_cost,
             scan_backlog_by_tier,
-            dirty_queue_len: 0,
-            cold_validate_count: 0,
+            dirty_queue_len,
+            cold_validate_count: self.cold_validate_count.load(Ordering::Relaxed),
             query_stale_hit_count: 0,
         }
     }
@@ -881,6 +880,12 @@ impl TieredWatchRuntime {
             let empty_scan_count = state.empty_scan_count.load(Ordering::Relaxed);
             let promotion_pending = state.promotion_pending.load(Ordering::Relaxed);
             let demotion_pending = state.demotion_pending.load(Ordering::Relaxed);
+            let next_scan_unix_secs = state.next_scan_unix_secs.load(Ordering::Relaxed);
+            let budget_blocked_count = state.budget_blocked_count.load(Ordering::Relaxed);
+            let last_budget_blocked_unix_secs =
+                state.last_budget_blocked_unix_secs.load(Ordering::Relaxed);
+            let dirty = state.dirty.load(Ordering::Relaxed);
+            let high_priority_scan = state.high_priority_scan.load(Ordering::Relaxed);
 
             match tier {
                 WatchTier::L0 => l0_dirs += 1,
@@ -893,6 +898,7 @@ impl TieredWatchRuntime {
             entries.push(TieredWatchDebugDir {
                 path: path.to_string_lossy().to_string(),
                 watch_tier: format!("{:?}", tier),
+                index_tier: format!("{:?}", state.index_residency()),
                 watch_cost: cost,
                 event_score,
                 last_event,
@@ -900,6 +906,12 @@ impl TieredWatchRuntime {
                 empty_scan_count,
                 promotion_pending,
                 demotion_pending,
+                dirty,
+                freshness: format!("{:?}", state.freshness()),
+                next_scan_unix_secs,
+                budget_blocked_count,
+                last_budget_blocked_unix_secs,
+                high_priority_scan,
             });
         }
 
@@ -922,6 +934,7 @@ impl TieredWatchRuntime {
 pub struct TieredWatchDebugDir {
     pub path: String,
     pub watch_tier: String,
+    pub index_tier: String,
     pub watch_cost: u64,
     pub event_score: u64,
     pub last_event: u64,
@@ -929,6 +942,12 @@ pub struct TieredWatchDebugDir {
     pub empty_scan_count: u32,
     pub promotion_pending: bool,
     pub demotion_pending: bool,
+    pub dirty: bool,
+    pub freshness: String,
+    pub next_scan_unix_secs: u64,
+    pub budget_blocked_count: u32,
+    pub last_budget_blocked_unix_secs: u64,
+    pub high_priority_scan: bool,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -1220,6 +1239,24 @@ mod tests {
     }
 
     #[test]
+    fn debug_dump_includes_observability_fields() {
+        let rt = runtime();
+        rt.record_event_paths([&PathBuf::from("/tmp/warm/file.txt")]);
+
+        let dump = rt.debug_dump(Some("/tmp/warm"));
+        assert_eq!(dump.dirs.len(), 1);
+        let warm = &dump.dirs[0];
+        assert_eq!(warm.watch_tier, "L1");
+        assert_eq!(warm.index_tier, "WarmMemory");
+        assert!(warm.dirty);
+        assert_eq!(warm.freshness, "Dirty");
+        assert_eq!(warm.next_scan_unix_secs, 0);
+        assert_eq!(warm.budget_blocked_count, 0);
+        assert_eq!(warm.last_budget_blocked_unix_secs, 0);
+        assert!(!warm.high_priority_scan);
+    }
+
+    #[test]
     fn score_decay_reduces_event_score_over_time() {
         let rt = runtime();
         let warm = PathBuf::from("/tmp/warm");
@@ -1241,18 +1278,16 @@ mod tests {
         rt.decay_scores(unix_secs() + 3_600, 3_600, 5);
 
         let after = rt.report().event_score_total;
-        assert!(after < before, "expected score to decay: before={before}, after={after}");
+        assert!(
+            after < before,
+            "expected score to decay: before={before}, after={after}"
+        );
     }
 
     #[test]
     fn budget_blocked_increments_budget_blocked_count() {
-        let rt = TieredWatchRuntime::new(
-            vec![(PathBuf::from("/tmp/hot"), 2)],
-            vec![],
-            2,
-            5_000,
-            20,
-        );
+        let rt =
+            TieredWatchRuntime::new(vec![(PathBuf::from("/tmp/hot"), 2)], vec![], 2, 5_000, 20);
         let dynamic = PathBuf::from("/tmp/hot/child");
 
         // First block
@@ -1277,13 +1312,8 @@ mod tests {
 
     #[test]
     fn high_priority_scan_affects_scan_batch_ordering() {
-        let rt = TieredWatchRuntime::new(
-            vec![(PathBuf::from("/tmp/hot"), 2)],
-            vec![],
-            2,
-            5_000,
-            20,
-        );
+        let rt =
+            TieredWatchRuntime::new(vec![(PathBuf::from("/tmp/hot"), 2)], vec![], 2, 5_000, 20);
         let hot = PathBuf::from("/tmp/hot");
 
         // Pump up the L0 score so replacement is impossible
@@ -1332,20 +1362,47 @@ mod tests {
 
     #[test]
     fn freshness_roundtrip() {
-        assert_eq!(Freshness::from_u8(Freshness::Fresh.as_u8()), Freshness::Fresh);
-        assert_eq!(Freshness::from_u8(Freshness::Stale.as_u8()), Freshness::Stale);
-        assert_eq!(Freshness::from_u8(Freshness::Dirty.as_u8()), Freshness::Dirty);
-        assert_eq!(Freshness::from_u8(Freshness::Unknown.as_u8()), Freshness::Unknown);
+        assert_eq!(
+            Freshness::from_u8(Freshness::Fresh.as_u8()),
+            Freshness::Fresh
+        );
+        assert_eq!(
+            Freshness::from_u8(Freshness::Stale.as_u8()),
+            Freshness::Stale
+        );
+        assert_eq!(
+            Freshness::from_u8(Freshness::Dirty.as_u8()),
+            Freshness::Dirty
+        );
+        assert_eq!(
+            Freshness::from_u8(Freshness::Unknown.as_u8()),
+            Freshness::Unknown
+        );
         assert_eq!(Freshness::from_u8(255), Freshness::Unknown);
     }
 
     #[test]
     fn index_residency_roundtrip() {
-        assert_eq!(IndexResidency::from_u8(IndexResidency::HotMemory.as_u8()), IndexResidency::HotMemory);
-        assert_eq!(IndexResidency::from_u8(IndexResidency::WarmMemory.as_u8()), IndexResidency::WarmMemory);
-        assert_eq!(IndexResidency::from_u8(IndexResidency::ColdMmap.as_u8()), IndexResidency::ColdMmap);
-        assert_eq!(IndexResidency::from_u8(IndexResidency::FrozenManifestOnly.as_u8()), IndexResidency::FrozenManifestOnly);
-        assert_eq!(IndexResidency::from_u8(255), IndexResidency::FrozenManifestOnly);
+        assert_eq!(
+            IndexResidency::from_u8(IndexResidency::HotMemory.as_u8()),
+            IndexResidency::HotMemory
+        );
+        assert_eq!(
+            IndexResidency::from_u8(IndexResidency::WarmMemory.as_u8()),
+            IndexResidency::WarmMemory
+        );
+        assert_eq!(
+            IndexResidency::from_u8(IndexResidency::ColdMmap.as_u8()),
+            IndexResidency::ColdMmap
+        );
+        assert_eq!(
+            IndexResidency::from_u8(IndexResidency::FrozenManifestOnly.as_u8()),
+            IndexResidency::FrozenManifestOnly
+        );
+        assert_eq!(
+            IndexResidency::from_u8(255),
+            IndexResidency::FrozenManifestOnly
+        );
     }
 
     #[test]
@@ -1380,6 +1437,7 @@ mod tests {
         rt.record_event_paths([&PathBuf::from("/tmp/warm/file.txt")]);
         let report = rt.report();
         assert_eq!(report.dirty_dirs, 1);
+        assert_eq!(report.dirty_queue_len, 1);
         assert_eq!(report.fresh_dirs, 1); // L0 is fresh
     }
 
@@ -1401,6 +1459,7 @@ mod tests {
         );
         let after = rt.report();
         assert_eq!(after.dirty_dirs, 0);
+        assert_eq!(after.dirty_queue_len, 0);
         assert_eq!(after.fresh_dirs, 2); // both L0 and L1 are fresh now
     }
 
@@ -1443,6 +1502,7 @@ mod tests {
         assert_eq!(l2.l2_dirs, 1);
         assert_eq!(l2.cold_mmap_dirs, 1);
         assert_eq!(l2.warm_memory_dirs, 0);
+        assert_eq!(l2.cold_validate_count, 0);
 
         rt.record_scan(
             warm.as_path(),
@@ -1457,6 +1517,7 @@ mod tests {
         assert_eq!(l3.l3_dirs, 1);
         assert_eq!(l3.frozen_manifest_dirs, 1);
         assert_eq!(l3.cold_mmap_dirs, 0);
+        assert_eq!(l3.cold_validate_count, 1);
     }
 
     #[test]
