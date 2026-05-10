@@ -1,6 +1,6 @@
 use super::*;
 use crate::core::{EventRecord, EventType, FileIdentifier};
-use crate::event::sync::DirtyScope;
+use crate::event::sync::{DirtyReason, DirtyScope};
 use crate::index::tiered::events::event_record_estimated_bytes;
 use crate::stats::EventPipelineStats;
 use crate::storage::snapshot::SnapshotStore;
@@ -701,4 +701,136 @@ async fn lsm_offline_dir_mtime_change_skips_disk_segments() {
         .await
         .unwrap();
     assert_eq!(idx.file_count(), 0);
+}
+
+#[test]
+fn cold_query_validates_unchanged_base_result() {
+    let root = unique_tmp_dir("cold-query-unchanged");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let path = root.join("stable_cold_hit.txt");
+    std::fs::write(&path, b"stable").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, path.clone())]);
+    idx.refresh_base();
+
+    let results = idx.query_limit_detailed("stable_cold_hit", 10);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].freshness, QueryResultFreshness::StaleChecked);
+    assert_eq!(results[0].index_tier, QueryResultIndexTier::ColdMmap);
+    assert!(results[0].validated);
+
+    let stats = idx.stats_report();
+    assert_eq!(stats.cold_validate_count, 1);
+    assert_eq!(stats.query_stale_hit_count, 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cold_query_suppresses_deleted_base_result() {
+    let root = unique_tmp_dir("cold-query-deleted");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let path = root.join("deleted_cold_hit.txt");
+    std::fs::write(&path, b"gone").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, path.clone())]);
+    idx.refresh_base();
+
+    std::fs::remove_file(&path).unwrap();
+
+    let results = idx.query_limit_detailed("deleted_cold_hit", 10);
+    assert!(results.is_empty());
+
+    let stats = idx.stats_report();
+    assert_eq!(stats.cold_validate_count, 1);
+    assert_eq!(stats.query_stale_hit_count, 1);
+    assert!(
+        idx.query("deleted_cold_hit").is_empty(),
+        "missing cold hit should be tombstoned by query validation"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cold_query_changed_result_enqueues_parent_rescan() {
+    let root = unique_tmp_dir("cold-query-changed");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let path = root.join("changed_cold_hit.txt");
+    std::fs::write(&path, b"old").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, path.clone())]);
+    idx.refresh_base();
+
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    std::fs::write(&path, b"new-content").unwrap();
+
+    let results = idx.query_limit_detailed("changed_cold_hit", 10);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].freshness, QueryResultFreshness::Changed);
+    assert!(results[0].validated);
+
+    let stats = idx.stats_report();
+    assert_eq!(stats.cold_validate_count, 1);
+    assert_eq!(stats.query_stale_hit_count, 1);
+    assert_eq!(idx.dirty_queue_len(), 1);
+
+    let dirty_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    assert_eq!(dirty_entry.reason, DirtyReason::QueryHitStale);
+    let report = idx.process_dirty_entry(dirty_entry, &[]);
+    assert!(!report.failed);
+    assert_eq!(report.dirs_scanned, 1);
+
+    let hot_results = idx.query_limit_detailed("changed_cold_hit", 10);
+    assert_eq!(hot_results.len(), 1);
+    assert_eq!(hot_results[0].freshness, QueryResultFreshness::Fresh);
+    assert!(!hot_results[0].validated);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn query_miss_path_enqueues_dirty_parent() {
+    let root = unique_tmp_dir("query-miss-dirty");
+    std::fs::create_dir_all(root.join("missing_dir")).unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let results = idx.query_limit_detailed("missing_dir/missing_file.txt", 10);
+    assert!(results.is_empty());
+    assert_eq!(idx.dirty_queue_len(), 1);
+
+    let dirty_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    assert_eq!(dirty_entry.reason, DirtyReason::QueryMiss);
+    assert_eq!(dirty_entry.scope.dir_paths(), &[root.join("missing_dir")]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dirty_queue_missing_leaf_retries_parent_scope() {
+    let root = unique_tmp_dir("dirty-retry-parent");
+    std::fs::create_dir_all(root.join("parent")).unwrap();
+    let missing_leaf = root.join("parent").join("gone");
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.enqueue_dirty_dirs(vec![missing_leaf], DirtyReason::QueryHitStale);
+
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let report = idx.process_dirty_entry(entry.clone(), &[]);
+    assert!(report.failed);
+    assert!(idx.retry_dirty_entry(entry));
+
+    let retry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    assert_eq!(retry.scope.dir_paths(), &[root.join("parent")]);
+    let retry_report = idx.process_dirty_entry(retry, &[]);
+    assert!(!retry_report.failed);
+    assert_eq!(retry_report.dirs_scanned, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
 }

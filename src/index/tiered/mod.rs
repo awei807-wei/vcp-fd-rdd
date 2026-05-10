@@ -21,6 +21,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::core::AdaptiveScheduler;
+use crate::event::sync::DirtyQueue;
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
@@ -56,10 +57,100 @@ pub struct StartupRepairStats {
     pub elapsed_ms: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct DirtyScanOutcome {
+    pub dir: PathBuf,
+    pub outcome: ScanOutcome,
+    pub reason: crate::event::sync::DirtyReason,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DirtyProcessReport {
+    pub entries_processed: usize,
+    pub dirs_scanned: usize,
+    pub changed: usize,
+    pub elapsed_ms: u64,
+    pub fast_sync_upserts: usize,
+    pub fast_sync_deletes: usize,
+    pub failed: bool,
+    pub outcomes: Vec<DirtyScanOutcome>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RecoveryStatus {
     pub report: StartupRecoveryReport,
     pub repair: StartupRepairStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryResultFreshness {
+    Fresh,
+    StaleChecked,
+    Changed,
+    Unknown,
+}
+
+impl QueryResultFreshness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::StaleChecked => "stale_checked",
+            Self::Changed => "changed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryResultIndexTier {
+    HotMemory,
+    WarmMemory,
+    ColdMmap,
+    FrozenManifestOnly,
+}
+
+impl QueryResultIndexTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HotMemory => "HotMemory",
+            Self::WarmMemory => "WarmMemory",
+            Self::ColdMmap => "ColdMmap",
+            Self::FrozenManifestOnly => "FrozenManifestOnly",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct QueryResultMeta {
+    pub meta: crate::core::FileMeta,
+    pub freshness: QueryResultFreshness,
+    pub index_tier: QueryResultIndexTier,
+    pub validated: bool,
+}
+
+impl QueryResultMeta {
+    pub fn hot(meta: crate::core::FileMeta) -> Self {
+        Self {
+            meta,
+            freshness: QueryResultFreshness::Fresh,
+            index_tier: QueryResultIndexTier::HotMemory,
+            validated: false,
+        }
+    }
+
+    pub fn cold(
+        meta: crate::core::FileMeta,
+        freshness: QueryResultFreshness,
+        index_tier: QueryResultIndexTier,
+        validated: bool,
+    ) -> Self {
+        Self {
+            meta,
+            freshness,
+            index_tier,
+            validated,
+        }
+    }
 }
 
 pub(crate) fn pathbuf_from_bytes(bytes: impl AsRef<[u8]>) -> PathBuf {
@@ -100,6 +191,8 @@ pub struct TieredIndex {
     pub follow_symlinks: bool,
     pub exclude_dirs: Vec<String>,
     pub(self) fast_sync_semaphore: Arc<tokio::sync::Semaphore>,
+    pub(self) dirty_queue: Mutex<DirtyQueue>,
+    pub(self) dirty_notify: Notify,
     pub(self) recovery_status: Mutex<RecoveryStatus>,
     pub(self) stable_snapshot_enabled: AtomicBool,
     pub(self) stats: Arc<StatsCollector>,

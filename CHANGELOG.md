@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added P0 observability closure for tiered watcher reports: richer `/debug/tiered-watch` per-directory fields, real `/watch-state` dirty/cold/stale counters, and runtime/sim report mapping documentation.
 - Added P1 runtime/sim parity hardening: hot L0 retention, high-priority BudgetBlocked ordering, ancestor-safe replacement, watch budget accounting, fixed-seed synthetic workload checks, and failure diagnostics that print runtime/sim strategy metrics.
 - Added P2 sim recommendation backfill hardening: multi-report conservative `emit-config`, sim-only ignored-field annotations, `apply --dry-run` full-config preview, and error-path tests for bad reports/output paths.
+- Added P4 cold query validation: `/search` results now include `freshness`, `index_tier`, and `validated`; cold/base hits are stat-checked, missing paths are tombstoned, changed paths enqueue parent-dir compensation, and validation/stale counters flow into metrics and `/watch-state`.
+- Added P5 DirtyQueue closure: dirty scopes now carry reason and priority, dedupe through debounce, retry with parent-scope expansion on failure, and unify inotify cold-tier events, query stale hits/misses, periodic cold scans, startup repair, and overflow recovery behind one local-rescan scheduler.
+- Tightened path-initials query detection so literal file paths such as `fd-rdd/todo.md` are not routed through `PathInitialsMatcher` as an extra full-scan anchor.
 
 ## [0.6.14] - 2026-05-02
 

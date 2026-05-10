@@ -1,7 +1,7 @@
 use crate::event::tiered_watch::TieredWatchDebugDump;
 use crate::index::TieredIndex;
 use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
-use crate::query::{execute_query, QueryMode, SortColumn, SortOrder};
+use crate::query::{execute_query_with_metadata, QueryMode, SortColumn, SortOrder};
 use crate::stats::{EventPipelineStats, MemoryReport, StatsReport, WatchStateReport};
 use crate::util::maybe_trim_rss;
 use axum::{
@@ -59,6 +59,9 @@ pub struct SearchResult {
     pub path: String,
     pub score: i64,
     pub highlights: Vec<[usize; 2]>,
+    pub freshness: String,
+    pub index_tier: String,
+    pub validated: bool,
 }
 
 #[derive(Deserialize)]
@@ -250,7 +253,7 @@ async fn search_handler(
     let sort = SortColumn::parse(params.sort.as_deref());
     let order = SortOrder::parse(params.order.as_deref());
     let search_task = tokio::task::spawn_blocking(move || {
-        execute_query(index.as_ref(), &kw_clone, limit, mode, sort, order)
+        execute_query_with_metadata(index.as_ref(), &kw_clone, limit, mode, sort, order)
     });
     let results = match tokio::time::timeout(state.config.query_timeout, search_task).await {
         Ok(Ok(results)) => results,
@@ -284,14 +287,17 @@ async fn search_handler(
     let config = ScoreConfig::from_query(&keyword);
     let response = results
         .into_iter()
-        .map(|m| {
-            let path_str = m.path.to_string_lossy().into_owned();
-            let score = score_result(&m, &config);
+        .map(|result| {
+            let path_str = result.meta.path.to_string_lossy().into_owned();
+            let score = score_result(&result.meta, &config);
             let highlights = compute_highlights(&path_str, &keyword);
             SearchResult {
                 path: path_str,
                 score,
                 highlights,
+                freshness: result.freshness.as_str().to_string(),
+                index_tier: result.index_tier.as_str().to_string(),
+                validated: result.validated,
             }
         })
         .collect();
@@ -476,5 +482,22 @@ mod tests {
         assert_eq!(resolve_query_mode(None).unwrap(), QueryMode::Exact);
         assert_eq!(resolve_query_mode(Some("fuzzy")).unwrap(), QueryMode::Fuzzy);
         assert!(resolve_query_mode(Some("oops")).is_err());
+    }
+
+    #[test]
+    fn search_result_serializes_cold_validation_fields() {
+        let value = serde_json::to_value(SearchResult {
+            path: "/tmp/a.txt".to_string(),
+            score: 10,
+            highlights: vec![[0, 3]],
+            freshness: "stale_checked".to_string(),
+            index_tier: "ColdMmap".to_string(),
+            validated: true,
+        })
+        .unwrap();
+
+        assert_eq!(value["freshness"], "stale_checked");
+        assert_eq!(value["index_tier"], "ColdMmap");
+        assert_eq!(value["validated"], true);
     }
 }

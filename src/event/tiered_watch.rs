@@ -226,9 +226,13 @@ impl TieredWatchRuntime {
         }
     }
 
-    pub fn record_event_paths<'a>(&self, paths: impl IntoIterator<Item = &'a PathBuf>) {
+    pub fn record_event_paths<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a PathBuf>,
+    ) -> Vec<PathBuf> {
         let now = unix_secs();
         let dirs = self.dirs.read();
+        let mut dirty_dirs = Vec::new();
         for path in paths {
             for (root, state) in dirs.iter() {
                 if !path_is_under_or_equal(path, root) {
@@ -249,9 +253,23 @@ impl TieredWatchRuntime {
                     state.dirty.store(true, Ordering::Relaxed);
                     state.dirty_since_unix_secs.store(now, Ordering::Relaxed);
                     state.set_freshness(Freshness::Dirty);
+                    if let Some(parent) = path.parent() {
+                        dirty_dirs.push(parent.to_path_buf());
+                    }
                 }
             }
         }
+        dirty_dirs.sort();
+        dirty_dirs.dedup();
+        dirty_dirs
+    }
+
+    pub fn covering_tier(&self, path: &Path) -> Option<WatchTier> {
+        let dirs = self.dirs.read();
+        dirs.iter()
+            .filter(|(root, _)| path_is_under_or_equal(path, root))
+            .max_by_key(|(root, _)| root.as_os_str().as_encoded_bytes().len())
+            .map(|(_, state)| state.tier())
     }
 
     pub fn max_watch_dirs(&self) -> usize {
@@ -449,6 +467,18 @@ impl TieredWatchRuntime {
             state.dirty.store(false, Ordering::Relaxed);
             state.set_freshness(Freshness::Fresh);
         }
+    }
+
+    pub fn record_scan_for_path(&self, path: &Path, outcome: ScanOutcome) -> Option<PathBuf> {
+        let target = {
+            let dirs = self.dirs.read();
+            dirs.iter()
+                .filter(|(root, _)| path_is_under_or_equal(path, root))
+                .max_by_key(|(root, _)| root.as_os_str().as_encoded_bytes().len())
+                .map(|(root, _)| root.clone())
+        }?;
+        self.record_scan(target.as_path(), outcome);
+        Some(target)
     }
 
     pub fn apply_scan_policy(
@@ -723,7 +753,6 @@ impl TieredWatchRuntime {
         let mut warm_memory_dirs = 0usize;
         let mut cold_mmap_dirs = 0usize;
         let mut frozen_manifest_dirs = 0usize;
-        let mut dirty_queue_len = 0usize;
 
         for state in dirs.values() {
             let tier = state.tier();
@@ -760,9 +789,6 @@ impl TieredWatchRuntime {
             }
             if state.promotion_pending.load(Ordering::Relaxed) {
                 pending_promotions += 1;
-            }
-            if state.dirty.load(Ordering::Relaxed) {
-                dirty_queue_len += 1;
             }
             if !matches!(tier, WatchTier::L0) {
                 let next_scan = state.next_scan_unix_secs.load(Ordering::Relaxed);
@@ -846,7 +872,7 @@ impl TieredWatchRuntime {
             l2_watch_cost,
             l3_watch_cost,
             scan_backlog_by_tier,
-            dirty_queue_len,
+            dirty_queue_len: 0,
             cold_validate_count: self.cold_validate_count.load(Ordering::Relaxed),
             query_stale_hit_count: 0,
         }
@@ -1504,11 +1530,12 @@ mod tests {
     fn record_event_paths_sets_dirty_for_non_l0() {
         let rt = runtime();
         let _warm = PathBuf::from("/tmp/warm");
-        rt.record_event_paths([&PathBuf::from("/tmp/warm/file.txt")]);
+        let dirty_dirs = rt.record_event_paths([&PathBuf::from("/tmp/warm/leaf/file.txt")]);
         let report = rt.report();
         assert_eq!(report.dirty_dirs, 1);
-        assert_eq!(report.dirty_queue_len, 1);
+        assert_eq!(report.dirty_queue_len, 0);
         assert_eq!(report.fresh_dirs, 1); // L0 is fresh
+        assert_eq!(dirty_dirs, vec![PathBuf::from("/tmp/warm/leaf")]);
     }
 
     #[test]
@@ -1531,6 +1558,28 @@ mod tests {
         assert_eq!(after.dirty_dirs, 0);
         assert_eq!(after.dirty_queue_len, 0);
         assert_eq!(after.fresh_dirs, 2); // both L0 and L1 are fresh now
+    }
+
+    #[test]
+    fn record_scan_for_leaf_clears_covering_cold_root() {
+        let rt = runtime();
+        let leaf = PathBuf::from("/tmp/warm/deep/file.txt");
+        rt.record_event_paths([&leaf]);
+        assert_eq!(rt.report().dirty_dirs, 1);
+
+        let recorded = rt.record_scan_for_path(
+            Path::new("/tmp/warm/deep"),
+            ScanOutcome {
+                scanned: 1,
+                changed: 0,
+                elapsed_ms: 1,
+            },
+        );
+
+        assert_eq!(recorded, Some(PathBuf::from("/tmp/warm")));
+        let report = rt.report();
+        assert_eq!(report.dirty_dirs, 0);
+        assert_eq!(report.fresh_dirs, 2);
     }
 
     #[test]

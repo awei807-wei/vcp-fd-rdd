@@ -113,6 +113,8 @@ impl TieredIndex {
             follow_symlinks,
             exclude_dirs,
             fast_sync_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            dirty_queue: Mutex::new(crate::event::sync::DirtyQueue::default()),
+            dirty_notify: Notify::new(),
             recovery_status: Mutex::new(super::RecoveryStatus::default()),
             stable_snapshot_enabled: AtomicBool::new(true),
             stats: Arc::new(crate::stats::StatsCollector::new()),

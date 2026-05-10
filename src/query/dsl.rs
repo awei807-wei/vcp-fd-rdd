@@ -246,7 +246,17 @@ fn is_path_initials_query(input: &str) -> bool {
         || input.starts_with("type:")
         || input.starts_with("case:")
         || input.starts_with("content:");
-    has_separator && !has_glob && !has_special_prefix
+    has_separator
+        && !has_glob
+        && !has_special_prefix
+        && input
+            .split(['/', '\\'])
+            .filter(|segment| !segment.is_empty())
+            .all(is_path_initials_segment)
+}
+
+fn is_path_initials_segment(segment: &str) -> bool {
+    !segment.is_empty() && segment.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
@@ -1174,5 +1184,12 @@ mod tests {
 
         let q3 = compile_query(r#"regex:"/a/x/.*\\.js$""#).unwrap();
         assert!(q3.matches(&meta("/a/x/VCPPlugin.js", 1, None))); // fullpath 模式
+    }
+
+    #[test]
+    fn path_initials_detection_ignores_literal_file_paths() {
+        assert!(is_path_initials_query("c/use/shi/pro"));
+        assert!(!is_path_initials_query("fd-rdd/todo.md"));
+        assert!(!is_path_initials_query("src/main.rs"));
     }
 }

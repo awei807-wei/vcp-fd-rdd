@@ -4,12 +4,15 @@ use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Task};
-use crate::event::sync::DirtyScope;
+use crate::event::sync::{now_ns, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyScope};
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
 use crate::index::PathFreshness;
 use crate::util::{maybe_trim_rss, path_has_excluded_component};
 
-use super::{pathbuf_from_bytes, ScanOutcome, StartupRepairStats, TieredIndex, REBUILD_COOLDOWN};
+use super::{
+    pathbuf_from_bytes, DirtyProcessReport, DirtyScanOutcome, ScanOutcome, StartupRepairStats,
+    TieredIndex, REBUILD_COOLDOWN,
+};
 
 fn visit_dirs_since(
     roots: &[PathBuf],
@@ -113,6 +116,17 @@ fn collect_dirs_changed_since(
     out.sort();
     out.dedup();
     out
+}
+
+fn should_skip_dirty_dir(
+    dir: &std::path::Path,
+    ignore_prefixes: &[PathBuf],
+    exclude_dirs: &[String],
+) -> bool {
+    ignore_prefixes
+        .iter()
+        .any(|ig| !ig.as_os_str().is_empty() && dir.starts_with(ig))
+        || path_has_excluded_component(dir, exclude_dirs)
 }
 
 #[derive(Debug, Default)]
@@ -324,6 +338,115 @@ impl TieredIndex {
             tracing::warn!("Fast-sync complete, triggering manual RSS trim...");
             maybe_trim_rss();
         });
+    }
+
+    pub fn enqueue_dirty(&self, scope: DirtyScope, reason: DirtyReason) {
+        self.enqueue_dirty_with_priority(scope, reason, reason.default_priority());
+    }
+
+    pub fn enqueue_dirty_dirs(&self, dirs: Vec<PathBuf>, reason: DirtyReason) {
+        if dirs.is_empty() {
+            return;
+        }
+        self.enqueue_dirty(DirtyScope::dirs(now_ns(), dirs), reason);
+    }
+
+    pub fn enqueue_dirty_with_priority(
+        &self,
+        scope: DirtyScope,
+        reason: DirtyReason,
+        priority: DirtyPriority,
+    ) {
+        {
+            let mut queue = self.dirty_queue.lock();
+            queue.enqueue(scope, reason, priority, now_ns());
+        }
+        self.dirty_notify.notify_one();
+    }
+
+    pub fn dirty_queue_len(&self) -> usize {
+        self.dirty_queue.lock().len()
+    }
+
+    pub fn dirty_queue_ready_batch(&self, limit: usize) -> Vec<DirtyQueueEntry> {
+        self.dirty_queue.lock().pop_ready(now_ns(), limit)
+    }
+
+    pub fn retry_dirty_entry(&self, entry: DirtyQueueEntry) -> bool {
+        let retry = {
+            let mut queue = self.dirty_queue.lock();
+            queue.retry(entry, now_ns())
+        };
+        if retry {
+            self.dirty_notify.notify_one();
+        }
+        retry
+    }
+
+    pub async fn wait_for_dirty_queue(&self) {
+        self.dirty_notify.notified().await;
+    }
+
+    pub fn process_dirty_entry(
+        &self,
+        entry: DirtyQueueEntry,
+        ignore_prefixes: &[PathBuf],
+    ) -> DirtyProcessReport {
+        let mut report = DirtyProcessReport {
+            entries_processed: 1,
+            ..DirtyProcessReport::default()
+        };
+
+        match &entry.scope {
+            DirtyScope::All { .. } => {
+                let sync = self.fast_sync(entry.scope.clone(), ignore_prefixes);
+                report.dirs_scanned = sync.dirs_scanned;
+                report.fast_sync_upserts = sync.upsert_events;
+                report.fast_sync_deletes = sync.delete_events;
+                report.changed = sync.upsert_events.saturating_add(sync.delete_events);
+                return report;
+            }
+            DirtyScope::Dirs { dirs, .. } => {
+                let mut had_failed_dir = false;
+                for dir in dirs {
+                    if should_skip_dirty_dir(dir, ignore_prefixes, &self.exclude_dirs) {
+                        continue;
+                    }
+                    match std::fs::symlink_metadata(dir) {
+                        Ok(meta) if meta.is_dir() => {
+                            let outcome =
+                                self.scan_dirs_immediate_outcome(std::slice::from_ref(dir));
+                            report.dirs_scanned = report.dirs_scanned.saturating_add(1);
+                            report.changed = report.changed.saturating_add(outcome.changed);
+                            report.elapsed_ms =
+                                report.elapsed_ms.saturating_add(outcome.elapsed_ms);
+                            report.outcomes.push(DirtyScanOutcome {
+                                dir: dir.clone(),
+                                outcome,
+                                reason: entry.reason,
+                            });
+                        }
+                        Ok(_) => {
+                            had_failed_dir = true;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            had_failed_dir = true;
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "dirty queue skipped unreadable dir {}: {}",
+                                dir.display(),
+                                e
+                            );
+                            had_failed_dir = true;
+                        }
+                    }
+                }
+                report.failed = had_failed_dir && report.dirs_scanned == 0;
+            }
+        }
+
+        report
     }
 
     pub(crate) fn fast_sync(

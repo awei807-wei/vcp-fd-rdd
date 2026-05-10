@@ -1,7 +1,7 @@
 use clap::Parser;
 use fd_rdd::config::{default_snapshot_path, default_socket_path, Config, WatchMode};
 use fd_rdd::event::ignore_filter::IgnoreFilter;
-use fd_rdd::event::sync::DirtyScope;
+use fd_rdd::event::sync::{DirtyReason, DirtyScope};
 use fd_rdd::event::tiered_watch::{TieredWatchDebugDump, TieredWatchDebugSummary};
 use fd_rdd::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
 use fd_rdd::index::TieredIndex;
@@ -242,11 +242,11 @@ async fn main() -> anyhow::Result<()> {
     startup_ignore_paths.push(store.path().to_path_buf());
     startup_ignore_paths.push(store.derived_lsm_dir_path());
     if watch_enabled && index.file_count() > 0 && startup_reconcile_cutoff_ns > 0 {
-        index.spawn_fast_sync(
+        index.enqueue_dirty(
             DirtyScope::All {
                 cutoff_ns: startup_reconcile_cutoff_ns,
             },
-            startup_ignore_paths.clone(),
+            DirtyReason::StartupRepair,
         );
     }
     let watch_plan = build_watch_plan(
@@ -292,6 +292,13 @@ async fn main() -> anyhow::Result<()> {
             "Filesystem watcher disabled; index updates require manual /scan or rebuild"
         );
     }
+    spawn_dirty_queue_loop(
+        index.clone(),
+        tiered_runtime.clone(),
+        watch_command_tx.clone(),
+        cfg.tiered_watch.clone(),
+        startup_ignore_paths.clone(),
+    );
     if effective_watch_mode == WatchMode::Tiered {
         if let Some(runtime) = tiered_runtime.clone() {
             spawn_tiered_scan_loop(
@@ -358,6 +365,12 @@ async fn main() -> anyhow::Result<()> {
                 .map(|runtime| runtime.report())
                 .unwrap_or_else(|| watch_state.as_ref().clone());
             let stats = index.stats_report();
+            report.dirty_queue_len = report
+                .dirty_queue_len
+                .saturating_add(index.dirty_queue_len());
+            report.cold_validate_count = report
+                .cold_validate_count
+                .saturating_add(stats.cold_validate_count);
             report.query_stale_hit_count = stats.query_stale_hit_count;
             report
         })
@@ -645,6 +658,86 @@ fn build_tiered_watch_plan(
     }
 }
 
+fn spawn_dirty_queue_loop(
+    index: Arc<TieredIndex>,
+    runtime: Option<Arc<TieredWatchRuntime>>,
+    watch_command_tx: tokio::sync::mpsc::Sender<WatchCommand>,
+    tiered: fd_rdd::config::TieredWatchConfig,
+    ignore_prefixes: Vec<PathBuf>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let batch = index.dirty_queue_ready_batch(16);
+            if batch.is_empty() {
+                tokio::select! {
+                    _ = index.wait_for_dirty_queue() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+                continue;
+            }
+
+            let work = batch.clone();
+            let work_index = index.clone();
+            let work_ignore_prefixes = ignore_prefixes.clone();
+            let processed = tokio::task::spawn_blocking(move || {
+                work.into_iter()
+                    .map(|entry| {
+                        let report =
+                            work_index.process_dirty_entry(entry.clone(), &work_ignore_prefixes);
+                        (entry, report)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+
+            let Ok(processed) = processed else {
+                tracing::warn!("dirty queue worker task failed");
+                for entry in batch {
+                    let _ = index.retry_dirty_entry(entry);
+                }
+                continue;
+            };
+
+            for (entry, report) in processed {
+                if report.failed {
+                    if !index.retry_dirty_entry(entry.clone()) {
+                        tracing::warn!("dirty queue dropped entry after retry budget: {:?}", entry);
+                    }
+                    continue;
+                }
+
+                if let Some(runtime) = runtime.as_ref() {
+                    for scan in report.outcomes {
+                        let policy_dir = runtime
+                            .record_scan_for_path(scan.dir.as_path(), scan.outcome)
+                            .unwrap_or_else(|| scan.dir.clone());
+                        runtime.apply_scan_policy(
+                            policy_dir.as_path(),
+                            tiered.l1_scan_interval_secs,
+                            tiered.l2_scan_interval_secs,
+                            tiered.l1_empty_scans_to_l2,
+                            tiered.l2_empty_scans_to_l3,
+                        );
+                        if scan.outcome.changed > 0 {
+                            send_promotion_command(runtime, &watch_command_tx, policy_dir).await;
+                        }
+                    }
+                }
+
+                tracing::debug!(
+                    "dirty queue processed reason={:?} dirs={} changed={} elapsed_ms={} fast_sync_upserts={} fast_sync_deletes={}",
+                    entry.reason,
+                    report.dirs_scanned,
+                    report.changed,
+                    report.elapsed_ms,
+                    report.fast_sync_upserts,
+                    report.fast_sync_deletes
+                );
+            }
+        }
+    });
+}
+
 fn spawn_tiered_scan_loop(
     index: Arc<TieredIndex>,
     runtime: Arc<TieredWatchRuntime>,
@@ -673,81 +766,40 @@ fn spawn_tiered_scan_loop(
             if batch.is_empty() {
                 continue;
             }
-
-            let index = index.clone();
-            match tokio::task::spawn_blocking(move || {
-                batch
-                    .into_iter()
-                    .map(|dir| {
-                        let outcome = index.scan_dirs_immediate_outcome(std::slice::from_ref(&dir));
-                        (dir, outcome)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .await
-            {
-                Ok(results) => {
-                    let mut scanned = 0usize;
-                    let mut changed = 0usize;
-                    let mut elapsed_ms = 0u64;
-                    for (dir, outcome) in results {
-                        runtime.record_scan(dir.as_path(), outcome);
-                        scanned = scanned.saturating_add(outcome.scanned);
-                        changed = changed.saturating_add(outcome.changed);
-                        elapsed_ms = elapsed_ms.saturating_add(outcome.elapsed_ms);
-                        runtime.apply_scan_policy(
-                            dir.as_path(),
-                            tiered.l1_scan_interval_secs,
-                            tiered.l2_scan_interval_secs,
-                            tiered.l1_empty_scans_to_l2,
-                            tiered.l2_empty_scans_to_l3,
-                        );
-                        if outcome.changed > 0 {
-                            match runtime.try_reserve_promotion(dir.as_path()) {
-                                fd_rdd::event::tiered_watch::PromotionDecision::SendAdd => {
-                                    if watch_command_tx
-                                        .send(WatchCommand::Add(dir.clone()))
-                                        .await
-                                        .is_err()
-                                    {
-                                        runtime.rollback_promote(dir.as_path());
-                                    }
-                                }
-                                fd_rdd::event::tiered_watch::PromotionDecision::Replace {
-                                    demote,
-                                    promote,
-                                } => {
-                                    let demote_path = demote.clone();
-                                    let promote_path = promote.clone();
-                                    if watch_command_tx
-                                        .send(WatchCommand::Replace { demote, promote })
-                                        .await
-                                        .is_err()
-                                    {
-                                        runtime.rollback_replacement(
-                                            demote_path.as_path(),
-                                            promote_path.as_path(),
-                                        );
-                                    }
-                                }
-                                fd_rdd::event::tiered_watch::PromotionDecision::BudgetBlocked
-                                | fd_rdd::event::tiered_watch::PromotionDecision::NotEligible => {}
-                            }
-                        }
-                    }
-                    tracing::debug!(
-                        "tiered warm scan complete: files={} changed={} elapsed_ms={}",
-                        scanned,
-                        changed,
-                        elapsed_ms
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("tiered warm scan task failed: {}", e);
-                }
-            }
+            index.enqueue_dirty_dirs(batch, DirtyReason::PeriodicColdScan);
         }
     });
+}
+
+async fn send_promotion_command(
+    runtime: &Arc<TieredWatchRuntime>,
+    watch_command_tx: &tokio::sync::mpsc::Sender<WatchCommand>,
+    dir: PathBuf,
+) {
+    match runtime.try_reserve_promotion(dir.as_path()) {
+        fd_rdd::event::tiered_watch::PromotionDecision::SendAdd => {
+            if watch_command_tx
+                .send(WatchCommand::Add(dir.clone()))
+                .await
+                .is_err()
+            {
+                runtime.rollback_promote(dir.as_path());
+            }
+        }
+        fd_rdd::event::tiered_watch::PromotionDecision::Replace { demote, promote } => {
+            let demote_path = demote.clone();
+            let promote_path = promote.clone();
+            if watch_command_tx
+                .send(WatchCommand::Replace { demote, promote })
+                .await
+                .is_err()
+            {
+                runtime.rollback_replacement(demote_path.as_path(), promote_path.as_path());
+            }
+        }
+        fd_rdd::event::tiered_watch::PromotionDecision::BudgetBlocked
+        | fd_rdd::event::tiered_watch::PromotionDecision::NotEligible => {}
+    }
 }
 
 fn initial_hot_candidates(

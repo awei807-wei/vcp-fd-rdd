@@ -1,4 +1,5 @@
 use crate::core::FileMeta;
+use crate::index::tiered::QueryResultMeta;
 use crate::index::TieredIndex;
 use crate::query::scoring::{score_result, ScoreConfig};
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -83,70 +84,93 @@ pub fn execute_query(
     sort: SortColumn,
     order: SortOrder,
 ) -> Vec<FileMeta> {
+    execute_query_with_metadata(index, keyword, limit, mode, sort, order)
+        .into_iter()
+        .map(|result| result.meta)
+        .collect()
+}
+
+pub fn execute_query_with_metadata(
+    index: &TieredIndex,
+    keyword: &str,
+    limit: usize,
+    mode: QueryMode,
+    sort: SortColumn,
+    order: SortOrder,
+) -> Vec<QueryResultMeta> {
     let mut results = match mode {
-        QueryMode::Exact => index.query_limit(keyword, limit),
+        QueryMode::Exact => index.query_limit_detailed(keyword, limit),
         QueryMode::Fuzzy => FzfIntegration::new().query_index(index, keyword, limit),
     };
 
-    sort_results(&mut results, keyword, sort, order);
+    sort_query_results(&mut results, keyword, sort, order);
     results
 }
 
-fn sort_results(results: &mut [FileMeta], keyword: &str, sort: SortColumn, order: SortOrder) {
-    results.sort_by(|a, b| {
-        let cmp = match sort {
-            SortColumn::Score => {
-                let config = ScoreConfig::from_query(keyword);
-                let sa = score_result(a, &config);
-                let sb = score_result(b, &config);
-                // Score: higher is better, so default desc
-                sb.cmp(&sa).then_with(|| a.path.cmp(&b.path))
-            }
-            SortColumn::Name => {
-                let na = a
-                    .path
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
-                let nb = b
-                    .path
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
-                na.cmp(&nb).then_with(|| a.path.cmp(&b.path))
-            }
-            SortColumn::Path => a.path.cmp(&b.path),
-            SortColumn::Ext => {
-                let ea = a
-                    .path
-                    .extension()
-                    .map(|e| e.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
-                let eb = b
-                    .path
-                    .extension()
-                    .map(|e| e.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
-                ea.cmp(&eb).then_with(|| a.path.cmp(&b.path))
-            }
-            SortColumn::DateModified => {
-                cmp_time(a.mtime, b.mtime).then_with(|| a.path.cmp(&b.path))
-            }
-            SortColumn::DateCreated => cmp_time(a.ctime, b.ctime).then_with(|| a.path.cmp(&b.path)),
-            SortColumn::DateAccessed => {
-                cmp_time(a.atime, b.atime).then_with(|| a.path.cmp(&b.path))
-            }
-        };
+fn sort_query_results(
+    results: &mut [QueryResultMeta],
+    keyword: &str,
+    sort: SortColumn,
+    order: SortOrder,
+) {
+    results.sort_by(|a, b| compare_meta(&a.meta, &b.meta, keyword, sort, order));
+}
 
-        // Score column is already desc by default; all others respect order param
-        if sort == SortColumn::Score {
-            cmp
-        } else if order == SortOrder::Desc {
-            cmp.reverse()
-        } else {
-            cmp
+fn compare_meta(
+    a: &FileMeta,
+    b: &FileMeta,
+    keyword: &str,
+    sort: SortColumn,
+    order: SortOrder,
+) -> std::cmp::Ordering {
+    let cmp = match sort {
+        SortColumn::Score => {
+            let config = ScoreConfig::from_query(keyword);
+            let sa = score_result(a, &config);
+            let sb = score_result(b, &config);
+            // Score: higher is better, so default desc
+            sb.cmp(&sa).then_with(|| a.path.cmp(&b.path))
         }
-    });
+        SortColumn::Name => {
+            let na = a
+                .path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let nb = b
+                .path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            na.cmp(&nb).then_with(|| a.path.cmp(&b.path))
+        }
+        SortColumn::Path => a.path.cmp(&b.path),
+        SortColumn::Ext => {
+            let ea = a
+                .path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let eb = b
+                .path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            ea.cmp(&eb).then_with(|| a.path.cmp(&b.path))
+        }
+        SortColumn::DateModified => cmp_time(a.mtime, b.mtime).then_with(|| a.path.cmp(&b.path)),
+        SortColumn::DateCreated => cmp_time(a.ctime, b.ctime).then_with(|| a.path.cmp(&b.path)),
+        SortColumn::DateAccessed => cmp_time(a.atime, b.atime).then_with(|| a.path.cmp(&b.path)),
+    };
+
+    // Score column is already desc by default; all others respect order param
+    if sort == SortColumn::Score {
+        cmp
+    } else if order == SortOrder::Desc {
+        cmp.reverse()
+    } else {
+        cmp
+    }
 }
 
 fn cmp_time(
@@ -196,14 +220,19 @@ impl FzfIntegration {
         results
     }
 
-    pub fn query_index(&self, index: &TieredIndex, keyword: &str, limit: usize) -> Vec<FileMeta> {
+    pub fn query_index(
+        &self,
+        index: &TieredIndex,
+        keyword: &str,
+        limit: usize,
+    ) -> Vec<QueryResultMeta> {
         if limit == 0 {
             return Vec::new();
         }
 
         let keyword = keyword.trim();
         if keyword.is_empty() {
-            return index.query_limit(keyword, limit);
+            return index.query_limit_detailed(keyword, limit);
         }
 
         let candidate_limit = fuzzy_candidate_limit(index.file_count(), limit);
@@ -212,11 +241,13 @@ impl FzfIntegration {
             candidates = index.collect_all_live_metas();
         }
 
-        self.match_query(keyword, candidates)
+        let metas = self
+            .match_query(keyword, candidates)
             .into_iter()
             .take(limit)
             .map(|(meta, _)| meta)
-            .collect()
+            .collect();
+        index.annotate_query_results(metas)
     }
 }
 

@@ -608,6 +608,7 @@ impl fmt::Display for MemoryReport {
 pub struct StatsReport {
     pub queries_total: u64,
     pub queries_avg_us: u64,
+    pub cold_validate_count: u64,
     pub query_stale_hit_count: u64,
     pub events_applied: u64,
     pub events_dropped: u64,
@@ -620,6 +621,7 @@ pub struct StatsReport {
 pub struct StatsCollector {
     queries_total: std::sync::atomic::AtomicU64,
     queries_total_us: std::sync::atomic::AtomicU64,
+    cold_validate_count: std::sync::atomic::AtomicU64,
     query_stale_hit_count: std::sync::atomic::AtomicU64,
     events_applied: std::sync::atomic::AtomicU64,
     events_dropped: std::sync::atomic::AtomicU64,
@@ -637,6 +639,14 @@ impl StatsCollector {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.queries_total_us
             .fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_cold_validate(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.cold_validate_count
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn record_query_stale_hits(&self, count: u64) {
@@ -677,6 +687,9 @@ impl StatsCollector {
         StatsReport {
             queries_total: total,
             queries_avg_us: total_us.checked_div(total).unwrap_or(0),
+            cold_validate_count: self
+                .cold_validate_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             query_stale_hit_count: self
                 .query_stale_hit_count
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -722,6 +735,7 @@ mod tests {
         let stats = StatsCollector::new();
         stats.record_query(10);
         stats.record_query(30);
+        stats.record_cold_validate(4);
         stats.record_query_stale_hits(3);
         stats.record_events_applied(7);
         stats.record_events_dropped(2);
@@ -731,6 +745,7 @@ mod tests {
         let report = stats.report();
         assert_eq!(report.queries_total, 2);
         assert_eq!(report.queries_avg_us, 20);
+        assert_eq!(report.cold_validate_count, 4);
         assert_eq!(report.query_stale_hit_count, 3);
         assert_eq!(report.events_applied, 7);
         assert_eq!(report.events_dropped, 2);

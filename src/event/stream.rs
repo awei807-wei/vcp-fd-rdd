@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::event::ignore_filter::IgnoreFilter;
-use crate::event::tiered_watch::TieredWatchRuntime;
+use crate::event::sync::{now_ns, DirtyReason, DirtyScope};
+use crate::event::tiered_watch::{TieredWatchRuntime, WatchTier};
 use crate::event::watcher::{check_inotify_limit, watch_roots_enhanced, EventWatcher};
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
@@ -518,11 +519,24 @@ impl EventPipeline {
                 if let Some(ref gi) = ignore_filter {
                     raw_events.retain(|ev| !ev.paths.iter().any(|p| gi.is_ignored(p)));
                 }
+                if raw_events.iter().any(|ev| ev.need_rescan()) {
+                    index.enqueue_dirty(
+                        DirtyScope::All {
+                            cutoff_ns: now_ns(),
+                        },
+                        DirtyReason::OverflowRecovery,
+                    );
+                    raw_events.retain(|ev| !ev.need_rescan());
+                }
                 if raw_events.is_empty() {
                     continue;
                 }
                 if let Some(runtime) = tiered_runtime.as_ref() {
-                    runtime.record_event_paths(raw_events.iter().flat_map(|ev| ev.paths.iter()));
+                    let dirty_dirs = runtime
+                        .record_event_paths(raw_events.iter().flat_map(|ev| ev.paths.iter()));
+                    if !dirty_dirs.is_empty() {
+                        index.enqueue_dirty_dirs(dirty_dirs, DirtyReason::InotifyEvent);
+                    }
                 }
 
                 // 动态注册新目录的递归监控。
@@ -562,6 +576,16 @@ impl EventPipeline {
                             continue;
                         }
                         if let Some(runtime) = tiered_runtime.as_ref() {
+                            if matches!(
+                                runtime.covering_tier(path.as_path()),
+                                Some(WatchTier::L2 | WatchTier::L3)
+                            ) {
+                                index.enqueue_dirty_dirs(
+                                    vec![path.clone()],
+                                    DirtyReason::InotifyEvent,
+                                );
+                                continue;
+                            }
                             let watch_cost = estimate_recursive_dir_count(
                                 path,
                                 runtime.max_watch_dirs(),
