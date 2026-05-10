@@ -104,6 +104,32 @@ jobs:
       - name: SIGTERM final snapshot resume test
         run: cargo test --locked --test p1_poweroff_resume -- --test-threads=1 --nocapture
 
+  sim-regression:
+    name: Tiered watcher sim regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run fixed-seed golden workloads
+        run: |
+          mkdir -p reports/ci
+          cargo run --locked --bin fd-rdd-sim -- regression \
+            --output reports/ci/sim-regression.json \
+            --markdown-output reports/ci/sim-regression.md
+
+      - name: Upload sim regression reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-regression
+          path: reports/ci/sim-regression.*
+          retention-days: 14
+
   test-multi-thread:
     name: Test multi-threaded (may expose flaky concurrency bugs)
     runs-on: ubuntu-latest

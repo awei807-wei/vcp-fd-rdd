@@ -685,6 +685,7 @@ pub fn adversarial_report(mut config: OptimizerConfig) -> BenchmarkReport {
         WorkloadProfile::Burst,
         WorkloadProfile::Dormant,
         WorkloadProfile::Adversarial,
+        WorkloadProfile::HomeDesktop,
     ];
     let candidates = grid_candidates(&config.policy);
     let mut aggregate = Vec::new();
@@ -750,6 +751,7 @@ fn evaluate_policy(config: &OptimizerConfig, policy: &PolicyParams) -> RunMetric
         WorkloadProfile::Burst,
         WorkloadProfile::Dormant,
         WorkloadProfile::Adversarial,
+        WorkloadProfile::HomeDesktop,
     ];
     let mut combined: Option<RunMetrics> = None;
     let mut worst_sla = 1.0;

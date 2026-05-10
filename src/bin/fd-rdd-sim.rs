@@ -5,9 +5,10 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use fd_rdd::config::{Config, WatchMode};
 use fd_rdd::sim::{
-    adversarial_report, evolve_report, grid_report, optimize_report, single_report,
+    adversarial_report, default_regression_policy, evolve_report, grid_report, optimize_report,
+    sim_regression_markdown, sim_regression_report, single_report,
     tiered_watch_config_patch_toml_from_reports, tiered_watch_recommendation_from_report,
-    write_existing_parent, BenchmarkReport, OptimizerConfig, PolicyParams,
+    write_existing_parent, BenchmarkReport, OptimizerConfig, PolicyParams, SimRegressionReport,
     TieredWatchRecommendation, WorkloadConfig, WorkloadProfile,
 };
 
@@ -34,6 +35,8 @@ enum Command {
     Evolve(EvolveArgs),
     /// Run grid candidates against multiple hostile workload profiles.
     Adversarial(CommonArgs),
+    /// Run fixed-seed small golden workloads and fail on policy regressions.
+    Regression(RegressionArgs),
     /// Emit a config.toml patch from a JSON benchmark report recommendation.
     EmitConfig(EmitConfigArgs),
     /// Preview the full config.toml after applying a report recommendation.
@@ -138,7 +141,7 @@ struct OptimizeArgs {
     #[arg(long, default_value_t = 0.5)]
     min_delta: f64,
 
-    /// Optimize against developer/burst/dormant/adversarial profiles together.
+    /// Optimize against developer/burst/dormant/adversarial/home-desktop profiles together.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     robust_profiles: bool,
 
@@ -177,12 +180,32 @@ struct ApplyArgs {
     dry_run: bool,
 }
 
+#[derive(Parser, Debug, Clone)]
+struct RegressionArgs {
+    /// Optional JSON/TOML policy file. Defaults to the built-in CI regression policy.
+    #[arg(long)]
+    policy: Option<PathBuf>,
+
+    /// Optional JSON report output path. Stdout is used when omitted.
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// Optional Markdown report output path.
+    #[arg(long)]
+    markdown_output: Option<PathBuf>,
+
+    /// Optional previous regression JSON report used only for Markdown delta columns.
+    #[arg(long)]
+    baseline: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ProfileArg {
     Developer,
     Burst,
     Dormant,
     Adversarial,
+    HomeDesktop,
 }
 
 impl From<ProfileArg> for WorkloadProfile {
@@ -192,6 +215,7 @@ impl From<ProfileArg> for WorkloadProfile {
             ProfileArg::Burst => Self::Burst,
             ProfileArg::Dormant => Self::Dormant,
             ProfileArg::Adversarial => Self::Adversarial,
+            ProfileArg::HomeDesktop => Self::HomeDesktop,
         }
     }
 }
@@ -244,6 +268,36 @@ fn main() -> anyhow::Result<()> {
             let output = common.output.clone();
             (adversarial_report(config_from_common(common)?), output)
         }
+        Command::Regression(args) => {
+            let policy = if let Some(path) = &args.policy {
+                load_policy(path)?
+            } else {
+                default_regression_policy()
+            };
+            let report = sim_regression_report(policy);
+            let baseline = match &args.baseline {
+                Some(path) => Some(read_regression_report(path)?),
+                None => None,
+            };
+            if let Some(path) = args.markdown_output {
+                let markdown = sim_regression_markdown(&report, baseline.as_ref());
+                write_text_creating_parent(&path, markdown.as_bytes())?;
+            }
+            let json = serde_json::to_string_pretty(&report)?;
+            if let Some(path) = args.output {
+                write_text_creating_parent(&path, json.as_bytes())?;
+            } else {
+                println!("{json}");
+            }
+            if !report.passed {
+                anyhow::bail!(
+                    "fd-rdd-sim regression failed: {}/{} cases failed",
+                    report.summary.failed_cases,
+                    report.summary.total_cases
+                );
+            }
+            return Ok(());
+        }
         Command::EmitConfig(args) => {
             let reports = read_reports(&args.input)?;
             let toml_patch = tiered_watch_config_patch_toml_from_reports(&reports)?;
@@ -272,10 +326,7 @@ fn main() -> anyhow::Result<()> {
 
     let json = serde_json::to_string_pretty(&report)?;
     if let Some(path) = output {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, json)?;
+        write_text_creating_parent(&path, json.as_bytes())?;
     } else {
         println!("{json}");
     }
@@ -292,6 +343,24 @@ fn read_reports(paths: &[PathBuf]) -> anyhow::Result<Vec<BenchmarkReport>> {
                 .with_context(|| format!("failed to parse JSON report {}", path.display()))
         })
         .collect()
+}
+
+fn read_regression_report(path: &Path) -> anyhow::Result<SimRegressionReport> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read regression report {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse regression JSON report {}", path.display()))
+}
+
+fn write_text_creating_parent(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+    }
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn read_config_for_dry_run(path: Option<&Path>) -> anyhow::Result<Config> {

@@ -732,6 +732,13 @@ mod tests {
                 duration_secs: 900,
                 seed: 2_026,
             },
+            WorkloadConfig {
+                profile: WorkloadProfile::HomeDesktop,
+                dirs: 260,
+                events: 1_200,
+                duration_secs: 900,
+                seed: 5_010,
+            },
         ];
 
         for config in cases {
@@ -780,6 +787,51 @@ mod tests {
                 sim_diag(&metrics)
             );
         }
+    }
+
+    #[test]
+    fn home_desktop_workload_exercises_cold_warming_and_large_scan_costs() {
+        let world = generate_world(WorkloadConfig {
+            profile: WorkloadProfile::HomeDesktop,
+            dirs: 360,
+            events: 1_800,
+            duration_secs: 1_200,
+            seed: 12_345,
+        });
+        let policy = PolicyParams {
+            max_watch_dirs: 36,
+            l1_scan_interval_secs: 6,
+            l2_scan_interval_secs: 45,
+            l1_empty_scans_to_l2: 2,
+            l2_empty_scans_to_l3: 2,
+            per_round_max_dirs: 6,
+            per_round_max_files: 1_800,
+            per_round_max_ms: 12,
+            ..PolicyParams::default()
+        };
+
+        let metrics = run_simulation(&world, &policy);
+
+        assert!(
+            metrics.watch_cost_peak <= policy.max_watch_dirs as u64,
+            "{}",
+            sim_diag(&metrics)
+        );
+        assert!(
+            metrics.promotions > 0,
+            "HomeDesktop should let cold or warm dirs become hot after real activity\n{}",
+            sim_diag(&metrics)
+        );
+        assert!(
+            metrics.final_l3_dirs > 0,
+            "HomeDesktop should leave some large cold roots in L3\n{}",
+            sim_diag(&metrics)
+        );
+        assert!(
+            metrics.scanned_files > metrics.scanned_dirs.saturating_mul(40),
+            "large media/archive/NAS dirs should make scan cost visible\n{}",
+            sim_diag(&metrics)
+        );
     }
 
     #[test]

@@ -189,10 +189,10 @@ DirtyQueue 是冷层补偿的统一入口，会合并来自 inotify 冷层事件
 
 ## fd-rdd-sim 压测框架
 
-`fd-rdd-sim` 是 tiered watcher 参数的 synthetic 竞技场，用来在不触碰真实文件系统 watcher 的情况下持续试错，收敛出 L0/L1/L2/L3 分层策略参数。它会生成热点聚集、突发写入、长眠目录或对抗性 workload，让候选策略反复竞争，并输出 SLA、发现延迟、watch/scan 成本、收敛轨迹和可回填到 `tiered_watch` 的推荐配置。
+`fd-rdd-sim` 是 tiered watcher 参数的 synthetic 竞技场，用来在不触碰真实文件系统 watcher 的情况下持续试错，收敛出 L0/L1/L2/L3 分层策略参数。它会生成热点聚集、突发写入、长眠目录、对抗性 workload，以及 `home-desktop` 这类 `$HOME` 桌面使用画像，让候选策略反复竞争，并输出 SLA、发现延迟、watch/scan 成本、收敛轨迹和可回填到 `tiered_watch` 的推荐配置。
 
 ```bash
-# 持续试错，跨 developer/burst/dormant/adversarial workload 收敛推荐参数
+# 持续试错，跨 developer/burst/dormant/adversarial/home-desktop workload 收敛推荐参数
 cargo run --bin fd-rdd-sim -- optimize \
   --dirs 3000 \
   --events 30000 \
@@ -205,8 +205,16 @@ cargo run --bin fd-rdd-sim -- optimize \
 # 单策略基线诊断，不代表最优
 cargo run --bin fd-rdd-sim -- single --profile developer --dirs 1000 --events 10000
 
+# 模拟日常 HOME 桌面工作负载：Downloads burst、文档/桌面高价值、小变更媒体和冷 NAS
+cargo run --bin fd-rdd-sim -- single --profile home-desktop --dirs 1200 --events 12000
+
 # 参数网格搜索 baseline
 cargo run --bin fd-rdd-sim -- grid --profile burst --top-n 5
+
+# CI 级策略回归：固定 seed small workloads + 阈值检查 + JSON/Markdown 报告
+cargo run --bin fd-rdd-sim -- regression \
+  --output reports/sim-regression.json \
+  --markdown-output reports/sim-regression.md
 
 # 遗传搜索单 workload baseline
 cargo run --bin fd-rdd-sim -- evolve --generations 16 --population 32
@@ -229,7 +237,11 @@ cargo run --bin fd-rdd-sim -- apply \
 
 可通过 `--policy policies/tiered-default.toml` 读取策略基线；CLI 里显式传入的预算、TTL、扫描周期参数会作为本次运行的覆盖值。`optimize` 报告中的 `convergence.phase` / `current_generation` / `current_generation_trials` 显示当前进度，`convergence.trace` 记录每代试错轨迹，`recommendation` 字段给出推荐的 `watch_mode = "tiered"`、`max_watch_dirs`、扫描周期和 TTL。
 
-`metrics` 除 SLA、发现延迟、watch/scan 成本外，也输出策略控制面指标：`promotions`、`demotions`、`replacements`、`promotion_budget_blocked` 以及最终 `final_l0_dirs` / `final_l1_dirs` / `final_l2_dirs` / `final_l3_dirs` 分布，用于和真实 runtime `/watch-state` 做趋势对照；字段映射维护在 `helloagents/wiki/runtime-sim-report-mapping.md`。P1 parity 回归已覆盖热 L0 保留、BudgetBlocked 高优先级扫描、祖先 L0 不被子候选驱逐、watch budget 不超限，以及 developer/burst/dormant/adversarial 固定 seed workload 的层级与事件计数稳定性；失败时会输出 runtime/sim 关键指标差异。`emit-config` 只生成当前 runtime 支持的 TOML patch，不写入用户配置文件；多个 `--input` 会按更低 watcher/scan 预算、更低 L0 TTL、更长冷层扫描周期和更快空扫降级生成保守汇总，输出会注释说明 `weights`、`per_round_max_dirs`、`per_round_max_files`、`per_round_max_ms` 等 sim-only 参数已忽略；`apply --dry-run` 只打印合并后的完整配置用于审阅。
+`home-desktop` profile 将 `$HOME` 拆成 synthetic 热根：`Downloads` 高频新增和 burst，`Documents/Desktop` 小规模高价值，`Pictures/Videos` 低变更但 scan cost 大，`Code` 可能活跃但不保证初始热，`Archive/NAS` 大、冷且有偶发冷查询压力；`.cache`、`node_modules`、构建目录等默认排除项在 workload 中表现为近零 scan work 且不产生事件。
+
+`regression` 子命令内置 5 个小规模 golden workload：`developer-small`、`burst-small`、`dormant-small`、`adversarial-small`、`home-desktop-small`。每个 case 固定 seed，并检查 `p95_discovery_delay_secs`、`promotion_budget_blocked`、`watch_cost_peak`、`scanned_files`、`final_l0_dirs`、`final_l3_dirs` 阈值；任何阈值失败都会在写出 JSON/Markdown 后以非零退出码结束，CI 会上传 `reports/ci/sim-regression.*` 便于比较策略变更前后差异。
+
+`metrics` 除 SLA、发现延迟、watch/scan 成本外，也输出策略控制面指标：`promotions`、`demotions`、`replacements`、`promotion_budget_blocked` 以及最终 `final_l0_dirs` / `final_l1_dirs` / `final_l2_dirs` / `final_l3_dirs` 分布，用于和真实 runtime `/watch-state` 做趋势对照；字段映射维护在 `helloagents/wiki/runtime-sim-report-mapping.md`。P1 parity 回归已覆盖热 L0 保留、BudgetBlocked 高优先级扫描、祖先 L0 不被子候选驱逐、watch budget 不超限，以及 developer/burst/dormant/adversarial/home-desktop 固定 seed workload 的层级与事件计数稳定性；失败时会输出 runtime/sim 关键指标差异。`emit-config` 只生成当前 runtime 支持的 TOML patch，不写入用户配置文件；多个 `--input` 会按更低 watcher/scan 预算、更低 L0 TTL、更长冷层扫描周期和更快空扫降级生成保守汇总，输出会注释说明 `weights`、`per_round_max_dirs`、`per_round_max_files`、`per_round_max_ms` 等 sim-only 参数已忽略；`apply --dry-run` 只打印合并后的完整配置用于审阅。
 
 长时间运行可用 `Ctrl-C` 中断；checkpoint 会在每代结束后原子写入。继续迭代时把同一个文件传给 `--resume` 和 `--checkpoint`：
 

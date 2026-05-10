@@ -3,6 +3,7 @@
 pub mod metrics;
 pub mod optimizer;
 pub mod policy;
+pub mod regression;
 pub mod rng;
 pub mod simulator;
 pub mod world;
@@ -16,5 +17,8 @@ pub use optimizer::{
     OptimizerConfig, TieredWatchRecommendation, SIM_ONLY_IGNORED_FIELDS,
 };
 pub use policy::{PolicyParams, ScoreWeights, SimTier};
+pub use regression::{
+    default_regression_policy, sim_regression_markdown, sim_regression_report, SimRegressionReport,
+};
 pub use simulator::run_simulation;
 pub use world::{generate_world, WorkloadConfig, WorkloadProfile, World, WorldSummary};
