@@ -38,6 +38,9 @@ pub enum WatchCommand {
     Add(PathBuf),
     Remove(PathBuf),
     Replace { demote: PathBuf, promote: PathBuf },
+    AddEphemeral(PathBuf),
+    RemoveEphemeral(PathBuf),
+    ReplaceEphemeral { remove: PathBuf, add: PathBuf },
 }
 
 type WatchCommandRx = Arc<Mutex<Option<tokio::sync::mpsc::Receiver<WatchCommand>>>>;
@@ -293,6 +296,7 @@ impl EventPipeline {
             let mut last_idle_trim = tokio::time::Instant::now();
             let mut last_idle_trim_total_events = 0u64;
             let mut dynamic_watches: HashSet<PathBuf> = HashSet::new();
+            let mut ephemeral_watches: HashSet<PathBuf> = HashSet::new();
             let pending_moves = pending_moves;
 
             loop {
@@ -326,6 +330,27 @@ impl EventPipeline {
                                     }
                                 }
                             }
+                            Some(WatchCommand::AddEphemeral(path)) => {
+                                match watcher.watch(path.as_path(), notify::RecursiveMode::Recursive) {
+                                    Ok(()) => {
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.confirm_ephemeral_added(path.as_path());
+                                        }
+                                        ephemeral_watches.insert(path.clone());
+                                        let scan_index = index.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let _ = scan_index.scan_dirs_immediate_deep(&[path]);
+                                        });
+                                    }
+                                    Err(e) => {
+                                        watch_failures.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.rollback_ephemeral_add(path.as_path());
+                                        }
+                                        tracing::warn!("tiered ephemeral watcher add failed for {:?}: {}", path, e);
+                                    }
+                                }
+                            }
                             Some(WatchCommand::Remove(path)) => {
                                 let child_watches = dynamic_watches
                                     .iter()
@@ -345,6 +370,24 @@ impl EventPipeline {
                                         runtime.confirm_demoted(child.as_path());
                                     }
                                 }
+                                let ephemeral_children = ephemeral_watches
+                                    .iter()
+                                    .filter(|child| child.as_path() != path.as_path() && child.starts_with(&path))
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                for child in ephemeral_children {
+                                    if let Err(e) = watcher.unwatch(child.as_path()) {
+                                        tracing::debug!(
+                                            "tiered ephemeral child remove failed for {:?}: {}",
+                                            child,
+                                            e
+                                        );
+                                    }
+                                    ephemeral_watches.remove(&child);
+                                    if let Some(runtime) = tiered_runtime.as_ref() {
+                                        runtime.confirm_ephemeral_removed(child.as_path());
+                                    }
+                                }
                                 match watcher.unwatch(path.as_path()) {
                                     Ok(()) => {
                                         dynamic_watches.remove(&path);
@@ -358,6 +401,23 @@ impl EventPipeline {
                                             runtime.rollback_demote(path.as_path());
                                         }
                                         tracing::warn!("tiered watcher remove failed for {:?}: {}", path, e);
+                                    }
+                                }
+                            }
+                            Some(WatchCommand::RemoveEphemeral(path)) => {
+                                match watcher.unwatch(path.as_path()) {
+                                    Ok(()) => {
+                                        ephemeral_watches.remove(&path);
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.confirm_ephemeral_removed(path.as_path());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        watch_failures.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.rollback_ephemeral_remove(path.as_path());
+                                        }
+                                        tracing::warn!("tiered ephemeral watcher remove failed for {:?}: {}", path, e);
                                     }
                                 }
                             }
@@ -378,6 +438,24 @@ impl EventPipeline {
                                     dynamic_watches.remove(&child);
                                     if let Some(runtime) = tiered_runtime.as_ref() {
                                         runtime.confirm_demoted(child.as_path());
+                                    }
+                                }
+                                let ephemeral_children = ephemeral_watches
+                                    .iter()
+                                    .filter(|child| child.as_path() != demote.as_path() && child.starts_with(&demote))
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                for child in ephemeral_children {
+                                    if let Err(e) = watcher.unwatch(child.as_path()) {
+                                        tracing::debug!(
+                                            "tiered ephemeral replacement child remove failed for {:?}: {}",
+                                            child,
+                                            e
+                                        );
+                                    }
+                                    ephemeral_watches.remove(&child);
+                                    if let Some(runtime) = tiered_runtime.as_ref() {
+                                        runtime.confirm_ephemeral_removed(child.as_path());
                                     }
                                 }
 
@@ -432,6 +510,55 @@ impl EventPipeline {
                                         tracing::warn!(
                                             "tiered watcher replacement add failed for {:?}: {}",
                                             promote,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Some(WatchCommand::ReplaceEphemeral { remove, add }) => {
+                                match watcher.unwatch(remove.as_path()) {
+                                    Ok(()) => {
+                                        ephemeral_watches.remove(&remove);
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.confirm_ephemeral_evicted(remove.as_path());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        watch_failures.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.rollback_ephemeral_replace(
+                                                remove.as_path(),
+                                                add.as_path(),
+                                            );
+                                        }
+                                        tracing::warn!(
+                                            "tiered ephemeral replacement remove failed for {:?}: {}",
+                                            remove,
+                                            e
+                                        );
+                                        continue;
+                                    }
+                                }
+
+                                match watcher.watch(add.as_path(), notify::RecursiveMode::Recursive) {
+                                    Ok(()) => {
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.confirm_ephemeral_added(add.as_path());
+                                        }
+                                        ephemeral_watches.insert(add.clone());
+                                        let scan_index = index.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let _ = scan_index.scan_dirs_immediate_deep(&[add]);
+                                        });
+                                    }
+                                    Err(e) => {
+                                        watch_failures.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(runtime) = tiered_runtime.as_ref() {
+                                            runtime.rollback_ephemeral_add(add.as_path());
+                                        }
+                                        tracing::warn!(
+                                            "tiered ephemeral replacement add failed for {:?}: {}",
+                                            add,
                                             e
                                         );
                                     }

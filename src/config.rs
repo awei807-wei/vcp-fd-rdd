@@ -201,6 +201,14 @@ pub struct TieredWatchConfig {
     pub l1_empty_scans_to_l2: u32,
     /// Empty L2 scans before demotion to L3.
     pub l2_empty_scans_to_l3: u32,
+    /// Independent budget for temporary watcher leases. These do not count as L0/L1/L2/L3.
+    pub ephemeral_watch_budget: usize,
+    /// Hard lifetime for a temporary watcher lease.
+    pub ephemeral_watch_ttl_secs: u64,
+    /// Idle lifetime for a temporary watcher lease since the last matching event.
+    pub ephemeral_idle_secs: u64,
+    /// Maximum estimated recursive watch cost allowed for one temporary root.
+    pub ephemeral_max_cost_per_root: usize,
     /// Initial hot directory candidates. `~` is expanded during config load.
     pub hot_dirs: Vec<PathBuf>,
 }
@@ -216,6 +224,10 @@ impl Default for TieredWatchConfig {
             l2_scan_interval_secs: 300,
             l1_empty_scans_to_l2: 5,
             l2_empty_scans_to_l3: 3,
+            ephemeral_watch_budget: 256,
+            ephemeral_watch_ttl_secs: 600,
+            ephemeral_idle_secs: 120,
+            ephemeral_max_cost_per_root: 64,
             hot_dirs: default_hot_dirs(),
         }
     }
@@ -430,5 +442,31 @@ exclude_dirs = ["custom_cache"]
         assert!(!persisted.contains("node_modules"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tiered_watch_defaults_include_ephemeral_lease_controls() {
+        let cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+watch_mode = "tiered"
+
+[tiered_watch]
+max_watch_dirs = 16
+"#,
+        )
+        .expect("config should parse with partial tiered_watch table");
+
+        assert_eq!(cfg.tiered_watch.max_watch_dirs, 16);
+        assert_eq!(cfg.tiered_watch.ephemeral_watch_budget, 256);
+        assert_eq!(cfg.tiered_watch.ephemeral_watch_ttl_secs, 600);
+        assert_eq!(cfg.tiered_watch.ephemeral_idle_secs, 120);
+        assert_eq!(cfg.tiered_watch.ephemeral_max_cost_per_root, 64);
+
+        let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
+        assert!(toml.contains("ephemeral_watch_budget"));
+        assert!(toml.contains("ephemeral_watch_ttl_secs"));
+        assert!(toml.contains("ephemeral_idle_secs"));
+        assert!(toml.contains("ephemeral_max_cost_per_root"));
     }
 }

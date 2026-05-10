@@ -2,7 +2,9 @@ use clap::Parser;
 use fd_rdd::config::{default_snapshot_path, default_socket_path, Config, WatchMode};
 use fd_rdd::event::ignore_filter::IgnoreFilter;
 use fd_rdd::event::sync::{DirtyReason, DirtyScope};
-use fd_rdd::event::tiered_watch::{TieredWatchDebugDump, TieredWatchDebugSummary};
+use fd_rdd::event::tiered_watch::{
+    EphemeralWatchConfig, EphemeralWatchDecision, TieredWatchDebugDump, TieredWatchDebugSummary,
+};
 use fd_rdd::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
 use fd_rdd::index::TieredIndex;
 use fd_rdd::query::SocketServer;
@@ -256,12 +258,13 @@ async fn main() -> anyhow::Result<()> {
         &exclude_dirs,
     );
     let tiered_runtime = if effective_watch_mode == WatchMode::Tiered {
-        Some(Arc::new(TieredWatchRuntime::new(
+        Some(Arc::new(TieredWatchRuntime::new_with_ephemeral(
             watch_plan.l0_roots.clone(),
             watch_plan.l1_roots.clone(),
             cfg.tiered_watch.max_watch_dirs.max(1),
             cfg.tiered_watch.scan_items_per_sec,
             cfg.tiered_watch.scan_ms_per_tick,
+            cfg.tiered_watch.ephemeral_watch_budget,
         )))
     } else {
         None
@@ -297,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
         tiered_runtime.clone(),
         watch_command_tx.clone(),
         cfg.tiered_watch.clone(),
+        exclude_dirs.clone(),
         startup_ignore_paths.clone(),
     );
     if effective_watch_mode == WatchMode::Tiered {
@@ -390,6 +394,9 @@ async fn main() -> anyhow::Result<()> {
                         l1_dirs: 0,
                         l2_dirs: 0,
                         l3_dirs: 0,
+                        ephemeral_watch_dirs: 0,
+                        ephemeral_watch_cost: 0,
+                        ephemeral_watch_budget: 0,
                         total_event_score: 0,
                     },
                 })
@@ -651,6 +658,7 @@ fn build_tiered_watch_plan(
             scan_backlog: rejected,
             scan_items_per_sec: tiered.scan_items_per_sec,
             scan_ms_per_tick: tiered.scan_ms_per_tick,
+            ephemeral_watch_budget: tiered.ephemeral_watch_budget,
             last_adjustment_unix_secs: now,
             notes,
             ..WatchStateReport::default()
@@ -663,6 +671,7 @@ fn spawn_dirty_queue_loop(
     runtime: Option<Arc<TieredWatchRuntime>>,
     watch_command_tx: tokio::sync::mpsc::Sender<WatchCommand>,
     tiered: fd_rdd::config::TieredWatchConfig,
+    exclude_dirs: Vec<String>,
     ignore_prefixes: Vec<PathBuf>,
 ) {
     tokio::spawn(async move {
@@ -698,6 +707,14 @@ fn spawn_dirty_queue_loop(
                 continue;
             };
 
+            let ephemeral_config = EphemeralWatchConfig {
+                budget: tiered.ephemeral_watch_budget,
+                ttl_secs: tiered.ephemeral_watch_ttl_secs,
+                idle_secs: tiered.ephemeral_idle_secs,
+                max_cost_per_root: tiered.ephemeral_max_cost_per_root,
+                ..EphemeralWatchConfig::default()
+            };
+
             for (entry, report) in processed {
                 if report.failed {
                     if !index.retry_dirty_entry(entry.clone()) {
@@ -718,8 +735,25 @@ fn spawn_dirty_queue_loop(
                             tiered.l1_empty_scans_to_l2,
                             tiered.l2_empty_scans_to_l3,
                         );
-                        if scan.outcome.changed > 0 {
-                            send_promotion_command(runtime, &watch_command_tx, policy_dir).await;
+                        let promotion_decision = if scan.outcome.changed > 0 {
+                            send_promotion_command(runtime, &watch_command_tx, policy_dir).await
+                        } else {
+                            fd_rdd::event::tiered_watch::PromotionDecision::NotEligible
+                        };
+                        if !matches!(
+                            promotion_decision,
+                            fd_rdd::event::tiered_watch::PromotionDecision::SendAdd
+                                | fd_rdd::event::tiered_watch::PromotionDecision::Replace { .. }
+                        ) {
+                            maybe_send_ephemeral_watch_command(
+                                runtime,
+                                &watch_command_tx,
+                                scan.dir.clone(),
+                                scan.outcome.changed,
+                                &exclude_dirs,
+                                &ephemeral_config,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -762,6 +796,20 @@ fn spawn_tiered_scan_loop(
                 }
             }
 
+            for removal in runtime.expire_ephemeral_watches(
+                tiered.ephemeral_idle_secs,
+                tiered.ephemeral_watch_ttl_secs,
+                EphemeralWatchConfig::default().no_change_limit,
+            ) {
+                if watch_command_tx
+                    .send(WatchCommand::RemoveEphemeral(removal.path.clone()))
+                    .await
+                    .is_err()
+                {
+                    runtime.rollback_ephemeral_remove(removal.path.as_path());
+                }
+            }
+
             let batch = runtime.scan_batch(max_dirs_per_tick);
             if batch.is_empty() {
                 continue;
@@ -775,8 +823,9 @@ async fn send_promotion_command(
     runtime: &Arc<TieredWatchRuntime>,
     watch_command_tx: &tokio::sync::mpsc::Sender<WatchCommand>,
     dir: PathBuf,
-) {
-    match runtime.try_reserve_promotion(dir.as_path()) {
+) -> fd_rdd::event::tiered_watch::PromotionDecision {
+    let decision = runtime.try_reserve_promotion(dir.as_path());
+    match decision.clone() {
         fd_rdd::event::tiered_watch::PromotionDecision::SendAdd => {
             if watch_command_tx
                 .send(WatchCommand::Add(dir.clone()))
@@ -799,6 +848,55 @@ async fn send_promotion_command(
         }
         fd_rdd::event::tiered_watch::PromotionDecision::BudgetBlocked
         | fd_rdd::event::tiered_watch::PromotionDecision::NotEligible => {}
+    }
+    decision
+}
+
+async fn maybe_send_ephemeral_watch_command(
+    runtime: &Arc<TieredWatchRuntime>,
+    watch_command_tx: &tokio::sync::mpsc::Sender<WatchCommand>,
+    dir: PathBuf,
+    changed: usize,
+    exclude_dirs: &[String],
+    config: &EphemeralWatchConfig,
+) {
+    if config.budget == 0 || !dir.is_dir() {
+        return;
+    }
+    if fd_rdd::util::path_has_excluded_component(dir.as_path(), exclude_dirs) {
+        return;
+    }
+    let cost = estimate_recursive_dir_count(
+        dir.as_path(),
+        config.max_cost_per_root.max(1).saturating_add(1),
+        exclude_dirs,
+    );
+    match runtime.note_dirty_scope_with_changed(dir.clone(), cost, exclude_dirs, config, changed) {
+        EphemeralWatchDecision::Add(path) => {
+            if watch_command_tx
+                .send(WatchCommand::AddEphemeral(path.clone()))
+                .await
+                .is_err()
+            {
+                runtime.rollback_ephemeral_add(path.as_path());
+            }
+        }
+        EphemeralWatchDecision::Replace { remove, add } => {
+            if watch_command_tx
+                .send(WatchCommand::ReplaceEphemeral {
+                    remove: remove.clone(),
+                    add: add.clone(),
+                })
+                .await
+                .is_err()
+            {
+                runtime.rollback_ephemeral_replace(remove.as_path(), add.as_path());
+            }
+        }
+        EphemeralWatchDecision::BudgetBlocked => {
+            tracing::debug!("tiered ephemeral watcher budget blocked for {:?}", dir);
+        }
+        EphemeralWatchDecision::NotEligible => {}
     }
 }
 

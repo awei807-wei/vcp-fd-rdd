@@ -187,6 +187,8 @@ HTTP `/search` 返回每条结果的 `score`、`highlights`，以及冷层校验
 
 DirtyQueue 是冷层补偿的统一入口，会合并来自 inotify 冷层事件、查询 stale hit、路径形态 query miss、周期冷层扫描、启动修复和 overflow recovery 的 dirty scope。队列带 debounce、优先级和重试；局部补扫优先扫描事件所在叶子目录，失败时再逐级扩大范围。
 
+Tiered watcher 还支持 Ephemeral Watch：当同一 dirty scope 在短窗口内反复触发、正式 L0 晋升又不合适或预算受阻时，后台会按独立的 `ephemeral_watch_budget` 创建临时 watcher 租约。临时 watcher 不属于 L0/L1/L2/L3，也不会替代 DirtyQueue；它只覆盖小成本局部根，并会在 idle、TTL、连续无变化补扫、被正式 L0 覆盖或预算驱逐时自动移除。
+
 ## fd-rdd-sim 压测框架
 
 `fd-rdd-sim` 是 tiered watcher 参数的 synthetic 竞技场，用来在不触碰真实文件系统 watcher 的情况下持续试错，收敛出 L0/L1/L2/L3 分层策略参数。它会生成热点聚集、突发写入、长眠目录、对抗性 workload，以及 `home-desktop` 这类 `$HOME` 桌面使用画像，让候选策略反复竞争，并输出 SLA、发现延迟、watch/scan 成本、收敛轨迹和可回填到 `tiered_watch` 的推荐配置。

@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added P5 DirtyQueue closure: dirty scopes now carry reason and priority, dedupe through debounce, retry with parent-scope expansion on failure, and unify inotify cold-tier events, query stale hits/misses, periodic cold scans, startup repair, and overflow recovery behind one local-rescan scheduler.
 - Added P6 `fd-rdd-sim --profile home-desktop`, modeling Downloads bursts, high-value Documents/Desktop, expensive low-change media, active Code, cold Archive/NAS pressure, and default-excluded cache/dependency/build trees.
 - Added P7 `fd-rdd-sim regression` with fixed-seed small golden workloads, JSON/Markdown strategy reports, threshold checks for delay/budget/watch/scan/tier metrics, and a CI job that uploads regression artifacts.
+- Added P8 Ephemeral Watch leases for repeated dirty scopes: temporary watcher commands, independent lease budget/TTL/idle/cost config, low-value lease eviction, L0 coverage expiry, `/watch-state` counters, and runtime tests for creation, budget replacement, exclusion, and expiry conditions.
 - Tightened path-initials query detection so literal file paths such as `fd-rdd/todo.md` are not routed through `PathInitialsMatcher` as an extra full-scan anchor.
 
 ## [0.6.14] - 2026-05-02

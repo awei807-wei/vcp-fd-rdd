@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -175,11 +175,104 @@ pub enum PromotionDecision {
     NotEligible,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EphemeralWatchDecision {
+    Add(PathBuf),
+    Replace { remove: PathBuf, add: PathBuf },
+    NotEligible,
+    BudgetBlocked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EphemeralWatchExpiry {
+    Idle,
+    Ttl,
+    NoChange,
+    CoveredByL0,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EphemeralWatchRemoval {
+    pub path: PathBuf,
+    pub reason: EphemeralWatchExpiry,
+}
+
+#[derive(Clone, Debug)]
+pub struct EphemeralWatchConfig {
+    pub budget: usize,
+    pub ttl_secs: u64,
+    pub idle_secs: u64,
+    pub max_cost_per_root: usize,
+    pub repeat_window_secs: u64,
+    pub repeat_threshold: u32,
+    pub no_change_limit: u32,
+}
+
+impl Default for EphemeralWatchConfig {
+    fn default() -> Self {
+        Self {
+            budget: 0,
+            ttl_secs: 600,
+            idle_secs: 120,
+            max_cost_per_root: 64,
+            repeat_window_secs: 60,
+            repeat_threshold: 2,
+            no_change_limit: 3,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EphemeralWatchLease {
+    path: PathBuf,
+    watch_cost: u64,
+    created_unix_secs: u64,
+    last_event_unix_secs: AtomicU64,
+    last_dirty_unix_secs: u64,
+    dirty_hits: u32,
+    no_change_scans: u32,
+    value_score: u64,
+    pending_add: bool,
+    pending_remove: bool,
+}
+
+impl EphemeralWatchLease {
+    fn pending(path: PathBuf, watch_cost: usize, now: u64) -> Self {
+        Self {
+            path,
+            watch_cost: watch_cost as u64,
+            created_unix_secs: now,
+            last_event_unix_secs: AtomicU64::new(now),
+            last_dirty_unix_secs: now,
+            dirty_hits: 1,
+            no_change_scans: 0,
+            value_score: 1,
+            pending_add: true,
+            pending_remove: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DirtyScopeObservation {
+    last_unix_secs: u64,
+    hits: u32,
+    score: u64,
+}
+
 #[derive(Debug)]
 pub struct TieredWatchRuntime {
     dirs: RwLock<HashMap<PathBuf, Arc<DirState>>>,
+    ephemeral: RwLock<HashMap<PathBuf, EphemeralWatchLease>>,
+    dirty_observations: RwLock<HashMap<PathBuf, DirtyScopeObservation>>,
     max_watch_dirs: u64,
     current_watch_cost: AtomicU64,
+    ephemeral_watch_budget: u64,
+    current_ephemeral_watch_cost: AtomicU64,
+    ephemeral_watch_created: AtomicU64,
+    ephemeral_watch_expired: AtomicU64,
+    ephemeral_watch_evicted: AtomicU64,
+    ephemeral_watch_budget_blocked: AtomicU64,
     scan_items_per_sec: usize,
     scan_ms_per_tick: u64,
     promotions: AtomicU64,
@@ -198,6 +291,24 @@ impl TieredWatchRuntime {
         scan_items_per_sec: usize,
         scan_ms_per_tick: u64,
     ) -> Self {
+        Self::new_with_ephemeral(
+            l0_roots,
+            l1_roots,
+            max_watch_dirs,
+            scan_items_per_sec,
+            scan_ms_per_tick,
+            0,
+        )
+    }
+
+    pub fn new_with_ephemeral(
+        l0_roots: Vec<(PathBuf, usize)>,
+        l1_roots: Vec<(PathBuf, usize)>,
+        max_watch_dirs: usize,
+        scan_items_per_sec: usize,
+        scan_ms_per_tick: u64,
+        ephemeral_watch_budget: usize,
+    ) -> Self {
         let now = unix_secs();
         let mut current_watch_cost = 0u64;
         let mut dirs = HashMap::new();
@@ -213,8 +324,16 @@ impl TieredWatchRuntime {
 
         Self {
             dirs: RwLock::new(dirs),
+            ephemeral: RwLock::new(HashMap::new()),
+            dirty_observations: RwLock::new(HashMap::new()),
             max_watch_dirs: max_watch_dirs as u64,
             current_watch_cost: AtomicU64::new(current_watch_cost),
+            ephemeral_watch_budget: ephemeral_watch_budget as u64,
+            current_ephemeral_watch_cost: AtomicU64::new(0),
+            ephemeral_watch_created: AtomicU64::new(0),
+            ephemeral_watch_expired: AtomicU64::new(0),
+            ephemeral_watch_evicted: AtomicU64::new(0),
+            ephemeral_watch_budget_blocked: AtomicU64::new(0),
             scan_items_per_sec,
             scan_ms_per_tick,
             promotions: AtomicU64::new(0),
@@ -231,6 +350,8 @@ impl TieredWatchRuntime {
         paths: impl IntoIterator<Item = &'a PathBuf>,
     ) -> Vec<PathBuf> {
         let now = unix_secs();
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        self.record_ephemeral_events(&paths, now);
         let dirs = self.dirs.read();
         let mut dirty_dirs = Vec::new();
         for path in paths {
@@ -262,6 +383,359 @@ impl TieredWatchRuntime {
         dirty_dirs.sort();
         dirty_dirs.dedup();
         dirty_dirs
+    }
+
+    fn record_ephemeral_events(&self, paths: &[&PathBuf], now: u64) {
+        if paths.is_empty() {
+            return;
+        }
+        let ephemeral = self.ephemeral.read();
+        for event_path in paths {
+            let mut best: Option<(&PathBuf, &EphemeralWatchLease)> = None;
+            for (root, lease) in ephemeral.iter() {
+                if lease.pending_add || lease.pending_remove {
+                    continue;
+                }
+                if !path_is_under_or_equal(event_path, root) {
+                    continue;
+                }
+                let should_replace = best
+                    .as_ref()
+                    .map(|(best_root, _)| {
+                        root.as_os_str().as_encoded_bytes().len()
+                            > best_root.as_os_str().as_encoded_bytes().len()
+                    })
+                    .unwrap_or(true);
+                if should_replace {
+                    best = Some((root, lease));
+                }
+            }
+            if let Some((_, lease)) = best {
+                lease.last_event_unix_secs.store(now, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn note_dirty_scope(
+        &self,
+        path: PathBuf,
+        watch_cost: usize,
+        exclude_dirs: &[String],
+        config: &EphemeralWatchConfig,
+    ) -> EphemeralWatchDecision {
+        let now = unix_secs();
+        self.note_dirty_scope_at(path, watch_cost, exclude_dirs, config, now, 0)
+    }
+
+    pub fn note_dirty_scope_with_changed(
+        &self,
+        path: PathBuf,
+        watch_cost: usize,
+        exclude_dirs: &[String],
+        config: &EphemeralWatchConfig,
+        changed: usize,
+    ) -> EphemeralWatchDecision {
+        let now = unix_secs();
+        self.note_dirty_scope_at(path, watch_cost, exclude_dirs, config, now, changed)
+    }
+
+    pub fn note_dirty_scope_at(
+        &self,
+        path: PathBuf,
+        watch_cost: usize,
+        exclude_dirs: &[String],
+        config: &EphemeralWatchConfig,
+        now: u64,
+        changed: usize,
+    ) -> EphemeralWatchDecision {
+        if config.budget == 0 || watch_cost == 0 {
+            return EphemeralWatchDecision::NotEligible;
+        }
+        if watch_cost > config.max_cost_per_root.max(1) {
+            return EphemeralWatchDecision::NotEligible;
+        }
+        if exclude_dirs
+            .iter()
+            .any(|name| !name.is_empty() && path_has_component(path.as_path(), name))
+        {
+            return EphemeralWatchDecision::NotEligible;
+        }
+        {
+            let dirs = self.dirs.read();
+            if dirs.iter().any(|(root, state)| {
+                state.tier() == WatchTier::L0 && path_is_under_or_equal(path.as_path(), root)
+            }) {
+                return EphemeralWatchDecision::NotEligible;
+            }
+        }
+
+        let observed = self.observe_dirty_scope(path.as_path(), now, changed, config);
+        let key = path.clone();
+        {
+            let mut ephemeral = self.ephemeral.write();
+            if let Some(lease) = ephemeral.get_mut(&key) {
+                lease.dirty_hits = observed;
+                lease.last_dirty_unix_secs = now;
+                lease.last_event_unix_secs.store(now, Ordering::Relaxed);
+                if changed == 0 {
+                    lease.no_change_scans = lease.no_change_scans.saturating_add(1);
+                } else {
+                    lease.no_change_scans = 0;
+                    lease.value_score = lease
+                        .value_score
+                        .saturating_add((changed as u64).saturating_mul(4).saturating_add(8));
+                }
+                return EphemeralWatchDecision::NotEligible;
+            }
+        }
+        if observed < config.repeat_threshold.max(1) {
+            return EphemeralWatchDecision::NotEligible;
+        }
+
+        let observations = self.dirty_observations.read();
+        let candidate_score = observations
+            .get(&key)
+            .map(|entry| entry.score)
+            .unwrap_or(u64::from(observed));
+        let mut ephemeral = self.ephemeral.write();
+        let covered_by_ephemeral = ephemeral.iter().any(|(root, lease)| {
+            !lease.pending_remove && path_is_under_or_equal(path.as_path(), root.as_path())
+        });
+        if covered_by_ephemeral {
+            return EphemeralWatchDecision::NotEligible;
+        }
+
+        let mut probe = EphemeralWatchLease::pending(path.clone(), watch_cost, now);
+        probe.dirty_hits = observed;
+        probe.value_score = candidate_score;
+        let cost = probe.watch_cost;
+        let budget = config.budget as u64;
+
+        if self
+            .current_ephemeral_watch_cost
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                if current.saturating_add(cost) <= budget {
+                    Some(current.saturating_add(cost))
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        {
+            ephemeral.insert(key, probe);
+            return EphemeralWatchDecision::Add(path);
+        }
+
+        if let Some(victim) = choose_ephemeral_victim(&ephemeral, path.as_path(), cost, budget) {
+            let victim_cost = ephemeral
+                .get(&victim)
+                .map(|lease| lease.watch_cost)
+                .unwrap_or(0);
+            if self
+                .current_ephemeral_watch_cost
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                    let next = current.saturating_sub(victim_cost).saturating_add(cost);
+                    if next <= budget {
+                        Some(next)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                if let Some(victim_lease) = ephemeral.get_mut(&victim) {
+                    victim_lease.pending_remove = true;
+                }
+                ephemeral.insert(key, probe);
+                self.ephemeral_watch_evicted.fetch_add(1, Ordering::Relaxed);
+                return EphemeralWatchDecision::Replace {
+                    remove: victim,
+                    add: path,
+                };
+            }
+        }
+
+        self.ephemeral_watch_budget_blocked
+            .fetch_add(1, Ordering::Relaxed);
+        EphemeralWatchDecision::BudgetBlocked
+    }
+
+    pub fn record_dirty_scope_repeat(
+        &self,
+        path: &Path,
+        changed: usize,
+        config: &EphemeralWatchConfig,
+    ) {
+        let now = unix_secs();
+        let hits = self.observe_dirty_scope(path, now, changed, config);
+        let mut ephemeral = self.ephemeral.write();
+        if let Some(lease) = ephemeral.get_mut(path) {
+            lease.dirty_hits = hits;
+            lease.last_dirty_unix_secs = now;
+            if changed == 0 {
+                lease.no_change_scans = lease.no_change_scans.saturating_add(1);
+            } else {
+                lease.no_change_scans = 0;
+                lease.value_score = lease
+                    .value_score
+                    .saturating_add((changed as u64).saturating_mul(4).saturating_add(8));
+            }
+        }
+    }
+
+    fn observe_dirty_scope(
+        &self,
+        path: &Path,
+        now: u64,
+        changed: usize,
+        config: &EphemeralWatchConfig,
+    ) -> u32 {
+        let key = path.to_path_buf();
+        let mut observations = self.dirty_observations.write();
+        let entry = observations
+            .entry(key)
+            .and_modify(|entry| {
+                if now.saturating_sub(entry.last_unix_secs) <= config.repeat_window_secs.max(1) {
+                    entry.hits = entry.hits.saturating_add(1);
+                } else {
+                    entry.hits = 1;
+                    entry.score = 0;
+                }
+                entry.last_unix_secs = now;
+                entry.score = entry
+                    .score
+                    .saturating_add((changed as u64).saturating_add(1));
+            })
+            .or_insert_with(|| DirtyScopeObservation {
+                last_unix_secs: now,
+                hits: 1,
+                score: (changed as u64).saturating_add(1),
+            });
+        entry.hits
+    }
+
+    pub fn expire_ephemeral_watches(
+        &self,
+        idle_secs: u64,
+        ttl_secs: u64,
+        no_change_limit: u32,
+    ) -> Vec<EphemeralWatchRemoval> {
+        let now = unix_secs();
+        self.expire_ephemeral_watches_at(now, idle_secs, ttl_secs, no_change_limit)
+    }
+
+    pub fn expire_ephemeral_watches_at(
+        &self,
+        now: u64,
+        idle_secs: u64,
+        ttl_secs: u64,
+        no_change_limit: u32,
+    ) -> Vec<EphemeralWatchRemoval> {
+        let l0_roots = {
+            let dirs = self.dirs.read();
+            dirs.iter()
+                .filter_map(|(path, state)| {
+                    if state.tier() == WatchTier::L0 {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut removals = Vec::new();
+        let mut ephemeral = self.ephemeral.write();
+        for lease in ephemeral.values_mut() {
+            if lease.pending_add || lease.pending_remove {
+                continue;
+            }
+            let reason = if l0_roots
+                .iter()
+                .any(|root| path_is_under_or_equal(lease.path.as_path(), root.as_path()))
+            {
+                Some(EphemeralWatchExpiry::CoveredByL0)
+            } else if ttl_secs > 0 && now.saturating_sub(lease.created_unix_secs) >= ttl_secs {
+                Some(EphemeralWatchExpiry::Ttl)
+            } else if idle_secs > 0
+                && now.saturating_sub(lease.last_event_unix_secs.load(Ordering::Relaxed))
+                    >= idle_secs
+            {
+                Some(EphemeralWatchExpiry::Idle)
+            } else if no_change_limit > 0 && lease.no_change_scans >= no_change_limit {
+                Some(EphemeralWatchExpiry::NoChange)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                lease.pending_remove = true;
+                removals.push(EphemeralWatchRemoval {
+                    path: lease.path.clone(),
+                    reason,
+                });
+            }
+        }
+        removals
+    }
+
+    pub fn confirm_ephemeral_added(&self, path: &Path) {
+        if let Some(lease) = self.ephemeral.write().get_mut(path) {
+            if lease.pending_add {
+                lease.pending_add = false;
+                self.ephemeral_watch_created.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn rollback_ephemeral_add(&self, path: &Path) {
+        let removed = self.ephemeral.write().remove(path);
+        if let Some(lease) = removed {
+            self.release_ephemeral_cost(lease.watch_cost);
+        }
+    }
+
+    pub fn confirm_ephemeral_removed(&self, path: &Path) {
+        let removed = self.ephemeral.write().remove(path);
+        if let Some(lease) = removed {
+            self.release_ephemeral_cost(lease.watch_cost);
+            self.ephemeral_watch_expired.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn confirm_ephemeral_evicted(&self, path: &Path) {
+        let _ = self.ephemeral.write().remove(path);
+    }
+
+    pub fn rollback_ephemeral_remove(&self, path: &Path) {
+        if let Some(lease) = self.ephemeral.write().get_mut(path) {
+            lease.pending_remove = false;
+        }
+    }
+
+    pub fn rollback_ephemeral_replace(&self, remove: &Path, add: &Path) {
+        let mut leases = self.ephemeral.write();
+        let add_cost = leases
+            .remove(add)
+            .map(|lease| lease.watch_cost)
+            .unwrap_or(0);
+        let mut victim_cost = 0;
+        if let Some(victim) = leases.get_mut(remove) {
+            victim.pending_remove = false;
+            victim_cost = victim.watch_cost;
+        }
+        drop(leases);
+        let _ = self.current_ephemeral_watch_cost.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(add_cost).saturating_add(victim_cost)),
+        );
+    }
+
+    fn release_ephemeral_cost(&self, cost: u64) {
+        let _ = self.current_ephemeral_watch_cost.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(cost)),
+        );
     }
 
     pub fn covering_tier(&self, path: &Path) -> Option<WatchTier> {
@@ -732,6 +1206,7 @@ impl TieredWatchRuntime {
 
     pub fn report(&self) -> WatchStateReport {
         let dirs = self.dirs.read();
+        let l0_candidates = dirs.len();
         let mut l0_dirs = 0usize;
         let mut l1_dirs = 0usize;
         let mut l2_dirs = 0usize;
@@ -802,11 +1277,29 @@ impl TieredWatchRuntime {
             event_score_total =
                 event_score_total.saturating_add(state.event_score.load(Ordering::Relaxed));
         }
+        drop(dirs);
+
+        let ephemeral = self.ephemeral.read();
+        let ephemeral_watch_dirs = ephemeral
+            .values()
+            .filter(|lease| !lease.pending_add && !lease.pending_remove)
+            .count();
+        let ephemeral_watch_cost = self.current_ephemeral_watch_cost.load(Ordering::Relaxed);
+        drop(ephemeral);
 
         let mut notes = vec![
             "tiered runtime controls L0/L1/L2/L3 hotness scheduling".to_string(),
             "cold L0 directories can be replaced when a hotter candidate needs budget".to_string(),
         ];
+        if self.ephemeral_watch_budget > 0 {
+            notes.push(format!(
+                "ephemeral watcher leases active={}/{} cost={}/{}",
+                ephemeral_watch_dirs,
+                self.ephemeral_watch_created.load(Ordering::Relaxed),
+                ephemeral_watch_cost,
+                self.ephemeral_watch_budget
+            ));
+        }
         if pending_promotions > 0 {
             notes.push(format!(
                 "{} promotion(s) are waiting for watcher command completion",
@@ -840,7 +1333,7 @@ impl TieredWatchRuntime {
             l3_dirs,
             watched_dirs_estimated,
             max_watch_dirs: self.max_watch_dirs as usize,
-            l0_candidates: dirs.len(),
+            l0_candidates,
             l0_admitted: l0_dirs,
             l0_rejected: l1_dirs + l2_dirs + l3_dirs,
             scan_backlog: l1_dirs + l2_dirs + l3_dirs,
@@ -871,6 +1364,15 @@ impl TieredWatchRuntime {
             l1_watch_cost,
             l2_watch_cost,
             l3_watch_cost,
+            ephemeral_watch_cost,
+            ephemeral_watch_budget: self.ephemeral_watch_budget as usize,
+            ephemeral_watch_dirs,
+            ephemeral_watch_created: self.ephemeral_watch_created.load(Ordering::Relaxed),
+            ephemeral_watch_expired: self.ephemeral_watch_expired.load(Ordering::Relaxed),
+            ephemeral_watch_evicted: self.ephemeral_watch_evicted.load(Ordering::Relaxed),
+            ephemeral_watch_budget_blocked: self
+                .ephemeral_watch_budget_blocked
+                .load(Ordering::Relaxed),
             scan_backlog_by_tier,
             dirty_queue_len: 0,
             cold_validate_count: self.cold_validate_count.load(Ordering::Relaxed),
@@ -891,6 +1393,13 @@ impl TieredWatchRuntime {
         let mut l2_dirs = 0usize;
         let mut l3_dirs = 0usize;
         let mut total_event_score = 0u64;
+        let ephemeral_paths = self
+            .ephemeral
+            .read()
+            .values()
+            .filter(|lease| !lease.pending_remove)
+            .map(|lease| lease.path.clone())
+            .collect::<HashSet<_>>();
 
         for (path, state) in dirs.iter() {
             if let Some(ref prefix) = filter {
@@ -938,6 +1447,7 @@ impl TieredWatchRuntime {
                 budget_blocked_count,
                 last_budget_blocked_unix_secs,
                 high_priority_scan,
+                ephemeral_watch: ephemeral_paths.contains(path),
             });
         }
 
@@ -950,6 +1460,9 @@ impl TieredWatchRuntime {
                 l1_dirs,
                 l2_dirs,
                 l3_dirs,
+                ephemeral_watch_dirs: ephemeral_paths.len(),
+                ephemeral_watch_cost: self.current_ephemeral_watch_cost.load(Ordering::Relaxed),
+                ephemeral_watch_budget: self.ephemeral_watch_budget as usize,
                 total_event_score,
             },
         }
@@ -974,6 +1487,7 @@ pub struct TieredWatchDebugDir {
     pub budget_blocked_count: u32,
     pub last_budget_blocked_unix_secs: u64,
     pub high_priority_scan: bool,
+    pub ephemeral_watch: bool,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -982,6 +1496,9 @@ pub struct TieredWatchDebugSummary {
     pub l1_dirs: usize,
     pub l2_dirs: usize,
     pub l3_dirs: usize,
+    pub ephemeral_watch_dirs: usize,
+    pub ephemeral_watch_cost: u64,
+    pub ephemeral_watch_budget: usize,
     pub total_event_score: u64,
 }
 
@@ -993,6 +1510,48 @@ pub struct TieredWatchDebugDump {
 
 fn path_is_under_or_equal(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
+}
+
+fn path_has_component(path: &Path, component: &str) -> bool {
+    path.components()
+        .any(|part| part.as_os_str().to_string_lossy() == component)
+}
+
+fn choose_ephemeral_victim(
+    leases: &HashMap<PathBuf, EphemeralWatchLease>,
+    candidate: &Path,
+    candidate_cost: u64,
+    budget: u64,
+) -> Option<PathBuf> {
+    let current = leases
+        .values()
+        .map(|lease| lease.watch_cost)
+        .fold(0u64, u64::saturating_add);
+    let mut victims = leases
+        .iter()
+        .filter_map(|(path, lease)| {
+            if lease.pending_add || lease.pending_remove {
+                return None;
+            }
+            if path_is_under_or_equal(candidate, path) {
+                return None;
+            }
+            if current
+                .saturating_sub(lease.watch_cost)
+                .saturating_add(candidate_cost)
+                > budget
+            {
+                return None;
+            }
+            Some((
+                lease.value_score,
+                lease.last_event_unix_secs.load(Ordering::Relaxed),
+                path.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    victims.sort_by_key(|(score, last_event, path)| (*score, *last_event, path.clone()));
+    victims.into_iter().next().map(|(_, _, path)| path)
 }
 
 fn unix_secs() -> u64 {
@@ -1650,5 +2209,178 @@ mod tests {
         );
         let report = rt.report();
         assert_eq!(report.promotion_budget_blocked, 1);
+    }
+
+    #[test]
+    fn ephemeral_watch_created_after_repeated_dirty_scope() {
+        let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 4);
+        let cfg = EphemeralWatchConfig {
+            budget: 4,
+            repeat_window_secs: 10,
+            repeat_threshold: 2,
+            max_cost_per_root: 2,
+            ..EphemeralWatchConfig::default()
+        };
+        let dir = PathBuf::from("/tmp/cold");
+
+        assert_eq!(
+            rt.note_dirty_scope_at(dir.clone(), 2, &[], &cfg, 100, 1),
+            EphemeralWatchDecision::NotEligible
+        );
+        assert_eq!(
+            rt.note_dirty_scope_at(dir.clone(), 2, &[], &cfg, 105, 1),
+            EphemeralWatchDecision::Add(dir.clone())
+        );
+
+        let reserved = rt.report();
+        assert_eq!(reserved.ephemeral_watch_cost, 2);
+        assert_eq!(reserved.ephemeral_watch_dirs, 0);
+
+        rt.confirm_ephemeral_added(dir.as_path());
+        let report = rt.report();
+        assert_eq!(report.ephemeral_watch_dirs, 1);
+        assert_eq!(report.ephemeral_watch_created, 1);
+        assert_eq!(report.ephemeral_watch_budget_blocked, 0);
+    }
+
+    #[test]
+    fn ephemeral_watch_respects_exclude_l0_and_cost_limits() {
+        let rt = TieredWatchRuntime::new_with_ephemeral(
+            vec![(PathBuf::from("/tmp/hot"), 1)],
+            Vec::new(),
+            1,
+            5_000,
+            20,
+            4,
+        );
+        let cfg = EphemeralWatchConfig {
+            budget: 4,
+            repeat_threshold: 1,
+            max_cost_per_root: 2,
+            ..EphemeralWatchConfig::default()
+        };
+
+        assert_eq!(
+            rt.note_dirty_scope_at(PathBuf::from("/tmp/hot/leaf"), 1, &[], &cfg, 100, 1),
+            EphemeralWatchDecision::NotEligible
+        );
+        assert_eq!(
+            rt.note_dirty_scope_at(
+                PathBuf::from("/tmp/cold/node_modules/pkg"),
+                1,
+                &["node_modules".to_string()],
+                &cfg,
+                100,
+                1,
+            ),
+            EphemeralWatchDecision::NotEligible
+        );
+        assert_eq!(
+            rt.note_dirty_scope_at(PathBuf::from("/tmp/cold/too-large"), 3, &[], &cfg, 100, 1),
+            EphemeralWatchDecision::NotEligible
+        );
+
+        let report = rt.report();
+        assert_eq!(report.ephemeral_watch_cost, 0);
+        assert_eq!(report.ephemeral_watch_dirs, 0);
+    }
+
+    #[test]
+    fn ephemeral_watch_expires_for_idle_ttl_no_change_and_l0_cover() {
+        let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 10);
+        let cfg = EphemeralWatchConfig {
+            budget: 10,
+            repeat_threshold: 1,
+            max_cost_per_root: 2,
+            ..EphemeralWatchConfig::default()
+        };
+
+        let idle = PathBuf::from("/tmp/idle");
+        assert_eq!(
+            rt.note_dirty_scope_at(idle.clone(), 1, &[], &cfg, 100, 1),
+            EphemeralWatchDecision::Add(idle.clone())
+        );
+        rt.confirm_ephemeral_added(idle.as_path());
+        let removals = rt.expire_ephemeral_watches_at(130, 20, 100, 3);
+        assert_eq!(removals.len(), 1);
+        assert_eq!(removals[0].path, idle);
+        assert_eq!(removals[0].reason, EphemeralWatchExpiry::Idle);
+        rt.confirm_ephemeral_removed(removals[0].path.as_path());
+
+        let ttl = PathBuf::from("/tmp/ttl");
+        assert_eq!(
+            rt.note_dirty_scope_at(ttl.clone(), 1, &[], &cfg, 200, 1),
+            EphemeralWatchDecision::Add(ttl.clone())
+        );
+        rt.confirm_ephemeral_added(ttl.as_path());
+        let removals = rt.expire_ephemeral_watches_at(260, 100, 50, 3);
+        assert_eq!(removals[0].reason, EphemeralWatchExpiry::Ttl);
+        rt.confirm_ephemeral_removed(removals[0].path.as_path());
+
+        let quiet = PathBuf::from("/tmp/quiet");
+        assert_eq!(
+            rt.note_dirty_scope_at(quiet.clone(), 1, &[], &cfg, 300, 0),
+            EphemeralWatchDecision::Add(quiet.clone())
+        );
+        rt.confirm_ephemeral_added(quiet.as_path());
+        rt.record_dirty_scope_repeat(quiet.as_path(), 0, &cfg);
+        rt.record_dirty_scope_repeat(quiet.as_path(), 0, &cfg);
+        let removals = rt.expire_ephemeral_watches_at(301, 100, 100, 2);
+        assert_eq!(removals[0].reason, EphemeralWatchExpiry::NoChange);
+        rt.confirm_ephemeral_removed(removals[0].path.as_path());
+
+        let covered = PathBuf::from("/workspace/project");
+        assert_eq!(
+            rt.note_dirty_scope_at(covered.clone(), 1, &[], &cfg, 400, 1),
+            EphemeralWatchDecision::Add(covered.clone())
+        );
+        rt.confirm_ephemeral_added(covered.as_path());
+        let l0 = PathBuf::from("/workspace");
+        assert_eq!(
+            rt.register_dynamic_candidate(l0.clone(), 1),
+            PromotionDecision::SendAdd
+        );
+        rt.confirm_promoted(l0.as_path());
+        let removals = rt.expire_ephemeral_watches_at(401, 100, 100, 3);
+        assert_eq!(removals[0].reason, EphemeralWatchExpiry::CoveredByL0);
+    }
+
+    #[test]
+    fn ephemeral_budget_replaces_low_value_lease_and_rolls_back() {
+        let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 2);
+        let cfg = EphemeralWatchConfig {
+            budget: 2,
+            repeat_threshold: 1,
+            max_cost_per_root: 1,
+            ..EphemeralWatchConfig::default()
+        };
+        let old = PathBuf::from("/tmp/old");
+        let new = PathBuf::from("/tmp/new");
+
+        assert_eq!(
+            rt.note_dirty_scope_at(old.clone(), 1, &[], &cfg, 100, 0),
+            EphemeralWatchDecision::Add(old.clone())
+        );
+        rt.confirm_ephemeral_added(old.as_path());
+        assert_eq!(
+            rt.note_dirty_scope_at(PathBuf::from("/tmp/other"), 1, &[], &cfg, 101, 0),
+            EphemeralWatchDecision::Add(PathBuf::from("/tmp/other"))
+        );
+
+        assert_eq!(
+            rt.note_dirty_scope_at(new.clone(), 1, &[], &cfg, 102, 10),
+            EphemeralWatchDecision::Replace {
+                remove: old.clone(),
+                add: new.clone(),
+            }
+        );
+        let replaced = rt.report();
+        assert_eq!(replaced.ephemeral_watch_cost, 2);
+        assert_eq!(replaced.ephemeral_watch_evicted, 1);
+
+        rt.rollback_ephemeral_replace(old.as_path(), new.as_path());
+        let rolled_back = rt.report();
+        assert_eq!(rolled_back.ephemeral_watch_cost, 2);
+        assert_eq!(rolled_back.ephemeral_watch_dirs, 1);
     }
 }
