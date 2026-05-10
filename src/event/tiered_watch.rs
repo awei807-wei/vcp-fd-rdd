@@ -956,6 +956,7 @@ impl TieredWatchRuntime {
         Some(target)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_scan_policy(
         &self,
         path: &Path,
@@ -1056,29 +1057,27 @@ impl TieredWatchRuntime {
 
         if reserved {
             PromotionDecision::SendAdd
-        } else {
-            if let Some(victim) = self.reserve_by_replacing_cold_l0(path, cost) {
-                PromotionDecision::Replace {
-                    demote: victim,
-                    promote: path.to_path_buf(),
-                }
-            } else {
-                let now = unix_secs();
-                state.promotion_pending.store(false, Ordering::Release);
-                let blocked_count = state
-                    .budget_blocked_count
-                    .fetch_add(1, Ordering::Relaxed)
-                    .saturating_add(1);
-                state
-                    .last_budget_blocked_unix_secs
-                    .store(now, Ordering::Relaxed);
-                if blocked_count > 1 {
-                    state.high_priority_scan.store(true, Ordering::Relaxed);
-                }
-                self.promotion_budget_blocked
-                    .fetch_add(1, Ordering::Relaxed);
-                PromotionDecision::BudgetBlocked
+        } else if let Some(victim) = self.reserve_by_replacing_cold_l0(path, cost) {
+            PromotionDecision::Replace {
+                demote: victim,
+                promote: path.to_path_buf(),
             }
+        } else {
+            let now = unix_secs();
+            state.promotion_pending.store(false, Ordering::Release);
+            let blocked_count = state
+                .budget_blocked_count
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            state
+                .last_budget_blocked_unix_secs
+                .store(now, Ordering::Relaxed);
+            if blocked_count > 1 {
+                state.high_priority_scan.store(true, Ordering::Relaxed);
+            }
+            self.promotion_budget_blocked
+                .fetch_add(1, Ordering::Relaxed);
+            PromotionDecision::BudgetBlocked
         }
     }
 

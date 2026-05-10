@@ -220,7 +220,7 @@ fn choose_parent(
         }
         WorkloadProfile::Dormant => {
             if rng.bool(0.65) {
-                rng.usize_range(0, next_id.min(64).max(1))
+                rng.usize_range(0, next_id.clamp(1, 64))
             } else {
                 rng.usize_range(0, next_id)
             }

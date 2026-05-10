@@ -54,6 +54,7 @@ pub struct StrategyCounters {
     pub final_l3_dirs: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn summarize(
     policy: &PolicyParams,
     detected_latencies: &[u64],

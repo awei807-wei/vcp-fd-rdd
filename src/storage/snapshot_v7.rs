@@ -435,7 +435,7 @@ impl RawPathTableLayout {
         })
     }
 
-    fn suffix<'a>(self, bytes: &'a [u8], slot: RawPathTableSlot) -> Option<&'a [u8]> {
+    fn suffix(self, bytes: &[u8], slot: RawPathTableSlot) -> Option<&[u8]> {
         let start = self.suffix_start.checked_add(slot.suffix_offset)?;
         let end = start.checked_add(slot.suffix_len)?;
         bytes.get(start..end)
@@ -463,14 +463,14 @@ enum V7PathResolver<'a> {
 impl V7PathResolver<'_> {
     fn resolve(&self, idx: u32) -> Option<Vec<u8>> {
         match self {
-            Self::Raw { bytes, layout } => resolve_raw_path(*bytes, *layout, idx),
+            Self::Raw { bytes, layout } => resolve_raw_path(bytes, *layout, idx),
             Self::Decoded(table) => table.resolve(idx),
         }
     }
 
     fn lookup(&self, target: &[u8]) -> Option<u32> {
         match self {
-            Self::Raw { bytes, layout } => lookup_raw_path(*bytes, *layout, target),
+            Self::Raw { bytes, layout } => lookup_raw_path(bytes, *layout, target),
             Self::Decoded(table) => table.lookup(target),
         }
     }

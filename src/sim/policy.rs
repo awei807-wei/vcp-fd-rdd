@@ -162,6 +162,16 @@ pub struct DirPolicyState {
     pub last_event_at: u64,
 }
 
+pub fn initial_l0_candidates(world: &World, policy: &PolicyParams) -> Vec<usize> {
+    let mut scored = world
+        .dirs
+        .iter()
+        .map(|dir| (policy.initial_score(dir), dir.id))
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, id)| id).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,14 +203,4 @@ mod tests {
         .sanitize();
         assert_eq!(SimTier::L3.scan_interval_secs(&disabled), u64::MAX);
     }
-}
-
-pub fn initial_l0_candidates(world: &World, policy: &PolicyParams) -> Vec<usize> {
-    let mut scored = world
-        .dirs
-        .iter()
-        .map(|dir| (policy.initial_score(dir), dir.id))
-        .collect::<Vec<_>>();
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, id)| id).collect()
 }

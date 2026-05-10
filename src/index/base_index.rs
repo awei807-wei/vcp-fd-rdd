@@ -178,8 +178,8 @@ impl ColdSegment {
         self.snapshot.get_meta(key).ok().flatten()
     }
 
-    fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
-        match self.snapshot.for_each_live_meta(|meta| f(meta)) {
+    fn for_each_live_meta(&self, f: impl FnMut(FileMeta)) {
+        match self.snapshot.for_each_live_meta(f) {
             Ok(()) => {}
             Err(e) => tracing::warn!(
                 "cold segment mmap metadata scan failed for {}: {}",
@@ -257,7 +257,7 @@ impl ColdSegmentStore {
 
     fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
         for segment in &self.segments {
-            segment.for_each_live_meta(|meta| f(meta));
+            segment.for_each_live_meta(&mut f);
         }
     }
 

@@ -66,6 +66,13 @@ api_search_json() {
   curl -fsS -G "${BASE_URL%/}/search" --data-urlencode "q=$q" "$@"
 }
 
+api_search_status() {
+  local q="$1"
+  shift
+  curl -sS -o /dev/null -w "%{http_code}" -G "${BASE_URL%/}/search" \
+    --data-urlencode "q=$q" "$@"
+}
+
 api_scan_json() {
   local path="$1"
   jq -nc --arg path "$path" '{paths:[$path]}' \
@@ -127,23 +134,18 @@ printf '0123456789abcdef\n' > "$BASE_DIR/media/十一_${RUN_ID}.jpg"
 printf '0123456789abcdef\n' > "$BASE_DIR/media/十一_${RUN_ID}.png"
 printf '0123456789abcdef\n' > "$BASE_DIR/media/十一_${RUN_ID}.txt"
 
-# 6) size:
-mkdir -p "$BASE_DIR/size"
-printf '123456789' > "$BASE_DIR/size/small_${RUN_ID}.bin"     # 9B
-printf '1234567890' > "$BASE_DIR/size/big_${RUN_ID}.bin"      # 10B
-
-# 7) dm:
+# 6) dm:
 mkdir -p "$BASE_DIR/dm"
 printf '0123456789abcdef\n' > "$BASE_DIR/dm/today_${RUN_ID}.txt"
 printf '0123456789abcdef\n' > "$BASE_DIR/dm/old_${RUN_ID}.txt"
 touch -d '2000-01-01 00:00:00' "$BASE_DIR/dm/old_${RUN_ID}.txt" 2>/dev/null || true
 
-# 8) regex:
+# 7) regex:
 mkdir -p "$BASE_DIR/regex"
 printf 'console.log(\"plugin\");\n' > "$BASE_DIR/regex/VCP${RUN_ID}Plugin.js"
 printf 'console.log(\"tool\");\n' > "$BASE_DIR/regex/VCP${RUN_ID}Tool.ts"
 
-# 9) additional coverage: parent/infolder/depth/len/type/fuzzy/sort/highlights/initials/CJK
+# 8) additional coverage: parent/infolder/depth/len/type/fuzzy/sort/highlights/initials/CJK
 mkdir -p "$BASE_DIR/filter_parent/target_parent" "$BASE_DIR/filter_parent/other_parent"
 printf 'parent match\n' > "$BASE_DIR/filter_parent/target_parent/parent_probe_${RUN_ID}.txt"
 printf 'other parent\n' > "$BASE_DIR/filter_parent/other_parent/parent_probe_${RUN_ID}.txt"
@@ -248,9 +250,8 @@ assert_has "$out" "media/十一_${RUN_ID}.jpg" "pic: 应命中 jpg"
 assert_has "$out" "media/十一_${RUN_ID}.png" "pic: 应命中 png"
 assert_not_has "$out" "media/十一_${RUN_ID}.txt" "pic: 不应命中 txt"
 
-out="$(api_search_paths "size:<10b small_${RUN_ID}")"
-assert_has "$out" "size/small_${RUN_ID}.bin" "size:<10b 应命中 9B"
-assert_not_has "$out" "size/big_${RUN_ID}.bin" "size:<10b 不应命中 10B"
+status="$(api_search_status "size:<10b")"
+[[ "$status" == "400" ]] || fail "size: 已移除，应返回 HTTP 400（实际 $status）"
 
 out="$(api_search_paths "dm:today today_${RUN_ID}")"
 assert_has "$out" "dm/today_${RUN_ID}.txt" "dm:today 应命中 today"
@@ -298,8 +299,8 @@ assert_has "$out" "segment/client/user/search/initials_probe_${RUN_ID}.txt" "路
 json="$(api_search_json "maindoctarget" --data-urlencode "mode=fuzzy" --data-urlencode "limit=200")"
 assert_json_expr "$json" ". | map(.path) | any(contains(\"main_document_target_${RUN_ID}.txt\"))" "mode=fuzzy 应命中文件"
 
-json="$(api_search_json "sortprobe" --data-urlencode "sort=size" --data-urlencode "order=desc" --data-urlencode "limit=20")"
-assert_json_expr "$json" ".[0].path | contains(\"sortprobe_large_${RUN_ID}.txt\")" "sort=size&order=desc 首项应为大文件"
+status="$(api_search_status "sortprobe" --data-urlencode "sort=size" --data-urlencode "order=desc" --data-urlencode "limit=20")"
+[[ "$status" == "400" ]] || fail "sort=size 已移除，应返回 HTTP 400（实际 $status）"
 
 json="$(api_search_json "highlightprobe_${RUN_ID}" --data-urlencode "limit=20")"
 assert_json_expr "$json" ".[0].highlights | length > 0" "搜索结果应返回 highlights"
