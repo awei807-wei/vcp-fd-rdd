@@ -19,7 +19,8 @@ use crate::util::pathbuf_from_encoded_vec;
 // ─────────────────────────────────────────────────────────────────────────────
 
 const V7_MAGIC: [u8; 8] = *b"FDRDDv7\0";
-const V7_VERSION: u32 = 1;
+const V7_VERSION_LEGACY_40B_ENTRY: u32 = 1;
+const V7_VERSION: u32 = 2;
 const V7_TRAILER_MAGIC: [u8; 8] = *b"TRAILv7\0";
 
 /// Header: 64 字节，固定大小，对齐到 8 字节。
@@ -42,6 +43,7 @@ const V7_HEADER_SIZE: usize = 64;
 ///   trailer_magic  [u8; 8]
 const V7_TRAILER_FIXED_SIZE: usize = 4 + 4 + 4 + 4 + 8 + 8;
 const FILE_ENTRY_REC_SIZE: usize = 8 + 8 + 4 + 4 + 8;
+const LEGACY_FILE_ENTRY_REC_SIZE: usize = 8 + 8 + 4 + 4 + 8 + 8;
 const RAW_PATH_TABLE_MAGIC: &[u8; 8] = b"PTV2raw\0";
 const RAW_PATH_TABLE_HEADER_SIZE: usize = 8 + 4 * 4;
 const RAW_PATH_TABLE_SLOT_SIZE: usize = 12;
@@ -124,12 +126,31 @@ fn encode_file_entry_index(fei: &FileEntryIndex) -> Vec<u8> {
     out
 }
 
-fn decode_file_entry_index(bytes: &[u8]) -> anyhow::Result<FileEntryIndex> {
+#[cfg(test)]
+fn encode_file_entry_index_legacy_40b(fei: &FileEntryIndex) -> Vec<u8> {
+    let mut out = Vec::new();
+    let len = fei.len() as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    for i in 0..fei.len() {
+        if let Some(e) = fei.get(i) {
+            out.extend_from_slice(&e.dev.to_le_bytes());
+            out.extend_from_slice(&e.ino.to_le_bytes());
+            out.extend_from_slice(&e.generation.to_le_bytes());
+            out.extend_from_slice(&e.path_idx.to_le_bytes());
+            out.extend_from_slice(&e.mtime_ns.to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes());
+        }
+    }
+    out
+}
+
+fn decode_file_entry_index(bytes: &[u8], snapshot_version: u32) -> anyhow::Result<FileEntryIndex> {
     if bytes.len() < 4 {
         anyhow::bail!("file entry index too small");
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
-    let expected = 4 + count * FILE_ENTRY_REC_SIZE;
+    let rec_size = file_entry_rec_size(snapshot_version)?;
+    let expected = 4 + count * rec_size;
     if bytes.len() < expected {
         anyhow::bail!("file entry index truncated");
     }
@@ -141,7 +162,7 @@ fn decode_file_entry_index(bytes: &[u8]) -> anyhow::Result<FileEntryIndex> {
         let generation = u32::from_le_bytes(bytes[off + 16..off + 20].try_into()?);
         let path_idx = u32::from_le_bytes(bytes[off + 20..off + 24].try_into()?);
         let mtime_ns = i64::from_le_bytes(bytes[off + 24..off + 32].try_into()?);
-        off += FILE_ENTRY_REC_SIZE;
+        off += rec_size;
 
         fei.push(FileEntry::from_file_key(
             crate::core::FileKey {
@@ -498,20 +519,30 @@ fn read_u32(bytes: &[u8], off: &mut usize) -> Option<u32> {
     Some(value)
 }
 
-fn entry_count_from_segment(bytes: &[u8]) -> Option<usize> {
+fn file_entry_rec_size(snapshot_version: u32) -> anyhow::Result<usize> {
+    match snapshot_version {
+        V7_VERSION => Ok(FILE_ENTRY_REC_SIZE),
+        V7_VERSION_LEGACY_40B_ENTRY => Ok(LEGACY_FILE_ENTRY_REC_SIZE),
+        version => anyhow::bail!("unsupported v7 snapshot version {}", version),
+    }
+}
+
+fn entry_count_from_segment(bytes: &[u8], snapshot_version: u32) -> Option<usize> {
     let mut off = 0usize;
     let count = read_u32(bytes, &mut off)? as usize;
-    let expected = 4usize.checked_add(count.checked_mul(FILE_ENTRY_REC_SIZE)?)?;
+    let rec_size = file_entry_rec_size(snapshot_version).ok()?;
+    let expected = 4usize.checked_add(count.checked_mul(rec_size)?)?;
     (expected <= bytes.len()).then_some(count)
 }
 
-fn file_entry_at(bytes: &[u8], docid: u32) -> Option<FileEntry> {
-    let count = entry_count_from_segment(bytes)?;
+fn file_entry_at(bytes: &[u8], snapshot_version: u32, docid: u32) -> Option<FileEntry> {
+    let count = entry_count_from_segment(bytes, snapshot_version)?;
     let docid_usize = docid as usize;
     if docid_usize >= count {
         return None;
     }
-    let off = 4 + docid_usize * FILE_ENTRY_REC_SIZE;
+    let rec_size = file_entry_rec_size(snapshot_version).ok()?;
+    let off = 4 + docid_usize * rec_size;
     Some(FileEntry {
         dev: u64::from_le_bytes(bytes.get(off..off + 8)?.try_into().ok()?),
         ino: u64::from_le_bytes(bytes.get(off + 8..off + 16)?.try_into().ok()?),
@@ -597,10 +628,14 @@ fn parent_posting(bytes: &[u8], parent_idx: u32) -> anyhow::Result<Option<Roarin
 // Header / Trailer 编解码
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn encode_header(num_segments: u32, header_crc: u32) -> [u8; V7_HEADER_SIZE] {
+fn encode_header_with_version(
+    num_segments: u32,
+    header_crc: u32,
+    version: u32,
+) -> [u8; V7_HEADER_SIZE] {
     let mut buf = [0u8; V7_HEADER_SIZE];
     buf[0..8].copy_from_slice(&V7_MAGIC);
-    buf[8..12].copy_from_slice(&V7_VERSION.to_le_bytes());
+    buf[8..12].copy_from_slice(&version.to_le_bytes());
     buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // flags
     buf[16..20].copy_from_slice(&num_segments.to_le_bytes());
     buf[20..24].copy_from_slice(&header_crc.to_le_bytes());
@@ -609,17 +644,17 @@ fn encode_header(num_segments: u32, header_crc: u32) -> [u8; V7_HEADER_SIZE] {
     buf
 }
 
-fn decode_header(buf: &[u8; V7_HEADER_SIZE]) -> Option<(u32, u32)> {
+fn decode_header(buf: &[u8; V7_HEADER_SIZE]) -> Option<(u32, u32, u32)> {
     if buf[0..8] != V7_MAGIC {
         return None;
     }
     let version = u32::from_le_bytes(buf[8..12].try_into().ok()?);
-    if version != V7_VERSION {
+    if version != V7_VERSION && version != V7_VERSION_LEGACY_40B_ENTRY {
         return None;
     }
     let num_segments = u32::from_le_bytes(buf[16..20].try_into().ok()?);
     let header_crc = u32::from_le_bytes(buf[20..24].try_into().ok()?);
-    Some((num_segments, header_crc))
+    Some((version, num_segments, header_crc))
 }
 
 fn compute_header_crc(buf: &[u8; V7_HEADER_SIZE]) -> u32 {
@@ -733,6 +768,7 @@ impl V7Trailer {
 pub struct V7Snapshot {
     mmap: Arc<Mmap>,
     segments: Vec<(V7SegKind, std::ops::Range<usize>)>,
+    version: u32,
 }
 
 impl V7Snapshot {
@@ -820,7 +856,7 @@ impl V7Snapshot {
                 if tombstones.contains(docid) {
                     continue;
                 }
-                let Some(entry) = file_entry_at(entries, docid) else {
+                let Some(entry) = file_entry_at(entries, self.version, docid) else {
                     continue;
                 };
                 let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
@@ -836,13 +872,13 @@ impl V7Snapshot {
             return Ok(out);
         }
 
-        let count = entry_count_from_segment(entries).unwrap_or(0);
+        let count = entry_count_from_segment(entries, self.version).unwrap_or(0);
         for docid in 0..count {
             let docid = docid as u32;
             if tombstones.contains(docid) {
                 continue;
             }
-            let Some(entry) = file_entry_at(entries, docid) else {
+            let Some(entry) = file_entry_at(entries, self.version, docid) else {
                 continue;
             };
             let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
@@ -865,14 +901,14 @@ impl V7Snapshot {
         };
         let resolver = self.path_resolver()?;
         let tombstones = self.tombstones()?;
-        let count = entry_count_from_segment(entries).unwrap_or(0);
+        let count = entry_count_from_segment(entries, self.version).unwrap_or(0);
 
         for docid in 0..count {
             let docid = docid as u32;
             if tombstones.contains(docid) {
                 continue;
             }
-            let Some(entry) = file_entry_at(entries, docid) else {
+            let Some(entry) = file_entry_at(entries, self.version, docid) else {
                 continue;
             };
             if entry.file_key() != key {
@@ -896,14 +932,14 @@ impl V7Snapshot {
             return Ok(());
         };
         let tombstones = self.tombstones()?;
-        let count = entry_count_from_segment(entries).unwrap_or(0);
+        let count = entry_count_from_segment(entries, self.version).unwrap_or(0);
 
         for docid in 0..count {
             let docid = docid as u32;
             if tombstones.contains(docid) {
                 continue;
             }
-            let Some(entry) = file_entry_at(entries, docid) else {
+            let Some(entry) = file_entry_at(entries, self.version, docid) else {
                 continue;
             };
             let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
@@ -945,7 +981,7 @@ impl V7Snapshot {
             if tombstones.contains(docid) {
                 continue;
             }
-            if let Some(entry) = file_entry_at(entries, docid) {
+            if let Some(entry) = file_entry_at(entries, self.version, docid) {
                 out.push(entry.file_key());
             }
         }
@@ -961,7 +997,7 @@ impl V7Snapshot {
             .unwrap_or_default();
         let entries_by_key = self
             .segment(V7SegKind::EntriesByKey)
-            .map(decode_file_entry_index)
+            .map(|bytes| decode_file_entry_index(bytes, self.version))
             .transpose()?
             .unwrap_or_default();
         let trigram_index = self
@@ -1012,7 +1048,7 @@ pub fn load_v7_from_path(path: &Path) -> anyhow::Result<Option<V7Snapshot>> {
         return Ok(None);
     }
     let header_buf: [u8; V7_HEADER_SIZE] = bytes[0..V7_HEADER_SIZE].try_into()?;
-    let (num_segments, header_crc) =
+    let (version, num_segments, header_crc) =
         decode_header(&header_buf).ok_or_else(|| anyhow::anyhow!("v7 header decode failed"))?;
     if compute_header_crc(&header_buf) != header_crc {
         tracing::warn!("v7 header crc mismatch, ignoring");
@@ -1078,6 +1114,7 @@ pub fn load_v7_from_path(path: &Path) -> anyhow::Result<Option<V7Snapshot>> {
     Ok(Some(V7Snapshot {
         mmap: Arc::new(mmap),
         segments,
+        version,
     }))
 }
 
@@ -1148,9 +1185,45 @@ fn write_v7_snapshot_atomic_legacy_trigram(
     write_v7_segments_atomic(path, segments_bytes)
 }
 
+#[cfg(test)]
+fn write_v7_snapshot_atomic_legacy_40b_entry(
+    path: &Path,
+    data: &BaseIndexData,
+) -> anyhow::Result<()> {
+    let segments_bytes: Vec<(V7SegKind, Vec<u8>)> = vec![
+        (V7SegKind::PathTable, encode_path_table(&data.path_table)),
+        (
+            V7SegKind::EntriesByKey,
+            encode_file_entry_index_legacy_40b(&data.entries_by_key),
+        ),
+        (
+            V7SegKind::EntriesByPath,
+            encode_file_entry_index_legacy_40b(&data.entries_by_key),
+        ),
+        (
+            V7SegKind::TrigramIndex,
+            encode_full_path_trigram_index(data),
+        ),
+        (
+            V7SegKind::ParentIndex,
+            encode_parent_index(&data.parent_index),
+        ),
+        (V7SegKind::Tombstones, encode_tombstones(&data.tombstones)),
+    ];
+    write_v7_segments_atomic_with_version(path, segments_bytes, V7_VERSION_LEGACY_40B_ENTRY)
+}
+
 fn write_v7_segments_atomic(
     path: &Path,
     segments_bytes: Vec<(V7SegKind, Vec<u8>)>,
+) -> anyhow::Result<()> {
+    write_v7_segments_atomic_with_version(path, segments_bytes, V7_VERSION)
+}
+
+fn write_v7_segments_atomic_with_version(
+    path: &Path,
+    segments_bytes: Vec<(V7SegKind, Vec<u8>)>,
+    version: u32,
 ) -> anyhow::Result<()> {
     let num_segments = segments_bytes.len() as u32;
     let mut seg_descs: Vec<V7SegDesc> = Vec::with_capacity(segments_bytes.len());
@@ -1190,7 +1263,7 @@ fn write_v7_segments_atomic(
         let mut file = std::fs::File::create(&tmp_path)?;
 
         // Header（先占位，crc 后填）
-        let mut header_buf = encode_header(num_segments, 0);
+        let mut header_buf = encode_header_with_version(num_segments, 0, version);
         file.write_all(&header_buf)?;
 
         // Segments
@@ -1215,7 +1288,7 @@ fn write_v7_segments_atomic(
 
         // 回填 header crc
         let header_crc = compute_header_crc(&header_buf);
-        header_buf = encode_header(num_segments, header_crc);
+        header_buf = encode_header_with_version(num_segments, header_crc, version);
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&header_buf)?;
 
@@ -1446,6 +1519,46 @@ mod tests {
 
         assert_eq!(decoded.entries_by_key.len(), 1);
         assert!(decoded.tombstones.contains(42));
+    }
+
+    #[test]
+    fn v7_writes_version_2_and_loads_legacy_40b_entries() {
+        let path = tmp_v7_path("legacy-40b-entry");
+        let key = FileKey {
+            dev: 9,
+            ino: 77,
+            generation: 3,
+        };
+        let mut paths = PathTableBuilder::new();
+        paths.push(0, b"/tmp/legacy-size-entry.txt");
+        let mut entries = FileEntryIndex::new();
+        entries.push(FileEntry::from_file_key(key, 0, 456));
+        let data = BaseIndexData {
+            path_table: paths.build(),
+            entries_by_key: entries.build(),
+            ..BaseIndexData::default()
+        };
+
+        write_v7_snapshot_atomic(&path, &data).unwrap();
+        let header = std::fs::read(&path).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(header[8..12].try_into().unwrap()),
+            V7_VERSION
+        );
+
+        write_v7_snapshot_atomic_legacy_40b_entry(&path, &data).unwrap();
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+        let decoded = loaded.to_base_index_data().unwrap();
+        let entry = decoded.entries_by_key.get(0).unwrap();
+        assert_eq!(entry.file_key(), key);
+        assert_eq!(entry.path_idx, 0);
+        assert_eq!(entry.mtime_ns, 456);
+
+        let meta = loaded.get_meta(key).unwrap().unwrap();
+        assert_eq!(meta.path, PathBuf::from("/tmp/legacy-size-entry.txt"));
+        assert_eq!(meta.size, 0);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

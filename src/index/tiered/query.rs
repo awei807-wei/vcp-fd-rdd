@@ -5,7 +5,7 @@ use crate::event::sync::DirtyReason;
 use crate::index::base_index::BaseIndexData;
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
 use crate::index::IndexLayer;
-use crate::query::dsl::compile_query;
+use crate::query::dsl::{compile_query, QueryCompileError};
 use crate::query::matcher::create_matcher;
 
 use super::arena::{path_deleted_by_any, PathArenaSet};
@@ -26,10 +26,46 @@ impl TieredIndex {
             .collect()
     }
 
+    /// 严格查询入口：DSL 编译失败时返回错误，供公开 API 拒绝非法过滤器。
+    pub fn query_limit_strict(
+        &self,
+        keyword: &str,
+        limit: usize,
+    ) -> Result<Vec<FileMeta>, QueryCompileError> {
+        self.query_limit_detailed_strict(keyword, limit)
+            .map(|results| results.into_iter().map(|r| r.meta).collect())
+    }
+
     /// 查询入口（带冷层校验元数据）：HTTP/API 使用它返回 result freshness 与 index tier。
     pub fn query_limit_detailed(&self, keyword: &str, limit: usize) -> Vec<QueryResultMeta> {
+        self.query_limit_detailed_legacy(keyword, limit)
+    }
+
+    /// 查询入口（严格 DSL）：编译失败时不回退到 legacy 文本匹配。
+    pub fn query_limit_detailed_strict(
+        &self,
+        keyword: &str,
+        limit: usize,
+    ) -> Result<Vec<QueryResultMeta>, QueryCompileError> {
+        self.query_limit_detailed_inner(keyword, limit, true)
+    }
+
+    fn query_limit_detailed_legacy(&self, keyword: &str, limit: usize) -> Vec<QueryResultMeta> {
+        self.query_limit_detailed_inner(keyword, limit, false)
+            .unwrap_or_else(|e| {
+                tracing::warn!("query failed unexpectedly, returning empty result: {}", e);
+                Vec::new()
+            })
+    }
+
+    fn query_limit_detailed_inner(
+        &self,
+        keyword: &str,
+        limit: usize,
+        strict: bool,
+    ) -> Result<Vec<QueryResultMeta>, QueryCompileError> {
         if limit == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         if self.base.load().file_count() == 0
@@ -46,17 +82,20 @@ impl TieredIndex {
                     "query dsl compile failed, fallback to legacy matcher: {}",
                     e
                 );
+                if strict || is_removed_size_filter_error(&e) {
+                    return Err(e);
+                }
                 let case_sensitive =
                     keyword.contains("case:") || keyword.chars().any(|c| c.is_uppercase());
                 let matcher = create_matcher(keyword, case_sensitive);
 
                 if let Some(results) = self.l1.query(matcher.as_ref()) {
                     tracing::debug!("L1 hit: {} results", results.len());
-                    return results
+                    return Ok(results
                         .into_iter()
                         .take(limit)
                         .map(QueryResultMeta::hot)
-                        .collect();
+                        .collect());
                 }
 
                 QueryPlan::legacy(matcher)
@@ -69,12 +108,12 @@ impl TieredIndex {
             for meta in results.iter().take(10) {
                 self.l1.insert(meta.meta.clone());
             }
-            return results;
+            return Ok(results);
         }
 
         self.l2.load_full().maybe_schedule_repair();
         self.enqueue_query_miss(keyword);
-        Vec::new()
+        Ok(Vec::new())
     }
 
     pub(crate) fn annotate_query_results(&self, metas: Vec<FileMeta>) -> Vec<QueryResultMeta> {
@@ -522,6 +561,14 @@ impl TieredIndex {
         self.enqueue_dirty_dirs(dirs, DirtyReason::QueryMiss);
         tracing::debug!("query miss enqueued dirty compensation for {}", keyword);
     }
+}
+
+fn is_removed_size_filter_error(err: &QueryCompileError) -> bool {
+    matches!(
+        err,
+        QueryCompileError::Filter(message)
+            if message.contains("size: is no longer supported")
+    )
 }
 
 fn query_miss_path_candidate(keyword: &str) -> Option<std::path::PathBuf> {

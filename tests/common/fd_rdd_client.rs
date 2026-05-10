@@ -17,8 +17,6 @@ pub struct SearchResult {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
-    pub size: u64,
-    #[serde(default)]
     pub score: i64,
     #[serde(default)]
     pub highlights: Vec<[usize; 2]>,

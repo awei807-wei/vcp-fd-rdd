@@ -183,7 +183,7 @@ curl "http://127.0.0.1:6060/search?q=mdt&mode=fuzzy&limit=20"
 fd-rdd-query --limit 2000 "*.rs"
 ```
 
-HTTP `/search` 返回每条结果的 `score`、`highlights`，以及冷层校验语义：`freshness`（如 `fresh` / `stale_checked` / `changed`）、`index_tier`（如 `HotMemory` / `ColdMmap`）和 `validated`。当冷层/base 命中已删除时，查询会写入 tombstone 并屏蔽旧结果；当文件 mtime 或身份变化时，会把命中父目录加入 DirtyQueue，由后台补偿调度做局部补扫。
+HTTP `/search` 返回每条结果的 `path`、`score`、`highlights`，以及冷层校验语义：`freshness`（如 `fresh` / `stale_checked` / `changed`）、`index_tier`（如 `HotMemory` / `ColdMmap`）和 `validated`。响应不再包含 `size` 字段。当冷层/base 命中已删除时，查询会写入 tombstone 并屏蔽旧结果；当文件 mtime 或身份变化时，会把命中父目录加入 DirtyQueue，由后台补偿调度做局部补扫。
 
 v7 快照启动时会挂载为 manifest-only 冷段：常驻内存只保留 segment manifest、路径 Bloom-style filter、mtime 范围和 dirty/freshness 状态；metadata/postings 不再 hydration 到 `BaseIndexData`，查询、metadata lookup 和 parent candidates 会直接从 mmap 段按需读取并返回 `index_tier = "FrozenManifestOnly"`。新写 v7 快照会持久化完整路径 trigram posting 与 `[0,0,0]` sentinel，使 mmap 查询可安全用 posting 判空；旧 basename-only 段或缺少 sentinel 的段会回退全段精确过滤，避免目录组件命中漏查。`/memory` 会拆出 `hot_memory_entries`、`manifest_only_entries`、`cold_segment_count`、`cold_manifest_bytes`、`cold_filter_bytes` 和 `cold_mmap_bytes`，用于证明冷层是降低索引驻留而不只是降低扫描频率。
 
@@ -330,7 +330,6 @@ fd-rdd --show-config
 |---|---|---|
 | `parent:` / `infolder:` | `parent:/home/user/Downloads` | 父目录匹配 |
 | `ext:` | `ext:rs;py` | 后缀过滤 |
-| `size:` | `size:>10mb` | 大小（b/kb/mb/gb） |
 | `dm:` / `dc:` / `da:` | `dm:today` / `dc:2024-01-01` | 修改/创建/访问日期 |
 | `depth:` | `depth:<=3` | 路径深度 |
 | `type:` | `type:file` | 文件类型 |
@@ -340,8 +339,10 @@ fd-rdd --show-config
 ### 排序
 
 ```
-sort=score | name | path | size | ext | date_modified | date_created | date_accessed
+sort=score | name | path | ext | date_modified | date_created | date_accessed
 ```
+
+`size:` 过滤器与 `sort=size` 已移除；HTTP `/search` 会对这些参数返回 400。
 
 ### Smart Case
 

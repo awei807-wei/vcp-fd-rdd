@@ -699,6 +699,9 @@ fn parse_atom_expr(word: &str, case_sensitive: &mut bool) -> Result<Expr, QueryC
             }
             Ok(Expr::Atom(Atom::Content(v)))
         }
+        Some("size") => Err(QueryCompileError::Filter(
+            "size: is no longer supported because file size is not stored in the index".into(),
+        )),
         Some("case") => {
             // 兼容 case: 出现在 split_prefix 分支；不进入 Expr
             if !tail.trim().is_empty() {
@@ -1156,6 +1159,15 @@ mod tests {
         assert!(q.matches(&m1));
         let m2 = meta("/a/十一.txt", 1, None);
         assert!(!q.matches(&m2));
+    }
+
+    #[test]
+    fn size_filter_is_rejected_not_text_matched() {
+        let err = match compile_query("size:>10mb") {
+            Ok(_) => panic!("size filter should be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("size: is no longer supported"));
     }
 
     #[test]

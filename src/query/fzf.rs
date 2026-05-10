@@ -48,14 +48,22 @@ pub enum SortColumn {
 
 impl SortColumn {
     pub fn parse(s: Option<&str>) -> Self {
+        Self::parse_strict(s).unwrap_or_default()
+    }
+
+    pub fn parse_strict(s: Option<&str>) -> Result<Self, String> {
         match s.map(str::trim).filter(|v| !v.is_empty()) {
-            Some("name") => Self::Name,
-            Some("path") => Self::Path,
-            Some("ext" | "extension") => Self::Ext,
-            Some("date_modified" | "dm" | "modified") => Self::DateModified,
-            Some("date_created" | "dc" | "created") => Self::DateCreated,
-            Some("date_accessed" | "da" | "accessed") => Self::DateAccessed,
-            _ => Self::Score,
+            None | Some("score") => Ok(Self::Score),
+            Some("name") => Ok(Self::Name),
+            Some("path") => Ok(Self::Path),
+            Some("ext" | "extension") => Ok(Self::Ext),
+            Some("date_modified" | "dm" | "modified") => Ok(Self::DateModified),
+            Some("date_created" | "dc" | "created") => Ok(Self::DateCreated),
+            Some("date_accessed" | "da" | "accessed") => Ok(Self::DateAccessed),
+            Some(value) => Err(format!(
+                "unsupported sort column {:?}; expected one of: score, name, path, ext, date_modified, date_created, date_accessed",
+                value
+            )),
         }
     }
 }
@@ -98,13 +106,29 @@ pub fn execute_query_with_metadata(
     sort: SortColumn,
     order: SortOrder,
 ) -> Vec<QueryResultMeta> {
+    execute_query_with_metadata_result(index, keyword, limit, mode, sort, order).unwrap_or_else(
+        |e| {
+            tracing::warn!("query execution failed, returning empty result: {}", e);
+            Vec::new()
+        },
+    )
+}
+
+pub fn execute_query_with_metadata_result(
+    index: &TieredIndex,
+    keyword: &str,
+    limit: usize,
+    mode: QueryMode,
+    sort: SortColumn,
+    order: SortOrder,
+) -> Result<Vec<QueryResultMeta>, crate::query::dsl::QueryCompileError> {
     let mut results = match mode {
-        QueryMode::Exact => index.query_limit_detailed(keyword, limit),
-        QueryMode::Fuzzy => FzfIntegration::new().query_index(index, keyword, limit),
+        QueryMode::Exact => index.query_limit_detailed_strict(keyword, limit)?,
+        QueryMode::Fuzzy => FzfIntegration::new().query_index_strict(index, keyword, limit)?,
     };
 
     sort_query_results(&mut results, keyword, sort, order);
-    results
+    Ok(results)
 }
 
 fn sort_query_results(
@@ -226,17 +250,30 @@ impl FzfIntegration {
         keyword: &str,
         limit: usize,
     ) -> Vec<QueryResultMeta> {
+        self.query_index_strict(index, keyword, limit)
+            .unwrap_or_else(|e| {
+                tracing::warn!("fuzzy query failed, returning empty result: {}", e);
+                Vec::new()
+            })
+    }
+
+    pub fn query_index_strict(
+        &self,
+        index: &TieredIndex,
+        keyword: &str,
+        limit: usize,
+    ) -> Result<Vec<QueryResultMeta>, crate::query::dsl::QueryCompileError> {
         if limit == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let keyword = keyword.trim();
         if keyword.is_empty() {
-            return index.query_limit_detailed(keyword, limit);
+            return index.query_limit_detailed_strict(keyword, limit);
         }
 
         let candidate_limit = fuzzy_candidate_limit(index.file_count(), limit);
-        let mut candidates = index.query_limit(keyword, candidate_limit);
+        let mut candidates = index.query_limit_strict(keyword, candidate_limit)?;
         if candidates.is_empty() {
             candidates = index.collect_all_live_metas();
         }
@@ -247,7 +284,7 @@ impl FzfIntegration {
             .take(limit)
             .map(|(meta, _)| meta)
             .collect();
-        index.annotate_query_results(metas)
+        Ok(index.annotate_query_results(metas))
     }
 }
 

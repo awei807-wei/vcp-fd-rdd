@@ -1,7 +1,7 @@
 use crate::event::tiered_watch::TieredWatchDebugDump;
 use crate::index::TieredIndex;
 use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
-use crate::query::{execute_query_with_metadata, QueryMode, SortColumn, SortOrder};
+use crate::query::{execute_query_with_metadata_result, QueryMode, SortColumn, SortOrder};
 use crate::stats::{EventPipelineStats, MemoryReport, StatsReport, WatchStateReport};
 use crate::util::maybe_trim_rss;
 use axum::{
@@ -250,13 +250,15 @@ async fn search_handler(
 
     let query_started = Instant::now();
     let kw_clone = keyword.clone();
-    let sort = SortColumn::parse(params.sort.as_deref());
+    let sort = SortColumn::parse_strict(params.sort.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let order = SortOrder::parse(params.order.as_deref());
     let search_task = tokio::task::spawn_blocking(move || {
-        execute_query_with_metadata(index.as_ref(), &kw_clone, limit, mode, sort, order)
+        execute_query_with_metadata_result(index.as_ref(), &kw_clone, limit, mode, sort, order)
     });
     let results = match tokio::time::timeout(state.config.query_timeout, search_task).await {
-        Ok(Ok(results)) => results,
+        Ok(Ok(Ok(results))) => results,
+        Ok(Ok(Err(e))) => return Err((StatusCode::BAD_REQUEST, e.to_string())),
         Ok(Err(e)) => {
             tracing::error!("HTTP search task failed: {}", e);
             return Err((
@@ -482,6 +484,12 @@ mod tests {
         assert_eq!(resolve_query_mode(None).unwrap(), QueryMode::Exact);
         assert_eq!(resolve_query_mode(Some("fuzzy")).unwrap(), QueryMode::Fuzzy);
         assert!(resolve_query_mode(Some("oops")).is_err());
+    }
+
+    #[test]
+    fn strict_sort_rejects_removed_size_column() {
+        let err = SortColumn::parse_strict(Some("size")).unwrap_err();
+        assert!(err.contains("unsupported sort column"));
     }
 
     #[test]

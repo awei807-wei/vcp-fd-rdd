@@ -353,7 +353,7 @@ async fn auto_flush_overlay_wakes_snapshot_loop() {
 }
 
 #[tokio::test]
-async fn query_filters_do_not_leak_old_segment_meta() -> anyhow::Result<()> {
+async fn removed_size_filter_is_not_text_matched() -> anyhow::Result<()> {
     let root = unique_tmp_dir("query-dsl-no-leak");
     std::fs::create_dir_all(&root)?;
 
@@ -367,13 +367,13 @@ async fn query_filters_do_not_leak_old_segment_meta() -> anyhow::Result<()> {
     // flush: 让旧元数据进入 v7 快照
     idx.snapshot_now(store.clone()).await?;
 
-    // 修改文件：新元数据进入 L2（size 变大）
+    // 修改文件：新元数据进入 L2。`size:` 已移除，查询入口不能把它当普通文本匹配。
     std::fs::write(&p, vec![b'a'; 128])?;
     idx.apply_events(&[mk_event(2, EventType::Modify, p.clone())]);
 
-    // 若未在 miss 时也 block path，旧段的 size 可能会"误命中"并被返回
     let r = idx.query_limit("size:<10b", 100);
-    assert!(r.is_empty(), "should not return stale disk meta");
+    assert!(r.is_empty(), "removed size filter must not text-match");
+    assert!(idx.query_limit_detailed_strict("size:<10b", 100).is_err());
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
