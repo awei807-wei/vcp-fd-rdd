@@ -5,6 +5,8 @@ use anyhow::Context;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{L3ScanPolicy, DEFAULT_L3_SCAN_INTERVAL_SECS};
+
 use super::metrics::{RunMetrics, RunReport};
 use super::policy::PolicyParams;
 use super::rng::Rng64;
@@ -89,6 +91,10 @@ pub struct TieredWatchRecommendation {
     pub l0_idle_ttl_secs: u64,
     pub l1_scan_interval_secs: u64,
     pub l2_scan_interval_secs: u64,
+    #[serde(default = "default_l3_scan_policy")]
+    pub l3_scan_policy: L3ScanPolicy,
+    #[serde(default = "default_l3_scan_interval_secs")]
+    pub l3_scan_interval_secs: u64,
     pub l1_empty_scans_to_l2: u32,
     pub l2_empty_scans_to_l3: u32,
 }
@@ -99,6 +105,14 @@ pub const SIM_ONLY_IGNORED_FIELDS: &[&str] = &[
     "per_round_max_files",
     "per_round_max_ms",
 ];
+
+fn default_l3_scan_policy() -> L3ScanPolicy {
+    L3ScanPolicy::Interval
+}
+
+fn default_l3_scan_interval_secs() -> u64 {
+    DEFAULT_L3_SCAN_INTERVAL_SECS
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct TieredWatchConfigPatch {
@@ -114,6 +128,8 @@ struct TieredWatchConfigPatchTable {
     l0_idle_ttl_secs: u64,
     l1_scan_interval_secs: u64,
     l2_scan_interval_secs: u64,
+    l3_scan_policy: L3ScanPolicy,
+    l3_scan_interval_secs: u64,
     l1_empty_scans_to_l2: u32,
     l2_empty_scans_to_l3: u32,
 }
@@ -174,6 +190,12 @@ pub fn conservative_tiered_watch_recommendation_from_reports(
             .l2_scan_interval_secs
             .max(recommendation.l2_scan_interval_secs)
             .max(aggregate.l1_scan_interval_secs.saturating_add(1));
+        aggregate.l3_scan_policy =
+            conservative_l3_scan_policy(aggregate.l3_scan_policy, recommendation.l3_scan_policy);
+        aggregate.l3_scan_interval_secs = aggregate
+            .l3_scan_interval_secs
+            .max(recommendation.l3_scan_interval_secs)
+            .max(1);
         aggregate.l1_empty_scans_to_l2 = aggregate
             .l1_empty_scans_to_l2
             .min(recommendation.l1_empty_scans_to_l2)
@@ -208,6 +230,16 @@ pub fn tiered_watch_recommendation_from_report(
         .ok_or_else(|| anyhow::anyhow!("report has no recommendation, best run, or baseline"))
 }
 
+fn conservative_l3_scan_policy(left: L3ScanPolicy, right: L3ScanPolicy) -> L3ScanPolicy {
+    match (left, right) {
+        (L3ScanPolicy::Disabled, _) | (_, L3ScanPolicy::Disabled) => L3ScanPolicy::Disabled,
+        (L3ScanPolicy::ValidateOnQuery, _) | (_, L3ScanPolicy::ValidateOnQuery) => {
+            L3ScanPolicy::ValidateOnQuery
+        }
+        _ => L3ScanPolicy::Interval,
+    }
+}
+
 pub fn tiered_watch_config_patch_toml(
     recommendation: &TieredWatchRecommendation,
 ) -> anyhow::Result<String> {
@@ -220,6 +252,8 @@ pub fn tiered_watch_config_patch_toml(
             l0_idle_ttl_secs: recommendation.l0_idle_ttl_secs,
             l1_scan_interval_secs: recommendation.l1_scan_interval_secs,
             l2_scan_interval_secs: recommendation.l2_scan_interval_secs,
+            l3_scan_policy: recommendation.l3_scan_policy,
+            l3_scan_interval_secs: recommendation.l3_scan_interval_secs,
             l1_empty_scans_to_l2: recommendation.l1_empty_scans_to_l2,
             l2_empty_scans_to_l3: recommendation.l2_empty_scans_to_l3,
         },
@@ -817,30 +851,52 @@ fn grid_candidates(base: &PolicyParams) -> Vec<PolicyParams> {
     let watch_options = spread_u32(base.max_watch_dirs, &[0.35, 0.65, 1.0, 1.5, 2.2]);
     let l1_options = spread_u64(base.l1_scan_interval_secs, &[0.5, 1.0, 1.75]);
     let l2_options = spread_u64(base.l2_scan_interval_secs, &[0.65, 1.0, 1.6]);
+    let l3_options = spread_u64(base.l3_scan_interval_secs, &[0.5, 1.0, 2.0]);
+    let l3_policy_options = l3_scan_policy_candidates(base.l3_scan_policy);
     let ttl_options = spread_u64(base.l0_idle_ttl_secs, &[0.5, 1.0, 2.0]);
 
     let mut out = Vec::new();
     for max_watch_dirs in watch_options {
         for l1_scan_interval_secs in &l1_options {
             for l2_scan_interval_secs in &l2_options {
-                for l0_idle_ttl_secs in &ttl_options {
-                    let mut policy = base.clone();
-                    policy.name = format!(
-                        "grid-w{}-l1{}-l2{}-ttl{}",
-                        max_watch_dirs,
-                        l1_scan_interval_secs,
-                        l2_scan_interval_secs,
-                        l0_idle_ttl_secs
-                    );
-                    policy.max_watch_dirs = max_watch_dirs;
-                    policy.l1_scan_interval_secs = *l1_scan_interval_secs;
-                    policy.l2_scan_interval_secs =
-                        (*l2_scan_interval_secs).max(l1_scan_interval_secs.saturating_add(1));
-                    policy.l0_idle_ttl_secs = *l0_idle_ttl_secs;
-                    out.push(policy.sanitize());
+                for l3_scan_policy in &l3_policy_options {
+                    for l3_scan_interval_secs in &l3_options {
+                        for l0_idle_ttl_secs in &ttl_options {
+                            let mut policy = base.clone();
+                            policy.name = format!(
+                                "grid-w{}-l1{}-l2{}-l3{:?}-{}-ttl{}",
+                                max_watch_dirs,
+                                l1_scan_interval_secs,
+                                l2_scan_interval_secs,
+                                l3_scan_policy,
+                                l3_scan_interval_secs,
+                                l0_idle_ttl_secs
+                            );
+                            policy.max_watch_dirs = max_watch_dirs;
+                            policy.l1_scan_interval_secs = *l1_scan_interval_secs;
+                            policy.l2_scan_interval_secs = (*l2_scan_interval_secs)
+                                .max(l1_scan_interval_secs.saturating_add(1));
+                            policy.l3_scan_policy = *l3_scan_policy;
+                            policy.l3_scan_interval_secs = *l3_scan_interval_secs;
+                            policy.l0_idle_ttl_secs = *l0_idle_ttl_secs;
+                            out.push(policy.sanitize());
+                        }
+                    }
                 }
             }
         }
+    }
+    out
+}
+
+fn l3_scan_policy_candidates(seed: L3ScanPolicy) -> [L3ScanPolicy; 3] {
+    let mut out = [
+        L3ScanPolicy::Interval,
+        L3ScanPolicy::ValidateOnQuery,
+        L3ScanPolicy::Disabled,
+    ];
+    if let Some(pos) = out.iter().position(|policy| *policy == seed) {
+        out.swap(0, pos);
     }
     out
 }
@@ -855,6 +911,8 @@ fn recommendation_from_policy(policy: &PolicyParams) -> TieredWatchRecommendatio
         l0_idle_ttl_secs: policy.l0_idle_ttl_secs,
         l1_scan_interval_secs: policy.l1_scan_interval_secs,
         l2_scan_interval_secs: policy.l2_scan_interval_secs,
+        l3_scan_policy: policy.l3_scan_policy,
+        l3_scan_interval_secs: policy.l3_scan_interval_secs,
         l1_empty_scans_to_l2: policy.l1_empty_scans_to_l2,
         l2_empty_scans_to_l3: policy.l2_empty_scans_to_l3,
     }
@@ -897,6 +955,16 @@ fn mutate_policy(parent: &PolicyParams, rng: &mut Rng64) -> PolicyParams {
         7_200,
         0.50 + rng.next_f64() * 1.8,
     );
+    policy.l3_scan_interval_secs = mutate_u64(
+        policy.l3_scan_interval_secs,
+        1,
+        604_800,
+        0.45 + rng.next_f64() * 2.0,
+    );
+    if rng.bool(0.35) {
+        let options = l3_scan_policy_candidates(policy.l3_scan_policy);
+        policy.l3_scan_policy = options[rng.usize_range(0, options.len())];
+    }
     policy.per_round_max_dirs = mutate_usize(
         policy.per_round_max_dirs,
         1,
@@ -924,6 +992,8 @@ fn rank_and_truncate(runs: &mut Vec<RunReport>, top_n: usize) {
         a.policy.max_watch_dirs == b.policy.max_watch_dirs
             && a.policy.l1_scan_interval_secs == b.policy.l1_scan_interval_secs
             && a.policy.l2_scan_interval_secs == b.policy.l2_scan_interval_secs
+            && a.policy.l3_scan_policy == b.policy.l3_scan_policy
+            && a.policy.l3_scan_interval_secs == b.policy.l3_scan_interval_secs
             && a.policy.l0_idle_ttl_secs == b.policy.l0_idle_ttl_secs
     });
     runs.truncate(top_n.max(1));
@@ -989,6 +1059,8 @@ mod tests {
             l0_idle_ttl_secs: 900,
             l1_scan_interval_secs: 15,
             l2_scan_interval_secs: 180,
+            l3_scan_policy: L3ScanPolicy::Interval,
+            l3_scan_interval_secs: DEFAULT_L3_SCAN_INTERVAL_SECS,
             l1_empty_scans_to_l2: 3,
             l2_empty_scans_to_l3: 2,
         }
@@ -1031,6 +1103,40 @@ mod tests {
         assert_eq!(report.runs[0].rank, 1);
         assert!(report.best.is_some());
         assert!(report.recommendation.is_some());
+    }
+
+    #[test]
+    fn grid_candidates_enumerate_l3_policy_modes() {
+        let policies = grid_candidates(&PolicyParams::default());
+
+        assert!(policies
+            .iter()
+            .any(|policy| policy.l3_scan_policy == L3ScanPolicy::Interval));
+        assert!(policies
+            .iter()
+            .any(|policy| policy.l3_scan_policy == L3ScanPolicy::ValidateOnQuery));
+        assert!(policies
+            .iter()
+            .any(|policy| policy.l3_scan_policy == L3ScanPolicy::Disabled));
+    }
+
+    #[test]
+    fn mutate_policy_can_change_l3_policy_mode() {
+        let base = PolicyParams::default();
+        let mut rng = Rng64::new(42);
+        let mut seen = Vec::new();
+
+        for _ in 0..128 {
+            let mode = mutate_policy(&base, &mut rng).l3_scan_policy;
+            if !seen.contains(&mode) {
+                seen.push(mode);
+            }
+        }
+
+        assert!(
+            seen.len() > 1,
+            "mutation should explore L3 policy modes, seen={seen:?}"
+        );
     }
 
     #[test]
@@ -1110,6 +1216,8 @@ mod tests {
         assert!(patch.contains("[tiered_watch]"));
         assert!(patch.contains("max_watch_dirs = 128"));
         assert!(patch.contains("scan_items_per_sec = 4000"));
+        assert!(patch.contains("l3_scan_policy = \"interval\""));
+        assert!(patch.contains("l3_scan_interval_secs = 21600"));
         assert!(patch.contains("l2_empty_scans_to_l3 = 2"));
         assert!(patch.contains("Sim-only policy fields ignored: weights"));
 
@@ -1132,6 +1240,8 @@ mod tests {
         first.l0_idle_ttl_secs = 1_200;
         first.l1_scan_interval_secs = 20;
         first.l2_scan_interval_secs = 200;
+        first.l3_scan_policy = L3ScanPolicy::Interval;
+        first.l3_scan_interval_secs = 21_600;
         first.l1_empty_scans_to_l2 = 5;
         first.l2_empty_scans_to_l3 = 4;
 
@@ -1141,6 +1251,8 @@ mod tests {
         second.l0_idle_ttl_secs = 600;
         second.l1_scan_interval_secs = 45;
         second.l2_scan_interval_secs = 400;
+        second.l3_scan_policy = L3ScanPolicy::ValidateOnQuery;
+        second.l3_scan_interval_secs = 43_200;
         second.l1_empty_scans_to_l2 = 2;
         second.l2_empty_scans_to_l3 = 2;
 
@@ -1156,6 +1268,8 @@ mod tests {
         assert_eq!(aggregate.l0_idle_ttl_secs, 600);
         assert_eq!(aggregate.l1_scan_interval_secs, 45);
         assert_eq!(aggregate.l2_scan_interval_secs, 400);
+        assert_eq!(aggregate.l3_scan_policy, L3ScanPolicy::ValidateOnQuery);
+        assert_eq!(aggregate.l3_scan_interval_secs, 43_200);
         assert_eq!(aggregate.l1_empty_scans_to_l2, 2);
         assert_eq!(aggregate.l2_empty_scans_to_l3, 2);
     }

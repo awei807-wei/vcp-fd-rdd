@@ -164,31 +164,25 @@ impl ColdSegment {
         if !self.filter.might_match_literal_hint(matcher.literal_hint()) {
             return Vec::new();
         }
-        self.snapshot
-            .to_base_index_data()
-            .map(|data| data.resident_query_keys(matcher))
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    "cold segment query decode failed for {}: {}",
-                    self.manifest.segment_path.display(),
-                    e
-                );
-                Vec::new()
-            })
+        self.snapshot.query_keys(matcher).unwrap_or_else(|e| {
+            tracing::warn!(
+                "cold segment mmap query failed for {}: {}",
+                self.manifest.segment_path.display(),
+                e
+            );
+            Vec::new()
+        })
     }
 
     fn get_meta(&self, key: FileKey) -> Option<FileMeta> {
-        self.snapshot
-            .to_base_index_data()
-            .ok()
-            .and_then(|data| data.resident_get_meta(key))
+        self.snapshot.get_meta(key).ok().flatten()
     }
 
     fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
-        match self.snapshot.to_base_index_data() {
-            Ok(data) => data.resident_for_each_live_meta(|meta| f(meta)),
+        match self.snapshot.for_each_live_meta(|meta| f(meta)) {
+            Ok(()) => {}
             Err(e) => tracing::warn!(
-                "cold segment metadata decode failed for {}: {}",
+                "cold segment mmap metadata scan failed for {}: {}",
                 self.manifest.segment_path.display(),
                 e
             ),
@@ -197,8 +191,7 @@ impl ColdSegment {
 
     fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
         self.snapshot
-            .to_base_index_data()
-            .map(|data| data.resident_parent_candidates(parent_path))
+            .parent_candidates(parent_path)
             .unwrap_or_default()
     }
 

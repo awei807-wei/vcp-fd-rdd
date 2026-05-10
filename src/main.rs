@@ -732,6 +732,8 @@ fn spawn_dirty_queue_loop(
                             policy_dir.as_path(),
                             tiered.l1_scan_interval_secs,
                             tiered.l2_scan_interval_secs,
+                            tiered.l3_scan_policy,
+                            tiered.l3_scan_interval_secs,
                             tiered.l1_empty_scans_to_l2,
                             tiered.l2_empty_scans_to_l3,
                         );

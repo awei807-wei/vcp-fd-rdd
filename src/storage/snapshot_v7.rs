@@ -5,11 +5,14 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::core::{FileKey, FileMeta};
 use crate::index::base_index::{BaseIndexData, FileEntryIndex, TrigramIndex};
 use crate::index::file_entry_v2::FileEntry;
 use crate::index::parent_index::ParentIndex;
 use crate::index::path_table_v2::{PathTableBuilder, PathTableV2};
+use crate::query::Matcher;
 use crate::storage::checksum::{crc32c_checksum, Crc32c};
+use crate::util::pathbuf_from_encoded_vec;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // v7 单文件 mmap 格式常量
@@ -38,6 +41,12 @@ const V7_HEADER_SIZE: usize = 64;
 ///   trailer_len    u64
 ///   trailer_magic  [u8; 8]
 const V7_TRAILER_FIXED_SIZE: usize = 4 + 4 + 4 + 4 + 8 + 8;
+const FILE_ENTRY_REC_SIZE: usize = 8 + 8 + 4 + 4 + 8;
+const RAW_PATH_TABLE_MAGIC: &[u8; 8] = b"PTV2raw\0";
+const RAW_PATH_TABLE_HEADER_SIZE: usize = 8 + 4 * 4;
+const RAW_PATH_TABLE_SLOT_SIZE: usize = 12;
+const RAW_PATH_TABLE_ANCHOR_INTERVAL: usize = 256;
+const TRIGRAM_SENTINEL: [u8; 3] = [0, 0, 0];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 段种类
@@ -120,8 +129,7 @@ fn decode_file_entry_index(bytes: &[u8]) -> anyhow::Result<FileEntryIndex> {
         anyhow::bail!("file entry index too small");
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
-    const REC_SIZE: usize = 8 + 8 + 4 + 4 + 8; // dev+ino+generation+path_idx+mtime_ns
-    let expected = 4 + count * REC_SIZE;
+    let expected = 4 + count * FILE_ENTRY_REC_SIZE;
     if bytes.len() < expected {
         anyhow::bail!("file entry index truncated");
     }
@@ -133,7 +141,7 @@ fn decode_file_entry_index(bytes: &[u8]) -> anyhow::Result<FileEntryIndex> {
         let generation = u32::from_le_bytes(bytes[off + 16..off + 20].try_into()?);
         let path_idx = u32::from_le_bytes(bytes[off + 20..off + 24].try_into()?);
         let mtime_ns = i64::from_le_bytes(bytes[off + 24..off + 32].try_into()?);
-        off += REC_SIZE;
+        off += FILE_ENTRY_REC_SIZE;
 
         fei.push(FileEntry::from_file_key(
             crate::core::FileKey {
@@ -152,12 +160,59 @@ fn decode_file_entry_index(bytes: &[u8]) -> anyhow::Result<FileEntryIndex> {
 // TrigramIndex 序列化 / 反序列化
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 fn encode_trigram_index(ti: &TrigramIndex) -> Vec<u8> {
     let mut out = Vec::new();
     let len = ti.len() as u32;
     out.extend_from_slice(&len.to_le_bytes());
     for (tri, bitmap) in &ti.inner {
         out.extend_from_slice(tri);
+        out.push(0); // pad
+        let mut posting = Vec::new();
+        bitmap
+            .serialize_into(&mut posting)
+            .expect("roaring serialize");
+        let posting_len: u32 = posting.len().try_into().unwrap_or(u32::MAX);
+        out.extend_from_slice(&posting_len.to_le_bytes());
+        out.extend_from_slice(&posting);
+    }
+    out
+}
+
+fn encode_full_path_trigram_index(data: &BaseIndexData) -> Vec<u8> {
+    let mut full_path_index: HashMap<[u8; 3], RoaringBitmap> = HashMap::new();
+
+    for (docid, entry) in data.entries_by_key.iter().enumerate() {
+        if data.tombstones.contains(docid as u32) {
+            continue;
+        }
+        let Some(path_bytes) = data.path_table.resolve(entry.path_idx) else {
+            continue;
+        };
+        let lower = String::from_utf8_lossy(&path_bytes).to_lowercase();
+        let bytes = lower.as_bytes();
+        if bytes.len() < 3 {
+            continue;
+        }
+        for tri in bytes.windows(3).map(|w| [w[0], w[1], w[2]]) {
+            full_path_index.entry(tri).or_default().insert(docid as u32);
+        }
+    }
+
+    full_path_index.entry(TRIGRAM_SENTINEL).or_default();
+    encode_trigram_map(&full_path_index)
+}
+
+fn encode_trigram_map(index: &HashMap<[u8; 3], RoaringBitmap>) -> Vec<u8> {
+    let mut entries: Vec<([u8; 3], &RoaringBitmap)> =
+        index.iter().map(|(tri, bitmap)| (*tri, bitmap)).collect();
+    entries.sort_by_key(|(tri, _)| *tri);
+
+    let mut out = Vec::new();
+    let len = entries.len() as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    for (tri, bitmap) in entries {
+        out.extend_from_slice(&tri);
         out.push(0); // pad
         let mut posting = Vec::new();
         bitmap
@@ -288,6 +343,254 @@ fn encode_tombstones(t: &RoaringBitmap) -> Vec<u8> {
 fn decode_tombstones(bytes: &[u8]) -> anyhow::Result<RoaringBitmap> {
     RoaringBitmap::deserialize_from(bytes)
         .map_err(|e| anyhow::anyhow!("tombstones deserialize failed: {}", e))
+}
+
+#[derive(Clone, Copy)]
+struct RawPathTableLayout {
+    slots_len: usize,
+    suffix_start: usize,
+    suffix_len: usize,
+    idx_start: usize,
+    idx_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RawPathTableSlot {
+    suffix_offset: usize,
+    shared_len: usize,
+    suffix_len: usize,
+    orig_idx: u32,
+}
+
+impl RawPathTableLayout {
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < RAW_PATH_TABLE_HEADER_SIZE
+            || &bytes[..8] != RAW_PATH_TABLE_MAGIC.as_slice()
+        {
+            return None;
+        }
+
+        let mut off = 8usize;
+        let slots_len = read_u32(bytes, &mut off)? as usize;
+        let suffix_len = read_u32(bytes, &mut off)? as usize;
+        let idx_len = read_u32(bytes, &mut off)? as usize;
+        let _legacy_anchors_len = read_u32(bytes, &mut off)?;
+
+        let slots_bytes = slots_len.checked_mul(RAW_PATH_TABLE_SLOT_SIZE)?;
+        let suffix_start = RAW_PATH_TABLE_HEADER_SIZE.checked_add(slots_bytes)?;
+        let idx_start = suffix_start.checked_add(suffix_len)?;
+        let idx_bytes = idx_len.checked_mul(4)?;
+        let total = idx_start.checked_add(idx_bytes)?;
+        if total > bytes.len() {
+            return None;
+        }
+
+        Some(Self {
+            slots_len,
+            suffix_start,
+            suffix_len,
+            idx_start,
+            idx_len,
+        })
+    }
+
+    fn slot(self, bytes: &[u8], pos: usize) -> Option<RawPathTableSlot> {
+        if pos >= self.slots_len {
+            return None;
+        }
+        let off = RAW_PATH_TABLE_HEADER_SIZE + pos * RAW_PATH_TABLE_SLOT_SIZE;
+        let suffix_offset = u32::from_le_bytes(bytes.get(off..off + 4)?.try_into().ok()?) as usize;
+        let shared_len = u16::from_le_bytes(bytes.get(off + 4..off + 6)?.try_into().ok()?) as usize;
+        let suffix_len = u16::from_le_bytes(bytes.get(off + 6..off + 8)?.try_into().ok()?) as usize;
+        let orig_idx = u32::from_le_bytes(bytes.get(off + 8..off + 12)?.try_into().ok()?);
+        if suffix_offset.checked_add(suffix_len)? > self.suffix_len {
+            return None;
+        }
+        Some(RawPathTableSlot {
+            suffix_offset,
+            shared_len,
+            suffix_len,
+            orig_idx,
+        })
+    }
+
+    fn suffix<'a>(self, bytes: &'a [u8], slot: RawPathTableSlot) -> Option<&'a [u8]> {
+        let start = self.suffix_start.checked_add(slot.suffix_offset)?;
+        let end = start.checked_add(slot.suffix_len)?;
+        bytes.get(start..end)
+    }
+
+    fn sorted_pos_for_idx(self, bytes: &[u8], idx: u32) -> Option<usize> {
+        let idx = idx as usize;
+        if idx >= self.idx_len {
+            return None;
+        }
+        let off = self.idx_start.checked_add(idx.checked_mul(4)?)?;
+        let sorted_pos = u32::from_le_bytes(bytes.get(off..off + 4)?.try_into().ok()?) as usize;
+        (sorted_pos < self.slots_len).then_some(sorted_pos)
+    }
+}
+
+enum V7PathResolver<'a> {
+    Raw {
+        bytes: &'a [u8],
+        layout: RawPathTableLayout,
+    },
+    Decoded(PathTableV2),
+}
+
+impl V7PathResolver<'_> {
+    fn resolve(&self, idx: u32) -> Option<Vec<u8>> {
+        match self {
+            Self::Raw { bytes, layout } => resolve_raw_path(*bytes, *layout, idx),
+            Self::Decoded(table) => table.resolve(idx),
+        }
+    }
+
+    fn lookup(&self, target: &[u8]) -> Option<u32> {
+        match self {
+            Self::Raw { bytes, layout } => lookup_raw_path(*bytes, *layout, target),
+            Self::Decoded(table) => table.lookup(target),
+        }
+    }
+}
+
+fn resolve_raw_path(bytes: &[u8], layout: RawPathTableLayout, idx: u32) -> Option<Vec<u8>> {
+    let sorted_pos = layout.sorted_pos_for_idx(bytes, idx)?;
+    let anchor_pos = (sorted_pos / RAW_PATH_TABLE_ANCHOR_INTERVAL) * RAW_PATH_TABLE_ANCHOR_INTERVAL;
+    let anchor = layout.slot(bytes, anchor_pos)?;
+    let mut path = layout.suffix(bytes, anchor)?.to_vec();
+
+    for pos in (anchor_pos + 1)..=sorted_pos {
+        let slot = layout.slot(bytes, pos)?;
+        if slot.shared_len > path.len() {
+            return None;
+        }
+        path.truncate(slot.shared_len);
+        path.extend_from_slice(layout.suffix(bytes, slot)?);
+    }
+
+    Some(path)
+}
+
+fn lookup_raw_path(bytes: &[u8], layout: RawPathTableLayout, target: &[u8]) -> Option<u32> {
+    let mut path = Vec::new();
+    for pos in 0..layout.slots_len {
+        let slot = layout.slot(bytes, pos)?;
+        if pos % RAW_PATH_TABLE_ANCHOR_INTERVAL == 0 {
+            path.clear();
+        }
+        if slot.shared_len > path.len() {
+            return None;
+        }
+        path.truncate(slot.shared_len);
+        path.extend_from_slice(layout.suffix(bytes, slot)?);
+        if path.as_slice() == target {
+            return Some(slot.orig_idx);
+        }
+    }
+    None
+}
+
+fn read_u32(bytes: &[u8], off: &mut usize) -> Option<u32> {
+    let value = u32::from_le_bytes(bytes.get(*off..*off + 4)?.try_into().ok()?);
+    *off += 4;
+    Some(value)
+}
+
+fn entry_count_from_segment(bytes: &[u8]) -> Option<usize> {
+    let mut off = 0usize;
+    let count = read_u32(bytes, &mut off)? as usize;
+    let expected = 4usize.checked_add(count.checked_mul(FILE_ENTRY_REC_SIZE)?)?;
+    (expected <= bytes.len()).then_some(count)
+}
+
+fn file_entry_at(bytes: &[u8], docid: u32) -> Option<FileEntry> {
+    let count = entry_count_from_segment(bytes)?;
+    let docid_usize = docid as usize;
+    if docid_usize >= count {
+        return None;
+    }
+    let off = 4 + docid_usize * FILE_ENTRY_REC_SIZE;
+    Some(FileEntry {
+        dev: u64::from_le_bytes(bytes.get(off..off + 8)?.try_into().ok()?),
+        ino: u64::from_le_bytes(bytes.get(off + 8..off + 16)?.try_into().ok()?),
+        generation: u32::from_le_bytes(bytes.get(off + 16..off + 20)?.try_into().ok()?),
+        path_idx: u32::from_le_bytes(bytes.get(off + 20..off + 24)?.try_into().ok()?),
+        mtime_ns: i64::from_le_bytes(bytes.get(off + 24..off + 32)?.try_into().ok()?),
+    })
+}
+
+fn entry_to_meta(entry: FileEntry, path_bytes: Vec<u8>) -> FileMeta {
+    FileMeta {
+        file_key: entry.file_key(),
+        path: pathbuf_from_encoded_vec(path_bytes),
+        size: 0,
+        mtime: if entry.mtime_ns >= 0 {
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(entry.mtime_ns as u64))
+        } else {
+            None
+        },
+        ctime: None,
+        atime: None,
+    }
+}
+
+fn posting_for_trigram(bytes: &[u8], tri: [u8; 3]) -> anyhow::Result<Option<RoaringBitmap>> {
+    if bytes.len() < 4 {
+        anyhow::bail!("trigram index too small");
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
+    let mut off = 4usize;
+    for _ in 0..count {
+        if off + 8 > bytes.len() {
+            anyhow::bail!("trigram index truncated");
+        }
+        let key = [bytes[off], bytes[off + 1], bytes[off + 2]];
+        let posting_len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into()?) as usize;
+        off += 8;
+        if off + posting_len > bytes.len() {
+            anyhow::bail!("trigram index posting truncated");
+        }
+        if key == tri {
+            let bitmap = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
+                .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
+            return Ok(Some(bitmap));
+        }
+        off += posting_len;
+    }
+    Ok(None)
+}
+
+fn trigram_index_has_sentinel(bytes: &[u8]) -> anyhow::Result<bool> {
+    posting_for_trigram(bytes, TRIGRAM_SENTINEL).map(|posting| posting.is_some())
+}
+
+fn parent_posting(bytes: &[u8], parent_idx: u32) -> anyhow::Result<Option<RoaringBitmap>> {
+    if bytes.len() < 4 {
+        anyhow::bail!("parent index too small");
+    }
+    let mut off = 0usize;
+    let count = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
+    off += 4;
+    for _ in 0..count {
+        if off + 8 > bytes.len() {
+            anyhow::bail!("parent index dir entry truncated");
+        }
+        let dir_idx = u32::from_le_bytes(bytes[off..off + 4].try_into()?);
+        let posting_len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into()?) as usize;
+        off += 8;
+        if off + posting_len > bytes.len() {
+            anyhow::bail!("parent index posting truncated");
+        }
+        if dir_idx == parent_idx {
+            let bitmap = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
+                .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
+            return Ok(Some(bitmap));
+        }
+        off += posting_len;
+    }
+    Ok(None)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -452,37 +755,201 @@ impl V7Snapshot {
             .map(|(_, r)| &self.bytes()[r.clone()])
     }
 
+    fn path_resolver(&self) -> anyhow::Result<V7PathResolver<'_>> {
+        let Some(bytes) = self.segment(V7SegKind::PathTable) else {
+            return Ok(V7PathResolver::Decoded(PathTableV2::default()));
+        };
+        if let Some(layout) = RawPathTableLayout::parse(bytes) {
+            return Ok(V7PathResolver::Raw { bytes, layout });
+        }
+        Ok(V7PathResolver::Decoded(decode_path_table(bytes)?))
+    }
+
+    fn tombstones(&self) -> anyhow::Result<RoaringBitmap> {
+        self.segment(V7SegKind::Tombstones)
+            .map(decode_tombstones)
+            .transpose()
+            .map(|t| t.unwrap_or_default())
+    }
+
+    fn trigram_candidates(&self, matcher: &dyn Matcher) -> anyhow::Result<Option<RoaringBitmap>> {
+        let Some(hint) = matcher.literal_hint() else {
+            return Ok(None);
+        };
+        let lower = String::from_utf8_lossy(hint).to_lowercase();
+        let bytes = lower.as_bytes();
+        if bytes.len() < 3 {
+            return Ok(None);
+        }
+        let Some(segment) = self.segment(V7SegKind::TrigramIndex) else {
+            return Ok(None);
+        };
+        if !trigram_index_has_sentinel(segment)? {
+            return Ok(None);
+        }
+
+        let mut acc: Option<RoaringBitmap> = None;
+        for tri in bytes.windows(3).map(|w| [w[0], w[1], w[2]]) {
+            let Some(posting) = posting_for_trigram(segment, tri)? else {
+                return Ok(Some(RoaringBitmap::new()));
+            };
+            match acc {
+                None => acc = Some(posting),
+                Some(ref mut current) => {
+                    *current &= &posting;
+                    if current.is_empty() {
+                        return Ok(Some(RoaringBitmap::new()));
+                    }
+                }
+            }
+        }
+
+        Ok(acc)
+    }
+
+    pub fn query_keys(&self, matcher: &dyn Matcher) -> anyhow::Result<Vec<FileKey>> {
+        let Some(entries) = self.segment(V7SegKind::EntriesByKey) else {
+            return Ok(Vec::new());
+        };
+        let resolver = self.path_resolver()?;
+        let tombstones = self.tombstones()?;
+        let mut out = Vec::new();
+
+        if let Some(candidates) = self.trigram_candidates(matcher)? {
+            for docid in candidates.iter() {
+                if tombstones.contains(docid) {
+                    continue;
+                }
+                let Some(entry) = file_entry_at(entries, docid) else {
+                    continue;
+                };
+                let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+                    continue;
+                };
+                let path_str = std::str::from_utf8(&path_bytes)
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&path_bytes));
+                if matcher.matches(&path_str) {
+                    out.push(entry.file_key());
+                }
+            }
+            return Ok(out);
+        }
+
+        let count = entry_count_from_segment(entries).unwrap_or(0);
+        for docid in 0..count {
+            let docid = docid as u32;
+            if tombstones.contains(docid) {
+                continue;
+            }
+            let Some(entry) = file_entry_at(entries, docid) else {
+                continue;
+            };
+            let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+                continue;
+            };
+            let path_str = std::str::from_utf8(&path_bytes)
+                .map(std::borrow::Cow::Borrowed)
+                .unwrap_or_else(|_| String::from_utf8_lossy(&path_bytes));
+            if matcher.matches(&path_str) {
+                out.push(entry.file_key());
+            }
+        }
+
+        Ok(out)
+    }
+
+    pub fn get_meta(&self, key: FileKey) -> anyhow::Result<Option<FileMeta>> {
+        let Some(entries) = self.segment(V7SegKind::EntriesByKey) else {
+            return Ok(None);
+        };
+        let resolver = self.path_resolver()?;
+        let tombstones = self.tombstones()?;
+        let count = entry_count_from_segment(entries).unwrap_or(0);
+
+        for docid in 0..count {
+            let docid = docid as u32;
+            if tombstones.contains(docid) {
+                continue;
+            }
+            let Some(entry) = file_entry_at(entries, docid) else {
+                continue;
+            };
+            if entry.file_key() != key {
+                continue;
+            }
+            let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+                continue;
+            };
+            return Ok(Some(entry_to_meta(entry, path_bytes)));
+        }
+
+        Ok(None)
+    }
+
     pub fn for_each_live_entry_path(
         &self,
         mut f: impl FnMut(&FileEntry, &[u8]),
     ) -> anyhow::Result<()> {
-        let path_table = self
-            .segment(V7SegKind::PathTable)
-            .map(decode_path_table)
-            .transpose()?
-            .unwrap_or_default();
-        let entries_by_key = self
-            .segment(V7SegKind::EntriesByKey)
-            .map(decode_file_entry_index)
-            .transpose()?
-            .unwrap_or_default();
-        let tombstones = self
-            .segment(V7SegKind::Tombstones)
-            .map(decode_tombstones)
-            .transpose()?
-            .unwrap_or_default();
+        let resolver = self.path_resolver()?;
+        let Some(entries) = self.segment(V7SegKind::EntriesByKey) else {
+            return Ok(());
+        };
+        let tombstones = self.tombstones()?;
+        let count = entry_count_from_segment(entries).unwrap_or(0);
 
-        for (docid, entry) in entries_by_key.iter().enumerate() {
-            if tombstones.contains(docid as u32) {
+        for docid in 0..count {
+            let docid = docid as u32;
+            if tombstones.contains(docid) {
                 continue;
             }
-            let Some(path_bytes) = path_table.resolve(entry.path_idx) else {
+            let Some(entry) = file_entry_at(entries, docid) else {
                 continue;
             };
-            f(entry, &path_bytes);
+            let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+                continue;
+            };
+            f(&entry, &path_bytes);
         }
 
         Ok(())
+    }
+
+    pub fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) -> anyhow::Result<()> {
+        self.for_each_live_entry_path(|entry, path_bytes| {
+            f(entry_to_meta(*entry, path_bytes.to_vec()));
+        })
+    }
+
+    pub fn parent_candidates(&self, parent_path: &str) -> anyhow::Result<Vec<FileKey>> {
+        let Some(entries) = self.segment(V7SegKind::EntriesByKey) else {
+            return Ok(Vec::new());
+        };
+        let Some(parent_index) = self.segment(V7SegKind::ParentIndex) else {
+            return Ok(Vec::new());
+        };
+        let resolver = self.path_resolver()?;
+        let parent_bytes = PathBuf::from(parent_path)
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec();
+        let Some(parent_idx) = resolver.lookup(&parent_bytes) else {
+            return Ok(Vec::new());
+        };
+        let Some(docids) = parent_posting(parent_index, parent_idx)? else {
+            return Ok(Vec::new());
+        };
+        let tombstones = self.tombstones()?;
+        let mut out = Vec::with_capacity(docids.len() as usize);
+        for docid in docids.iter() {
+            if tombstones.contains(docid) {
+                continue;
+            }
+            if let Some(entry) = file_entry_at(entries, docid) {
+                out.push(entry.file_key());
+            }
+        }
+        Ok(out)
     }
 
     /// 反序列化为 BaseIndexData（当前阶段仍做反序列化，后续可优化为零拷贝）。
@@ -642,6 +1109,34 @@ pub fn write_v7_snapshot_atomic(path: &Path, data: &BaseIndexData) -> anyhow::Re
         ),
         (
             V7SegKind::TrigramIndex,
+            encode_full_path_trigram_index(data),
+        ),
+        (
+            V7SegKind::ParentIndex,
+            encode_parent_index(&data.parent_index),
+        ),
+        (V7SegKind::Tombstones, encode_tombstones(&data.tombstones)),
+    ];
+    write_v7_segments_atomic(path, segments_bytes)
+}
+
+#[cfg(test)]
+fn write_v7_snapshot_atomic_legacy_trigram(
+    path: &Path,
+    data: &BaseIndexData,
+) -> anyhow::Result<()> {
+    let segments_bytes: Vec<(V7SegKind, Vec<u8>)> = vec![
+        (V7SegKind::PathTable, encode_path_table(&data.path_table)),
+        (
+            V7SegKind::EntriesByKey,
+            encode_file_entry_index(&data.entries_by_key),
+        ),
+        (
+            V7SegKind::EntriesByPath,
+            encode_file_entry_index(&data.entries_by_key),
+        ),
+        (
+            V7SegKind::TrigramIndex,
             encode_trigram_index(&data.trigram_index),
         ),
         (
@@ -650,7 +1145,13 @@ pub fn write_v7_snapshot_atomic(path: &Path, data: &BaseIndexData) -> anyhow::Re
         ),
         (V7SegKind::Tombstones, encode_tombstones(&data.tombstones)),
     ];
+    write_v7_segments_atomic(path, segments_bytes)
+}
 
+fn write_v7_segments_atomic(
+    path: &Path,
+    segments_bytes: Vec<(V7SegKind, Vec<u8>)>,
+) -> anyhow::Result<()> {
     let num_segments = segments_bytes.len() as u32;
     let mut seg_descs: Vec<V7SegDesc> = Vec::with_capacity(segments_bytes.len());
     let mut cursor = align_up(V7_HEADER_SIZE, 8);
@@ -854,6 +1355,7 @@ fn file_modified_unix_ns(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::core::FileKey;
+    use crate::query::ExactMatcher;
     use std::path::PathBuf;
 
     fn tmp_v7_path(tag: &str) -> PathBuf {
@@ -862,6 +1364,65 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("fd-rdd-v7-{}-{}", tag, nanos))
+    }
+
+    fn add_path_trigrams(index: &mut TrigramIndex, path: &str, docid: u32) {
+        let lower = path.to_lowercase();
+        for tri in lower.as_bytes().windows(3) {
+            let mut key = [0u8; 3];
+            key.copy_from_slice(tri);
+            index.inner.entry(key).or_default().insert(docid);
+        }
+    }
+
+    fn add_basename_trigrams(index: &mut TrigramIndex, path: &str, docid: u32) {
+        let Some(name) = Path::new(path).file_name() else {
+            return;
+        };
+        let lower = name.to_string_lossy().to_lowercase();
+        for tri in lower.as_bytes().windows(3) {
+            let mut key = [0u8; 3];
+            key.copy_from_slice(tri);
+            index.inner.entry(key).or_default().insert(docid);
+        }
+    }
+
+    fn add_trigram_sentinel(index: &mut TrigramIndex) {
+        index.inner.entry([0, 0, 0]).or_default();
+    }
+
+    fn sample_query_data() -> (BaseIndexData, FileKey) {
+        let key = FileKey {
+            dev: 7,
+            ino: 11,
+            generation: 0,
+        };
+        let skipped = FileKey {
+            dev: 7,
+            ino: 12,
+            generation: 0,
+        };
+
+        let mut paths = PathTableBuilder::new();
+        paths.push(0, b"/tmp/cold/needle.txt");
+        paths.push(1, b"/tmp/cold/skip.log");
+        paths.push(2, b"/tmp/cold");
+
+        let mut entries = FileEntryIndex::new();
+        entries.push(FileEntry::from_file_key(key, 0, 123));
+        entries.push(FileEntry::from_file_key(skipped, 1, 456));
+
+        let mut data = BaseIndexData {
+            path_table: paths.build(),
+            entries_by_key: entries.build(),
+            ..BaseIndexData::default()
+        };
+        add_path_trigrams(&mut data.trigram_index, "/tmp/cold/needle.txt", 0);
+        add_path_trigrams(&mut data.trigram_index, "/tmp/cold/skip.log", 1);
+        add_trigram_sentinel(&mut data.trigram_index);
+        data.parent_index.dir_to_files.insert(2, vec![0, 1]);
+        data.tombstones.insert(1);
+        (data, key)
     }
 
     #[test]
@@ -891,6 +1452,221 @@ mod tests {
     fn v7_load_missing_returns_none() {
         let path = tmp_v7_path("missing");
         assert!(load_v7_from_path(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn v7_query_uses_direct_mmap_segments() {
+        let path = tmp_v7_path("direct-query");
+        let (data, key) = sample_query_data();
+        write_v7_snapshot_atomic(&path, &data).unwrap();
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+
+        let matcher = ExactMatcher::new("needle", false);
+        assert_eq!(loaded.query_keys(&matcher).unwrap(), vec![key]);
+
+        let meta = loaded.get_meta(key).unwrap().expect("meta should exist");
+        assert_eq!(meta.path, PathBuf::from("/tmp/cold/needle.txt"));
+
+        let parent_keys = loaded.parent_candidates("/tmp/cold").unwrap();
+        assert_eq!(parent_keys, vec![key]);
+
+        let missing = ExactMatcher::new("skip", false);
+        assert!(loaded.query_keys(&missing).unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v7_writer_persists_full_path_trigram_sentinel() {
+        let path = tmp_v7_path("writer-full-path-sentinel");
+        let key = FileKey {
+            dev: 7,
+            ino: 19,
+            generation: 0,
+        };
+
+        let mut paths = PathTableBuilder::new();
+        paths.push(0, b"/tmp/archive/needle.txt");
+
+        let mut entries = FileEntryIndex::new();
+        entries.push(FileEntry::from_file_key(key, 0, 123));
+
+        let data = BaseIndexData {
+            path_table: paths.build(),
+            entries_by_key: entries.build(),
+            ..BaseIndexData::default()
+        };
+
+        write_v7_snapshot_atomic(&path, &data).unwrap();
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+        let segment = loaded
+            .segment(V7SegKind::TrigramIndex)
+            .expect("trigram segment");
+
+        assert!(trigram_index_has_sentinel(segment).unwrap());
+        assert!(posting_for_trigram(segment, *b"arc").unwrap().is_some());
+
+        let matcher = ExactMatcher::new("archive", false);
+        assert_eq!(loaded.query_keys(&matcher).unwrap(), vec![key]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v7_legacy_query_falls_back_full_scan_when_basename_trigram_missing() {
+        let path = tmp_v7_path("legacy-basename-trigram-missing");
+        let key = FileKey {
+            dev: 7,
+            ino: 21,
+            generation: 0,
+        };
+
+        let mut paths = PathTableBuilder::new();
+        paths.push(0, b"/tmp/archive/file.txt");
+
+        let mut entries = FileEntryIndex::new();
+        entries.push(FileEntry::from_file_key(key, 0, 123));
+
+        let mut data = BaseIndexData {
+            path_table: paths.build(),
+            entries_by_key: entries.build(),
+            ..BaseIndexData::default()
+        };
+        add_basename_trigrams(&mut data.trigram_index, "/tmp/archive/file.txt", 0);
+
+        write_v7_snapshot_atomic_legacy_trigram(&path, &data).unwrap();
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+
+        let matcher = ExactMatcher::new("archive", false);
+        assert_eq!(loaded.query_keys(&matcher).unwrap(), vec![key]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v7_legacy_query_falls_back_full_scan_when_basename_trigram_intersection_is_empty() {
+        let path = tmp_v7_path("legacy-basename-trigram-empty-intersection");
+        let key = FileKey {
+            dev: 7,
+            ino: 31,
+            generation: 0,
+        };
+        let noise_keys = [
+            FileKey {
+                dev: 7,
+                ino: 32,
+                generation: 0,
+            },
+            FileKey {
+                dev: 7,
+                ino: 33,
+                generation: 0,
+            },
+            FileKey {
+                dev: 7,
+                ino: 34,
+                generation: 0,
+            },
+            FileKey {
+                dev: 7,
+                ino: 35,
+                generation: 0,
+            },
+            FileKey {
+                dev: 7,
+                ino: 36,
+                generation: 0,
+            },
+        ];
+        let paths_bytes: [&[u8]; 6] = [
+            b"/tmp/archive/file.txt",
+            b"/tmp/noise/arc.log",
+            b"/tmp/noise/rch.log",
+            b"/tmp/noise/chi.log",
+            b"/tmp/noise/hiv.log",
+            b"/tmp/noise/ive.log",
+        ];
+        let path_strs = [
+            "/tmp/archive/file.txt",
+            "/tmp/noise/arc.log",
+            "/tmp/noise/rch.log",
+            "/tmp/noise/chi.log",
+            "/tmp/noise/hiv.log",
+            "/tmp/noise/ive.log",
+        ];
+
+        let mut paths = PathTableBuilder::new();
+        for (idx, bytes) in paths_bytes.iter().enumerate() {
+            paths.push(idx as u32, bytes);
+        }
+
+        let mut entries = FileEntryIndex::new();
+        entries.push(FileEntry::from_file_key(key, 0, 123));
+        for (idx, noise_key) in noise_keys.iter().enumerate() {
+            entries.push(FileEntry::from_file_key(*noise_key, idx as u32 + 1, 123));
+        }
+
+        let mut data = BaseIndexData {
+            path_table: paths.build(),
+            entries_by_key: entries.build(),
+            ..BaseIndexData::default()
+        };
+        for (docid, path_str) in path_strs.iter().enumerate() {
+            add_basename_trigrams(&mut data.trigram_index, path_str, docid as u32);
+        }
+
+        write_v7_snapshot_atomic_legacy_trigram(&path, &data).unwrap();
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+
+        let matcher = ExactMatcher::new("archive", false);
+        assert_eq!(loaded.query_keys(&matcher).unwrap(), vec![key]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v7_query_ignores_basename_only_trigram_candidates_without_sentinel() {
+        let path = tmp_v7_path("basename-trigram-no-sentinel");
+        let keys = [
+            FileKey {
+                dev: 7,
+                ino: 41,
+                generation: 0,
+            },
+            FileKey {
+                dev: 7,
+                ino: 42,
+                generation: 0,
+            },
+        ];
+        let path_strs = ["/tmp/archive/file.txt", "/tmp/noise/archive.log"];
+
+        let mut paths = PathTableBuilder::new();
+        for (idx, path_str) in path_strs.iter().enumerate() {
+            paths.push(idx as u32, path_str.as_bytes());
+        }
+
+        let mut entries = FileEntryIndex::new();
+        for (idx, key) in keys.iter().enumerate() {
+            entries.push(FileEntry::from_file_key(*key, idx as u32, 123));
+        }
+
+        let mut data = BaseIndexData {
+            path_table: paths.build(),
+            entries_by_key: entries.build(),
+            ..BaseIndexData::default()
+        };
+        for (docid, path_str) in path_strs.iter().enumerate() {
+            add_basename_trigrams(&mut data.trigram_index, path_str, docid as u32);
+        }
+
+        write_v7_snapshot_atomic_legacy_trigram(&path, &data).unwrap();
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+
+        let matcher = ExactMatcher::new("archive", false);
+        assert_eq!(loaded.query_keys(&matcher).unwrap(), keys);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

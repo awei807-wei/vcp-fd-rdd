@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 修复 L3 scan policy 实现缺口：`TieredWatchConfig`、daemon 调度、`fd-rdd-sim` policy/recommendation/config patch 现在都显式支持 `l3_scan_policy` 与 `l3_scan_interval_secs`，`validate_on_query` / `disabled` 不再被固定 `L2*2` 周期主动扫描。
+- 修复 manifest-only cold segment 查询路径：冷段 query、metadata lookup 和 parent candidates 改为直接按需读取 v7 mmap 段，避免每次冷查询都 `to_base_index_data()` 全量 hydration。
+- 修复 v7 mmap 冷段 trigram 预过滤的 false negative：旧 basename-only 段或 posting 缺失/空交集时会回退全段精确过滤，目录组件命中不再漏查。
+- 修复 v7 snapshot 写入与 sim optimizer 遗漏：新写 v7 段会持久化完整路径 trigram posting 与 sentinel，使 manifest-only 冷段可直接使用 mmap posting；grid/evolve/optimize 现在会枚举和变异 `interval`、`validate_on_query`、`disabled` 三种 L3 策略模式。
+
 ## [0.6.16] - 2026-05-10
 
 覆盖提交范围：`9a6d9d7` 到 `607e6c3`。

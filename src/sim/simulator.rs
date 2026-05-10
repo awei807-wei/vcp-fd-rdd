@@ -411,6 +411,7 @@ fn covered_by_l0(world: &World, dirs: &[DirRuntime], dir_id: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::L3ScanPolicy;
     use crate::event::tiered_watch::{PromotionDecision, TieredWatchRuntime};
     use crate::sim::metrics::RunMetrics;
     use crate::sim::policy::ScoreWeights;
@@ -684,7 +685,7 @@ mod tests {
                     elapsed_ms: 1,
                 },
             );
-            runtime.apply_scan_policy(warm, 1, 1, 1, 1);
+            runtime.apply_scan_policy(warm, 1, 1, L3ScanPolicy::Interval, 1, 1, 1);
         }
         let report = runtime.report();
         assert_eq!(report.l3_dirs, 1, "{}", parity_diag(&metrics, &report));

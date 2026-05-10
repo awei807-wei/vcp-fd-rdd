@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::config::{L3ScanPolicy, DEFAULT_L3_SCAN_INTERVAL_SECS};
+
 use super::world::{DirNode, World};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -17,7 +19,13 @@ impl SimTier {
             Self::L0 => u64::MAX,
             Self::L1 => policy.l1_scan_interval_secs,
             Self::L2 => policy.l2_scan_interval_secs,
-            Self::L3 => policy.l2_scan_interval_secs.saturating_mul(2).max(1),
+            Self::L3 => {
+                if policy.l3_scan_policy.schedules_periodic_scan() {
+                    policy.l3_scan_interval_secs
+                } else {
+                    u64::MAX
+                }
+            }
         }
     }
 }
@@ -55,6 +63,10 @@ pub struct PolicyParams {
     pub l0_idle_ttl_secs: u64,
     pub l1_scan_interval_secs: u64,
     pub l2_scan_interval_secs: u64,
+    #[serde(default = "default_l3_scan_policy")]
+    pub l3_scan_policy: L3ScanPolicy,
+    #[serde(default = "default_l3_scan_interval_secs")]
+    pub l3_scan_interval_secs: u64,
     pub l1_empty_scans_to_l2: u32,
     pub l2_empty_scans_to_l3: u32,
     pub per_round_max_dirs: usize,
@@ -66,6 +78,14 @@ pub struct PolicyParams {
     pub weights: ScoreWeights,
 }
 
+fn default_l3_scan_policy() -> L3ScanPolicy {
+    L3ScanPolicy::Interval
+}
+
+fn default_l3_scan_interval_secs() -> u64 {
+    DEFAULT_L3_SCAN_INTERVAL_SECS
+}
+
 impl Default for PolicyParams {
     fn default() -> Self {
         Self {
@@ -75,6 +95,8 @@ impl Default for PolicyParams {
             l0_idle_ttl_secs: 600,
             l1_scan_interval_secs: 20,
             l2_scan_interval_secs: 180,
+            l3_scan_policy: L3ScanPolicy::Interval,
+            l3_scan_interval_secs: DEFAULT_L3_SCAN_INTERVAL_SECS,
             l1_empty_scans_to_l2: 4,
             l2_empty_scans_to_l3: 3,
             per_round_max_dirs: 16,
@@ -97,6 +119,7 @@ impl PolicyParams {
         self.l2_scan_interval_secs = self
             .l2_scan_interval_secs
             .max(self.l1_scan_interval_secs.saturating_add(1));
+        self.l3_scan_interval_secs = self.l3_scan_interval_secs.max(1);
         self.l1_empty_scans_to_l2 = self.l1_empty_scans_to_l2.max(1);
         self.l2_empty_scans_to_l3 = self.l2_empty_scans_to_l3.max(1);
         self.per_round_max_dirs = self.per_round_max_dirs.max(1);
@@ -137,6 +160,39 @@ impl PolicyParams {
 pub struct DirPolicyState {
     pub recent_events: u32,
     pub last_event_at: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn l3_scan_interval_honors_explicit_policy() {
+        let interval = PolicyParams {
+            l2_scan_interval_secs: 10,
+            l3_scan_policy: L3ScanPolicy::Interval,
+            l3_scan_interval_secs: 123,
+            ..PolicyParams::default()
+        }
+        .sanitize();
+        assert_eq!(SimTier::L3.scan_interval_secs(&interval), 123);
+
+        let validate_on_query = PolicyParams {
+            l3_scan_policy: L3ScanPolicy::ValidateOnQuery,
+            l3_scan_interval_secs: 123,
+            ..PolicyParams::default()
+        }
+        .sanitize();
+        assert_eq!(SimTier::L3.scan_interval_secs(&validate_on_query), u64::MAX);
+
+        let disabled = PolicyParams {
+            l3_scan_policy: L3ScanPolicy::Disabled,
+            l3_scan_interval_secs: 123,
+            ..PolicyParams::default()
+        }
+        .sanitize();
+        assert_eq!(SimTier::L3.scan_interval_secs(&disabled), u64::MAX);
+    }
 }
 
 pub fn initial_l0_candidates(world: &World, policy: &PolicyParams) -> Vec<usize> {

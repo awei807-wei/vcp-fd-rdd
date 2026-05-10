@@ -185,7 +185,7 @@ fd-rdd-query --limit 2000 "*.rs"
 
 HTTP `/search` 返回每条结果的 `score`、`highlights`，以及冷层校验语义：`freshness`（如 `fresh` / `stale_checked` / `changed`）、`index_tier`（如 `HotMemory` / `ColdMmap`）和 `validated`。当冷层/base 命中已删除时，查询会写入 tombstone 并屏蔽旧结果；当文件 mtime 或身份变化时，会把命中父目录加入 DirtyQueue，由后台补偿调度做局部补扫。
 
-v7 快照启动时会挂载为 manifest-only 冷段：常驻内存只保留 segment manifest、路径 Bloom-style filter、mtime 范围和 dirty/freshness 状态；metadata/postings 不再 hydration 到 `BaseIndexData`，查询命中时从 mmap 段按需反序列化并返回 `index_tier = "FrozenManifestOnly"`。`/memory` 会拆出 `hot_memory_entries`、`manifest_only_entries`、`cold_segment_count`、`cold_manifest_bytes`、`cold_filter_bytes` 和 `cold_mmap_bytes`，用于证明冷层是降低索引驻留而不只是降低扫描频率。
+v7 快照启动时会挂载为 manifest-only 冷段：常驻内存只保留 segment manifest、路径 Bloom-style filter、mtime 范围和 dirty/freshness 状态；metadata/postings 不再 hydration 到 `BaseIndexData`，查询、metadata lookup 和 parent candidates 会直接从 mmap 段按需读取并返回 `index_tier = "FrozenManifestOnly"`。新写 v7 快照会持久化完整路径 trigram posting 与 `[0,0,0]` sentinel，使 mmap 查询可安全用 posting 判空；旧 basename-only 段或缺少 sentinel 的段会回退全段精确过滤，避免目录组件命中漏查。`/memory` 会拆出 `hot_memory_entries`、`manifest_only_entries`、`cold_segment_count`、`cold_manifest_bytes`、`cold_filter_bytes` 和 `cold_mmap_bytes`，用于证明冷层是降低索引驻留而不只是降低扫描频率。
 
 DirtyQueue 是冷层补偿的统一入口，会合并来自 inotify 冷层事件、查询 stale hit、路径形态 query miss、周期冷层扫描、启动修复和 overflow recovery 的 dirty scope。队列带 debounce、优先级和重试；局部补扫优先扫描事件所在叶子目录，失败时再逐级扩大范围。
 
@@ -239,7 +239,7 @@ cargo run --bin fd-rdd-sim -- apply \
   --dry-run
 ```
 
-可通过 `--policy policies/tiered-default.toml` 读取策略基线；CLI 里显式传入的预算、TTL、扫描周期参数会作为本次运行的覆盖值。`optimize` 报告中的 `convergence.phase` / `current_generation` / `current_generation_trials` 显示当前进度，`convergence.trace` 记录每代试错轨迹，`recommendation` 字段给出推荐的 `watch_mode = "tiered"`、`max_watch_dirs`、扫描周期和 TTL。
+可通过 `--policy policies/tiered-default.toml` 读取策略基线；CLI 里显式传入的预算、TTL、扫描周期和 `--l3-scan-policy interval|validate_on_query|disabled` 参数会作为本次运行的覆盖值。`grid`、`evolve` 和 `optimize` 会主动搜索三种 L3 策略模式，推荐结果不会被初始 seed 锁死在 `interval`。`optimize` 报告中的 `convergence.phase` / `current_generation` / `current_generation_trials` 显示当前进度，`convergence.trace` 记录每代试错轨迹，`recommendation` 字段给出推荐的 `watch_mode = "tiered"`、`max_watch_dirs`、L1/L2/L3 扫描策略和 TTL。
 
 `home-desktop` profile 将 `$HOME` 拆成 synthetic 热根：`Downloads` 高频新增和 burst，`Documents/Desktop` 小规模高价值，`Pictures/Videos` 低变更但 scan cost 大，`Code` 可能活跃但不保证初始热，`Archive/NAS` 大、冷且有偶发冷查询压力；`.cache`、`node_modules`、构建目录等默认排除项在 workload 中表现为近零 scan work 且不产生事件。
 

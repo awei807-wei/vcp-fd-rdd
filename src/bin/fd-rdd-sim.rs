@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use fd_rdd::config::{Config, WatchMode};
+use fd_rdd::config::{Config, L3ScanPolicy, WatchMode};
 use fd_rdd::sim::{
     adversarial_report, default_regression_policy, evolve_report, grid_report, optimize_report,
     sim_regression_markdown, sim_regression_report, single_report,
@@ -84,6 +84,14 @@ struct CommonArgs {
     /// L2 cold scan interval.
     #[arg(long)]
     l2_scan_interval_secs: Option<u64>,
+
+    /// L3 scan policy: interval, validate_on_query, or disabled.
+    #[arg(long, value_parser = parse_l3_scan_policy)]
+    l3_scan_policy: Option<L3ScanPolicy>,
+
+    /// L3 low-frequency scan interval used by interval policy.
+    #[arg(long)]
+    l3_scan_interval_secs: Option<u64>,
 
     /// Max directories scanned per tick.
     #[arg(long)]
@@ -393,6 +401,8 @@ fn merge_tiered_watch_config(
     config.tiered_watch.l0_idle_ttl_secs = recommendation.l0_idle_ttl_secs;
     config.tiered_watch.l1_scan_interval_secs = recommendation.l1_scan_interval_secs;
     config.tiered_watch.l2_scan_interval_secs = recommendation.l2_scan_interval_secs;
+    config.tiered_watch.l3_scan_policy = recommendation.l3_scan_policy;
+    config.tiered_watch.l3_scan_interval_secs = recommendation.l3_scan_interval_secs;
     config.tiered_watch.l1_empty_scans_to_l2 = recommendation.l1_empty_scans_to_l2;
     config.tiered_watch.l2_empty_scans_to_l3 = recommendation.l2_empty_scans_to_l3;
     Ok(config)
@@ -419,6 +429,12 @@ fn config_from_common(args: CommonArgs) -> anyhow::Result<OptimizerConfig> {
     if let Some(value) = args.l2_scan_interval_secs {
         policy.l2_scan_interval_secs = value;
     }
+    if let Some(value) = args.l3_scan_policy {
+        policy.l3_scan_policy = value;
+    }
+    if let Some(value) = args.l3_scan_interval_secs {
+        policy.l3_scan_interval_secs = value;
+    }
     if let Some(value) = args.per_round_max_dirs {
         policy.per_round_max_dirs = value;
     }
@@ -438,6 +454,10 @@ fn config_from_common(args: CommonArgs) -> anyhow::Result<OptimizerConfig> {
         top_n: args.top_n,
         ..OptimizerConfig::default()
     })
+}
+
+fn parse_l3_scan_policy(value: &str) -> Result<L3ScanPolicy, String> {
+    value.parse()
 }
 
 fn load_policy(path: &PathBuf) -> anyhow::Result<PolicyParams> {

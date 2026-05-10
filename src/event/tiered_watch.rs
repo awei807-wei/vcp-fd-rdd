@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::config::L3ScanPolicy;
 use crate::index::tiered::ScanOutcome;
 use crate::stats::WatchStateReport;
 
@@ -960,6 +961,8 @@ impl TieredWatchRuntime {
         path: &Path,
         l1_interval_secs: u64,
         l2_interval_secs: u64,
+        l3_scan_policy: L3ScanPolicy,
+        l3_interval_secs: u64,
         l1_empty_scans_to_l2: u32,
         l2_empty_scans_to_l3: u32,
     ) {
@@ -1001,7 +1004,7 @@ impl TieredWatchRuntime {
                 state.set_index_residency(IndexResidency::FrozenManifestOnly);
                 state.empty_scan_count.store(0, Ordering::Relaxed);
                 state.next_scan_unix_secs.store(
-                    now.saturating_add(l2_interval_secs.saturating_mul(2).max(1)),
+                    next_l3_scan_unix_secs(now, l3_scan_policy, l3_interval_secs),
                     Ordering::Relaxed,
                 );
                 self.last_adjustment_unix_secs.store(now, Ordering::Relaxed);
@@ -1020,7 +1023,7 @@ impl TieredWatchRuntime {
             }
             WatchTier::L3 => {
                 state.next_scan_unix_secs.store(
-                    now.saturating_add(l2_interval_secs.saturating_mul(2).max(1)),
+                    next_l3_scan_unix_secs(now, l3_scan_policy, l3_interval_secs),
                     Ordering::Relaxed,
                 );
             }
@@ -1517,6 +1520,14 @@ fn path_has_component(path: &Path, component: &str) -> bool {
         .any(|part| part.as_os_str().to_string_lossy() == component)
 }
 
+fn next_l3_scan_unix_secs(now: u64, policy: L3ScanPolicy, interval_secs: u64) -> u64 {
+    if policy.schedules_periodic_scan() {
+        now.saturating_add(interval_secs.max(1))
+    } else {
+        u64::MAX
+    }
+}
+
 fn choose_ephemeral_victim(
     leases: &HashMap<PathBuf, EphemeralWatchLease>,
     candidate: &Path,
@@ -1692,7 +1703,7 @@ mod tests {
                 elapsed_ms: 1,
             },
         );
-        rt.apply_scan_policy(warm.as_path(), 1, 2, 1, 1);
+        rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
         let l2 = rt.report();
         assert_eq!(l2.l1_dirs, 0);
         assert_eq!(l2.l2_dirs, 1);
@@ -1706,7 +1717,7 @@ mod tests {
                 elapsed_ms: 1,
             },
         );
-        rt.apply_scan_policy(warm.as_path(), 1, 2, 1, 1);
+        rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
         let l3 = rt.report();
         assert_eq!(l3.l2_dirs, 0);
         assert_eq!(l3.l3_dirs, 1);
@@ -1725,7 +1736,7 @@ mod tests {
                 elapsed_ms: 1,
             },
         );
-        rt.apply_scan_policy(warm.as_path(), 1, 2, 1, 1);
+        rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
         rt.record_scan(
             warm.as_path(),
             ScanOutcome {
@@ -1734,7 +1745,7 @@ mod tests {
                 elapsed_ms: 1,
             },
         );
-        rt.apply_scan_policy(warm.as_path(), 1, 2, 1, 1);
+        rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
 
         assert_eq!(rt.report().l1_dirs, 1);
         assert_eq!(
@@ -2175,7 +2186,7 @@ mod tests {
                 elapsed_ms: 1,
             },
         );
-        rt.apply_scan_policy(warm.as_path(), 1, 2, 1, 1);
+        rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
         let l2 = rt.report();
         assert_eq!(l2.l2_dirs, 1);
         assert_eq!(l2.cold_mmap_dirs, 1);
@@ -2190,12 +2201,122 @@ mod tests {
                 elapsed_ms: 1,
             },
         );
-        rt.apply_scan_policy(warm.as_path(), 1, 2, 1, 1);
+        rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
         let l3 = rt.report();
         assert_eq!(l3.l3_dirs, 1);
         assert_eq!(l3.frozen_manifest_dirs, 1);
         assert_eq!(l3.cold_mmap_dirs, 0);
         assert_eq!(l3.cold_validate_count, 1);
+    }
+
+    #[test]
+    fn l3_interval_policy_uses_explicit_l3_interval() {
+        let rt = runtime();
+        let warm = PathBuf::from("/tmp/warm");
+        let before = unix_secs();
+
+        rt.record_scan(
+            warm.as_path(),
+            ScanOutcome {
+                scanned: 1,
+                changed: 0,
+                elapsed_ms: 1,
+            },
+        );
+        rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 99, 1, 1);
+        rt.record_scan(
+            warm.as_path(),
+            ScanOutcome {
+                scanned: 1,
+                changed: 0,
+                elapsed_ms: 1,
+            },
+        );
+        rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 99, 1, 1);
+
+        let dump = rt.debug_dump(Some("/tmp/warm"));
+        let dir = dump.dirs.first().expect("warm dir should be present");
+        assert_eq!(dir.watch_tier, "L3");
+        assert!(dir.next_scan_unix_secs >= before.saturating_add(99));
+        assert!(dir.next_scan_unix_secs < before.saturating_add(120));
+    }
+
+    #[test]
+    fn l3_validate_on_query_policy_disables_periodic_l3_scan() {
+        let rt = runtime();
+        let warm = PathBuf::from("/tmp/warm");
+
+        rt.record_scan(
+            warm.as_path(),
+            ScanOutcome {
+                scanned: 1,
+                changed: 0,
+                elapsed_ms: 1,
+            },
+        );
+        rt.apply_scan_policy(
+            warm.as_path(),
+            1,
+            2,
+            L3ScanPolicy::ValidateOnQuery,
+            99,
+            1,
+            1,
+        );
+        rt.record_scan(
+            warm.as_path(),
+            ScanOutcome {
+                scanned: 1,
+                changed: 0,
+                elapsed_ms: 1,
+            },
+        );
+        rt.apply_scan_policy(
+            warm.as_path(),
+            1,
+            2,
+            L3ScanPolicy::ValidateOnQuery,
+            99,
+            1,
+            1,
+        );
+
+        let dump = rt.debug_dump(Some("/tmp/warm"));
+        let dir = dump.dirs.first().expect("warm dir should be present");
+        assert_eq!(dir.watch_tier, "L3");
+        assert_eq!(dir.next_scan_unix_secs, u64::MAX);
+        assert!(rt.scan_batch(8).is_empty());
+    }
+
+    #[test]
+    fn l3_disabled_policy_disables_periodic_l3_scan() {
+        let rt = runtime();
+        let warm = PathBuf::from("/tmp/warm");
+
+        rt.record_scan(
+            warm.as_path(),
+            ScanOutcome {
+                scanned: 1,
+                changed: 0,
+                elapsed_ms: 1,
+            },
+        );
+        rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Disabled, 99, 1, 1);
+        rt.record_scan(
+            warm.as_path(),
+            ScanOutcome {
+                scanned: 1,
+                changed: 0,
+                elapsed_ms: 1,
+            },
+        );
+        rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Disabled, 99, 1, 1);
+
+        let dump = rt.debug_dump(Some("/tmp/warm"));
+        let dir = dump.dirs.first().expect("warm dir should be present");
+        assert_eq!(dir.watch_tier, "L3");
+        assert_eq!(dir.next_scan_unix_secs, u64::MAX);
+        assert!(rt.scan_batch(8).is_empty());
     }
 
     #[test]

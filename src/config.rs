@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use crate::util::{default_exclude_dirs, normalize_exclude_dirs};
 
+pub const DEFAULT_L3_SCAN_INTERVAL_SECS: u64 = 21_600;
+
 /// Returns the platform-appropriate default socket path (user-isolated).
 ///
 /// - Linux: `$XDG_RUNTIME_DIR/fd-rdd/fd-rdd.sock`
@@ -197,6 +199,10 @@ pub struct TieredWatchConfig {
     pub l1_scan_interval_secs: u64,
     /// Cold verification interval.
     pub l2_scan_interval_secs: u64,
+    /// L3 scan behavior: periodic interval, validate-on-query only, or disabled.
+    pub l3_scan_policy: L3ScanPolicy,
+    /// Low-frequency L3 verification interval used when l3_scan_policy = "interval".
+    pub l3_scan_interval_secs: u64,
     /// Empty L1 scans before demotion to L2.
     pub l1_empty_scans_to_l2: u32,
     /// Empty L2 scans before demotion to L3.
@@ -213,6 +219,37 @@ pub struct TieredWatchConfig {
     pub hot_dirs: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum L3ScanPolicy {
+    #[default]
+    Interval,
+    #[serde(alias = "validate-on-query")]
+    ValidateOnQuery,
+    Disabled,
+}
+
+impl L3ScanPolicy {
+    pub fn schedules_periodic_scan(self) -> bool {
+        matches!(self, Self::Interval)
+    }
+}
+
+impl std::str::FromStr for L3ScanPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "interval" => Ok(Self::Interval),
+            "validate_on_query" | "validate-on-query" => Ok(Self::ValidateOnQuery),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(format!(
+                "unsupported L3 scan policy {other:?}; expected interval, validate_on_query, or disabled"
+            )),
+        }
+    }
+}
+
 impl Default for TieredWatchConfig {
     fn default() -> Self {
         Self {
@@ -222,6 +259,8 @@ impl Default for TieredWatchConfig {
             l0_idle_ttl_secs: 7_200,
             l1_scan_interval_secs: 30,
             l2_scan_interval_secs: 300,
+            l3_scan_policy: L3ScanPolicy::Interval,
+            l3_scan_interval_secs: DEFAULT_L3_SCAN_INTERVAL_SECS,
             l1_empty_scans_to_l2: 5,
             l2_empty_scans_to_l3: 3,
             ephemeral_watch_budget: 256,
@@ -462,11 +501,48 @@ max_watch_dirs = 16
         assert_eq!(cfg.tiered_watch.ephemeral_watch_ttl_secs, 600);
         assert_eq!(cfg.tiered_watch.ephemeral_idle_secs, 120);
         assert_eq!(cfg.tiered_watch.ephemeral_max_cost_per_root, 64);
+        assert_eq!(cfg.tiered_watch.l3_scan_policy, L3ScanPolicy::Interval);
+        assert_eq!(
+            cfg.tiered_watch.l3_scan_interval_secs,
+            DEFAULT_L3_SCAN_INTERVAL_SECS
+        );
 
         let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
+        assert!(toml.contains("l3_scan_policy"));
+        assert!(toml.contains("l3_scan_interval_secs"));
         assert!(toml.contains("ephemeral_watch_budget"));
         assert!(toml.contains("ephemeral_watch_ttl_secs"));
         assert!(toml.contains("ephemeral_idle_secs"));
         assert!(toml.contains("ephemeral_max_cost_per_root"));
+    }
+
+    #[test]
+    fn tiered_watch_l3_scan_policy_accepts_documented_values() {
+        let cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+watch_mode = "tiered"
+
+[tiered_watch]
+l3_scan_policy = "validate_on_query"
+l3_scan_interval_secs = 999
+"#,
+        )
+        .expect("config should parse documented L3 policy");
+
+        assert_eq!(
+            cfg.tiered_watch.l3_scan_policy,
+            L3ScanPolicy::ValidateOnQuery
+        );
+        assert_eq!(cfg.tiered_watch.l3_scan_interval_secs, 999);
+
+        let legacy_hyphen: TieredWatchConfig = toml::from_str(
+            r#"
+l3_scan_policy = "validate-on-query"
+"#,
+        )
+        .expect("hyphenated value should remain accepted for CLI-style configs");
+
+        assert_eq!(legacy_hyphen.l3_scan_policy, L3ScanPolicy::ValidateOnQuery);
     }
 }
