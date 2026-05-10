@@ -246,17 +246,33 @@ fn is_path_initials_query(input: &str) -> bool {
         || input.starts_with("type:")
         || input.starts_with("case:")
         || input.starts_with("content:");
-    has_separator
-        && !has_glob
-        && !has_special_prefix
-        && input
-            .split(['/', '\\'])
-            .filter(|segment| !segment.is_empty())
-            .all(is_path_initials_segment)
+    if !has_separator || has_glob || has_special_prefix {
+        return false;
+    }
+
+    let segments = input
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let Some((last, prefix_segments)) = segments.split_last() else {
+        return false;
+    };
+
+    !prefix_segments.is_empty()
+        && prefix_segments.iter().all(|s| is_path_initials_segment(s))
+        && is_path_initials_tail_segment(last)
 }
 
 fn is_path_initials_segment(segment: &str) -> bool {
     !segment.is_empty() && segment.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+fn is_path_initials_tail_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.contains('.')
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
@@ -1201,7 +1217,19 @@ mod tests {
     #[test]
     fn path_initials_detection_ignores_literal_file_paths() {
         assert!(is_path_initials_query("c/use/shi/pro"));
+        assert!(is_path_initials_query("c/u/s/initials_probe_123"));
         assert!(!is_path_initials_query("fd-rdd/todo.md"));
         assert!(!is_path_initials_query("src/main.rs"));
+    }
+
+    #[test]
+    fn path_initials_query_matches_filename_tail_with_underscores() {
+        let q = compile_query("c/u/s/initials_probe_123").unwrap();
+        let m = meta(
+            "/tmp/fd_rdd_smoke/segment/client/user/search/initials_probe_123.txt",
+            1,
+            None,
+        );
+        assert!(q.matches(&m));
     }
 }

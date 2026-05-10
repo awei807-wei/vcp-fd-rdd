@@ -379,6 +379,28 @@ async fn removed_size_filter_is_not_text_matched() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn strict_dsl_preserves_path_initials_with_filename_tail() {
+    let root = unique_tmp_dir("query-path-initials-tail");
+    let dir = root.join("segment/client/user/search");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let p = dir.join("initials_probe_123.txt");
+    std::fs::write(&p, b"initials").unwrap();
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, p.clone())]);
+
+    let results = idx
+        .query_limit_detailed_strict("c/u/s/initials_probe_123", 100)
+        .unwrap();
+    assert!(
+        results.iter().any(|r| r.meta.path == p),
+        "strict DSL query should preserve path-initials matching for smoke-style filename tails"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn v7_load_mounts_base_without_l2_hydration_and_preserves_next_snapshot() -> anyhow::Result<()>
 {
