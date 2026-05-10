@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::{FileKey, FileMeta};
@@ -11,7 +11,293 @@ use crate::index::path_table_v2::PathTableV2;
 use crate::index::PathFreshness;
 use crate::query::Matcher;
 use crate::stats::BaseStats;
+use crate::storage::snapshot_v7::V7Snapshot;
 use crate::util::pathbuf_from_encoded_vec;
+
+const COLD_NAME_FILTER_WORDS: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColdSegmentManifest {
+    pub segment_id: u64,
+    pub root_path: PathBuf,
+    pub tier: String,
+    pub generation: u64,
+    pub last_scan_time: u64,
+    pub freshness: String,
+    pub dirty_flag: bool,
+    pub entry_count: usize,
+    pub segment_path: PathBuf,
+    pub mtime_min_ns: i64,
+    pub mtime_max_ns: i64,
+    pub mmap_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ColdNameFilter {
+    bits: Vec<u64>,
+    inserted_trigrams: usize,
+}
+
+impl Default for ColdNameFilter {
+    fn default() -> Self {
+        Self {
+            bits: vec![0; COLD_NAME_FILTER_WORDS],
+            inserted_trigrams: 0,
+        }
+    }
+}
+
+impl ColdNameFilter {
+    fn insert_path_bytes(&mut self, path_bytes: &[u8]) {
+        let lower = String::from_utf8_lossy(path_bytes).to_lowercase();
+        let bytes = lower.as_bytes();
+        if bytes.len() < 3 {
+            return;
+        }
+        for tri in bytes.windows(3) {
+            self.insert_trigram(tri);
+        }
+    }
+
+    fn insert_trigram(&mut self, tri: &[u8]) {
+        let bit = trigram_filter_bit(tri);
+        self.bits[bit / 64] |= 1u64 << (bit % 64);
+        self.inserted_trigrams = self.inserted_trigrams.saturating_add(1);
+    }
+
+    fn might_match_literal_hint(&self, hint: Option<&[u8]>) -> bool {
+        let Some(hint) = hint else {
+            return true;
+        };
+        let lower = String::from_utf8_lossy(hint).to_lowercase();
+        let bytes = lower.as_bytes();
+        if bytes.len() < 3 {
+            return true;
+        }
+        bytes.windows(3).all(|tri| {
+            let bit = trigram_filter_bit(tri);
+            (self.bits[bit / 64] & (1u64 << (bit % 64))) != 0
+        })
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        (std::mem::size_of::<Self>() + self.bits.capacity() * std::mem::size_of::<u64>()) as u64
+    }
+}
+
+fn trigram_filter_bit(tri: &[u8]) -> usize {
+    let mut h = 0x811c9dc5u32;
+    for &b in tri.iter().take(3) {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    (h as usize) % (COLD_NAME_FILTER_WORDS * 64)
+}
+
+#[derive(Clone)]
+pub struct ColdSegment {
+    pub manifest: ColdSegmentManifest,
+    filter: ColdNameFilter,
+    snapshot: Arc<V7Snapshot>,
+}
+
+impl std::fmt::Debug for ColdSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColdSegment")
+            .field("manifest", &self.manifest)
+            .field("filter_bits", &self.filter.bits.len())
+            .field("inserted_trigrams", &self.filter.inserted_trigrams)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ColdSegment {
+    pub fn from_v7_snapshot(
+        segment_id: u64,
+        root_path: PathBuf,
+        segment_path: PathBuf,
+        generation: u64,
+        snapshot: Arc<V7Snapshot>,
+    ) -> anyhow::Result<Self> {
+        let mut filter = ColdNameFilter::default();
+        let mut entry_count = 0usize;
+        let mut min_mtime = i64::MAX;
+        let mut max_mtime = i64::MIN;
+
+        snapshot.for_each_live_entry_path(|entry, path_bytes| {
+            entry_count = entry_count.saturating_add(1);
+            filter.insert_path_bytes(path_bytes);
+            if entry.mtime_ns >= 0 {
+                min_mtime = min_mtime.min(entry.mtime_ns);
+                max_mtime = max_mtime.max(entry.mtime_ns);
+            }
+        })?;
+
+        if min_mtime == i64::MAX {
+            min_mtime = -1;
+        }
+        if max_mtime == i64::MIN {
+            max_mtime = -1;
+        }
+
+        Ok(Self {
+            manifest: ColdSegmentManifest {
+                segment_id,
+                root_path,
+                tier: "L3".to_string(),
+                generation,
+                last_scan_time: generation,
+                freshness: "fresh".to_string(),
+                dirty_flag: false,
+                entry_count,
+                segment_path,
+                mtime_min_ns: min_mtime,
+                mtime_max_ns: max_mtime,
+                mmap_bytes: snapshot.mapped_len() as u64,
+            },
+            filter,
+            snapshot,
+        })
+    }
+
+    fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
+        if !self.filter.might_match_literal_hint(matcher.literal_hint()) {
+            return Vec::new();
+        }
+        self.snapshot
+            .to_base_index_data()
+            .map(|data| data.resident_query_keys(matcher))
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "cold segment query decode failed for {}: {}",
+                    self.manifest.segment_path.display(),
+                    e
+                );
+                Vec::new()
+            })
+    }
+
+    fn get_meta(&self, key: FileKey) -> Option<FileMeta> {
+        self.snapshot
+            .to_base_index_data()
+            .ok()
+            .and_then(|data| data.resident_get_meta(key))
+    }
+
+    fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
+        match self.snapshot.to_base_index_data() {
+            Ok(data) => data.resident_for_each_live_meta(|meta| f(meta)),
+            Err(e) => tracing::warn!(
+                "cold segment metadata decode failed for {}: {}",
+                self.manifest.segment_path.display(),
+                e
+            ),
+        }
+    }
+
+    fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
+        self.snapshot
+            .to_base_index_data()
+            .map(|data| data.resident_parent_candidates(parent_path))
+            .unwrap_or_default()
+    }
+
+    fn manifest_bytes(&self) -> u64 {
+        (std::mem::size_of::<ColdSegmentManifest>()
+            + self.manifest.root_path.as_os_str().as_encoded_bytes().len()
+            + self
+                .manifest
+                .segment_path
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+            + self.manifest.tier.len()
+            + self.manifest.freshness.len()) as u64
+    }
+
+    fn filter_bytes(&self) -> u64 {
+        self.filter.allocated_bytes()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ColdSegmentStore {
+    segments: Vec<ColdSegment>,
+}
+
+impl ColdSegmentStore {
+    pub fn single(segment: ColdSegment) -> Self {
+        Self {
+            segments: vec![segment],
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn manifests(&self) -> impl Iterator<Item = &ColdSegmentManifest> {
+        self.segments.iter().map(|segment| &segment.manifest)
+    }
+
+    fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
+        let mut out = Vec::new();
+        for segment in &self.segments {
+            out.extend(segment.query_keys(matcher));
+        }
+        out
+    }
+
+    fn get_meta(&self, key: FileKey) -> Option<FileMeta> {
+        self.segments
+            .iter()
+            .find_map(|segment| segment.get_meta(key))
+    }
+
+    fn contains_key(&self, key: FileKey) -> bool {
+        self.get_meta(key).is_some()
+    }
+
+    fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
+        for segment in &self.segments {
+            segment.for_each_live_meta(|meta| f(meta));
+        }
+    }
+
+    fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
+        let mut out = Vec::new();
+        for segment in &self.segments {
+            out.extend(segment.parent_candidates(parent_path));
+        }
+        out
+    }
+
+    fn manifest_only_entries(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|segment| segment.manifest.entry_count)
+            .sum()
+    }
+
+    fn manifest_bytes(&self) -> u64 {
+        self.segments.iter().map(ColdSegment::manifest_bytes).sum()
+    }
+
+    fn filter_bytes(&self) -> u64 {
+        self.segments.iter().map(ColdSegment::filter_bytes).sum()
+    }
+
+    fn mmap_bytes(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|segment| segment.manifest.mmap_bytes)
+            .sum()
+    }
+}
 
 /// TrigramIndex: 只读的 trigram → RoaringBitmap 映射。
 ///
@@ -69,10 +355,36 @@ pub struct BaseIndexData {
     pub trigram_index: TrigramIndex,
     pub parent_index: ParentIndex,
     pub tombstones: RoaringBitmap,
+    pub cold_segments: ColdSegmentStore,
 }
 
 impl BaseIndexData {
+    pub fn from_cold_v7_snapshot(
+        segment_path: PathBuf,
+        root_path: PathBuf,
+        generation: u64,
+        snapshot: Arc<V7Snapshot>,
+    ) -> anyhow::Result<Self> {
+        let segment_id = cold_segment_id(segment_path.as_path(), generation);
+        let segment = ColdSegment::from_v7_snapshot(
+            segment_id,
+            root_path,
+            segment_path,
+            generation,
+            snapshot,
+        )?;
+        Ok(Self {
+            cold_segments: ColdSegmentStore::single(segment),
+            ..Self::default()
+        })
+    }
+
     pub fn file_count(&self) -> usize {
+        self.resident_file_count()
+            .saturating_add(self.cold_segments.manifest_only_entries())
+    }
+
+    fn resident_file_count(&self) -> usize {
         self.entries_by_key
             .len()
             .saturating_sub(self.tombstones.len() as usize)
@@ -86,11 +398,23 @@ impl BaseIndexData {
         let parent_bytes = self.parent_index.allocated_bytes() as u64;
         let tombstone_bytes =
             std::mem::size_of::<RoaringBitmap>() as u64 + self.tombstones.serialized_size() as u64;
-        let estimated_bytes =
-            path_table_bytes + entries_bytes + trigram_bytes + parent_bytes + tombstone_bytes;
+        let cold_manifest_bytes = self.cold_segments.manifest_bytes();
+        let cold_filter_bytes = self.cold_segments.filter_bytes();
+        let cold_mmap_bytes = self.cold_segments.mmap_bytes();
+        let manifest_only_entries = self.cold_segments.manifest_only_entries();
+        let estimated_bytes = path_table_bytes
+            + entries_bytes
+            + trigram_bytes
+            + parent_bytes
+            + tombstone_bytes
+            + cold_manifest_bytes
+            + cold_filter_bytes;
 
         BaseStats {
             file_count: self.file_count(),
+            hot_memory_entries: self.resident_file_count(),
+            manifest_only_entries,
+            cold_segment_count: self.cold_segments.len(),
             path_table_entries: self.path_table.len(),
             path_table_bytes,
             entries_count: self.entries_by_key.len(),
@@ -103,11 +427,19 @@ impl BaseIndexData {
             parent_bytes,
             tombstone_count: self.tombstones.len() as usize,
             tombstone_bytes,
+            cold_manifest_bytes,
+            cold_filter_bytes,
+            cold_mmap_bytes,
             estimated_bytes,
         }
     }
 
     pub fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
+        self.resident_for_each_live_meta(&mut f);
+        self.cold_segments.for_each_live_meta(f);
+    }
+
+    fn resident_for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
         for (docid, entry) in self.entries_by_key.iter().enumerate() {
             if self.tombstones.contains(docid as u32) {
                 continue;
@@ -120,6 +452,12 @@ impl BaseIndexData {
     }
 
     pub fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
+        let mut out = self.resident_query_keys(matcher);
+        out.extend(self.cold_segments.query_keys(matcher));
+        out
+    }
+
+    fn resident_query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
         let candidates = self.trigram_candidates(matcher);
         let mut out = Vec::new();
 
@@ -167,6 +505,11 @@ impl BaseIndexData {
     }
 
     pub fn get_meta(&self, key: FileKey) -> Option<FileMeta> {
+        self.resident_get_meta(key)
+            .or_else(|| self.cold_segments.get_meta(key))
+    }
+
+    fn resident_get_meta(&self, key: FileKey) -> Option<FileMeta> {
         let docid = self.entries_by_key.lookup_docid_by_filekey(key)?;
         if self.tombstones.contains(docid) {
             return None;
@@ -197,6 +540,14 @@ impl BaseIndexData {
         }
     }
 
+    pub fn key_is_manifest_only(&self, key: FileKey) -> bool {
+        self.resident_get_meta(key).is_none() && self.cold_segments.contains_key(key)
+    }
+
+    pub fn has_manifest_only_segments(&self) -> bool {
+        !self.cold_segments.is_empty()
+    }
+
     pub fn delete_alignment_with_parent_index(
         &self,
         dirty_dirs: &HashSet<PathBuf>,
@@ -221,10 +572,27 @@ impl BaseIndexData {
             let path = pathbuf_from_encoded_vec(path_bytes);
             result.push((doc_id as u64, path));
         }
+        let mut cold_doc_id = result.len() as u64;
+        self.cold_segments.for_each_live_meta(|meta| {
+            if meta
+                .path
+                .parent()
+                .is_some_and(|parent| dirty_dirs.contains(parent))
+            {
+                result.push((cold_doc_id, meta.path));
+                cold_doc_id = cold_doc_id.saturating_add(1);
+            }
+        });
         result
     }
 
     pub fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
+        let mut keys = self.resident_parent_candidates(parent_path);
+        keys.extend(self.cold_segments.parent_candidates(parent_path));
+        keys
+    }
+
+    fn resident_parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
         let parent_bytes = PathBuf::from(parent_path)
             .as_os_str()
             .as_encoded_bytes()
@@ -280,6 +648,15 @@ impl BaseIndexData {
         }
         Some(acc)
     }
+}
+
+fn cold_segment_id(path: &Path, generation: u64) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in path.as_os_str().as_encoded_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^ generation
 }
 
 fn entry_to_meta(entry: &FileEntry, path_bytes: &[u8]) -> FileMeta {

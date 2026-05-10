@@ -275,9 +275,12 @@ impl TieredIndex {
                 }
                 let _ = blocked_paths.insert(path_bytes);
                 if plan.matches(&meta) {
-                    if let Some(result) =
-                        self.validate_cold_result(meta, QueryResultIndexTier::ColdMmap)
-                    {
+                    let index_tier = if base.key_is_manifest_only(key) {
+                        QueryResultIndexTier::FrozenManifestOnly
+                    } else {
+                        QueryResultIndexTier::ColdMmap
+                    };
+                    if let Some(result) = self.validate_cold_result(meta, index_tier) {
                         results.push(result);
                         if results.len() >= limit {
                             return results;
@@ -296,7 +299,6 @@ impl TieredIndex {
             &mut blocked_paths,
             &mut results,
             limit,
-            QueryResultIndexTier::ColdMmap,
         ) {
             return results;
         }
@@ -326,14 +328,13 @@ impl TieredIndex {
     fn query_layer(
         &self,
         plan: &QueryPlan,
-        layer: &dyn IndexLayer,
+        layer: &BaseIndexData,
         layer_deleted: Option<&PathArenaSet>,
         deleted_sources: &[Arc<PathArenaSet>],
         seen: &mut std::collections::HashSet<FileKey>,
         blocked_paths: &mut PathArenaSet,
         results: &mut Vec<QueryResultMeta>,
         limit: usize,
-        index_tier: QueryResultIndexTier,
     ) -> bool {
         for anchor in plan.anchors() {
             for key in layer.query_keys(anchor.as_ref()) {
@@ -355,6 +356,11 @@ impl TieredIndex {
 
                 let _ = blocked_paths.insert(path_bytes);
                 if plan.matches(&meta) {
+                    let index_tier = if layer.key_is_manifest_only(key) {
+                        QueryResultIndexTier::FrozenManifestOnly
+                    } else {
+                        QueryResultIndexTier::ColdMmap
+                    };
                     if let Some(result) = self.validate_cold_result(meta, index_tier) {
                         results.push(result);
                         if results.len() >= limit {
@@ -373,7 +379,12 @@ impl TieredIndex {
         if self.delta_buffer.lock().is_live(path_bytes) {
             return Some(QueryResultMeta::hot(meta));
         }
-        self.validate_cold_result(meta, QueryResultIndexTier::ColdMmap)
+        let index_tier = if self.base.load().key_is_manifest_only(meta.file_key) {
+            QueryResultIndexTier::FrozenManifestOnly
+        } else {
+            QueryResultIndexTier::ColdMmap
+        };
+        self.validate_cold_result(meta, index_tier)
     }
 
     fn validate_cold_result(

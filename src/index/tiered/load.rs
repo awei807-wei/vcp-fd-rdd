@@ -343,13 +343,13 @@ impl TieredIndex {
         ];
 
         for (source, path) in snapshot_candidates {
-            match crate::storage::snapshot_v7::try_load_v7(path) {
+            match crate::storage::snapshot_v7::try_load_v7_cold(path, roots.as_slice()) {
                 Ok(Some(v7_data)) => {
                     tracing::info!(
-                        "{} snapshot loaded directly into base: {} entries, {} trigrams",
+                        "{} snapshot mounted as cold base: {} entries, {} manifest segment(s)",
                         source,
-                        v7_data.entries_by_key.len(),
-                        v7_data.trigram_index.len()
+                        v7_data.file_count(),
+                        v7_data.cold_segments.len()
                     );
                     let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
                     let idx = Self::new_with_base(

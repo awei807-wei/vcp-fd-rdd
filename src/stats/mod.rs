@@ -81,6 +81,9 @@ pub struct L1Stats {
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct BaseStats {
     pub file_count: usize,
+    pub hot_memory_entries: usize,
+    pub manifest_only_entries: usize,
+    pub cold_segment_count: usize,
     pub path_table_entries: usize,
     pub path_table_bytes: u64,
     pub entries_count: usize,
@@ -93,6 +96,9 @@ pub struct BaseStats {
     pub parent_bytes: u64,
     pub tombstone_count: usize,
     pub tombstone_bytes: u64,
+    pub cold_manifest_bytes: u64,
+    pub cold_filter_bytes: u64,
+    pub cold_mmap_bytes: u64,
     pub estimated_bytes: u64,
 }
 
@@ -402,6 +408,16 @@ impl fmt::Display for MemoryReport {
         )?;
         writeln!(
             f,
+            "║   hot entries:  {:>10}                       ║",
+            self.base.hot_memory_entries
+        )?;
+        writeln!(
+            f,
+            "║   manifest only:{:>10}  (segments={:>5})     ║",
+            self.base.manifest_only_entries, self.base.cold_segment_count
+        )?;
+        writeln!(
+            f,
             "║   path table:   {:>10}                       ║",
             human_bytes(self.base.path_table_bytes)
         )?;
@@ -419,6 +435,17 @@ impl fmt::Display for MemoryReport {
             f,
             "║   parent:       {:>10}                       ║",
             human_bytes(self.base.parent_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   cold manifest:{:>10}  (filter={:>10})      ║",
+            human_bytes(self.base.cold_manifest_bytes),
+            human_bytes(self.base.cold_filter_bytes)
+        )?;
+        writeln!(
+            f,
+            "║   cold mmap:    {:>10}  (not heap est)       ║",
+            human_bytes(self.base.cold_mmap_bytes)
         )?;
         writeln!(
             f,

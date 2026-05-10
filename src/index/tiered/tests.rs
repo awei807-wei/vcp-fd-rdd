@@ -426,6 +426,57 @@ async fn v7_load_mounts_base_without_l2_hydration_and_preserves_next_snapshot() 
 }
 
 #[tokio::test]
+async fn v7_load_mounts_manifest_only_cold_segment_and_queries_on_demand() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("v7-cold-manifest");
+    let content_root = root.join("content");
+    let archive = content_root.join("archive");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&archive)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+
+    for i in 0..128u32 {
+        let path = archive.join(format!("cold_file_{i:03}.txt"));
+        std::fs::write(&path, format!("cold-{i}"))?;
+        idx.apply_events(&[mk_event(u64::from(i) + 1, EventType::Create, path)]);
+    }
+    idx.refresh_base();
+    let hot_report = idx.memory_report(EventPipelineStats::default()).base;
+    assert_eq!(hot_report.hot_memory_entries, 128);
+    assert_eq!(hot_report.manifest_only_entries, 0);
+    idx.snapshot_now(store.clone()).await?;
+
+    let loaded = Arc::new(TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?);
+    let cold_report = loaded.memory_report(EventPipelineStats::default()).base;
+    assert_eq!(loaded.l2.load().file_count(), 0);
+    assert_eq!(cold_report.hot_memory_entries, 0);
+    assert_eq!(cold_report.manifest_only_entries, 128);
+    assert_eq!(cold_report.cold_segment_count, 1);
+    assert!(cold_report.cold_mmap_bytes > 0);
+    assert!(
+        cold_report.estimated_bytes < hot_report.estimated_bytes,
+        "manifest-only residency should be smaller than hydrated base: hot={hot_report:?} cold={cold_report:?}"
+    );
+
+    let results = loaded.query_limit_detailed("cold_file_042", 10);
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].index_tier,
+        QueryResultIndexTier::FrozenManifestOnly
+    );
+    assert!(results[0].validated);
+
+    let after_query = loaded.memory_report(EventPipelineStats::default()).base;
+    assert_eq!(after_query.hot_memory_entries, 0);
+    assert_eq!(after_query.manifest_only_entries, 128);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn periodic_flush_batch_threshold_skips_then_flushes() {
     let root = unique_tmp_dir("periodic-batch-events");
     std::fs::create_dir_all(&root).unwrap();

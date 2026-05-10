@@ -2,7 +2,7 @@ use memmap2::Mmap;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::index::base_index::{BaseIndexData, FileEntryIndex, TrigramIndex};
@@ -437,6 +437,10 @@ impl V7Snapshot {
         self.mmap.as_ref()
     }
 
+    pub fn mapped_len(&self) -> usize {
+        self.bytes().len()
+    }
+
     pub fn slice(&self, r: std::ops::Range<usize>) -> &[u8] {
         &self.bytes()[r]
     }
@@ -446,6 +450,39 @@ impl V7Snapshot {
             .iter()
             .find(|(k, _)| *k == kind)
             .map(|(_, r)| &self.bytes()[r.clone()])
+    }
+
+    pub fn for_each_live_entry_path(
+        &self,
+        mut f: impl FnMut(&FileEntry, &[u8]),
+    ) -> anyhow::Result<()> {
+        let path_table = self
+            .segment(V7SegKind::PathTable)
+            .map(decode_path_table)
+            .transpose()?
+            .unwrap_or_default();
+        let entries_by_key = self
+            .segment(V7SegKind::EntriesByKey)
+            .map(decode_file_entry_index)
+            .transpose()?
+            .unwrap_or_default();
+        let tombstones = self
+            .segment(V7SegKind::Tombstones)
+            .map(decode_tombstones)
+            .transpose()?
+            .unwrap_or_default();
+
+        for (docid, entry) in entries_by_key.iter().enumerate() {
+            if tombstones.contains(docid as u32) {
+                continue;
+            }
+            let Some(path_bytes) = path_table.resolve(entry.path_idx) else {
+                continue;
+            };
+            f(entry, &path_bytes);
+        }
+
+        Ok(())
     }
 
     /// 反序列化为 BaseIndexData（当前阶段仍做反序列化，后续可优化为零拷贝）。
@@ -482,6 +519,7 @@ impl V7Snapshot {
             trigram_index,
             parent_index,
             tombstones,
+            cold_segments: Default::default(),
         })
     }
 }
@@ -773,6 +811,43 @@ pub fn try_load_v7(path: &Path) -> anyhow::Result<Option<BaseIndexData>> {
         },
         None => Ok(None),
     }
+}
+
+pub fn try_load_v7_cold(path: &Path, roots: &[PathBuf]) -> anyhow::Result<Option<BaseIndexData>> {
+    let Some(snapshot) = load_v7_from_path(path)? else {
+        return Ok(None);
+    };
+    let root_path = cold_root_path(roots);
+    let generation = file_modified_unix_ns(path);
+    let snapshot = Arc::new(snapshot);
+    let data =
+        BaseIndexData::from_cold_v7_snapshot(path.to_path_buf(), root_path, generation, snapshot)?;
+    tracing::info!(
+        "v7 snapshot mounted as manifest-only cold segment: {} entries",
+        data.file_count()
+    );
+    Ok(Some(data))
+}
+
+fn cold_root_path(roots: &[PathBuf]) -> PathBuf {
+    match roots {
+        [single] => single.clone(),
+        [] => PathBuf::from("/"),
+        _ => PathBuf::from("/"),
+    }
+}
+
+fn file_modified_unix_ns(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| {
+            d.as_secs()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(u64::from(d.subsec_nanos()))
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

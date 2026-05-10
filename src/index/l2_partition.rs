@@ -1931,6 +1931,7 @@ impl PersistentIndex {
             trigram_index: tri,
             parent_index,
             tombstones: tombstones_bitmap,
+            cold_segments: Default::default(),
         }
     }
 }

@@ -7,22 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+## [0.6.16] - 2026-05-10
 
-- Added `fd-rdd-sim`, a synthetic tiered watcher policy benchmark CLI with continuous `optimize`, single-run baseline, grid-search, genetic-search, and adversarial robustness modes.
-- Added `src/sim/*` world, policy, simulator, metrics, and optimizer modules for deterministic workload generation and JSON report output.
-- Added `policies/tiered-default.toml` as a baseline simulation policy.
-- Added `fd-rdd-sim emit-config` to turn benchmark report recommendations into reviewable `watch_mode = "tiered"` and `[tiered_watch]` TOML patches.
-- Added simulation strategy counters for promotions, demotions, L0 replacements, promotion budget blocks, and final L0/L1/L2/L3 distribution, with parity tests against the runtime replacement and empty-scan demotion shapes.
-- Added P0 observability closure for tiered watcher reports: richer `/debug/tiered-watch` per-directory fields, real `/watch-state` dirty/cold/stale counters, and runtime/sim report mapping documentation.
-- Added P1 runtime/sim parity hardening: hot L0 retention, high-priority BudgetBlocked ordering, ancestor-safe replacement, watch budget accounting, fixed-seed synthetic workload checks, and failure diagnostics that print runtime/sim strategy metrics.
-- Added P2 sim recommendation backfill hardening: multi-report conservative `emit-config`, sim-only ignored-field annotations, `apply --dry-run` full-config preview, and error-path tests for bad reports/output paths.
-- Added P4 cold query validation: `/search` results now include `freshness`, `index_tier`, and `validated`; cold/base hits are stat-checked, missing paths are tombstoned, changed paths enqueue parent-dir compensation, and validation/stale counters flow into metrics and `/watch-state`.
-- Added P5 DirtyQueue closure: dirty scopes now carry reason and priority, dedupe through debounce, retry with parent-scope expansion on failure, and unify inotify cold-tier events, query stale hits/misses, periodic cold scans, startup repair, and overflow recovery behind one local-rescan scheduler.
-- Added P6 `fd-rdd-sim --profile home-desktop`, modeling Downloads bursts, high-value Documents/Desktop, expensive low-change media, active Code, cold Archive/NAS pressure, and default-excluded cache/dependency/build trees.
-- Added P7 `fd-rdd-sim regression` with fixed-seed small golden workloads, JSON/Markdown strategy reports, threshold checks for delay/budget/watch/scan/tier metrics, and a CI job that uploads regression artifacts.
-- Added P8 Ephemeral Watch leases for repeated dirty scopes: temporary watcher commands, independent lease budget/TTL/idle/cost config, low-value lease eviction, L0 coverage expiry, `/watch-state` counters, and runtime tests for creation, budget replacement, exclusion, and expiry conditions.
-- Tightened path-initials query detection so literal file paths such as `fd-rdd/todo.md` are not routed through `PathInitialsMatcher` as an extra full-scan anchor.
+覆盖提交范围：`9a6d9d7` 到 `607e6c3`。
+
+### 分层 watcher
+
+- 完成 L0/L1/L2/L3 热度调度：引入 `event_score`、分层扫描队列、空扫降级、变化回升、冷 L0 替换和 watch 预算阻塞统计。
+- 补齐 `/debug/tiered-watch` 与 `/watch-state` 观测闭环，暴露目录层级、dirty/freshness、next scan、预算阻塞、高优先级扫描、冷层校验和查询 stale 命中计数。
+- 明确 L3 策略语义，支持 interval、validate-on-query、disabled 三类行为，不再把 L3 周期固定推导为 L2 的两倍。
+- 实现 Ephemeral Watch 临时监听租约：重复 dirty scope 可申请独立预算的临时 watcher，并按 TTL、idle、无变化补扫、L0 覆盖和低价值驱逐自动释放。
+
+### 冷层查询与补偿
+
+- `/search` 结果增加 `freshness`、`index_tier`、`validated`，冷层/base 命中会执行 `stat` 校验。
+- 删除或非文件命中会写 tombstone 并屏蔽旧结果；mtime 或文件身份变化会返回当前 metadata，并把父目录加入 DirtyQueue。
+- 完成 DirtyQueue 闭环：统一承接 inotify 冷层事件、查询 stale hit、路径形态 query miss、周期冷层扫描、启动修复和 overflow recovery。
+- DirtyQueue 支持 reason、priority、debounce、失败重试和父级 scope 扩大，局部补扫优先处理叶子目录。
+
+### 仿真与策略回归
+
+- 新增 `fd-rdd-sim` 策略仿真框架，支持 single、grid、evolve、adversarial、optimize，并输出 SLA、发现延迟、watch/scan 成本和策略动作计数。
+- `emit-config` 支持从 benchmark report 生成可审阅的 `watch_mode = "tiered"` 与 `[tiered_watch]` TOML patch，并标注 sim-only 字段。
+- 增加 runtime/sim parity 回归，覆盖热 L0 保留、BudgetBlocked 高优先级排序、祖先 L0 替换保护、watch budget 上限和固定 seed workload。
+- 新增 `home-desktop` workload 与 `fd-rdd-sim regression`，用固定 seed golden workloads 在 CI 中检查发现延迟、预算阻塞、watch 成本、扫描量和最终层级分布。
+- 优化 sim 运行日志，提前初始化 tracing，并输出优化轮次、试验进度、耗时和 ETA。
+
+### 索引内存与查询性能
+
+- 移除 `FileEntry.size`，降低 mtime 常驻精度，合并 `PathTableV2` 内部 Vec，并移除短组件索引，进一步压缩 base 常驻内存。
+- trigram 索引改为 basename-only 候选，降低 posting 体量；路径字面查询不再误加 `PathInitialsMatcher`，避免 `fd-rdd/todo.md` 这类查询退化为额外全扫。
+- v7 快照启动时挂载为 manifest-only 冷段，常驻 segment manifest、路径 Bloom-style filter、mtime range 和 dirty/freshness 状态。
+- 冷段 metadata/postings 通过 mmap 按需加载，查询命中返回 `index_tier = "FrozenManifestOnly"`；`/memory` 拆出 hot entries、manifest-only entries、cold segment 和 cold mmap 字节。
+
+### 文档与验证
+
+- 更新 README、CHANGELOG 和 runtime/sim 字段映射文档，说明 tiered watcher、DirtyQueue、Ephemeral Watch、冷层查询校验和真实 index residency。
+- 增加冷层查询、DirtyQueue、Ephemeral Watch、sim 配置回填、策略回归和 manifest-only 冷挂载测试。
 
 ## [0.6.14] - 2026-05-02
 
