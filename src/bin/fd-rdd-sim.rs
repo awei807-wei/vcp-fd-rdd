@@ -229,6 +229,8 @@ impl From<ProfileArg> for WorkloadProfile {
 }
 
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
     let args = Args::parse();
     let (report, output) = match args.command {
         Command::Optimize(args) => {

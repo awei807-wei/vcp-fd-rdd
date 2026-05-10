@@ -563,6 +563,21 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
             write_checkpoint(path, &report)?;
         }
 
+        if let Some(best) = best_seen.first() {
+            tracing::info!(
+                "optimize generation {}/{} finished: trials={} best_score={:.2} best_sla={:.3} best_p95={}s watch_peak={} stale={}/{}",
+                generation,
+                start_generation + config.generations.max(1),
+                trials,
+                best.metrics.objective_score,
+                best.metrics.sla_rate,
+                best.metrics.p95_detect_secs,
+                best.metrics.watch_cost_peak,
+                stale_generations,
+                config.patience.max(1),
+            );
+        }
+
         if stale_generations >= config.patience.max(1) {
             converged = true;
             break;
