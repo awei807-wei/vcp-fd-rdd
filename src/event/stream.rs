@@ -1,6 +1,6 @@
 use notify::Watcher;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,7 +12,9 @@ use crate::event::tiered_watch::{TieredWatchRuntime, WatchTier};
 use crate::event::watcher::{check_inotify_limit, watch_roots_enhanced, EventWatcher};
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
-use crate::util::{maybe_trim_rss, path_has_excluded_component};
+use crate::util::{
+    estimate_notify_recursive_watch_count, maybe_trim_rss, path_has_excluded_component,
+};
 
 fn shrink_if_large_vec<T>(v: &mut Vec<T>, keep_cap: usize) -> bool {
     if v.capacity() > keep_cap.saturating_mul(2) {
@@ -713,10 +715,9 @@ impl EventPipeline {
                                 );
                                 continue;
                             }
-                            let watch_cost = estimate_recursive_dir_count(
+                            let watch_cost = estimate_notify_recursive_watch_count(
                                 path,
                                 runtime.max_watch_dirs(),
-                                &exclude_dirs,
                             );
                             match runtime.register_dynamic_candidate(path.clone(), watch_cost) {
                                 crate::event::tiered_watch::PromotionDecision::SendAdd => {
@@ -953,34 +954,6 @@ fn should_ignore_event(ev: &notify::Event, ignore_prefixes: &[PathBuf]) -> bool 
         }
     }
     false
-}
-
-fn estimate_recursive_dir_count(root: &Path, cap: usize, exclude_dirs: &[String]) -> usize {
-    fn walk(path: &Path, cap: usize, exclude_dirs: &[String], count: &mut usize) {
-        if *count >= cap {
-            return;
-        }
-        *count = (*count).saturating_add(1);
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if *count >= cap {
-                return;
-            }
-            let path = entry.path();
-            if path_has_excluded_component(&path, exclude_dirs) {
-                continue;
-            }
-            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-                walk(&path, cap, exclude_dirs, count);
-            }
-        }
-    }
-
-    let mut count = 0usize;
-    walk(root, cap.max(1), exclude_dirs, &mut count);
-    count.max(1)
 }
 
 #[derive(Default)]

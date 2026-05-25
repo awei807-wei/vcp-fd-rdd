@@ -1,5 +1,11 @@
 use std::fmt;
 
+pub mod metrics_reporter;
+pub use metrics_reporter::{
+    MetricsHealthSnapshot, MetricsMemorySnapshot, MetricsReporter, MetricsRuntimeSnapshot,
+    MetricsSnapshot,
+};
+
 /// 内存占用统计（字节级精确）
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct MemoryReport {
@@ -27,6 +33,8 @@ pub struct MemoryReport {
     pub rebuild: RebuildStats,
     /// 进程级 RSS（从 /proc/self/statm 读取）
     pub process_rss_bytes: u64,
+    /// 进程级 swap（从 /proc/self/status 的 VmSwap 读取；Linux-only）
+    pub process_swap_bytes: u64,
     /// 进程级内存拆分（从 /proc/self/smaps_rollup 读取；Linux-only）
     pub process_smaps_rollup: Option<SmapsRollupStats>,
     /// 进程级 page faults（从 /proc/self/stat 读取；Linux-only）
@@ -171,12 +179,20 @@ pub struct EventPipelineStats {
 pub struct WatchStateReport {
     pub mode: String,
     pub backend: String,
+    pub watch_profile: String,
     pub l0_dirs: usize,
     pub l1_dirs: usize,
     pub l2_dirs: usize,
     pub l3_dirs: usize,
     pub watched_dirs_estimated: usize,
     pub max_watch_dirs: usize,
+    pub system_max_user_watches: usize,
+    pub required_watch_cost: u64,
+    pub watch_budget_shortfall: u64,
+    pub strict_coverage_ok: bool,
+    pub strict_coverage_failure: bool,
+    pub strict_fail_on_budget_exceeded: bool,
+    pub strict_uncovered_dirs: Vec<String>,
     pub l0_candidates: usize,
     pub l0_admitted: usize,
     pub l0_rejected: usize,
@@ -192,6 +208,8 @@ pub struct WatchStateReport {
     pub next_scan_unix_secs: u64,
     pub event_score_total: u64,
     pub fresh_dirs: usize,
+    pub scanned_fresh_dirs: usize,
+    pub eventually_consistent_dirs: usize,
     pub stale_dirs: usize,
     pub dirty_dirs: usize,
     pub unknown_dirs: usize,
@@ -259,6 +277,27 @@ impl MemoryReport {
                 parts.get(1)?.parse::<u64>().ok()
             })
             .map(|pages| pages * 4096) // x86_64 page size
+            .unwrap_or(0)
+    }
+
+    /// 从 /proc/self/status 读取 VmSwap（kB → bytes）。
+    pub fn read_process_swap() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                for line in s.lines() {
+                    let Some(rest) = line.strip_prefix("VmSwap:") else {
+                        continue;
+                    };
+                    let mut parts = rest.split_whitespace();
+                    let value_kb = parts.next()?.parse::<u64>().ok()?;
+                    let unit = parts.next().unwrap_or("");
+                    if unit == "kB" {
+                        return Some(value_kb.saturating_mul(1024));
+                    }
+                }
+                Some(0)
+            })
             .unwrap_or(0)
     }
 
@@ -345,6 +384,13 @@ impl fmt::Display for MemoryReport {
             "║ Process RSS: {:>35} ║",
             human_bytes(self.process_rss_bytes)
         )?;
+        if self.process_swap_bytes > 0 {
+            writeln!(
+                f,
+                "║ Process Swap: {:>34} ║",
+                human_bytes(self.process_swap_bytes)
+            )?;
+        }
         if let Some(s) = &self.process_smaps_rollup {
             writeln!(
                 f,

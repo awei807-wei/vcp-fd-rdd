@@ -20,6 +20,9 @@
 - `p1_streaming_export.rs` — 流式导出字节一致性
 - `p1_compaction_fast.rs` — fast/legacy compaction 等价性
 - `p1_visibility_latency.rs` — 文件可见性延迟
+- `p1_api_e2e.rs` — HTTP API 与 `fd-rdd-query` 真实 daemon 端到端
+- `p1_real_watcher.rs` — 真实 watcher create/rename/delete 端到端
+- `p1_crash_recovery_matrix.rs` — abrupt kill、坏快照与启动修复组合恢复
 
 ## v0.6.0 测试相关变更
 
@@ -35,6 +38,12 @@
 
 - 断电恢复基建新增 `p1_snapshot_recovery.rs` 的 stable snapshot 当前/前一版本回退、runtime-state 缺失/损坏保守恢复测试，`p1_wal_recovery.rs` 的 WAL 截断尾恢复信号测试，以及 `p1_startup_repair.rs` 的启动 repair scan 决策测试。
 - CI 新增 `Poweroff recovery regression` 专项 job，显式运行快照回退、WAL 截断尾、startup repair 三组恢复测试，避免断电恢复只被全量测试隐式覆盖。
+
+## v0.6.16 测试相关变更
+
+- `stress-large-scale` workflow 显式运行 `large_directory_scan_100k_files` 与 `high_load_event_processing` 两个 ignored 重型测试。
+- `stress-hybrid-large-scale` workflow 继续显式运行 `p2_large_scale_hybrid` 的 80 万文件混合工作区测试，并保持 `continue-on-error`，避免 GitHub runner 资源波动阻塞普通分支推进。
+- 新增 `p1_api_e2e.rs`、`p1_real_watcher.rs`、`p1_crash_recovery_matrix.rs`，补齐 daemon HTTP/UDS 真实链路、真实 watcher 文件事件、坏快照/非干净退出后的启动修复组合。
 
 ## v0.6.0 更新（零拷贝序列化 P1 + Compaction 降维 P2）
 

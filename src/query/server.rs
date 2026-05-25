@@ -28,6 +28,10 @@ pub struct HealthTelemetry {
     pub watch_failures: u64,
     pub watcher_degraded: bool,
     pub degraded_roots: usize,
+    pub event_watcher_degraded: bool,
+    pub event_degraded_roots: usize,
+    pub tiered_degraded: bool,
+    pub tiered_unwatched_dirs: usize,
     pub overflow_drops: u64,
     pub rescan_signals: u64,
     pub snapshot_source: String,
@@ -41,8 +45,17 @@ pub struct HealthTelemetry {
     pub l1_dirs: usize,
     pub l2_dirs: usize,
     pub l3_dirs: usize,
+    pub max_watch_dirs: usize,
     pub watch_budget_utilization_pct: u8,
     pub promotion_budget_blocked: u64,
+    pub watch_profile: String,
+    pub system_max_user_watches: usize,
+    pub required_watch_cost: u64,
+    pub watch_budget_shortfall: u64,
+    pub strict_coverage_ok: bool,
+    pub strict_coverage_failure: bool,
+    pub strict_fail_on_budget_exceeded: bool,
+    pub strict_uncovered_dirs: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -92,6 +105,10 @@ pub struct HealthResponse {
     pub watch_failures: u64,
     pub watcher_degraded: bool,
     pub degraded_roots: usize,
+    pub event_watcher_degraded: bool,
+    pub event_degraded_roots: usize,
+    pub tiered_degraded: bool,
+    pub tiered_unwatched_dirs: usize,
     pub overflow_drops: u64,
     pub rescan_signals: u64,
     pub snapshot_source: String,
@@ -105,8 +122,17 @@ pub struct HealthResponse {
     pub l1_dirs: usize,
     pub l2_dirs: usize,
     pub l3_dirs: usize,
+    pub max_watch_dirs: usize,
     pub watch_budget_utilization_pct: u8,
     pub promotion_budget_blocked: u64,
+    pub watch_profile: String,
+    pub system_max_user_watches: usize,
+    pub required_watch_cost: u64,
+    pub watch_budget_shortfall: u64,
+    pub strict_coverage_ok: bool,
+    pub strict_coverage_failure: bool,
+    pub strict_fail_on_budget_exceeded: bool,
+    pub strict_uncovered_dirs: Vec<String>,
     pub issues: Vec<String>,
 }
 
@@ -320,10 +346,25 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     let mut issues = Vec::new();
     if !health.watch_enabled {
         issues.push("watcher_disabled".to_string());
-    } else if health.watcher_degraded {
+    } else if health.event_watcher_degraded {
         issues.push(format!(
-            "watcher_degraded: {} unwatched directories are using fallback polling",
-            health.degraded_roots
+            "event_watcher_degraded: {} roots are using fallback polling",
+            health.event_degraded_roots
+        ));
+    }
+    if health.tiered_degraded {
+        issues.push(format!(
+            "tiered_non_l0_dirs: {} directories are intentionally outside L0",
+            health.tiered_unwatched_dirs
+        ));
+    }
+    if health.strict_coverage_failure {
+        issues.push(format!(
+            "strict_coverage_incomplete: required_watch_cost={} max_watch_dirs={} shortfall={} uncovered={:?}",
+            health.required_watch_cost,
+            health.max_watch_dirs,
+            health.watch_budget_shortfall,
+            health.strict_uncovered_dirs
         ));
     }
     if health.watch_failures > 0 {
@@ -361,7 +402,9 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     }
     let index_health = if !health.watch_enabled {
         "static"
-    } else if health.watcher_degraded {
+    } else if health.event_watcher_degraded
+        || (health.strict_coverage_failure && health.strict_fail_on_budget_exceeded)
+    {
         "degraded"
     } else if issues.is_empty() {
         "ok"
@@ -379,6 +422,10 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         watch_failures: health.watch_failures,
         watcher_degraded: health.watcher_degraded,
         degraded_roots: health.degraded_roots,
+        event_watcher_degraded: health.event_watcher_degraded,
+        event_degraded_roots: health.event_degraded_roots,
+        tiered_degraded: health.tiered_degraded,
+        tiered_unwatched_dirs: health.tiered_unwatched_dirs,
         overflow_drops: health.overflow_drops,
         rescan_signals: health.rescan_signals,
         snapshot_source: health.snapshot_source,
@@ -392,8 +439,17 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         l1_dirs: health.l1_dirs,
         l2_dirs: health.l2_dirs,
         l3_dirs: health.l3_dirs,
+        max_watch_dirs: health.max_watch_dirs,
         watch_budget_utilization_pct: health.watch_budget_utilization_pct,
         promotion_budget_blocked: health.promotion_budget_blocked,
+        watch_profile: health.watch_profile,
+        system_max_user_watches: health.system_max_user_watches,
+        required_watch_cost: health.required_watch_cost,
+        watch_budget_shortfall: health.watch_budget_shortfall,
+        strict_coverage_ok: health.strict_coverage_ok,
+        strict_coverage_failure: health.strict_coverage_failure,
+        strict_fail_on_budget_exceeded: health.strict_fail_on_budget_exceeded,
+        strict_uncovered_dirs: health.strict_uncovered_dirs,
         issues,
     })
 }

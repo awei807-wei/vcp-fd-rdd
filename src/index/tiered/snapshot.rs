@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::storage::snapshot::{
-    write_recovery_runtime_state, write_stable_v7_atomic, RecoveryRuntimeState,
+    stable_v7_path_for, write_recovery_runtime_state, write_stable_v7_atomic, RecoveryRuntimeState,
 };
-use crate::storage::snapshot_v7::write_v7_snapshot_atomic;
+use crate::storage::snapshot_v7::{try_load_v7_cold, write_v7_snapshot_atomic};
 use crate::storage::traits::StorageBackend;
 use crate::util::maybe_trim_rss;
 
@@ -76,16 +76,19 @@ impl TieredIndex {
         };
 
         // 写入 v7 快照（原子写：tmp + rename）
+        let mut remount_path = None;
         if let Err(e) = write_v7_snapshot_atomic(&v7_path, &base) {
             tracing::warn!("v7 snapshot write failed: {}", e);
         } else {
             tracing::info!("v7 snapshot written to {:?}", v7_path);
+            remount_path = Some(v7_path.clone());
         }
 
         if self.stable_snapshot_enabled.load(Ordering::Relaxed) {
             if let Err(e) = write_stable_v7_atomic(store.path(), &base) {
                 tracing::warn!("stable v7 snapshot write failed: {}", e);
             } else {
+                remount_path = Some(stable_v7_path_for(store.path()));
                 let state = RecoveryRuntimeState {
                     last_clean_shutdown: false,
                     last_snapshot_unix_secs: unix_secs(),
@@ -99,6 +102,22 @@ impl TieredIndex {
                 tracing::info!("stable v7 snapshot written for recovery");
             }
         }
+
+        if let Some(path) = remount_path {
+            match try_load_v7_cold(&path, self.roots.as_slice()) {
+                Ok(Some(cold_base)) => {
+                    self.base.store(Arc::new(cold_base));
+                    tracing::info!("snapshot base remounted cold from {:?}", path);
+                }
+                Ok(None) => {
+                    tracing::warn!("snapshot cold remount skipped: {:?} was not loadable", path);
+                }
+                Err(e) => {
+                    tracing::warn!("snapshot cold remount failed for {:?}: {}", path, e);
+                }
+            }
+        }
+        drop(base);
 
         self.l1.clear();
         if let Some(w) = self.wal.lock().clone() {

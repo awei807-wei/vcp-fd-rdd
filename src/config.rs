@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::util::{default_exclude_dirs, normalize_exclude_dirs};
 
 pub const DEFAULT_L3_SCAN_INTERVAL_SECS: u64 = 21_600;
+pub const DEFAULT_TIERED_MAX_WATCH_DIRS: usize = 131_072;
 
 /// Returns the platform-appropriate default socket path (user-isolated).
 ///
@@ -184,9 +185,10 @@ pub enum WatchMode {
     Off,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TieredWatchConfig {
+    /// Consistency/cost profile for tiered watcher behavior.
+    pub profile: TieredWatchProfile,
     /// Upper bound for estimated recursive inotify watches admitted into L0.
     pub max_watch_dirs: usize,
     /// Token budget for L1/L2 scan work. First tiered implementation uses this as diagnostics.
@@ -217,6 +219,19 @@ pub struct TieredWatchConfig {
     pub ephemeral_max_cost_per_root: usize,
     /// Initial hot directory candidates. `~` is expanded during config load.
     pub hot_dirs: Vec<PathBuf>,
+    /// Directories that must be covered by L0 when profile = "strict".
+    pub strict_required_hot_dirs: Vec<PathBuf>,
+    /// Treat strict required coverage shortfall as degraded health instead of warning.
+    pub strict_fail_on_budget_exceeded: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TieredWatchProfile {
+    Strict,
+    #[default]
+    Balanced,
+    LowPower,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -253,7 +268,8 @@ impl std::str::FromStr for L3ScanPolicy {
 impl Default for TieredWatchConfig {
     fn default() -> Self {
         Self {
-            max_watch_dirs: 8_192,
+            profile: TieredWatchProfile::Balanced,
+            max_watch_dirs: DEFAULT_TIERED_MAX_WATCH_DIRS,
             scan_items_per_sec: 5_000,
             scan_ms_per_tick: 20,
             l0_idle_ttl_secs: 7_200,
@@ -268,7 +284,89 @@ impl Default for TieredWatchConfig {
             ephemeral_idle_secs: 120,
             ephemeral_max_cost_per_root: 64,
             hot_dirs: default_hot_dirs(),
+            strict_required_hot_dirs: default_hot_dirs(),
+            strict_fail_on_budget_exceeded: true,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for TieredWatchConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct RawTieredWatchConfig {
+            profile: TieredWatchProfile,
+            max_watch_dirs: Option<usize>,
+            scan_items_per_sec: usize,
+            scan_ms_per_tick: u64,
+            l0_idle_ttl_secs: u64,
+            l1_scan_interval_secs: u64,
+            l2_scan_interval_secs: u64,
+            l3_scan_policy: L3ScanPolicy,
+            l3_scan_interval_secs: u64,
+            l1_empty_scans_to_l2: u32,
+            l2_empty_scans_to_l3: u32,
+            ephemeral_watch_budget: usize,
+            ephemeral_watch_ttl_secs: u64,
+            ephemeral_idle_secs: u64,
+            ephemeral_max_cost_per_root: usize,
+            hot_dirs: Vec<PathBuf>,
+            strict_required_hot_dirs: Vec<PathBuf>,
+            strict_fail_on_budget_exceeded: bool,
+        }
+
+        impl Default for RawTieredWatchConfig {
+            fn default() -> Self {
+                let defaults = TieredWatchConfig::default();
+                Self {
+                    profile: defaults.profile,
+                    max_watch_dirs: None,
+                    scan_items_per_sec: defaults.scan_items_per_sec,
+                    scan_ms_per_tick: defaults.scan_ms_per_tick,
+                    l0_idle_ttl_secs: defaults.l0_idle_ttl_secs,
+                    l1_scan_interval_secs: defaults.l1_scan_interval_secs,
+                    l2_scan_interval_secs: defaults.l2_scan_interval_secs,
+                    l3_scan_policy: defaults.l3_scan_policy,
+                    l3_scan_interval_secs: defaults.l3_scan_interval_secs,
+                    l1_empty_scans_to_l2: defaults.l1_empty_scans_to_l2,
+                    l2_empty_scans_to_l3: defaults.l2_empty_scans_to_l3,
+                    ephemeral_watch_budget: defaults.ephemeral_watch_budget,
+                    ephemeral_watch_ttl_secs: defaults.ephemeral_watch_ttl_secs,
+                    ephemeral_idle_secs: defaults.ephemeral_idle_secs,
+                    ephemeral_max_cost_per_root: defaults.ephemeral_max_cost_per_root,
+                    hot_dirs: defaults.hot_dirs,
+                    strict_required_hot_dirs: defaults.strict_required_hot_dirs,
+                    strict_fail_on_budget_exceeded: defaults.strict_fail_on_budget_exceeded,
+                }
+            }
+        }
+
+        let raw = RawTieredWatchConfig::deserialize(deserializer)?;
+        let max_watch_dirs = raw.max_watch_dirs.unwrap_or(DEFAULT_TIERED_MAX_WATCH_DIRS);
+
+        Ok(Self {
+            profile: raw.profile,
+            max_watch_dirs,
+            scan_items_per_sec: raw.scan_items_per_sec,
+            scan_ms_per_tick: raw.scan_ms_per_tick,
+            l0_idle_ttl_secs: raw.l0_idle_ttl_secs,
+            l1_scan_interval_secs: raw.l1_scan_interval_secs,
+            l2_scan_interval_secs: raw.l2_scan_interval_secs,
+            l3_scan_policy: raw.l3_scan_policy,
+            l3_scan_interval_secs: raw.l3_scan_interval_secs,
+            l1_empty_scans_to_l2: raw.l1_empty_scans_to_l2,
+            l2_empty_scans_to_l3: raw.l2_empty_scans_to_l3,
+            ephemeral_watch_budget: raw.ephemeral_watch_budget,
+            ephemeral_watch_ttl_secs: raw.ephemeral_watch_ttl_secs,
+            ephemeral_idle_secs: raw.ephemeral_idle_secs,
+            ephemeral_max_cost_per_root: raw.ephemeral_max_cost_per_root,
+            hot_dirs: raw.hot_dirs,
+            strict_required_hot_dirs: raw.strict_required_hot_dirs,
+            strict_fail_on_budget_exceeded: raw.strict_fail_on_budget_exceeded,
+        })
     }
 }
 
@@ -342,6 +440,12 @@ impl Config {
         cfg.tiered_watch.hot_dirs = cfg
             .tiered_watch
             .hot_dirs
+            .into_iter()
+            .map(expand_tilde_path)
+            .collect();
+        cfg.tiered_watch.strict_required_hot_dirs = cfg
+            .tiered_watch
+            .strict_required_hot_dirs
             .into_iter()
             .map(expand_tilde_path)
             .collect();
@@ -501,6 +605,7 @@ max_watch_dirs = 16
         assert_eq!(cfg.tiered_watch.ephemeral_watch_ttl_secs, 600);
         assert_eq!(cfg.tiered_watch.ephemeral_idle_secs, 120);
         assert_eq!(cfg.tiered_watch.ephemeral_max_cost_per_root, 64);
+        assert_eq!(cfg.tiered_watch.profile, TieredWatchProfile::Balanced);
         assert_eq!(cfg.tiered_watch.l3_scan_policy, L3ScanPolicy::Interval);
         assert_eq!(
             cfg.tiered_watch.l3_scan_interval_secs,
@@ -509,11 +614,80 @@ max_watch_dirs = 16
 
         let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
         assert!(toml.contains("l3_scan_policy"));
+        assert!(toml.contains("profile"));
+        assert!(toml.contains("strict_required_hot_dirs"));
+        assert!(toml.contains("strict_fail_on_budget_exceeded"));
         assert!(toml.contains("l3_scan_interval_secs"));
         assert!(toml.contains("ephemeral_watch_budget"));
         assert!(toml.contains("ephemeral_watch_ttl_secs"));
         assert!(toml.contains("ephemeral_idle_secs"));
         assert!(toml.contains("ephemeral_max_cost_per_root"));
+    }
+
+    #[test]
+    fn tiered_watch_profile_defaults_to_high_watch_budget() {
+        let balanced: Config = toml::from_str(
+            r#"
+roots = ["~"]
+watch_mode = "tiered"
+
+[tiered_watch]
+"#,
+        )
+        .expect("balanced profile should parse");
+
+        assert_eq!(balanced.tiered_watch.profile, TieredWatchProfile::Balanced);
+        assert_eq!(
+            balanced.tiered_watch.max_watch_dirs,
+            DEFAULT_TIERED_MAX_WATCH_DIRS
+        );
+
+        let cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+watch_mode = "tiered"
+
+[tiered_watch]
+profile = "strict"
+"#,
+        )
+        .expect("strict profile should parse");
+
+        assert_eq!(cfg.tiered_watch.profile, TieredWatchProfile::Strict);
+        assert_eq!(
+            cfg.tiered_watch.max_watch_dirs,
+            DEFAULT_TIERED_MAX_WATCH_DIRS
+        );
+        assert!(cfg.tiered_watch.strict_fail_on_budget_exceeded);
+        assert_eq!(
+            cfg.tiered_watch.strict_required_hot_dirs,
+            super::default_hot_dirs()
+        );
+    }
+
+    #[test]
+    fn strict_tiered_watch_profile_accepts_explicit_overrides() {
+        let cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+watch_mode = "tiered"
+
+[tiered_watch]
+profile = "strict"
+max_watch_dirs = 32
+strict_required_hot_dirs = ["~/Documents"]
+strict_fail_on_budget_exceeded = false
+"#,
+        )
+        .expect("strict overrides should parse");
+
+        assert_eq!(cfg.tiered_watch.profile, TieredWatchProfile::Strict);
+        assert_eq!(cfg.tiered_watch.max_watch_dirs, 32);
+        assert_eq!(
+            cfg.tiered_watch.strict_required_hot_dirs,
+            vec![PathBuf::from("~/Documents")]
+        );
+        assert!(!cfg.tiered_watch.strict_fail_on_budget_exceeded);
     }
 
     #[test]

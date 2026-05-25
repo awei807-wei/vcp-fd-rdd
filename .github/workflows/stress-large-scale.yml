@@ -50,7 +50,37 @@ jobs:
           retention-days: 1
 
   # ───────────────────────────────────────────────────────────────────────────
-  # Job 2: 大规模数据集压力测试（100,000 文件）
+  # Job 2: ignored Rust stress tests
+  # ───────────────────────────────────────────────────────────────────────────
+  ignored-rust-stress-tests:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run 100k directory scan ignored test
+        run: |
+          cargo test --locked --test p1_edge_cases large_directory_scan_100k_files -- --ignored --nocapture --test-threads=1
+
+      - name: Run high-load event processing ignored test
+        run: |
+          cargo test --locked --test p1_event_processing high_load_event_processing -- --ignored --nocapture --test-threads=1
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 3: 大规模数据集压力测试（100,000 文件）
   # ───────────────────────────────────────────────────────────────────────────
   test-large-scale:
     needs: build

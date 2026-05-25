@@ -3,9 +3,10 @@
 pub mod fd_rdd_client;
 pub mod sys_monitor;
 
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fd_rdd_client::SearchResult;
 
@@ -20,6 +21,13 @@ pub fn unique_tmp_dir(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("fd-rdd-{}-{}", tag, nanos))
 }
 
+/// Pick a likely-free local test port.
+#[allow(dead_code)]
+pub fn unique_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral test port");
+    listener.local_addr().expect("ephemeral test port").port()
+}
+
 /// Managed fd-rdd child process.
 ///
 /// Spawns the `fd-rdd` binary built from the same workspace and exposes
@@ -28,6 +36,7 @@ pub struct FdRddProcess {
     pub child: Child,
     #[allow(dead_code)]
     pub port: u16,
+    work_dir: PathBuf,
 }
 
 impl FdRddProcess {
@@ -36,6 +45,8 @@ impl FdRddProcess {
     /// Extra CLI arguments can be passed via `extra_args`.
     pub fn spawn(root: &Path, port: u16, snapshot_path: &Path, extra_args: &[&str]) -> Self {
         let exe = fd_rdd_exe_path();
+        let work_dir = unique_tmp_dir("daemon-cwd");
+        std::fs::create_dir_all(&work_dir).expect("create daemon work dir");
         let mut cmd = Command::new(&exe);
         cmd.arg("--root")
             .arg(root)
@@ -44,17 +55,38 @@ impl FdRddProcess {
             .arg("--snapshot-path")
             .arg(snapshot_path)
             .args(extra_args)
+            .current_dir(&work_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn fd-rdd from {}: {}", exe.display(), e));
 
-        // Give the server a moment to bind.
-        std::thread::sleep(Duration::from_millis(500));
+        let ready_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if fd_rdd_client::health_check_with_timeout(port, Duration::from_millis(500)) {
+                break;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => panic!("fd-rdd exited before /health was ready: {status}"),
+                Ok(None) => {}
+                Err(e) => panic!("failed to poll fd-rdd child status: {e}"),
+            }
+            if Instant::now() >= ready_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(&work_dir);
+                panic!("timed out waiting for fd-rdd /health on port {port}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
 
-        Self { child, port }
+        Self {
+            child,
+            port,
+            work_dir,
+        }
     }
 
     /// HTTP GET `/health` – returns `true` if the server responds with 2xx.
@@ -85,6 +117,7 @@ impl FdRddProcess {
     pub fn kill(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.work_dir);
     }
 
     /// Ask the child process to shut down gracefully and wait for final snapshot.
@@ -106,15 +139,25 @@ impl FdRddProcess {
         unsafe {
             libc::kill(self.child.id() as i32, libc::SIGTERM);
         }
+        let mut exited = false;
         for _ in 0..max_attempts {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => {
+                    exited = true;
+                    break;
+                }
                 Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(_) => return,
+                Err(_) => {
+                    exited = true;
+                    break;
+                }
             }
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if !exited {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.work_dir);
     }
 
     #[cfg(not(unix))]
@@ -132,7 +175,7 @@ impl FdRddProcess {
 /// Resolve the path to the `fd-rdd` binary in the Cargo target directory.
 ///
 /// Works for both `cargo test` (debug) and `cargo test --release`.
-fn fd_rdd_exe_path() -> PathBuf {
+pub fn fd_rdd_exe_path() -> PathBuf {
     let current_exe = std::env::current_exe().expect("current_exe");
     // current_exe is roughly target/{debug|release}/deps/test-binary-xxx.exe
     let target_dir = current_exe
@@ -141,6 +184,18 @@ fn fd_rdd_exe_path() -> PathBuf {
         .expect("target dir");
     target_dir
         .join("fd-rdd")
+        .with_extension(std::env::consts::EXE_EXTENSION)
+}
+
+#[allow(dead_code)]
+pub fn fd_rdd_query_exe_path() -> PathBuf {
+    let current_exe = std::env::current_exe().expect("current_exe");
+    let target_dir = current_exe
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("target dir");
+    target_dir
+        .join("fd-rdd-query")
         .with_extension(std::env::consts::EXE_EXTENSION)
 }
 

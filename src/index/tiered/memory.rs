@@ -104,6 +104,7 @@ impl TieredIndex {
             overlay,
             rebuild,
             process_rss_bytes: MemoryReport::read_process_rss(),
+            process_swap_bytes: MemoryReport::read_process_swap(),
             process_smaps_rollup,
             process_faults: MemoryReport::read_faults(),
             index_estimated_bytes,

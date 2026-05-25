@@ -119,3 +119,78 @@ pub fn path_has_excluded_component(path: &Path, exclude_dirs: &[String]) -> bool
             .any(|excluded| name == excluded.as_str())
     })
 }
+
+/// Estimate how many directory watches `notify::RecursiveMode::Recursive` will register.
+///
+/// This intentionally does not apply fd-rdd's scan/index `exclude_dirs`: notify still
+/// installs inotify watches below excluded subtrees when asked to watch a parent
+/// recursively, and the tiered watcher budget must model that kernel-facing cost.
+///
+/// Returns at most `cap + 1`. A result greater than `cap` means the root is too
+/// large for the current watch budget and must not be admitted into L0.
+pub fn estimate_notify_recursive_watch_count(root: &Path, cap: usize) -> usize {
+    fn walk(path: &Path, limit: usize, count: &mut usize) {
+        if *count >= limit {
+            return;
+        }
+        *count = (*count).saturating_add(1);
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if *count >= limit {
+                return;
+            }
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                walk(entry.path().as_path(), limit, count);
+            }
+        }
+    }
+
+    let mut count = 0usize;
+    let limit = cap.max(1).saturating_add(1);
+    walk(root, limit, &mut count);
+    count.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("fd-rdd-util-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn notify_watch_estimate_counts_excluded_subtrees() {
+        let root = temp_dir("notify-watch-estimate");
+        std::fs::create_dir_all(root.join("node_modules/pkg/a")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        let exclude_dirs = vec!["node_modules".to_string()];
+        assert!(path_has_excluded_component(
+            root.join("node_modules/pkg").as_path(),
+            &exclude_dirs
+        ));
+        assert_eq!(
+            estimate_notify_recursive_watch_count(root.as_path(), 100),
+            5
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn notify_watch_estimate_reports_cap_plus_one_on_overflow() {
+        let root = temp_dir("notify-watch-estimate-cap");
+        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+
+        assert_eq!(estimate_notify_recursive_watch_count(root.as_path(), 2), 3);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

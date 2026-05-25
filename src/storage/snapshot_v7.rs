@@ -1,4 +1,6 @@
 use memmap2::Mmap;
+#[cfg(unix)]
+use memmap2::UncheckedAdvice;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
@@ -791,6 +793,21 @@ impl V7Snapshot {
             .map(|(_, r)| &self.bytes()[r.clone()])
     }
 
+    pub fn advise_dontneed(&self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: 调用方只在生成 owned 查询/物化结果后调用；映射只读，
+            // 后续查询仍可按需重新 fault 页面。
+            if let Err(e) = unsafe {
+                self.mmap
+                    .as_ref()
+                    .unchecked_advise(UncheckedAdvice::DontNeed)
+            } {
+                tracing::debug!("v7 mmap MADV_DONTNEED failed: {}", e);
+            }
+        }
+    }
+
     fn path_resolver(&self) -> anyhow::Result<V7PathResolver<'_>> {
         let Some(bytes) = self.segment(V7SegKind::PathTable) else {
             return Ok(V7PathResolver::Decoded(PathTableV2::default()));
@@ -895,6 +912,64 @@ impl V7Snapshot {
         Ok(out)
     }
 
+    pub fn query_metas(&self, matcher: &dyn Matcher) -> anyhow::Result<Vec<FileMeta>> {
+        let Some(entries) = self.segment(V7SegKind::EntriesByKey) else {
+            return Ok(Vec::new());
+        };
+        let resolver = self.path_resolver()?;
+        let tombstones = self.tombstones()?;
+        let mut out = Vec::new();
+
+        if let Some(candidates) = self.trigram_candidates(matcher)? {
+            for docid in candidates.iter() {
+                if tombstones.contains(docid) {
+                    continue;
+                }
+                let Some(entry) = file_entry_at(entries, self.version, docid) else {
+                    continue;
+                };
+                let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+                    continue;
+                };
+                let matched = {
+                    let path_str = std::str::from_utf8(&path_bytes)
+                        .map(std::borrow::Cow::Borrowed)
+                        .unwrap_or_else(|_| String::from_utf8_lossy(&path_bytes));
+                    matcher.matches(&path_str)
+                };
+                if matched {
+                    out.push(entry_to_meta(entry, path_bytes));
+                }
+            }
+            return Ok(out);
+        }
+
+        let count = entry_count_from_segment(entries, self.version).unwrap_or(0);
+        for docid in 0..count {
+            let docid = docid as u32;
+            if tombstones.contains(docid) {
+                continue;
+            }
+            let Some(entry) = file_entry_at(entries, self.version, docid) else {
+                continue;
+            };
+            let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+                continue;
+            };
+            let matched = {
+                let path_str = std::str::from_utf8(&path_bytes)
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&path_bytes));
+                matcher.matches(&path_str)
+            };
+            if matched {
+                out.push(entry_to_meta(entry, path_bytes));
+            }
+        }
+
+        Ok(out)
+    }
+
     pub fn get_meta(&self, key: FileKey) -> anyhow::Result<Option<FileMeta>> {
         let Some(entries) = self.segment(V7SegKind::EntriesByKey) else {
             return Ok(None);
@@ -984,6 +1059,41 @@ impl V7Snapshot {
             if let Some(entry) = file_entry_at(entries, self.version, docid) {
                 out.push(entry.file_key());
             }
+        }
+        Ok(out)
+    }
+
+    pub fn parent_metas(&self, parent_path: &str) -> anyhow::Result<Vec<FileMeta>> {
+        let Some(entries) = self.segment(V7SegKind::EntriesByKey) else {
+            return Ok(Vec::new());
+        };
+        let Some(parent_index) = self.segment(V7SegKind::ParentIndex) else {
+            return Ok(Vec::new());
+        };
+        let resolver = self.path_resolver()?;
+        let parent_bytes = PathBuf::from(parent_path)
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec();
+        let Some(parent_idx) = resolver.lookup(&parent_bytes) else {
+            return Ok(Vec::new());
+        };
+        let Some(docids) = parent_posting(parent_index, parent_idx)? else {
+            return Ok(Vec::new());
+        };
+        let tombstones = self.tombstones()?;
+        let mut out = Vec::with_capacity(docids.len() as usize);
+        for docid in docids.iter() {
+            if tombstones.contains(docid) {
+                continue;
+            }
+            let Some(entry) = file_entry_at(entries, self.version, docid) else {
+                continue;
+            };
+            let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+                continue;
+            };
+            out.push(entry_to_meta(entry, path_bytes));
         }
         Ok(out)
     }
@@ -1109,6 +1219,15 @@ pub fn load_v7_from_path(path: &Path) -> anyhow::Result<Option<V7Snapshot>> {
     if global_hasher.finalize() != trailer.global_crc32c {
         tracing::warn!("v7 global crc mismatch, ignoring");
         return Ok(None);
+    }
+
+    #[cfg(unix)]
+    {
+        // SAFETY: all checksum/validation slices have gone out of use before this call.
+        // The mapping is read-only and file-backed; later queries can fault pages back on demand.
+        if let Err(e) = unsafe { mmap.unchecked_advise(UncheckedAdvice::DontNeed) } {
+            tracing::debug!("v7 mmap MADV_DONTNEED failed for {}: {}", path.display(), e);
+        }
     }
 
     Ok(Some(V7Snapshot {
@@ -1576,15 +1695,22 @@ mod tests {
 
         let matcher = ExactMatcher::new("needle", false);
         assert_eq!(loaded.query_keys(&matcher).unwrap(), vec![key]);
+        let metas = loaded.query_metas(&matcher).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].path, PathBuf::from("/tmp/cold/needle.txt"));
 
         let meta = loaded.get_meta(key).unwrap().expect("meta should exist");
         assert_eq!(meta.path, PathBuf::from("/tmp/cold/needle.txt"));
 
         let parent_keys = loaded.parent_candidates("/tmp/cold").unwrap();
         assert_eq!(parent_keys, vec![key]);
+        let parent_metas = loaded.parent_metas("/tmp/cold").unwrap();
+        assert_eq!(parent_metas.len(), 1);
+        assert_eq!(parent_metas[0].file_key, key);
 
         let missing = ExactMatcher::new("skip", false);
         assert!(loaded.query_keys(&missing).unwrap().is_empty());
+        assert!(loaded.query_metas(&missing).unwrap().is_empty());
 
         let _ = std::fs::remove_file(path);
     }

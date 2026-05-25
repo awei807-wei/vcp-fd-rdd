@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -281,6 +281,8 @@ pub struct TieredWatchRuntime {
     replacements: AtomicU64,
     promotion_budget_blocked: AtomicU64,
     cold_validate_count: AtomicU64,
+    dirty_queue_len: AtomicUsize,
+    query_stale_hit_count: AtomicU64,
     last_adjustment_unix_secs: AtomicU64,
 }
 
@@ -342,6 +344,8 @@ impl TieredWatchRuntime {
             replacements: AtomicU64::new(0),
             promotion_budget_blocked: AtomicU64::new(0),
             cold_validate_count: AtomicU64::new(0),
+            dirty_queue_len: AtomicUsize::new(0),
+            query_stale_hit_count: AtomicU64::new(0),
             last_adjustment_unix_secs: AtomicU64::new(now),
         }
     }
@@ -1223,6 +1227,8 @@ impl TieredWatchRuntime {
         let mut scan_backlog_by_tier = [0usize; 4];
         let now = unix_secs();
         let mut fresh_dirs = 0usize;
+        let mut scanned_fresh_dirs = 0usize;
+        let mut eventually_consistent_dirs = 0usize;
         let mut stale_dirs = 0usize;
         let mut dirty_dirs = 0usize;
         let mut unknown_dirs = 0usize;
@@ -1252,7 +1258,14 @@ impl TieredWatchRuntime {
                     l3_watch_cost = l3_watch_cost.saturating_add(cost);
                 }
             }
-            match state.freshness() {
+            let freshness = state.freshness();
+            if tier == WatchTier::L3 {
+                eventually_consistent_dirs += 1;
+                if freshness == Freshness::Fresh {
+                    scanned_fresh_dirs += 1;
+                }
+            }
+            match freshness {
                 Freshness::Fresh => fresh_dirs += 1,
                 Freshness::Stale => stale_dirs += 1,
                 Freshness::Dirty => dirty_dirs += 1,
@@ -1329,12 +1342,20 @@ impl TieredWatchRuntime {
         WatchStateReport {
             mode: "tiered".to_string(),
             backend: "notify".to_string(),
+            watch_profile: "runtime".to_string(),
             l0_dirs,
             l1_dirs,
             l2_dirs,
             l3_dirs,
             watched_dirs_estimated,
             max_watch_dirs: self.max_watch_dirs as usize,
+            system_max_user_watches: 0,
+            required_watch_cost: 0,
+            watch_budget_shortfall: 0,
+            strict_coverage_ok: true,
+            strict_coverage_failure: false,
+            strict_fail_on_budget_exceeded: false,
+            strict_uncovered_dirs: Vec::new(),
             l0_candidates,
             l0_admitted: l0_dirs,
             l0_rejected: l1_dirs + l2_dirs + l3_dirs,
@@ -1354,6 +1375,8 @@ impl TieredWatchRuntime {
             },
             event_score_total,
             fresh_dirs,
+            scanned_fresh_dirs,
+            eventually_consistent_dirs,
             stale_dirs,
             dirty_dirs,
             unknown_dirs,
@@ -1376,10 +1399,18 @@ impl TieredWatchRuntime {
                 .ephemeral_watch_budget_blocked
                 .load(Ordering::Relaxed),
             scan_backlog_by_tier,
-            dirty_queue_len: 0,
+            dirty_queue_len: self.dirty_queue_len.load(Ordering::Relaxed),
             cold_validate_count: self.cold_validate_count.load(Ordering::Relaxed),
-            query_stale_hit_count: 0,
+            query_stale_hit_count: self.query_stale_hit_count.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn set_dirty_queue_len(&self, len: usize) {
+        self.dirty_queue_len.store(len, Ordering::Relaxed);
+    }
+
+    pub fn set_query_stale_hit_count(&self, count: u64) {
+        self.query_stale_hit_count.store(count, Ordering::Relaxed);
     }
 
     fn state(&self, path: &Path) -> Option<Arc<DirState>> {
@@ -1444,7 +1475,7 @@ impl TieredWatchRuntime {
                 promotion_pending,
                 demotion_pending,
                 dirty,
-                freshness: format!("{:?}", state.freshness()),
+                freshness: display_freshness(tier, state.freshness()).to_string(),
                 next_scan_unix_secs,
                 budget_blocked_count,
                 last_budget_blocked_unix_secs,
@@ -1517,6 +1548,17 @@ fn path_is_under_or_equal(path: &Path, root: &Path) -> bool {
 fn path_has_component(path: &Path, component: &str) -> bool {
     path.components()
         .any(|part| part.as_os_str().to_string_lossy() == component)
+}
+
+fn display_freshness(tier: WatchTier, freshness: Freshness) -> &'static str {
+    match (tier, freshness) {
+        (WatchTier::L3, Freshness::Fresh) => "ScannedFresh",
+        (WatchTier::L3, Freshness::Stale | Freshness::Unknown) => "EventuallyConsistent",
+        (_, Freshness::Fresh) => "Fresh",
+        (_, Freshness::Stale) => "Stale",
+        (_, Freshness::Dirty) => "Dirty",
+        (_, Freshness::Unknown) => "Unknown",
+    }
 }
 
 fn next_l3_scan_unix_secs(now: u64, policy: L3ScanPolicy, interval_secs: u64) -> u64 {

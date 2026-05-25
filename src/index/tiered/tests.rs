@@ -469,6 +469,22 @@ async fn v7_load_mounts_manifest_only_cold_segment_and_queries_on_demand() -> an
     assert_eq!(hot_report.hot_memory_entries, 128);
     assert_eq!(hot_report.manifest_only_entries, 0);
     idx.snapshot_now(store.clone()).await?;
+    let after_snapshot_report = idx.memory_report(EventPipelineStats::default()).base;
+    assert_eq!(idx.l2.load().file_count(), 0);
+    assert_eq!(after_snapshot_report.hot_memory_entries, 0);
+    assert_eq!(after_snapshot_report.manifest_only_entries, 128);
+    assert_eq!(after_snapshot_report.cold_segment_count, 1);
+    assert!(after_snapshot_report.cold_mmap_bytes > 0);
+    assert!(
+        after_snapshot_report.estimated_bytes < hot_report.estimated_bytes,
+        "snapshot should remount base as manifest-only cold segment: hot={hot_report:?} after={after_snapshot_report:?}"
+    );
+    let after_snapshot_results = idx.query_limit_detailed("cold_file_042", 10);
+    assert_eq!(after_snapshot_results.len(), 1);
+    assert_eq!(
+        after_snapshot_results[0].index_tier,
+        QueryResultIndexTier::FrozenManifestOnly
+    );
 
     let loaded = Arc::new(TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?);
     let cold_report = loaded.memory_report(EventPipelineStats::default()).base;

@@ -29,11 +29,23 @@ fn client() -> reqwest::blocking::Client {
         .expect("build reqwest blocking client")
 }
 
+fn client_with_timeout(timeout: Duration) -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("build reqwest blocking client")
+}
+
 /// Perform a lightweight health check against `/health`.
 #[allow(dead_code)]
 pub fn health_check(port: u16) -> bool {
+    health_check_with_timeout(port, BASE_TIMEOUT)
+}
+
+/// Perform a lightweight health check against `/health` with a custom timeout.
+pub fn health_check_with_timeout(port: u16, timeout: Duration) -> bool {
     let url = format!("http://127.0.0.1:{}/health", port);
-    match client().get(&url).send() {
+    match client_with_timeout(timeout).get(&url).send() {
         Ok(resp) => resp.status().is_success(),
         Err(_) => false,
     }
@@ -42,6 +54,16 @@ pub fn health_check(port: u16) -> bool {
 /// Fetch `/status` and return the parsed JSON value.
 pub fn status(port: u16) -> Option<serde_json::Value> {
     let url = format!("http://127.0.0.1:{}/status", port);
+    match client().get(&url).send() {
+        Ok(resp) if resp.status().is_success() => resp.json().ok(),
+        _ => None,
+    }
+}
+
+/// Fetch `/health` and return the parsed JSON value.
+#[allow(dead_code)]
+pub fn health_json(port: u16) -> Option<serde_json::Value> {
+    let url = format!("http://127.0.0.1:{}/health", port);
     match client().get(&url).send() {
         Ok(resp) if resp.status().is_success() => resp.json().ok(),
         _ => None,

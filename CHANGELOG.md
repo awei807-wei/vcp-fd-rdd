@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 测试补强：新增 daemon API/UDS E2E、真实 watcher create/rename/delete、abrupt kill 与坏 stable snapshot 启动修复组合测试，补齐此前偏模块级的关键真实链路缺口。
+- 仓库清理：将本地运行生成的 `reports/`/`report/` 加入忽略，并停止追踪历史报告产物，避免测试与 daemon 运行污染提交。
+- CI 压测补齐：`stress-large-scale` workflow 显式运行 `large_directory_scan_100k_files` 与 `high_load_event_processing` 两个 ignored 重型测试；80 万文件 hybrid 压测继续由 `stress-hybrid-large-scale` 执行。
+- 提高 tiered watcher 默认预算：未显式配置 `max_watch_dirs` 时默认使用 `131072`，避免首次 `--watch-mode tiered` 仍因 balanced 低预算把 `Downloads` / `Documents` 留在非实时层。
+- 新增 tiered watcher `profile = "strict" | "balanced" | "low_power"`：strict 模式要求 `strict_required_hot_dirs` 全部进入 L0；预算不足时 `/watch-state` 输出 required cost、shortfall 和 uncovered dirs，`/health` 按 fail-hard 配置返回 degraded 或 warning。
+- 修正 L3 一致性语义：`/debug/tiered-watch` 将 L3 上次扫描干净展示为 `ScannedFresh`，metrics diagnostics 使用 `eventually_consistent_dirs` 标记未实时 watch 覆盖的 L3 目录。
+- 新增 metrics JSONL 统一诊断快照：保留顶层 `/watch-state` 字段兼容旧 jq 查询，并追加 `runtime`、`memory`、`health`、`diagnostics` 嵌套对象；`/health` 拆分底层 event watcher 降级与 tiered 非 L0 冷层目录口径，`/memory` 增加 `process_swap_bytes`。
+- 优化 manifest-only v7 冷段查询：base 查询层改为直接从 cold mmap 返回 `FileMeta` 与 tier 标记，避免 `query_keys -> get_meta -> key_is_manifest_only` 对 50 万级 cold segment 重复全段扫描；冷段构建和冷查询后会对 v7 mmap 执行 `MADV_DONTNEED`，降低查询后 tmpfs snapshot 页长期计入 RSS 的概率。
+- 修复 snapshot 后 base 重新热化：`snapshot_now()` 写出 v7 后会立即重新以 manifest-only cold segment 挂载，避免当前进程把 50 万级路径表留在 hot memory。
+- 修复冷挂载与 tiered watch 成本口径：v7 mmap 完整 CRC 校验后执行 `MADV_DONTNEED`，避免 tmpfs snapshot 校验页长期计入进程 RSS；tiered L0/动态/临时 watcher 预算改按 notify 真实递归目录数估算，单根超过预算时返回 `cap + 1` 并拒绝进入 L0，不再用排除目录后的扫描成本低估 inotify watch 数。
+- 调整 `/health` 严重级别：底层 event watcher 降级仍为 `index_health = "degraded"`，纯 tiered 非 L0 冷层、watch budget 满或 promotion blocked 只作为 `warning`，避免把预算策略误报成 watcher 故障。
 - Breaking change: HTTP `/search` 响应正式删除 `size` 字段；`size:` 过滤器和 `sort=size` 已移除，传入时返回 400 而不是回退到文本匹配或 score 排序。
 - 存储兼容：v7 单文件快照 header version 升级到 2，新写 entry 为 32B；读取端继续兼容旧 version 1 的 40B entry 并忽略历史 `size` 字段。
 - 修复 L3 scan policy 实现缺口：`TieredWatchConfig`、daemon 调度、`fd-rdd-sim` policy/recommendation/config patch 现在都显式支持 `l3_scan_policy` 与 `l3_scan_interval_secs`，`validate_on_query` / `disabled` 不再被固定 `L2*2` 周期主动扫描。

@@ -33,6 +33,12 @@ pub struct ColdSegmentManifest {
 }
 
 #[derive(Clone, Debug)]
+pub struct BaseQueryMatch {
+    pub meta: FileMeta,
+    pub manifest_only: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct ColdNameFilter {
     bits: Vec<u64>,
     inserted_trigrams: usize,
@@ -140,6 +146,8 @@ impl ColdSegment {
             max_mtime = -1;
         }
 
+        snapshot.advise_dontneed();
+
         Ok(Self {
             manifest: ColdSegmentManifest {
                 segment_id,
@@ -164,7 +172,9 @@ impl ColdSegment {
         if !self.filter.might_match_literal_hint(matcher.literal_hint()) {
             return Vec::new();
         }
-        self.snapshot.query_keys(matcher).unwrap_or_else(|e| {
+        let result = self.snapshot.query_keys(matcher);
+        self.snapshot.advise_dontneed();
+        result.unwrap_or_else(|e| {
             tracing::warn!(
                 "cold segment mmap query failed for {}: {}",
                 self.manifest.segment_path.display(),
@@ -174,12 +184,32 @@ impl ColdSegment {
         })
     }
 
+    fn query_metas(&self, matcher: &dyn Matcher) -> Vec<FileMeta> {
+        if !self.filter.might_match_literal_hint(matcher.literal_hint()) {
+            return Vec::new();
+        }
+        let result = self.snapshot.query_metas(matcher);
+        self.snapshot.advise_dontneed();
+        result.unwrap_or_else(|e| {
+            tracing::warn!(
+                "cold segment mmap metadata query failed for {}: {}",
+                self.manifest.segment_path.display(),
+                e
+            );
+            Vec::new()
+        })
+    }
+
     fn get_meta(&self, key: FileKey) -> Option<FileMeta> {
-        self.snapshot.get_meta(key).ok().flatten()
+        let result = self.snapshot.get_meta(key).ok().flatten();
+        self.snapshot.advise_dontneed();
+        result
     }
 
     fn for_each_live_meta(&self, f: impl FnMut(FileMeta)) {
-        match self.snapshot.for_each_live_meta(f) {
+        let result = self.snapshot.for_each_live_meta(f);
+        self.snapshot.advise_dontneed();
+        match result {
             Ok(()) => {}
             Err(e) => tracing::warn!(
                 "cold segment mmap metadata scan failed for {}: {}",
@@ -190,9 +220,15 @@ impl ColdSegment {
     }
 
     fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
-        self.snapshot
-            .parent_candidates(parent_path)
-            .unwrap_or_default()
+        let result = self.snapshot.parent_candidates(parent_path);
+        self.snapshot.advise_dontneed();
+        result.unwrap_or_default()
+    }
+
+    fn parent_metas(&self, parent_path: &str) -> Vec<FileMeta> {
+        let result = self.snapshot.parent_metas(parent_path);
+        self.snapshot.advise_dontneed();
+        result.unwrap_or_default()
     }
 
     fn manifest_bytes(&self) -> u64 {
@@ -245,6 +281,14 @@ impl ColdSegmentStore {
         out
     }
 
+    fn query_metas(&self, matcher: &dyn Matcher) -> Vec<FileMeta> {
+        let mut out = Vec::new();
+        for segment in &self.segments {
+            out.extend(segment.query_metas(matcher));
+        }
+        out
+    }
+
     fn get_meta(&self, key: FileKey) -> Option<FileMeta> {
         self.segments
             .iter()
@@ -265,6 +309,14 @@ impl ColdSegmentStore {
         let mut out = Vec::new();
         for segment in &self.segments {
             out.extend(segment.parent_candidates(parent_path));
+        }
+        out
+    }
+
+    fn parent_metas(&self, parent_path: &str) -> Vec<FileMeta> {
+        let mut out = Vec::new();
+        for segment in &self.segments {
+            out.extend(segment.parent_metas(parent_path));
         }
         out
     }
@@ -450,6 +502,27 @@ impl BaseIndexData {
         out
     }
 
+    pub fn query_metas(&self, matcher: &dyn Matcher) -> Vec<BaseQueryMatch> {
+        let mut out: Vec<BaseQueryMatch> = self
+            .resident_query_metas(matcher)
+            .into_iter()
+            .map(|meta| BaseQueryMatch {
+                meta,
+                manifest_only: false,
+            })
+            .collect();
+        out.extend(
+            self.cold_segments
+                .query_metas(matcher)
+                .into_iter()
+                .map(|meta| BaseQueryMatch {
+                    meta,
+                    manifest_only: true,
+                }),
+        );
+        out
+    }
+
     fn resident_query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
         let candidates = self.trigram_candidates(matcher);
         let mut out = Vec::new();
@@ -489,6 +562,59 @@ impl BaseIndexData {
                     };
                     if matcher.matches(&path_str) {
                         out.push(entry.file_key());
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    fn resident_query_metas(&self, matcher: &dyn Matcher) -> Vec<FileMeta> {
+        let candidates = self.trigram_candidates(matcher);
+        let mut out = Vec::new();
+
+        match candidates {
+            Some(bitmap) => {
+                for docid in bitmap.iter() {
+                    if self.tombstones.contains(docid) {
+                        continue;
+                    }
+                    let Some(entry) = self.entries_by_key.get(docid as usize) else {
+                        continue;
+                    };
+                    let Some(path_bytes) = self.path_table.resolve(entry.path_idx) else {
+                        continue;
+                    };
+                    let matched = {
+                        let path_str = match std::str::from_utf8(&path_bytes) {
+                            Ok(s) => std::borrow::Cow::Borrowed(s),
+                            Err(_) => String::from_utf8_lossy(&path_bytes),
+                        };
+                        matcher.matches(&path_str)
+                    };
+                    if matched {
+                        out.push(entry_to_meta(entry, &path_bytes));
+                    }
+                }
+            }
+            None => {
+                for (docid, entry) in self.entries_by_key.iter().enumerate() {
+                    if self.tombstones.contains(docid as u32) {
+                        continue;
+                    }
+                    let Some(path_bytes) = self.path_table.resolve(entry.path_idx) else {
+                        continue;
+                    };
+                    let matched = {
+                        let path_str = match std::str::from_utf8(&path_bytes) {
+                            Ok(s) => std::borrow::Cow::Borrowed(s),
+                            Err(_) => String::from_utf8_lossy(&path_bytes),
+                        };
+                        matcher.matches(&path_str)
+                    };
+                    if matched {
+                        out.push(entry_to_meta(entry, &path_bytes));
                     }
                 }
             }
@@ -539,6 +665,28 @@ impl BaseIndexData {
 
     pub fn has_manifest_only_segments(&self) -> bool {
         !self.cold_segments.is_empty()
+    }
+
+    pub fn parent_query_metas(&self, parent_path: &str) -> Vec<BaseQueryMatch> {
+        let mut out = Vec::new();
+        for key in self.resident_parent_candidates(parent_path) {
+            if let Some(meta) = self.resident_get_meta(key) {
+                out.push(BaseQueryMatch {
+                    meta,
+                    manifest_only: false,
+                });
+            }
+        }
+        out.extend(
+            self.cold_segments
+                .parent_metas(parent_path)
+                .into_iter()
+                .map(|meta| BaseQueryMatch {
+                    meta,
+                    manifest_only: true,
+                }),
+        );
+        out
     }
 
     pub fn delete_alignment_with_parent_index(

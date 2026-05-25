@@ -297,14 +297,12 @@ impl TieredIndex {
 
         // ParentIndex fast path: if query has a parent filter, get exact candidates from base
         if let Some(ref parent_path) = plan.parent_filter() {
-            let candidates = base.parent_candidates(parent_path);
-            for key in candidates {
+            for hit in base.parent_query_metas(parent_path) {
+                let key = hit.meta.file_key;
                 if !seen.insert(key) {
                     continue;
                 }
-                let Some(meta) = base.get_meta(key) else {
-                    continue;
-                };
+                let meta = hit.meta;
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
                 let blocked = blocked_paths.contains(path_bytes)
                     || path_deleted_by_any(path_bytes, deleted_sources.as_slice());
@@ -314,7 +312,7 @@ impl TieredIndex {
                 }
                 let _ = blocked_paths.insert(path_bytes);
                 if plan.matches(&meta) {
-                    let index_tier = if base.key_is_manifest_only(key) {
+                    let index_tier = if hit.manifest_only {
                         QueryResultIndexTier::FrozenManifestOnly
                     } else {
                         QueryResultIndexTier::ColdMmap
@@ -376,14 +374,13 @@ impl TieredIndex {
         limit: usize,
     ) -> bool {
         for anchor in plan.anchors() {
-            for key in layer.query_keys(anchor.as_ref()) {
+            for hit in layer.query_metas(anchor.as_ref()) {
+                let key = hit.meta.file_key;
                 if !seen.insert(key) {
                     continue;
                 }
 
-                let Some(meta) = layer.get_meta(key) else {
-                    continue;
-                };
+                let meta = hit.meta;
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
                 let blocked = blocked_paths.contains(path_bytes)
                     || layer_deleted.is_some_and(|paths| paths.contains(path_bytes))
@@ -395,7 +392,7 @@ impl TieredIndex {
 
                 let _ = blocked_paths.insert(path_bytes);
                 if plan.matches(&meta) {
-                    let index_tier = if layer.key_is_manifest_only(key) {
+                    let index_tier = if hit.manifest_only {
                         QueryResultIndexTier::FrozenManifestOnly
                     } else {
                         QueryResultIndexTier::ColdMmap

@@ -1,19 +1,25 @@
 use clap::Parser;
-use fd_rdd::config::{default_snapshot_path, default_socket_path, Config, WatchMode};
+use fd_rdd::config::{
+    default_snapshot_path, default_socket_path, Config, TieredWatchProfile, WatchMode,
+};
 use fd_rdd::event::ignore_filter::IgnoreFilter;
 use fd_rdd::event::sync::{DirtyReason, DirtyScope};
 use fd_rdd::event::tiered_watch::{
     EphemeralWatchConfig, EphemeralWatchDecision, TieredWatchDebugDump, TieredWatchDebugSummary,
 };
+use fd_rdd::event::watcher::check_inotify_limit;
 use fd_rdd::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
 use fd_rdd::index::TieredIndex;
 use fd_rdd::query::SocketServer;
 use fd_rdd::query::{HealthTelemetry, QueryServer};
-use fd_rdd::stats::{EventPipelineStats, WatchStateReport};
+use fd_rdd::stats::{
+    EventPipelineStats, MetricsHealthSnapshot, MetricsMemorySnapshot, MetricsReporter,
+    MetricsRuntimeSnapshot, MetricsSnapshot, WatchStateReport,
+};
 use fd_rdd::storage::snapshot::{
     write_recovery_runtime_state, RecoveryRuntimeState, SnapshotStore,
 };
-use fd_rdd::util::normalize_exclude_dirs;
+use fd_rdd::util::{estimate_notify_recursive_watch_count, normalize_exclude_dirs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -315,28 +321,36 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 6) 启动 HTTP 查询服务
-    let health_provider = {
+    let health_provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync> = {
         let index = index.clone();
         let pipeline = pipeline.clone();
         let health_watch_state = watch_state.clone();
         let health_tiered_runtime = tiered_runtime.clone();
         Arc::new(move || {
             let stats = pipeline.stats();
-            let watch_state = health_tiered_runtime
+            let mut watch_state = health_tiered_runtime
                 .as_ref()
                 .map(|runtime| runtime.report())
                 .unwrap_or_else(|| health_watch_state.as_ref().clone());
+            apply_watch_plan_static_fields(&mut watch_state, health_watch_state.as_ref());
             let recovery = index.recovery_status();
+            let event_watcher_degraded = stats.watcher_degraded;
+            let event_degraded_roots = stats.degraded_roots;
+            let tiered_unwatched_dirs = watch_state
+                .l1_dirs
+                .saturating_add(watch_state.l2_dirs)
+                .saturating_add(watch_state.l3_dirs);
+            let tiered_degraded = tiered_unwatched_dirs > 0;
             HealthTelemetry {
                 last_snapshot_time: index.last_snapshot_time(),
                 watch_enabled,
                 watch_failures: stats.watch_failures,
-                watcher_degraded: stats.watcher_degraded || watch_state.l0_rejected > 0,
-                degraded_roots: stats
-                    .degraded_roots
-                    .saturating_add(watch_state.l1_dirs)
-                    .saturating_add(watch_state.l2_dirs)
-                    .saturating_add(watch_state.l3_dirs),
+                watcher_degraded: event_watcher_degraded || tiered_degraded,
+                degraded_roots: event_degraded_roots.saturating_add(tiered_unwatched_dirs),
+                event_watcher_degraded,
+                event_degraded_roots,
+                tiered_degraded,
+                tiered_unwatched_dirs,
                 overflow_drops: stats.overflow_drops,
                 rescan_signals: stats.rescan_signals,
                 snapshot_source: recovery.report.snapshot_source,
@@ -350,8 +364,17 @@ async fn main() -> anyhow::Result<()> {
                 l1_dirs: watch_state.l1_dirs,
                 l2_dirs: watch_state.l2_dirs,
                 l3_dirs: watch_state.l3_dirs,
+                max_watch_dirs: watch_state.max_watch_dirs,
                 watch_budget_utilization_pct: watch_state.watch_budget_utilization_pct,
                 promotion_budget_blocked: watch_state.promotion_budget_blocked,
+                watch_profile: watch_state.watch_profile,
+                system_max_user_watches: watch_state.system_max_user_watches,
+                required_watch_cost: watch_state.required_watch_cost,
+                watch_budget_shortfall: watch_state.watch_budget_shortfall,
+                strict_coverage_ok: watch_state.strict_coverage_ok,
+                strict_coverage_failure: watch_state.strict_coverage_failure,
+                strict_fail_on_budget_exceeded: watch_state.strict_fail_on_budget_exceeded,
+                strict_uncovered_dirs: watch_state.strict_uncovered_dirs,
             }
         })
     };
@@ -364,18 +387,20 @@ async fn main() -> anyhow::Result<()> {
         let watch_state = watch_state.clone();
         let tiered_runtime = tiered_runtime.clone();
         Arc::new(move || {
+            if let Some(runtime) = tiered_runtime.as_ref() {
+                runtime.set_dirty_queue_len(index.dirty_queue_len());
+                let stats = index.stats_report();
+                runtime.set_query_stale_hit_count(stats.query_stale_hit_count);
+            }
             let mut report = tiered_runtime
                 .as_ref()
                 .map(|runtime| runtime.report())
                 .unwrap_or_else(|| watch_state.as_ref().clone());
+            apply_watch_plan_static_fields(&mut report, watch_state.as_ref());
             let stats = index.stats_report();
-            report.dirty_queue_len = report
-                .dirty_queue_len
-                .saturating_add(index.dirty_queue_len());
             report.cold_validate_count = report
                 .cold_validate_count
                 .saturating_add(stats.cold_validate_count);
-            report.query_stale_hit_count = stats.query_stale_hit_count;
             report
         })
     };
@@ -403,9 +428,9 @@ async fn main() -> anyhow::Result<()> {
         })
     };
     let query_server = QueryServer::new(index.clone())
-        .with_health_provider(health_provider)
+        .with_health_provider(health_provider.clone())
         .with_stats_provider(stats_provider.clone())
-        .with_watch_state_provider(watch_state_provider)
+        .with_watch_state_provider(watch_state_provider.clone())
         .with_tiered_watch_debug_provider(tiered_watch_debug_provider);
     tokio::spawn(async move {
         if let Err(e) = query_server.run(http_port).await {
@@ -440,11 +465,67 @@ async fn main() -> anyhow::Result<()> {
     // 8) 启动内存报告循环（每 60 秒）
     {
         let report_index = index.clone();
+        let report_stats_provider = stats_provider.clone();
 
         tokio::spawn(async move {
             report_index
-                .memory_report_loop(stats_provider, report_interval_secs)
+                .memory_report_loop(report_stats_provider, report_interval_secs)
                 .await;
+        });
+    }
+
+    // 8.5) 启动指标文件上报循环（每 30 秒）
+    {
+        let output_dir = std::path::PathBuf::from("./reports/metrics");
+        let metrics_provider: Arc<dyn Fn() -> MetricsSnapshot + Send + Sync> = {
+            let index = index.clone();
+            let watch_state_provider = watch_state_provider.clone();
+            let stats_provider = stats_provider.clone();
+            let health_provider = health_provider.clone();
+            Arc::new(move || {
+                let watch = watch_state_provider();
+                let pipeline = stats_provider();
+                let runtime =
+                    MetricsRuntimeSnapshot::from_reports(index.stats_report(), pipeline.clone());
+                let memory_report = index.memory_report(pipeline);
+                let memory = MetricsMemorySnapshot::from_report(&memory_report);
+                let health = health_provider();
+                let health = MetricsHealthSnapshot {
+                    watch_profile: health.watch_profile,
+                    watch_enabled: health.watch_enabled,
+                    watcher_degraded: health.watcher_degraded,
+                    degraded_roots: health.degraded_roots,
+                    event_watcher_degraded: health.event_watcher_degraded,
+                    event_degraded_roots: health.event_degraded_roots,
+                    tiered_degraded: health.tiered_degraded,
+                    tiered_unwatched_dirs: health.tiered_unwatched_dirs,
+                    max_watch_dirs: health.max_watch_dirs,
+                    system_max_user_watches: health.system_max_user_watches,
+                    required_watch_cost: health.required_watch_cost,
+                    watch_budget_shortfall: health.watch_budget_shortfall,
+                    strict_coverage_ok: health.strict_coverage_ok,
+                    strict_coverage_failure: health.strict_coverage_failure,
+                    strict_fail_on_budget_exceeded: health.strict_fail_on_budget_exceeded,
+                    strict_uncovered_dirs: health.strict_uncovered_dirs,
+                    watch_failures: health.watch_failures,
+                    overflow_drops: health.overflow_drops,
+                    rescan_signals: health.rescan_signals,
+                    last_snapshot_time: health.last_snapshot_time,
+                    snapshot_source: health.snapshot_source,
+                    wal_events_replayed: health.wal_events_replayed,
+                    wal_truncated_tail_records: health.wal_truncated_tail_records,
+                    startup_repair_ran: health.startup_repair_ran,
+                    startup_repair_escalated: health.startup_repair_escalated,
+                    startup_repair_scanned: health.startup_repair_scanned,
+                    startup_repair_changed: health.startup_repair_changed,
+                    last_clean_shutdown: health.last_clean_shutdown,
+                };
+                MetricsSnapshot::new(watch, runtime, memory, health)
+            })
+        };
+        let reporter = MetricsReporter::new(metrics_provider, output_dir, 30);
+        tokio::spawn(async move {
+            reporter.run().await;
         });
     }
 
@@ -485,6 +566,22 @@ fn mark_runtime_state(
     };
     if let Err(e) = write_recovery_runtime_state(snapshot_path, &state) {
         tracing::warn!("failed to write recovery runtime state: {}", e);
+    }
+}
+
+fn apply_watch_plan_static_fields(report: &mut WatchStateReport, plan: &WatchStateReport) {
+    report.watch_profile = plan.watch_profile.clone();
+    report.system_max_user_watches = plan.system_max_user_watches;
+    report.required_watch_cost = plan.required_watch_cost;
+    report.watch_budget_shortfall = plan.watch_budget_shortfall;
+    report.strict_coverage_ok = plan.strict_coverage_ok;
+    report.strict_coverage_failure = plan.strict_coverage_failure;
+    report.strict_fail_on_budget_exceeded = plan.strict_fail_on_budget_exceeded;
+    report.strict_uncovered_dirs = plan.strict_uncovered_dirs.clone();
+    for note in &plan.notes {
+        if !report.notes.contains(note) {
+            report.notes.push(note.clone());
+        }
     }
 }
 
@@ -543,6 +640,14 @@ fn watch_mode_label(mode: WatchMode) -> &'static str {
     }
 }
 
+fn watch_profile_label(profile: TieredWatchProfile) -> &'static str {
+    match profile {
+        TieredWatchProfile::Strict => "strict",
+        TieredWatchProfile::Balanced => "balanced",
+        TieredWatchProfile::LowPower => "low_power",
+    }
+}
+
 fn modified_unix_ns(path: &std::path::Path) -> u64 {
     let Ok(meta) = std::fs::metadata(path) else {
         return 0;
@@ -573,6 +678,8 @@ fn build_watch_plan(
             state: WatchStateReport {
                 mode: watch_mode_label(mode).to_string(),
                 backend: "notify".to_string(),
+                watch_profile: "recursive".to_string(),
+                strict_coverage_ok: true,
                 l0_dirs: roots.len(),
                 l0_admitted: roots.len(),
                 notes: vec!["recursive mode watches every configured root".to_string()],
@@ -586,6 +693,8 @@ fn build_watch_plan(
             state: WatchStateReport {
                 mode: watch_mode_label(mode).to_string(),
                 backend: "none".to_string(),
+                watch_profile: "off".to_string(),
+                strict_coverage_ok: true,
                 notes: vec!["watcher disabled; use /scan or rebuild for updates".to_string()],
                 ..WatchStateReport::default()
             },
@@ -600,20 +709,51 @@ fn build_tiered_watch_plan(
     exclude_dirs: &[String],
 ) -> WatchPlan {
     let mut candidates = initial_hot_candidates(roots, &tiered.hot_dirs, exclude_dirs);
+    let mut required = if tiered.profile == TieredWatchProfile::Strict {
+        strict_required_candidates(roots, &tiered.strict_required_hot_dirs, exclude_dirs)
+    } else {
+        Vec::new()
+    };
     if candidates.is_empty() {
-        candidates.extend(roots.iter().filter(|p| p.is_dir()).cloned());
+        if tiered.profile == TieredWatchProfile::Strict && !required.is_empty() {
+            candidates.extend(required.iter().cloned());
+        } else {
+            candidates.extend(roots.iter().filter(|p| p.is_dir()).cloned());
+        }
     }
+    candidates.extend(required.iter().cloned());
     candidates.sort();
     candidates.dedup();
+    required.sort();
+    required.dedup();
 
     let mut admitted = Vec::new();
     let mut scan_roots = Vec::new();
     let mut rejected = 0usize;
     let mut estimated_total = 0usize;
     let max_watch_dirs = tiered.max_watch_dirs.max(1);
+    let system_max_user_watches = check_inotify_limit(0).unwrap_or(0) as usize;
+    let mut strict_uncovered_dirs = Vec::new();
+    let mut required_watch_cost = 0u64;
 
+    let required_set = required.iter().collect::<std::collections::HashSet<_>>();
+    for candidate in required.iter() {
+        let estimated = estimate_notify_recursive_watch_count(candidate, max_watch_dirs);
+        required_watch_cost = required_watch_cost.saturating_add(estimated as u64);
+        if estimated_total.saturating_add(estimated) <= max_watch_dirs {
+            estimated_total = estimated_total.saturating_add(estimated);
+            admitted.push((candidate.clone(), estimated));
+        } else {
+            rejected = rejected.saturating_add(1);
+            strict_uncovered_dirs.push(candidate.to_string_lossy().to_string());
+            scan_roots.push((candidate.clone(), estimated));
+        }
+    }
     for candidate in candidates.iter() {
-        let estimated = estimate_recursive_dir_count(candidate, max_watch_dirs, exclude_dirs);
+        if required_set.contains(candidate) {
+            continue;
+        }
+        let estimated = estimate_notify_recursive_watch_count(candidate, max_watch_dirs);
         if estimated_total.saturating_add(estimated) <= max_watch_dirs {
             estimated_total = estimated_total.saturating_add(estimated);
             admitted.push((candidate.clone(), estimated));
@@ -634,6 +774,24 @@ fn build_tiered_watch_plan(
     if admitted.is_empty() {
         notes.push("no L0 directories admitted under current budget".to_string());
     }
+    let watch_budget_shortfall = required_watch_cost.saturating_sub(max_watch_dirs as u64);
+    let strict_coverage_ok = tiered.profile != TieredWatchProfile::Strict
+        || (strict_uncovered_dirs.is_empty() && watch_budget_shortfall == 0);
+    let strict_coverage_failure =
+        tiered.profile == TieredWatchProfile::Strict && !strict_coverage_ok;
+    if tiered.profile == TieredWatchProfile::Strict {
+        notes.push(format!(
+            "strict profile requires L0 coverage for {} configured hot dir(s)",
+            required.len()
+        ));
+        if strict_coverage_failure {
+            notes.push(format!(
+                "strict coverage incomplete: shortfall={} uncovered={}",
+                watch_budget_shortfall,
+                strict_uncovered_dirs.len()
+            ));
+        }
+    }
 
     let watch_roots = admitted
         .iter()
@@ -646,12 +804,20 @@ fn build_tiered_watch_plan(
         state: WatchStateReport {
             mode: watch_mode_label(WatchMode::Tiered).to_string(),
             backend: "notify".to_string(),
+            watch_profile: watch_profile_label(tiered.profile).to_string(),
             l0_dirs: admitted.len(),
             l1_dirs: rejected,
             l2_dirs: 0,
             l3_dirs: 0,
             watched_dirs_estimated: estimated_total,
             max_watch_dirs,
+            system_max_user_watches,
+            required_watch_cost,
+            watch_budget_shortfall,
+            strict_coverage_ok,
+            strict_coverage_failure,
+            strict_fail_on_budget_exceeded: tiered.strict_fail_on_budget_exceeded,
+            strict_uncovered_dirs,
             l0_candidates: candidates.len(),
             l0_admitted: admitted.len(),
             l0_rejected: rejected,
@@ -664,6 +830,24 @@ fn build_tiered_watch_plan(
             ..WatchStateReport::default()
         },
     }
+}
+
+fn strict_required_candidates(
+    roots: &[PathBuf],
+    required_hot_dirs: &[PathBuf],
+    exclude_dirs: &[String],
+) -> Vec<PathBuf> {
+    required_hot_dirs
+        .iter()
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            !fd_rdd::util::path_has_excluded_component(path.as_path(), exclude_dirs)
+                && roots
+                    .iter()
+                    .any(|root| path_is_under_or_equal(path.as_path(), root.as_path()))
+        })
+        .cloned()
+        .collect()
 }
 
 fn spawn_dirty_queue_loop(
@@ -868,10 +1052,9 @@ async fn maybe_send_ephemeral_watch_command(
     if fd_rdd::util::path_has_excluded_component(dir.as_path(), exclude_dirs) {
         return;
     }
-    let cost = estimate_recursive_dir_count(
+    let cost = estimate_notify_recursive_watch_count(
         dir.as_path(),
         config.max_cost_per_root.max(1).saturating_add(1),
-        exclude_dirs,
     );
     match runtime.note_dirty_scope_with_changed(dir.clone(), cost, exclude_dirs, config, changed) {
         EphemeralWatchDecision::Add(path) => {
@@ -920,34 +1103,75 @@ fn path_is_under_or_equal(path: &std::path::Path, root: &std::path::Path) -> boo
     path == root || path.starts_with(root)
 }
 
-fn estimate_recursive_dir_count(
-    root: &std::path::Path,
-    cap: usize,
-    exclude_dirs: &[String],
-) -> usize {
-    fn walk(path: &std::path::Path, cap: usize, exclude_dirs: &[String], count: &mut usize) {
-        if *count >= cap {
-            return;
-        }
-        *count = (*count).saturating_add(1);
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if *count >= cap {
-                return;
-            }
-            let path = entry.path();
-            if fd_rdd::util::path_has_excluded_component(&path, exclude_dirs) {
-                continue;
-            }
-            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-                walk(&path, cap, exclude_dirs, count);
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("fd-rdd-main-{tag}-{}-{nanos}", std::process::id()))
     }
 
-    let mut count = 0usize;
-    walk(root, cap, exclude_dirs, &mut count);
-    count.max(1)
+    #[test]
+    fn strict_watch_plan_admits_all_required_dirs_when_budget_allows() {
+        let root = temp_root("strict-budget-ok");
+        let documents = root.join("Documents");
+        let downloads = root.join("Downloads");
+        std::fs::create_dir_all(documents.join("project")).unwrap();
+        std::fs::create_dir_all(downloads.join("archive/nested")).unwrap();
+
+        let mut cfg = fd_rdd::config::TieredWatchConfig {
+            profile: TieredWatchProfile::Strict,
+            max_watch_dirs: 64,
+            ..fd_rdd::config::TieredWatchConfig::default()
+        };
+        cfg.hot_dirs.clear();
+        cfg.strict_required_hot_dirs = vec![documents.clone(), downloads.clone()];
+
+        let plan = build_tiered_watch_plan(std::slice::from_ref(&root), &cfg, &[]);
+
+        assert_eq!(plan.state.watch_profile, "strict");
+        assert_eq!(plan.state.l0_dirs, 2);
+        assert_eq!(plan.state.l1_dirs, 0);
+        assert!(plan.state.required_watch_cost > 0);
+        assert_eq!(plan.state.watch_budget_shortfall, 0);
+        assert!(plan.state.strict_coverage_ok);
+        assert!(!plan.state.strict_coverage_failure);
+        assert!(plan.state.strict_uncovered_dirs.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strict_watch_plan_reports_uncovered_required_dirs_when_budget_is_short() {
+        let root = temp_root("strict-budget-short");
+        let documents = root.join("Documents");
+        let downloads = root.join("Downloads");
+        std::fs::create_dir_all(documents.join("project")).unwrap();
+        std::fs::create_dir_all(downloads.join("archive/nested")).unwrap();
+
+        let mut cfg = fd_rdd::config::TieredWatchConfig {
+            profile: TieredWatchProfile::Strict,
+            max_watch_dirs: 2,
+            ..fd_rdd::config::TieredWatchConfig::default()
+        };
+        cfg.hot_dirs.clear();
+        cfg.strict_required_hot_dirs = vec![documents.clone(), downloads.clone()];
+
+        let plan = build_tiered_watch_plan(std::slice::from_ref(&root), &cfg, &[]);
+
+        assert_eq!(plan.state.l0_dirs, 1);
+        assert_eq!(plan.state.l1_dirs, 1);
+        assert!(plan.state.required_watch_cost > plan.state.max_watch_dirs as u64);
+        assert!(plan.state.watch_budget_shortfall > 0);
+        assert!(!plan.state.strict_coverage_ok);
+        assert!(plan.state.strict_coverage_failure);
+        assert_eq!(plan.state.strict_uncovered_dirs.len(), 1);
+        assert!(plan.state.strict_uncovered_dirs[0].contains("Downloads"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

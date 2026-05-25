@@ -19,7 +19,7 @@
 - **长期稳定**：compaction 做物理回收；heap high-water 主动 trim；内存报告可量化 RSS 组成
 - **Tiered Watcher**：预算受控的热点目录监听，避免 inotify 耗尽系统 watch 配额
 
-当前版本 **v0.6.15** · [更新日志](CHANGELOG.md) · [编年史](fd-rdd-编年史.md)
+当前版本 **v0.6.16** · [更新日志](CHANGELOG.md) · [编年史](fd-rdd-编年史.md)
 
 </details>
 
@@ -37,7 +37,7 @@
 - **Stable long-running**: compaction reclaims storage; proactive heap trim; attributed memory reports
 - **Tiered Watcher**: budget-constrained hot-directory watching to avoid exhausting inotify limits
 
-Current version **v0.6.15** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-编年史.md)
+Current version **v0.6.16** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-编年史.md)
 
 </details>
 
@@ -55,7 +55,7 @@ Current version **v0.6.15** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-�
 - **長期安定**: compaction による物理的回収、ヒープ高水位の積極的トリム、RSS 構成の可視化
 - **Tiered Watcher**: 予算制約付きのホットディレクトリ監視、inotify 枯渇の防止
 
-現在のバージョン **v0.6.15** · [変更履歴](CHANGELOG.md) · [年代記](fd-rdd-编年史.md)
+現在のバージョン **v0.6.16** · [変更履歴](CHANGELOG.md) · [年代記](fd-rdd-编年史.md)
 
 </details>
 
@@ -190,6 +190,29 @@ v7 快照启动时会挂载为 manifest-only 冷段：常驻内存只保留 segm
 DirtyQueue 是冷层补偿的统一入口，会合并来自 inotify 冷层事件、查询 stale hit、路径形态 query miss、周期冷层扫描、启动修复和 overflow recovery 的 dirty scope。队列带 debounce、优先级和重试；局部补扫优先扫描事件所在叶子目录，失败时再逐级扩大范围。
 
 Tiered watcher 还支持 Ephemeral Watch：当同一 dirty scope 在短窗口内反复触发、正式 L0 晋升又不合适或预算受阻时，后台会按独立的 `ephemeral_watch_budget` 创建临时 watcher 租约。临时 watcher 不属于 L0/L1/L2/L3，也不会替代 DirtyQueue；它只覆盖小成本局部根，并会在 idle、TTL、连续无变化补扫、被正式 L0 覆盖或预算驱逐时自动移除。
+
+Tiered watcher 的一致性 profile 用 `tiered_watch.profile` 控制：
+
+```toml
+watch_mode = "tiered"
+
+[tiered_watch]
+profile = "strict" # strict | balanced | low_power
+max_watch_dirs = 131072
+strict_required_hot_dirs = [
+  "~/Documents",
+  "~/Downloads",
+  "~/Desktop",
+  "~/Music",
+  "~/Pictures",
+  "~/Videos",
+]
+strict_fail_on_budget_exceeded = true
+```
+
+`strict` 会要求 `strict_required_hot_dirs` 全部进入 L0 watcher；预算不足时 `/watch-state` 输出 `required_watch_cost`、`watch_budget_shortfall` 和 `strict_uncovered_dirs`，`/health` 在 `strict_fail_on_budget_exceeded = true` 时返回 `index_health = "degraded"`，否则返回 `warning`。未配置 `max_watch_dirs` 时，tiered watcher 默认预算为 `131072`；未配置 profile 时保持 `balanced` 行为。
+
+L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` 会把 L3 上次扫描干净的目录展示为 `ScannedFresh`，未被实时覆盖的 L3 目录按 `EventuallyConsistent` 口径出现在 `/watch-state.eventually_consistent_dirs` 与 metrics diagnostics 中。
 
 ## fd-rdd-sim 压测框架
 
@@ -363,6 +386,24 @@ sort=score | name | path | ext | date_modified | date_created | date_accessed
 | `/watch-state` | GET | Watcher 控制面状态 |
 | `/debug/tiered-watch` | GET | Tiered watcher 单目录调度状态 |
 | `/trim` | GET/POST | 手动触发内存 trim |
+
+### 指标文件 / Metrics JSONL
+
+daemon 每 30 秒追加一条统一诊断快照到 `./reports/metrics/metrics_YYYY-MM-DD_HH.json`，文件名按 UTC 小时划分。JSONL 顶层保持 `/watch-state` 字段兼容，因此已有查询仍可直接使用：
+
+```bash
+jq '.dirty_queue_len' reports/metrics/metrics_$(date -u +%F_%H).json
+jq 'select(.query_stale_hit_count > 100)' reports/metrics/metrics_*.json
+```
+
+新增嵌套对象：
+
+- `runtime`：查询、事件、snapshot、fast-sync 计数。
+- `memory`：RSS、Swap、PSS、Private Dirty、索引估算和 overlay 摘要。
+- `health`：恢复状态、底层 event watcher 降级、tiered 非 L0 目录口径，以及 strict coverage 结果。
+- `diagnostics`：按同一时间线给出 `ok` / `warning` / `degraded` 与可读 issue 列表；L3 会以 `eventually_consistent_dirs` 标记，不再和实时 fresh 混淆。
+
+`/health.watcher_degraded` 仍为兼容字段；新增 `event_watcher_degraded` 表示 notify/event pipeline 真实降级，`tiered_degraded` 表示 tiered 模式下存在非 L0 冷层目录，`strict_coverage_failure` 表示 strict required dirs 未完全进入 L0，这三类问题不要混为一类。
 
 ## 索引文档
 
