@@ -27,7 +27,7 @@ use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::DirtyQueue;
 use crate::fs_policy::{FsPolicyConfig, SharedMountPolicyCounters};
 use crate::index::l1_cache::L1Cache;
-use crate::index::l2_partition::PersistentIndex;
+use crate::index::l2_partition::{physical_dedupe_stats_from_metas, PersistentIndex};
 use crate::index::l3_cold::IndexBuilder;
 use crate::stats::{StatsCollector, StatsReport};
 use crate::storage::quarantine::{FreezeGate, QuarantineState, RootStateRecord};
@@ -430,23 +430,45 @@ impl TieredIndex {
 
 impl DiagnosticSource for TieredIndex {
     fn collect(&self, report: &mut DiagnosticReport) {
-        let quarantine = self.quarantine_state.lock();
-        let gate = self.freeze_gate.lock();
-        let clock = self.clock_skew.lock();
+        let quarantine_roots = self.quarantine_state.lock().active_root_count();
+        let (freeze_gates, freeze_blocked_events) = {
+            let gate = self.freeze_gate.lock();
+            (gate.frozen_root_count(), gate.blocked_events())
+        };
+        let (
+            clock_skew_count,
+            clock_last_drift_ms,
+            clock_cutoff_trusted,
+            reconciliation_window_active,
+        ) = {
+            let clock = self.clock_skew.lock();
+            let cutoff_trusted = clock.cutoff_trusted();
+            (
+                clock.skew_count(),
+                clock.last_negative_drift().as_millis() as u64,
+                cutoff_trusted,
+                !cutoff_trusted,
+            )
+        };
 
-        report.storage.quarantine_roots = quarantine.active_root_count();
-        report.storage.freeze_gates = gate.frozen_root_count();
-        report.storage.freeze_blocked_events = gate.blocked_events();
+        report.storage.quarantine_roots = quarantine_roots;
+        report.storage.freeze_gates = freeze_gates;
+        report.storage.freeze_blocked_events = freeze_blocked_events;
         report.storage.quarantine_verify_pending =
             self.quarantine_verify_pending.load(Ordering::Relaxed) as usize;
         report.storage.quarantine_verified_roots =
             self.quarantine_verified_roots.load(Ordering::Relaxed);
-        report.clocks.skew_count = clock.skew_count();
-        report.clocks.last_drift_ms = clock.last_negative_drift().as_millis() as u64;
-        report.clocks.cutoff_trusted = clock.cutoff_trusted();
+        let physical =
+            physical_dedupe_stats_from_metas(self.collect_live_metas_for_diagnostics(), None);
+        report.storage.hardlink_group_count = physical.hardlink_group_count;
+        report.storage.hardlink_max_group_size = physical.max_group_size;
+
+        report.clocks.skew_count = clock_skew_count;
+        report.clocks.last_drift_ms = clock_last_drift_ms;
+        report.clocks.cutoff_trusted = clock_cutoff_trusted;
         report.clocks.reconciliation_count =
             self.clock_reconciliation_count.load(Ordering::Relaxed);
-        report.clocks.reconciliation_window_active = !clock.cutoff_trusted();
+        report.clocks.reconciliation_window_active = reconciliation_window_active;
         let ioprio_idle = self.ioprio_idle_set.load(Ordering::Relaxed);
         let ioprio_failed = self.ioprio_set_failed.load(Ordering::Relaxed);
         report.io.ioprio_class = if ioprio_idle {

@@ -287,6 +287,55 @@ pub struct PhysicalDedupeStats {
     pub max_group_size: usize,
 }
 
+pub fn physical_dedupe_stats_from_metas(
+    metas: impl IntoIterator<Item = FileMeta>,
+    prefix: Option<&Path>,
+) -> PhysicalDedupeStats {
+    physical_dedupe_stats_from_groups(&group_paths_by_file_key(metas, prefix))
+}
+
+fn group_paths_by_file_key(
+    metas: impl IntoIterator<Item = FileMeta>,
+    prefix: Option<&Path>,
+) -> HashMap<FileKey, Vec<PathBuf>> {
+    let normalized_prefix = prefix.map(crate::index::tiered::normalize_path);
+    let mut groups: HashMap<FileKey, Vec<PathBuf>> = HashMap::new();
+
+    for meta in metas {
+        if normalized_prefix
+            .as_ref()
+            .is_some_and(|prefix| !meta.path.starts_with(prefix))
+        {
+            continue;
+        }
+        groups.entry(meta.file_key).or_default().push(meta.path);
+    }
+
+    groups
+}
+
+fn physical_dedupe_stats_from_groups(
+    groups: &HashMap<FileKey, Vec<PathBuf>>,
+) -> PhysicalDedupeStats {
+    let mut stats = PhysicalDedupeStats {
+        live_path_count: groups.values().map(Vec::len).sum(),
+        physical_file_count: groups.len(),
+        ..PhysicalDedupeStats::default()
+    };
+
+    for paths in groups.values() {
+        if paths.len() < 2 {
+            continue;
+        }
+        stats.hardlink_group_count += 1;
+        stats.hardlink_path_count += paths.len();
+        stats.duplicate_path_count += paths.len() - 1;
+        stats.max_group_size = stats.max_group_size.max(paths.len());
+    }
+
+    stats
+}
+
 #[derive(Clone, Debug)]
 enum OneOrManyDocId {
     One(DocId),
@@ -883,23 +932,7 @@ impl PersistentIndex {
 
     pub fn physical_dedupe_stats_for_prefix(&self, prefix: Option<&Path>) -> PhysicalDedupeStats {
         let groups = self.live_paths_by_file_key(prefix);
-        let mut stats = PhysicalDedupeStats {
-            live_path_count: groups.values().map(Vec::len).sum(),
-            physical_file_count: groups.len(),
-            ..PhysicalDedupeStats::default()
-        };
-
-        for paths in groups.values() {
-            if paths.len() < 2 {
-                continue;
-            }
-            stats.hardlink_group_count += 1;
-            stats.hardlink_path_count += paths.len();
-            stats.duplicate_path_count += paths.len() - 1;
-            stats.max_group_size = stats.max_group_size.max(paths.len());
-        }
-
-        stats
+        physical_dedupe_stats_from_groups(&groups)
     }
 
     /// 构建/重建 ParentIndex

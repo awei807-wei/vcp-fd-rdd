@@ -35,6 +35,8 @@ pub struct StorageDiagnostics {
     pub quarantine_verify_pending: usize,
     pub quarantine_verified_roots: u64,
     pub case_policy_conflict_count: u64,
+    pub hardlink_group_count: usize,
+    pub hardlink_max_group_size: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

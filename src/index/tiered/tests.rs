@@ -180,6 +180,35 @@ fn tiered_diagnostics_include_io_governor_counters() {
 }
 
 #[test]
+fn tiered_diagnostics_include_hardlink_physical_stats() {
+    let root = unique_tmp_dir("hardlink-diag");
+    std::fs::create_dir_all(&root).unwrap();
+    let original = root.join("original.txt");
+    let alias_a = root.join("alias-a.txt");
+    let alias_b = root.join("alias-b.txt");
+    let copy = root.join("copy.txt");
+    std::fs::write(&original, b"same").unwrap();
+    std::fs::hard_link(&original, &alias_a).unwrap();
+    std::fs::hard_link(&original, &alias_b).unwrap();
+    std::fs::write(&copy, b"same").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, original),
+        mk_event(2, EventType::Create, alias_a),
+        mk_event(3, EventType::Create, alias_b),
+        mk_event(4, EventType::Create, copy),
+    ]);
+
+    let mut report = DiagnosticReport::default();
+    idx.collect(&mut report);
+    assert_eq!(report.storage.hardlink_group_count, 1);
+    assert_eq!(report.storage.hardlink_max_group_size, 3);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn freeze_gate_blocks_destructive_events_before_delta_buffer() {
     let root = unique_tmp_dir("freeze-delta");
     std::fs::create_dir_all(&root).unwrap();

@@ -132,6 +132,10 @@ impl TieredIndex {
 
     pub(crate) fn collect_all_live_metas(&self) -> Vec<FileMeta> {
         let _guard = QueryGenerationGuard::new(self);
+        self.collect_live_metas_for_diagnostics()
+    }
+
+    pub(crate) fn collect_live_metas_for_diagnostics(&self) -> Vec<FileMeta> {
         let base = self.base.load_full();
         let db = self.delta_buffer.lock();
         let mut del = PathArenaSet::default();
@@ -177,6 +181,21 @@ impl TieredIndex {
                 &mut results,
             );
         });
+
+        if base.file_count() == 0 {
+            self.l2.load_full().for_each_live_meta(|meta| {
+                if self.path_is_frozen(meta.path.as_path()) {
+                    return;
+                }
+                collect_live_meta(
+                    meta,
+                    None,
+                    deleted_sources.as_slice(),
+                    &mut blocked_paths,
+                    &mut results,
+                );
+            });
+        }
 
         results
     }
