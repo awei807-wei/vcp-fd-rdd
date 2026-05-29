@@ -129,6 +129,38 @@ fn delete_one_hardlink_path_keeps_other_alias_live() {
 }
 
 #[test]
+fn delete_one_of_three_hardlinks_keeps_remaining_group_visible() {
+    let root = unique_tmp_dir("delete-one-of-three");
+    std::fs::create_dir_all(&root).unwrap();
+    let original = root.join("original.txt");
+    let alias_a = root.join("alias-a.txt");
+    let alias_b = root.join("alias-b.txt");
+    std::fs::write(&original, b"same").unwrap();
+    std::fs::hard_link(&original, &alias_a).unwrap();
+    std::fs::hard_link(&original, &alias_b).unwrap();
+
+    let idx = build_index(&root);
+    idx.mark_deleted_by_path(&alias_a);
+
+    let groups = group_paths(&idx, 2, None);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0],
+        sorted_paths(vec![original.clone(), alias_b.clone()])
+    );
+
+    let stats = idx.physical_dedupe_stats();
+    assert_eq!(stats.live_path_count, 2);
+    assert_eq!(stats.physical_file_count, 1);
+    assert_eq!(stats.hardlink_group_count, 1);
+    assert_eq!(stats.hardlink_path_count, 2);
+    assert_eq!(stats.duplicate_path_count, 1);
+    assert_eq!(stats.max_group_size, 2);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn hardlink_rename_updates_only_renamed_path() {
     let root = unique_tmp_dir("rename-one");
     std::fs::create_dir_all(&root).unwrap();
