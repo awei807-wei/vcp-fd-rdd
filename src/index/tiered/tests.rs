@@ -627,6 +627,50 @@ fn fast_sync_reconciles_add_and_delete() {
 }
 
 #[test]
+fn fast_sync_and_immediate_scan_consume_io_governor() {
+    let root = unique_tmp_dir("io-governor-sync");
+    std::fs::create_dir_all(&root).unwrap();
+    let first = root.join("governor_first.txt");
+    std::fs::write(&first, b"first").unwrap();
+
+    let l1 = L1Cache::with_capacity(1000);
+    let l2 = Arc::new(PersistentIndex::new_with_roots(vec![root.clone()]));
+    let l3 = IndexBuilder::new(vec![root.clone()]);
+    let governor = Arc::new(IoGovernor::new(true, 1_000_000));
+    let idx = TieredIndex::new_with_base_and_io_governor(
+        l1,
+        l2,
+        l3,
+        vec![root.clone()],
+        false,
+        true,
+        false,
+        Vec::new(),
+        None,
+        governor,
+    );
+
+    let (scanned, _) = idx.scan_dirs_immediate(std::slice::from_ref(&root));
+    assert_eq!(scanned, 1);
+    let after_scan = idx.io_governor.operations();
+    assert!(after_scan >= 1);
+
+    let second = root.join("governor_second.txt");
+    std::fs::write(&second, b"second").unwrap();
+    let report = idx.fast_sync(
+        DirtyScope::Dirs {
+            cutoff_ns: 0,
+            dirs: vec![root.clone()],
+        },
+        &[],
+    );
+    assert!(report.dirs_scanned >= 1);
+    assert!(idx.io_governor.operations() > after_scan);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn fast_sync_untrusted_clock_forces_full_crawl_despite_future_cutoff() {
     let root = unique_tmp_dir("fast-sync-clock");
     std::fs::create_dir_all(&root).unwrap();

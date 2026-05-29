@@ -7,6 +7,7 @@ use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Tas
 use crate::event::sync::{now_ns, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyScope};
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
 use crate::index::PathFreshness;
+use crate::io_governor::IoGovernor;
 use crate::util::{maybe_trim_rss, path_has_excluded_component};
 
 use super::{
@@ -20,6 +21,7 @@ fn visit_dirs_since(
     exclude_dirs: &[String],
     cutoff_ns: u64,
     log_prefix: &str,
+    io_governor: &IoGovernor,
     mut on_dir: impl FnMut(&std::path::Path, bool) -> bool,
 ) -> bool {
     use std::time::Duration;
@@ -45,6 +47,7 @@ fn visit_dirs_since(
             continue;
         }
 
+        io_governor.before_io();
         let md = match std::fs::symlink_metadata(&dir) {
             Ok(m) => m,
             Err(_) => continue,
@@ -62,6 +65,7 @@ fn visit_dirs_since(
             return true;
         }
 
+        io_governor.before_io();
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
             Err(e) => {
@@ -97,6 +101,7 @@ fn collect_dirs_changed_since(
     ignore_prefixes: &[PathBuf],
     exclude_dirs: &[String],
     cutoff_ns: u64,
+    io_governor: &IoGovernor,
 ) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     visit_dirs_since(
@@ -105,6 +110,7 @@ fn collect_dirs_changed_since(
         exclude_dirs,
         cutoff_ns,
         "fast-sync",
+        io_governor,
         |dir, changed| {
             if changed {
                 out.push(dir.to_path_buf());
@@ -462,6 +468,7 @@ impl TieredIndex {
         self.observe_clock_boundary();
 
         let mut report = FastSyncReport::default();
+        let io_governor = self.io_governor.as_ref();
 
         // 1) 计算需要对齐的目录集合
         let mut dirs: Vec<PathBuf> = match scope {
@@ -472,6 +479,7 @@ impl TieredIndex {
                     ignore_prefixes,
                     &self.exclude_dirs,
                     cutoff_ns,
+                    io_governor,
                 )
             }
             DirtyScope::Dirs { dirs, cutoff_ns } => {
@@ -488,6 +496,7 @@ impl TieredIndex {
                         ignore_prefixes,
                         &self.exclude_dirs,
                         effective_cutoff_ns,
+                        io_governor,
                     )
                 } else {
                     Vec::new()
@@ -508,6 +517,7 @@ impl TieredIndex {
             {
                 return false;
             }
+            io_governor.before_io();
             std::fs::symlink_metadata(d)
                 .map(|m| m.is_dir())
                 .unwrap_or(false)
@@ -581,6 +591,7 @@ impl TieredIndex {
                 }
 
                 let path = super::normalize_path(ent.path());
+                io_governor.before_io();
                 let meta = match ent.metadata() {
                     Ok(meta) => meta,
                     Err(err) => {
@@ -632,6 +643,7 @@ impl TieredIndex {
         let base = self.base.load_full();
         let to_delete = base.delete_alignment_with_parent_index(&dirty_dirs);
         for (_doc_id, path) in to_delete {
+            io_governor.before_io();
             match std::fs::symlink_metadata(&path) {
                 Ok(_) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -670,6 +682,7 @@ impl TieredIndex {
         let mut scanned: usize = 0;
         let mut changed: usize = 0;
         let mut seq: u64 = 0;
+        let io_governor = self.io_governor.as_ref();
 
         for dir in dirs {
             let mut dir_count = 0;
@@ -729,6 +742,7 @@ impl TieredIndex {
                 dir_count += 1;
 
                 let path = super::normalize_path(ent.path());
+                io_governor.before_io();
                 let meta = match ent.metadata() {
                     Ok(m) => m,
                     Err(err) => {
@@ -881,6 +895,7 @@ impl TieredIndex {
             if !roots.iter().any(|root| meta.path.starts_with(root)) {
                 return;
             }
+            self.io_governor.before_io();
             match std::fs::symlink_metadata(&meta.path) {
                 Ok(_) => return,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
