@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mount policy 诊断收口到共享计数器：full build、rebuild、fast-sync、immediate scan、dynamic watch 和 ephemeral watch 入口统一记录拒绝原因，watcher 动态注册前会先执行 mount policy，拒绝时回滚 tiered/ephemeral reservation 并跳过 `watch()` 与后续深扫；FUSE/SSHFS 可疑 mount 通过后台 probe timeout cache 避免扫描线程直接执行可能挂起的 `readdir`。
 - 配置支持结构化 `[[roots]]`，兼容旧 `roots = []`；`detected_policy`、`conflict_count`、mount state、freeze gate 等运行时探测状态不会写回 `config.toml`。
 - case policy 探测先尝试平台 `pathconf(_PC_CASE_SENSITIVE)` 能力；`EINVAL`/unsupported 时回落到受控临时对象探测，只读、缺失或无权限 root 保持 `Unknown`，Unicode fold 回归继续覆盖 `ß -> ss` 的 byte-window trigram。
+- fast-sync 在使用 dirty mtime cutoff 前观察 wall/monotonic clock boundary；当 cutoff 被标记为不可信时转为全量 crawl，并在对账完成后恢复 trusted 状态，避免 wall-clock 回拨后漏掉离线新增文件。
 - 补齐 case policy 自动探测基础、mount policy 拒绝原因矩阵、clock skew dirty window 和 root/system daemon 默认禁用未认证 HTTP query/scan 的安全策略测试。
 - 测试补强：新增 daemon API/UDS E2E、真实 watcher create/rename/delete、abrupt kill 与坏 stable snapshot 启动修复组合测试，补齐此前偏模块级的关键真实链路缺口。
 - 仓库清理：将本地运行生成的 `reports/`/`report/` 加入忽略，并停止追踪历史报告产物，避免测试与 daemon 运行污染提交。

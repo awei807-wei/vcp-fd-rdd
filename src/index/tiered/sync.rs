@@ -459,6 +459,8 @@ impl TieredIndex {
     ) -> FastSyncReport {
         use std::collections::HashSet;
 
+        self.observe_clock_boundary();
+
         let mut report = FastSyncReport::default();
 
         // 1) 计算需要对齐的目录集合

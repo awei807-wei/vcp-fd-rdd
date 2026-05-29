@@ -552,6 +552,45 @@ fn fast_sync_reconciles_add_and_delete() {
 }
 
 #[test]
+fn fast_sync_untrusted_clock_forces_full_crawl_despite_future_cutoff() {
+    let root = unique_tmp_dir("fast-sync-clock");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let unseen = root.join("clock_reconcile_new.txt");
+    std::fs::write(&unseen, b"new").unwrap();
+
+    {
+        let mut clock = idx.clock_skew.lock();
+        let base_wall = std::time::SystemTime::now();
+        let base_mono = std::time::Instant::now();
+        assert!(!clock.observe(base_wall, base_mono));
+        assert!(clock.observe(
+            base_wall - std::time::Duration::from_secs(3),
+            base_mono + std::time::Duration::from_secs(3),
+        ));
+        assert!(!clock.cutoff_trusted());
+    }
+
+    let future_cutoff_ns =
+        crate::event::sync::now_ns().saturating_add(24 * 60 * 60 * 1_000_000_000);
+    let report = idx.fast_sync(
+        DirtyScope::Dirs {
+            cutoff_ns: future_cutoff_ns,
+            dirs: vec![root.clone()],
+        },
+        &[],
+    );
+
+    assert!(report.dirs_scanned >= 1);
+    assert!(report.upsert_events >= 1);
+    assert!(!idx.query("clock_reconcile_new").is_empty());
+    assert!(idx.clock_skew.lock().cutoff_trusted());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn nfd_query_matches_nfc_normalized_path() {
     let root = unique_tmp_dir("unicode-query");
     std::fs::create_dir_all(&root).unwrap();
