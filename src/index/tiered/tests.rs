@@ -1779,3 +1779,29 @@ fn dirty_queue_missing_leaf_retries_parent_scope() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn dirty_scan_collects_project_marker_roots() {
+    let root = unique_tmp_dir("project-marker-scan");
+    let project = root.join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        b"[package]\nname = \"marker-test\"\n",
+    )
+    .unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.enqueue_dirty_dirs(vec![project.clone()], DirtyReason::QueryMiss);
+
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let markers = vec!["Cargo.toml".to_string(), ".git".to_string()];
+    let report = idx.process_dirty_entry_with_project_markers(entry, &[], &markers);
+
+    assert!(!report.failed);
+    assert_eq!(report.dirs_scanned, 1);
+    assert_eq!(report.outcomes.len(), 1);
+    assert_eq!(report.outcomes[0].outcome.project_roots, vec![project]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

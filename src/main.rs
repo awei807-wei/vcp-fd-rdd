@@ -961,11 +961,15 @@ fn spawn_dirty_queue_loop(
             let work = batch.clone();
             let work_index = index.clone();
             let work_ignore_prefixes = ignore_prefixes.clone();
+            let work_project_markers = tiered.project_markers.clone();
             let processed = tokio::task::spawn_blocking(move || {
                 work.into_iter()
                     .map(|entry| {
-                        let report =
-                            work_index.process_dirty_entry(entry.clone(), &work_ignore_prefixes);
+                        let report = work_index.process_dirty_entry_with_project_markers(
+                            entry.clone(),
+                            &work_ignore_prefixes,
+                            &work_project_markers,
+                        );
                         (entry, report)
                     })
                     .collect::<Vec<_>>()
@@ -987,6 +991,10 @@ fn spawn_dirty_queue_loop(
                 max_cost_per_root: tiered.ephemeral_max_cost_per_root,
                 ..EphemeralWatchConfig::default()
             };
+            let marker_ephemeral_config = EphemeralWatchConfig {
+                repeat_threshold: 1,
+                ..ephemeral_config.clone()
+            };
 
             for (entry, report) in processed {
                 if report.failed {
@@ -998,8 +1006,10 @@ fn spawn_dirty_queue_loop(
 
                 if let Some(runtime) = runtime.as_ref() {
                     for scan in report.outcomes {
+                        let changed = scan.outcome.changed;
+                        let project_roots = scan.outcome.project_roots.clone();
                         let policy_dir = runtime
-                            .record_scan_for_path(scan.dir.as_path(), scan.outcome)
+                            .record_scan_for_path(scan.dir.as_path(), scan.outcome.clone())
                             .unwrap_or_else(|| scan.dir.clone());
                         runtime.apply_scan_policy(
                             policy_dir.as_path(),
@@ -1010,7 +1020,7 @@ fn spawn_dirty_queue_loop(
                             tiered.l1_empty_scans_to_l2,
                             tiered.l2_empty_scans_to_l3,
                         );
-                        let promotion_decision = if scan.outcome.changed > 0 {
+                        let promotion_decision = if changed > 0 {
                             send_promotion_command(runtime, &watch_command_tx, policy_dir).await
                         } else {
                             fd_rdd::event::tiered_watch::PromotionDecision::NotEligible
@@ -1024,11 +1034,52 @@ fn spawn_dirty_queue_loop(
                                 runtime,
                                 &watch_command_tx,
                                 scan.dir.clone(),
-                                scan.outcome.changed,
+                                changed,
                                 &exclude_dirs,
                                 &ephemeral_config,
                             )
                             .await;
+                        }
+
+                        for project_root in project_roots {
+                            if !project_marker_root_is_eligible(
+                                project_root.as_path(),
+                                index.roots.as_slice(),
+                                &exclude_dirs,
+                                &ignore_prefixes,
+                            ) {
+                                continue;
+                            }
+                            let watch_cost = estimate_notify_recursive_watch_count(
+                                project_root.as_path(),
+                                tiered.max_watch_dirs.max(1),
+                            );
+                            let decision = runtime.register_project_marker_candidate(
+                                project_root.clone(),
+                                watch_cost,
+                            );
+                            let marker_promotion = send_promotion_decision_command(
+                                runtime,
+                                &watch_command_tx,
+                                project_root.clone(),
+                                decision,
+                            )
+                            .await;
+                            if !matches!(
+                                marker_promotion,
+                                fd_rdd::event::tiered_watch::PromotionDecision::SendAdd
+                                    | fd_rdd::event::tiered_watch::PromotionDecision::Replace { .. }
+                            ) {
+                                maybe_send_ephemeral_watch_command(
+                                    runtime,
+                                    &watch_command_tx,
+                                    project_root,
+                                    changed.max(1),
+                                    &exclude_dirs,
+                                    &marker_ephemeral_config,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -1045,6 +1096,22 @@ fn spawn_dirty_queue_loop(
             }
         }
     });
+}
+
+fn project_marker_root_is_eligible(
+    project_root: &std::path::Path,
+    roots: &[PathBuf],
+    exclude_dirs: &[String],
+    ignore_prefixes: &[PathBuf],
+) -> bool {
+    project_root.is_dir()
+        && roots
+            .iter()
+            .any(|root| path_is_under_or_equal(project_root, root.as_path()))
+        && !fd_rdd::util::path_has_excluded_component(project_root, exclude_dirs)
+        && !ignore_prefixes
+            .iter()
+            .any(|ignore| !ignore.as_os_str().is_empty() && project_root.starts_with(ignore))
 }
 
 fn spawn_tiered_scan_loop(
@@ -1100,6 +1167,15 @@ async fn send_promotion_command(
     dir: PathBuf,
 ) -> fd_rdd::event::tiered_watch::PromotionDecision {
     let decision = runtime.try_reserve_promotion(dir.as_path());
+    send_promotion_decision_command(runtime, watch_command_tx, dir, decision).await
+}
+
+async fn send_promotion_decision_command(
+    runtime: &Arc<TieredWatchRuntime>,
+    watch_command_tx: &tokio::sync::mpsc::Sender<WatchCommand>,
+    dir: PathBuf,
+    decision: fd_rdd::event::tiered_watch::PromotionDecision,
+) -> fd_rdd::event::tiered_watch::PromotionDecision {
     match decision.clone() {
         fd_rdd::event::tiered_watch::PromotionDecision::SendAdd => {
             if watch_command_tx

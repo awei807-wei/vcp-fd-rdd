@@ -911,6 +911,41 @@ impl TieredWatchRuntime {
         self.try_reserve_promotion(path.as_path())
     }
 
+    pub fn register_project_marker_candidate(
+        &self,
+        path: PathBuf,
+        watch_cost: usize,
+    ) -> PromotionDecision {
+        let now = unix_secs();
+        let state = {
+            let mut dirs = self.dirs.write();
+            dirs.entry(path.clone())
+                .or_insert_with(|| Arc::new(DirState::new(WatchTier::L1, watch_cost, now)))
+                .clone()
+        };
+
+        state.last_event_unix_secs.store(now, Ordering::Relaxed);
+        state.next_scan_unix_secs.store(0, Ordering::Relaxed);
+        state.high_priority_scan.store(true, Ordering::Relaxed);
+        state
+            .event_score
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |score| {
+                Some(score.saturating_add(96).min(10_000))
+            })
+            .ok();
+
+        if matches!(state.tier(), WatchTier::L0) {
+            return PromotionDecision::NotEligible;
+        }
+        if state.promotion_pending.load(Ordering::Relaxed) {
+            return PromotionDecision::NotEligible;
+        }
+
+        state.watch_cost.store(watch_cost as u64, Ordering::Relaxed);
+
+        self.try_reserve_promotion(path.as_path())
+    }
+
     pub fn record_scan(&self, path: &Path, outcome: ScanOutcome) {
         if let Some(state) = self.state(path) {
             let now = unix_secs();
@@ -1645,6 +1680,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.record_scan(
@@ -1653,6 +1689,7 @@ mod tests {
                 scanned: 1,
                 changed: 1,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
 
@@ -1713,6 +1750,33 @@ mod tests {
     }
 
     #[test]
+    fn project_marker_candidate_reserves_budget_and_marks_high_priority() {
+        let rt = runtime();
+        let project = PathBuf::from("/tmp/projects/app");
+
+        assert_eq!(
+            rt.register_project_marker_candidate(project.clone(), 1),
+            PromotionDecision::SendAdd
+        );
+        let reserved = rt.report();
+        assert_eq!(reserved.watched_dirs_estimated, 3);
+        assert_eq!(reserved.l1_dirs, 2);
+
+        let dump = rt.debug_dump(Some("/tmp/projects/app"));
+        let dir = dump
+            .dirs
+            .first()
+            .expect("project marker candidate should be tracked");
+        assert!(dir.high_priority_scan);
+        assert!(dir.event_score >= 96);
+
+        rt.confirm_promoted(project.as_path());
+        let promoted = rt.report();
+        assert_eq!(promoted.l0_dirs, 2);
+        assert_eq!(promoted.l1_dirs, 1);
+    }
+
+    #[test]
     fn dynamic_candidate_stays_l1_when_budget_blocked() {
         let rt = runtime();
         let dynamic = PathBuf::from("/tmp/hot/too-large-child");
@@ -1732,6 +1796,46 @@ mod tests {
     }
 
     #[test]
+    fn project_marker_candidate_gets_priority_when_budget_blocked() {
+        let rt =
+            TieredWatchRuntime::new(vec![(PathBuf::from("/tmp/hot"), 2)], vec![], 2, 5_000, 20);
+        let hot = PathBuf::from("/tmp/hot");
+        rt.record_scan(
+            hot.as_path(),
+            ScanOutcome {
+                scanned: 1,
+                changed: 30,
+                elapsed_ms: 1,
+                project_roots: Vec::new(),
+            },
+        );
+
+        let normal = PathBuf::from("/tmp/normal");
+        let project = PathBuf::from("/tmp/project");
+
+        assert_eq!(
+            rt.register_dynamic_candidate(normal.clone(), 1),
+            PromotionDecision::BudgetBlocked
+        );
+        assert_eq!(
+            rt.register_project_marker_candidate(project.clone(), 1),
+            PromotionDecision::BudgetBlocked
+        );
+
+        let batch = rt.scan_batch(10);
+        let project_pos = batch.iter().position(|p| p == &project);
+        let normal_pos = batch.iter().position(|p| p == &normal);
+        assert!(
+            project_pos.is_some() && normal_pos.is_some(),
+            "project and normal candidates should both stay scannable"
+        );
+        assert!(
+            project_pos.unwrap() < normal_pos.unwrap(),
+            "project marker candidate should be scanned before normal candidate"
+        );
+    }
+
+    #[test]
     fn empty_scans_demote_l1_to_l2_and_l3() {
         let rt = runtime();
         let warm = PathBuf::from("/tmp/warm");
@@ -1742,6 +1846,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
@@ -1756,6 +1861,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
@@ -1775,6 +1881,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
@@ -1784,6 +1891,7 @@ mod tests {
                 scanned: 1,
                 changed: 2,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
@@ -1812,6 +1920,7 @@ mod tests {
                 scanned: 1,
                 changed: 4,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
 
@@ -1905,6 +2014,7 @@ mod tests {
                 scanned: 1,
                 changed: 1,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
 
@@ -1960,6 +2070,7 @@ mod tests {
                 scanned: 1,
                 changed: 10,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
 
@@ -2018,6 +2129,7 @@ mod tests {
                 scanned: 1,
                 changed: 2,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
 
@@ -2051,6 +2163,7 @@ mod tests {
                 scanned: 10,
                 changed: 20,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
 
@@ -2163,6 +2276,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         let after = rt.report();
@@ -2184,6 +2298,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
 
@@ -2225,6 +2340,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
@@ -2240,6 +2356,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 4, 1, 1);
@@ -2262,6 +2379,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 99, 1, 1);
@@ -2271,6 +2389,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Interval, 99, 1, 1);
@@ -2293,6 +2412,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(
@@ -2310,6 +2430,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(
@@ -2340,6 +2461,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Disabled, 99, 1, 1);
@@ -2349,6 +2471,7 @@ mod tests {
                 scanned: 1,
                 changed: 0,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         rt.apply_scan_policy(warm.as_path(), 1, 2, L3ScanPolicy::Disabled, 99, 1, 1);

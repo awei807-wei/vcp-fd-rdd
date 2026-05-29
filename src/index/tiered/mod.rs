@@ -40,11 +40,12 @@ use self::rebuild::RebuildState;
 
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanOutcome {
     pub scanned: usize,
     pub changed: usize,
     pub elapsed_ms: u64,
+    pub project_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default)]

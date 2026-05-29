@@ -599,6 +599,7 @@ mod tests {
                 scanned: 1,
                 changed: 1,
                 elapsed_ms: 1,
+                project_roots: Vec::new(),
             },
         );
         let decision = runtime.try_reserve_promotion(hotter.as_path());
@@ -683,6 +684,7 @@ mod tests {
                     scanned: 1,
                     changed: 0,
                     elapsed_ms: 1,
+                    project_roots: Vec::new(),
                 },
             );
             runtime.apply_scan_policy(warm, 1, 1, L3ScanPolicy::Interval, 1, 1, 1);

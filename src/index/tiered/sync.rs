@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -140,6 +140,27 @@ fn should_skip_dirty_dir(
         .iter()
         .any(|ig| !ig.as_os_str().is_empty() && dir.starts_with(ig))
         || path_has_excluded_component(dir, exclude_dirs)
+}
+
+fn project_root_for_marker(path: &Path, markers: &[String]) -> Option<PathBuf> {
+    if markers.is_empty() {
+        return None;
+    }
+    let file_name = path.file_name()?.to_string_lossy();
+    if markers.iter().any(|marker| marker == file_name.as_ref()) {
+        return path.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+fn path_has_hidden_component_after_root(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .any(|component| match component {
+            std::path::Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+            _ => false,
+        })
 }
 
 #[derive(Debug, Default)]
@@ -388,6 +409,15 @@ impl TieredIndex {
         entry: DirtyQueueEntry,
         ignore_prefixes: &[PathBuf],
     ) -> DirtyProcessReport {
+        self.process_dirty_entry_with_project_markers(entry, ignore_prefixes, &[])
+    }
+
+    pub fn process_dirty_entry_with_project_markers(
+        &self,
+        entry: DirtyQueueEntry,
+        ignore_prefixes: &[PathBuf],
+        project_markers: &[String],
+    ) -> DirtyProcessReport {
         let mut report = DirtyProcessReport {
             entries_processed: 1,
             ..DirtyProcessReport::default()
@@ -410,8 +440,10 @@ impl TieredIndex {
                     }
                     match std::fs::symlink_metadata(dir) {
                         Ok(meta) if meta.is_dir() => {
-                            let outcome =
-                                self.scan_dirs_immediate_outcome(std::slice::from_ref(dir));
+                            let outcome = self.scan_dirs_immediate_outcome_with_project_markers(
+                                std::slice::from_ref(dir),
+                                project_markers,
+                            );
                             report.dirs_scanned = report.dirs_scanned.saturating_add(1);
                             report.changed = report.changed.saturating_add(outcome.changed);
                             report.elapsed_ms =
@@ -666,6 +698,16 @@ impl TieredIndex {
         max_depth: Option<usize>,
         max_entries_per_dir: usize,
     ) -> ScanOutcome {
+        self.scan_dirs_with_depth_and_project_markers(dirs, max_depth, max_entries_per_dir, &[])
+    }
+
+    fn scan_dirs_with_depth_and_project_markers(
+        &self,
+        dirs: &[&PathBuf],
+        max_depth: Option<usize>,
+        max_entries_per_dir: usize,
+        project_markers: &[String],
+    ) -> ScanOutcome {
         let start = Instant::now();
 
         let mut upsert_events: Vec<EventRecord> = Vec::new();
@@ -675,6 +717,9 @@ impl TieredIndex {
         let mut seq: u64 = 0;
         let io_governor = self.io_governor.as_ref();
 
+        let mut project_roots = Vec::new();
+        let hidden_markers_enabled = project_markers.iter().any(|marker| marker.starts_with('.'));
+
         for dir in dirs {
             let mut dir_count = 0;
             let mut builder = ignore::WalkBuilder::new(dir);
@@ -682,7 +727,7 @@ impl TieredIndex {
                 builder.max_depth(Some(d));
             }
             builder
-                .hidden(!self.include_hidden)
+                .hidden(!self.include_hidden && !hidden_markers_enabled)
                 .follow_links(false)
                 .ignore(self.ignore_enabled)
                 .git_ignore(self.ignore_enabled)
@@ -693,9 +738,15 @@ impl TieredIndex {
             let root = (*dir).clone();
             let exclude_dirs = self.exclude_dirs.clone();
             let mount_policy_counters = self.mount_policy_counters();
+            let include_hidden = self.include_hidden;
+            let project_markers_filter = project_markers.to_vec();
             builder.filter_entry(move |entry| {
                 (exclude_dirs.is_empty()
                     || !path_has_excluded_component(entry.path(), &exclude_dirs))
+                    && (include_hidden
+                        || !hidden_markers_enabled
+                        || !path_has_hidden_component_after_root(entry.path(), root.as_path())
+                        || project_root_for_marker(entry.path(), &project_markers_filter).is_some())
                     && fs_policy
                         .as_ref()
                         .map(|policy| {
@@ -736,6 +787,13 @@ impl TieredIndex {
                 dir_count += 1;
 
                 let path = super::normalize_path(ent.path());
+                if let Some(project_root) = project_root_for_marker(path.as_path(), project_markers)
+                {
+                    project_roots.push(project_root);
+                }
+                if !self.include_hidden && path_has_hidden_component_after_root(ent.path(), dir) {
+                    continue;
+                }
                 io_governor.before_io();
                 let meta = match ent.metadata() {
                     Ok(m) => m,
@@ -782,11 +840,24 @@ impl TieredIndex {
         }
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
+        project_roots.sort();
+        project_roots.dedup();
+
         ScanOutcome {
             scanned,
             changed,
             elapsed_ms,
+            project_roots,
         }
+    }
+
+    pub fn scan_dirs_immediate_outcome_with_project_markers(
+        &self,
+        dirs: &[PathBuf],
+        project_markers: &[String],
+    ) -> ScanOutcome {
+        let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
+        self.scan_dirs_with_depth_and_project_markers(&dirs, Some(1), 10_000, project_markers)
     }
 
     pub fn path_freshness(
