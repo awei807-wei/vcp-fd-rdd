@@ -1,5 +1,6 @@
 use crate::stats::{
-    infer_heap_high_water, EventPipelineStats, MemoryReport, OverlayStats, RebuildStats,
+    infer_heap_high_water, EventPipelineStats, GenerationStats, MemoryReport, OverlayStats,
+    RebuildStats,
 };
 use crate::util::maybe_trim_rss;
 use std::collections::VecDeque;
@@ -31,8 +32,12 @@ impl TieredIndex {
     /// 生成完整内存报告
     pub fn memory_report(&self, pipeline_stats: EventPipelineStats) -> MemoryReport {
         let l1 = self.l1.memory_stats();
-        let base = self.base.load().memory_stats();
-        let l2 = self.l2.load_full().memory_stats();
+        let base_generation = self.base.load_full();
+        let base_strong_refs = Arc::strong_count(&base_generation);
+        let base = base_generation.memory_stats();
+        let l2_generation = self.l2.load_full();
+        let l2_strong_refs = Arc::strong_count(&l2_generation);
+        let l2 = l2_generation.memory_stats();
         let overlay = {
             let db = self.delta_buffer.lock();
             let deleted_count = db.deleted_paths().count();
@@ -103,6 +108,10 @@ impl TieredIndex {
             event_pipeline: pipeline_stats,
             overlay,
             rebuild,
+            generation: GenerationStats {
+                base_strong_refs,
+                l2_strong_refs,
+            },
             process_rss_bytes: MemoryReport::read_process_rss(),
             process_swap_bytes: MemoryReport::read_process_swap(),
             process_smaps_rollup,

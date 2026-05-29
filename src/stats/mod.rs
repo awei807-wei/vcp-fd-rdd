@@ -31,6 +31,8 @@ pub struct MemoryReport {
     pub overlay: OverlayStats,
     /// rebuild（pending 事件队列）
     pub rebuild: RebuildStats,
+    /// ArcSwap 当前 generation 的强引用观测
+    pub generation: GenerationStats,
     /// 进程级 RSS（从 /proc/self/statm 读取）
     pub process_rss_bytes: u64,
     /// 进程级 swap（从 /proc/self/status 的 VmSwap 读取；Linux-only）
@@ -266,6 +268,14 @@ pub struct RebuildStats {
     pub estimated_bytes: u64,
 }
 
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct GenerationStats {
+    /// 当前 BaseIndexData generation 的 Arc strong_count（包含本次 report 采样引用）。
+    pub base_strong_refs: usize,
+    /// 当前 PersistentIndex generation 的 Arc strong_count（包含本次 report 采样引用）。
+    pub l2_strong_refs: usize,
+}
+
 impl MemoryReport {
     /// 从 /proc/self/statm 读取进程 RSS
     pub fn read_process_rss() -> u64 {
@@ -423,6 +433,11 @@ impl fmt::Display for MemoryReport {
                 pf.minflt, pf.majflt
             )?;
         }
+        writeln!(
+            f,
+            "║ Generation refs: base={:<8} l2={:<8}       ║",
+            self.generation.base_strong_refs, self.generation.l2_strong_refs
+        )?;
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ L1 Cache:                                        ║")?;
         writeln!(

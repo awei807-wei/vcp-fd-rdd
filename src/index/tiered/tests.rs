@@ -514,6 +514,29 @@ fn overlay_delete_then_recreate_cancels_deleted() {
 }
 
 #[test]
+fn memory_report_tracks_generation_strong_refs() {
+    let root = unique_tmp_dir("generation-refs");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    let baseline = idx.memory_report(EventPipelineStats::default()).generation;
+    let _base_ref = idx.base.load_full();
+    let _l2_ref = idx.l2.load_full();
+    let with_refs = idx.memory_report(EventPipelineStats::default()).generation;
+
+    assert!(
+        with_refs.base_strong_refs > baseline.base_strong_refs,
+        "base strong refs should include externally held Arc generations: baseline={baseline:?} with_refs={with_refs:?}"
+    );
+    assert!(
+        with_refs.l2_strong_refs > baseline.l2_strong_refs,
+        "l2 strong refs should include externally held Arc generations: baseline={baseline:?} with_refs={with_refs:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn overlay_rename_tracks_from_as_delete_and_to_as_upsert() {
     let root = unique_tmp_dir("overlay-rename");
     std::fs::create_dir_all(&root).unwrap();

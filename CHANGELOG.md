@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - full build、rebuild 和 `IndexBuilder` 增量补扫会在文件 metadata 读取前消费共享 I/O Governor token，相关操作计数进入 `/health.diagnostics.io`。
 - fast-sync、dirty queue 即时扫描和启动修复扫描会在目录/metadata 检查前消费共享 I/O Governor token。
 - I/O Governor 会按固定操作间隔低频采样 Linux PSI，并使用配置阈值触发 backoff，避免每次 I/O 都读取 `/proc/pressure/io`。
+- `/memory` 与 metrics JSONL 暴露当前 base/L2 generation 的 Arc strong refs，便于观察查询或后台任务是否延长旧代存活。
 - 补齐 case policy 自动探测基础、mount policy 拒绝原因矩阵、clock skew dirty window 和 root/system daemon 默认禁用未认证 HTTP query/scan 的安全策略测试。
 - 测试补强：新增 daemon API/UDS E2E、真实 watcher create/rename/delete、abrupt kill 与坏 stable snapshot 启动修复组合测试，补齐此前偏模块级的关键真实链路缺口。
 - 仓库清理：将本地运行生成的 `reports/`/`report/` 加入忽略，并停止追踪历史报告产物，避免测试与 daemon 运行污染提交。
