@@ -155,6 +155,7 @@ pub struct IoGovernor {
     operations: AtomicU64,
     backoff_count: AtomicU64,
     backoff_millis: AtomicU64,
+    token_bucket_limited_count: AtomicU64,
 }
 
 impl IoGovernor {
@@ -169,6 +170,7 @@ impl IoGovernor {
             operations: AtomicU64::new(0),
             backoff_count: AtomicU64::new(0),
             backoff_millis: AtomicU64::new(0),
+            token_bucket_limited_count: AtomicU64::new(0),
         }
     }
 
@@ -185,6 +187,8 @@ impl IoGovernor {
             if self.bucket.lock().unwrap().try_take_at(Instant::now(), 1) {
                 break;
             }
+            self.token_bucket_limited_count
+                .fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -209,6 +213,10 @@ impl IoGovernor {
 
     pub fn backoff_count(&self) -> u64 {
         self.backoff_count.load(Ordering::Relaxed)
+    }
+
+    pub fn token_bucket_limited_count(&self) -> u64 {
+        self.token_bucket_limited_count.load(Ordering::Relaxed)
     }
 }
 
@@ -292,6 +300,25 @@ mod tests {
         assert!(bucket.try_take_at(now, 1));
         assert!(!bucket.try_take_at(now, 1));
         assert!(bucket.try_take_at(now + Duration::from_millis(100), 1));
+    }
+
+    #[test]
+    fn governor_counts_token_bucket_waits() {
+        let governor = IoGovernor::new(true, 1);
+        governor.before_io();
+        governor.before_io();
+
+        assert_eq!(governor.operations(), 2);
+        assert!(governor.token_bucket_limited_count() > 0);
+    }
+
+    #[test]
+    fn disabled_governor_does_not_count_token_bucket_waits() {
+        let governor = IoGovernor::disabled();
+        governor.before_io();
+
+        assert_eq!(governor.operations(), 0);
+        assert_eq!(governor.token_bucket_limited_count(), 0);
     }
 
     #[test]
