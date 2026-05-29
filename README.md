@@ -227,7 +227,7 @@ strict_fail_on_budget_exceeded = true
 
 `strict` 会要求 `strict_required_hot_dirs` 全部进入 L0 watcher；预算不足时 `/watch-state` 输出 `required_watch_cost`、`watch_budget_shortfall` 和 `strict_uncovered_dirs`，`/health` 在 `strict_fail_on_budget_exceeded = true` 时返回 `index_health = "degraded"`，否则返回 `warning`。未配置 `max_watch_dirs` 时，tiered watcher 默认预算为 `131072`；未配置 profile 时保持 `balanced` 行为。
 
-L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` 会把 L3 上次扫描干净的目录展示为 `ScannedFresh`，未被实时覆盖的 L3 目录按 `EventuallyConsistent` 口径出现在 `/watch-state.eventually_consistent_dirs` 与 metrics diagnostics 中。
+L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` 会把 L3 上次扫描干净的目录展示为 `ScannedFresh`，未被实时覆盖的 L3 目录按 `EventuallyConsistent` 口径出现在 `/watch-state.eventually_consistent_dirs` 与 metrics diagnostics 中。嵌套项目会在 `/debug/tiered-watch` 中暴露 `nearest_ancestor_root`、`descendant_roots`、`l0_covering_root`、`budget_isolated_from_ancestor` 和 `nested_relation`，用于解释祖先/后代项目之间的覆盖与预算隔离关系。
 
 ## fd-rdd-sim 压测框架
 

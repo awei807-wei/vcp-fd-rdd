@@ -1455,6 +1455,17 @@ impl TieredWatchRuntime {
     pub fn debug_dump(&self, root_filter: Option<&str>) -> TieredWatchDebugDump {
         let dirs = self.dirs.read();
         let filter = root_filter.map(|s| s.to_string());
+        let dir_paths = dirs.keys().cloned().collect::<Vec<_>>();
+        let l0_paths = dirs
+            .iter()
+            .filter_map(|(path, state)| {
+                if state.tier() == WatchTier::L0 {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         let mut entries = Vec::new();
         let mut l0_dirs = 0usize;
         let mut l1_dirs = 0usize;
@@ -1489,6 +1500,16 @@ impl TieredWatchRuntime {
                 state.last_budget_blocked_unix_secs.load(Ordering::Relaxed);
             let dirty = state.dirty.load(Ordering::Relaxed);
             let high_priority_scan = state.high_priority_scan.load(Ordering::Relaxed);
+            let nearest_ancestor_root = nearest_ancestor_root(path.as_path(), &dir_paths);
+            let descendant_roots = descendant_roots(path.as_path(), &dir_paths);
+            let l0_covering_root = nearest_covering_root(path.as_path(), &l0_paths);
+            let budget_isolated_from_ancestor = nearest_ancestor_root.is_some();
+            let nested_relation = nested_relation(
+                path.as_path(),
+                nearest_ancestor_root.as_deref(),
+                !descendant_roots.is_empty(),
+                l0_covering_root.as_deref(),
+            );
 
             match tier {
                 WatchTier::L0 => l0_dirs += 1,
@@ -1516,6 +1537,11 @@ impl TieredWatchRuntime {
                 last_budget_blocked_unix_secs,
                 high_priority_scan,
                 ephemeral_watch: ephemeral_paths.contains(path),
+                nearest_ancestor_root,
+                descendant_roots,
+                l0_covering_root,
+                budget_isolated_from_ancestor,
+                nested_relation,
             });
         }
 
@@ -1556,6 +1582,11 @@ pub struct TieredWatchDebugDir {
     pub last_budget_blocked_unix_secs: u64,
     pub high_priority_scan: bool,
     pub ephemeral_watch: bool,
+    pub nearest_ancestor_root: Option<String>,
+    pub descendant_roots: Vec<String>,
+    pub l0_covering_root: Option<String>,
+    pub budget_isolated_from_ancestor: bool,
+    pub nested_relation: String,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -1578,6 +1609,53 @@ pub struct TieredWatchDebugDump {
 
 fn path_is_under_or_equal(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
+}
+
+fn nearest_ancestor_root(path: &Path, roots: &[PathBuf]) -> Option<String> {
+    roots
+        .iter()
+        .filter(|root| root.as_path() != path && path_is_under_or_equal(path, root.as_path()))
+        .max_by_key(|root| root.as_os_str().as_encoded_bytes().len())
+        .map(|root| root.to_string_lossy().to_string())
+}
+
+fn nearest_covering_root(path: &Path, roots: &[PathBuf]) -> Option<String> {
+    roots
+        .iter()
+        .filter(|root| path_is_under_or_equal(path, root.as_path()))
+        .max_by_key(|root| root.as_os_str().as_encoded_bytes().len())
+        .map(|root| root.to_string_lossy().to_string())
+}
+
+fn descendant_roots(path: &Path, roots: &[PathBuf]) -> Vec<String> {
+    let mut descendants = roots
+        .iter()
+        .filter(|root| root.as_path() != path && path_is_under_or_equal(root.as_path(), path))
+        .map(|root| root.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    descendants.sort();
+    descendants
+}
+
+fn nested_relation(
+    path: &Path,
+    nearest_ancestor_root: Option<&str>,
+    has_descendants: bool,
+    l0_covering_root: Option<&str>,
+) -> String {
+    if let Some(l0_root) = l0_covering_root {
+        let path = path.to_string_lossy();
+        if l0_root != path.as_ref() {
+            return "covered_by_l0_ancestor".to_string();
+        }
+    }
+    if nearest_ancestor_root.is_some() {
+        return "nested_under_cold_root".to_string();
+    }
+    if has_descendants {
+        return "ancestor_of_nested_roots".to_string();
+    }
+    "standalone".to_string()
 }
 
 fn path_has_component(path: &Path, component: &str) -> bool {
@@ -2000,6 +2078,67 @@ mod tests {
         assert_eq!(warm.budget_blocked_count, 0);
         assert_eq!(warm.last_budget_blocked_unix_secs, 0);
         assert!(!warm.high_priority_scan);
+    }
+
+    #[test]
+    fn debug_dump_explains_nested_project_relationships() {
+        let rt = TieredWatchRuntime::new(
+            vec![(PathBuf::from("/workspace"), 3)],
+            vec![(PathBuf::from("/workspace/project"), 1)],
+            4,
+            5_000,
+            20,
+        );
+
+        let dump = rt.debug_dump(Some("/workspace"));
+        let parent = dump
+            .dirs
+            .iter()
+            .find(|dir| dir.path == "/workspace")
+            .expect("parent root should be present");
+        let child = dump
+            .dirs
+            .iter()
+            .find(|dir| dir.path == "/workspace/project")
+            .expect("nested project root should be present");
+
+        assert_eq!(parent.descendant_roots, vec!["/workspace/project"]);
+        assert_eq!(parent.nearest_ancestor_root, None);
+        assert_eq!(parent.l0_covering_root.as_deref(), Some("/workspace"));
+        assert!(!parent.budget_isolated_from_ancestor);
+        assert_eq!(parent.nested_relation, "ancestor_of_nested_roots");
+
+        assert_eq!(child.nearest_ancestor_root.as_deref(), Some("/workspace"));
+        assert!(child.descendant_roots.is_empty());
+        assert_eq!(child.l0_covering_root.as_deref(), Some("/workspace"));
+        assert!(child.budget_isolated_from_ancestor);
+        assert_eq!(child.nested_relation, "covered_by_l0_ancestor");
+    }
+
+    #[test]
+    fn debug_dump_marks_nested_project_under_cold_root() {
+        let rt = TieredWatchRuntime::new(
+            Vec::new(),
+            vec![
+                (PathBuf::from("/workspace"), 3),
+                (PathBuf::from("/workspace/project"), 1),
+            ],
+            4,
+            5_000,
+            20,
+        );
+
+        let dump = rt.debug_dump(Some("/workspace/project"));
+        let child = dump
+            .dirs
+            .iter()
+            .find(|dir| dir.path == "/workspace/project")
+            .expect("nested project root should be present");
+
+        assert_eq!(child.nearest_ancestor_root.as_deref(), Some("/workspace"));
+        assert_eq!(child.l0_covering_root, None);
+        assert!(child.budget_isolated_from_ancestor);
+        assert_eq!(child.nested_relation, "nested_under_cold_root");
     }
 
     #[test]
