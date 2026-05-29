@@ -22,6 +22,11 @@
 #   若无法读取 /proc/<pid>/smaps_rollup（权限限制），可：
 #   - 把 --fd-metric 改为 rss（会 fallback 到 /proc/<pid>/statm）
 #   - 或用 --spawn-fd 让脚本启动 fd-rdd（成为父进程），继续检查 pd/pc/pss
+#
+# memory_light profile 对照示例：
+#   python3 scripts/fs-churn.py --verdict --report-json /tmp/fd-rdd-memory-light.json \
+#     --root /tmp/fd-rdd-churn --reset --cleanup \
+#     --auto-spawn-fd --fd-runtime-profile memory_light
 
 from __future__ import annotations
 
@@ -455,39 +460,34 @@ def _auto_spawn_fd_cmd(
     fd_bin: str,
     root: Path,
     report_interval_secs: int,
-    trim_interval_secs: int,
-    trim_pd_threshold_mb: int,
     event_channel_size: int,
     debounce_ms: int,
+    runtime_profile: str,
 ) -> list[str]:
     snapshot_path = root / "index.db"
-    return [
+    uds_socket = root / "fd-rdd.sock"
+    cmd = [
         fd_bin,
         "--root",
         str(root),
         "--snapshot-path",
         str(snapshot_path),
+        "--uds-socket",
+        str(uds_socket),
         "--http-port",
         "0",
-        "--no-build",
-        "--no-snapshot",
         "--snapshot-interval-secs",
         "0",
         "--report-interval-secs",
         str(report_interval_secs),
-        "--trim-interval-secs",
-        str(trim_interval_secs),
-        "--trim-pd-threshold-mb",
-        str(trim_pd_threshold_mb),
         "--event-channel-size",
         str(event_channel_size),
         "--debounce-ms",
         str(debounce_ms),
-        "--auto-flush-overlay-paths",
-        "5000",
-        "--auto-flush-overlay-bytes",
-        "0",
     ]
+    if runtime_profile:
+        cmd.extend(["--runtime-profile", runtime_profile])
+    return cmd
 
 
 def _int_arg(v: str) -> int:
@@ -914,18 +914,6 @@ def main(argv: list[str]) -> int:
         help="--auto-spawn-fd 时的 fd-rdd MemoryReport 间隔（秒）；默认：--verdict=5，其它=0（禁用）",
     )
     ap.add_argument(
-        "--fd-trim-interval-secs",
-        type=_int_arg,
-        default=-1,
-        help="--auto-spawn-fd 时的 fd-rdd trim 检查间隔（秒，-1=按 --verdict 默认策略，0=禁用）",
-    )
-    ap.add_argument(
-        "--fd-trim-pd-threshold-mb",
-        type=_int_arg,
-        default=-1,
-        help="--auto-spawn-fd 时的 fd-rdd trim Private_Dirty 阈值（MB，-1=按 --verdict 默认策略）",
-    )
-    ap.add_argument(
         "--fd-event-channel-size",
         type=_int_arg,
         default=4096,
@@ -936,6 +924,12 @@ def main(argv: list[str]) -> int:
         type=_int_arg,
         default=100,
         help="--auto-spawn-fd 时的 watcher debounce 窗口（毫秒）",
+    )
+    ap.add_argument(
+        "--fd-runtime-profile",
+        choices=["", "default", "memory_light", "memory-light"],
+        default="",
+        help="--auto-spawn-fd 时传给 fd-rdd 的 runtime profile；留空表示不覆盖 daemon/config。",
     )
 
     # 让脚本成为 fd-rdd 的父进程：在 yama/ptrace_scope 限制下也能读到 smaps_rollup（pd/pc/pss）
@@ -1004,20 +998,13 @@ def main(argv: list[str]) -> int:
         if report_interval_secs < 0:
             report_interval_secs = 5 if args.verdict else 0
 
-        # --verdict 模式下，默认开启 fd-rdd 的条件性 trim 循环（更贴近“过载后可恢复”的验收口径）。
-        # 可用 --fd-trim-interval-secs=0 显式关闭。
-        if args.fd_trim_interval_secs < 0:
-            args.fd_trim_interval_secs = 5 if args.verdict else 0
-        if args.fd_trim_pd_threshold_mb < 0:
-            args.fd_trim_pd_threshold_mb = 32 if args.verdict else 128
         cmd = _auto_spawn_fd_cmd(
             fd_bin,
             args.root,
             report_interval_secs=report_interval_secs,
-            trim_interval_secs=max(0, args.fd_trim_interval_secs),
-            trim_pd_threshold_mb=max(0, args.fd_trim_pd_threshold_mb),
             event_channel_size=max(1, args.fd_event_channel_size),
             debounce_ms=max(0, args.fd_debounce_ms),
+            runtime_profile=args.fd_runtime_profile,
         )
         spawn_cmd = cmd
         try:

@@ -328,10 +328,22 @@ jq '{
 | `ignore_enabled` | `bool` | `true` | `.gitignore` 规则 |
 | `watch_enabled` | `bool` | `true` | 启用文件监听 |
 | `watch_mode` | `String` | `"recursive"` | `recursive` / `tiered` / `off` |
+| `runtime_profile` | `String` | `"default"` | `default` / `memory_light` |
 | `snapshot_interval_secs` | `u64` | `300` | 快照落盘周期 |
 | `stable_snapshot_enabled` | `bool` | `true` | 稳定快照轮转 |
 | `startup_repair_enabled` | `bool` | `true` | 启动修复扫描 |
 | `log_level` | `String` | `"info"` | trace / debug / info / warn / error |
+
+`runtime_profile = "memory_light"` 适合更关注常驻内存上限、可接受更频繁 snapshot/flush 的环境。该模式会降低 DeltaBuffer 触发 flush 的路径数/字节门槛，给周期 flush 增加最大滞留时间，缩短 rebuild 合并冷却，并在 WAL 体积超过阈值时请求 snapshot 边界；强制 flush、退出前 final snapshot、WAL replay 和离线 root 的 Freeze Gate 保护不变。CLI 可用 `--runtime-profile memory_light` 临时覆盖。
+
+可用 `scripts/fs-churn.py` 做默认 profile 与 `memory_light` 的 churn 对照：
+
+```bash
+python3 scripts/fs-churn.py --verdict \
+  --report-json /tmp/fd-rdd-memory-light.json \
+  --root /tmp/fd-rdd-churn --reset --cleanup \
+  --auto-spawn-fd --fd-runtime-profile memory_light
+```
 
 优先级：`CLI 参数 > config.toml > 默认值`。查看生效配置：
 
