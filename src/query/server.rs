@@ -1,3 +1,4 @@
+use crate::core::FileKind;
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::tiered_watch::TieredWatchDebugDump;
 use crate::index::TieredIndex;
@@ -85,6 +86,8 @@ pub struct SearchParams {
 #[derive(Serialize)]
 pub struct SearchResult {
     pub path: String,
+    #[serde(rename = "type")]
+    pub entry_type: String,
     pub score: i64,
     pub highlights: Vec<[usize; 2]>,
     pub freshness: String,
@@ -307,6 +310,13 @@ fn resolve_query_mode(mode: Option<&str>) -> Result<QueryMode, String> {
     QueryMode::parse_label(mode).map_err(|e| format!("invalid query mode: {}", e))
 }
 
+fn entry_type_label(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::File => "file",
+        FileKind::Directory => "dir",
+    }
+}
+
 async fn search_handler(
     Query(params): Query<SearchParams>,
     State(state): State<QueryServerState>,
@@ -364,6 +374,7 @@ async fn search_handler(
             let highlights = compute_highlights(&path_str, &keyword);
             SearchResult {
                 path: path_str,
+                entry_type: entry_type_label(result.meta.kind).to_string(),
                 score,
                 highlights,
                 freshness: result.freshness.as_str().to_string(),
@@ -649,6 +660,7 @@ mod tests {
     fn search_result_serializes_cold_validation_fields() {
         let value = serde_json::to_value(SearchResult {
             path: "/tmp/a.txt".to_string(),
+            entry_type: "file".to_string(),
             score: 10,
             highlights: vec![[0, 3]],
             freshness: "stale_checked".to_string(),
@@ -657,6 +669,7 @@ mod tests {
         })
         .unwrap();
 
+        assert_eq!(value["type"], "file");
         assert_eq!(value["freshness"], "stale_checked");
         assert_eq!(value["index_tier"], "ColdMmap");
         assert_eq!(value["validated"], true);

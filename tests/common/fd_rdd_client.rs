@@ -14,6 +14,8 @@ const BASE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchResult {
     pub path: PathBuf,
+    #[serde(rename = "type", default)]
+    pub entry_type: String,
     #[serde(default)]
     pub name: String,
     #[serde(default)]

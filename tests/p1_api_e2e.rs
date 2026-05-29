@@ -112,7 +112,9 @@ fn http_api_manual_scan_and_observability_endpoints_work() {
     );
 
     let late = root.join("manual_scan_api_probe.txt");
+    let late_dir = root.join("manual_scan_dir_probe");
     std::fs::write(&late, b"manual").unwrap();
+    std::fs::create_dir_all(&late_dir).unwrap();
     assert!(
         !common::fd_rdd_client::search(port, "manual_scan_api_probe", 10)
             .iter()
@@ -133,6 +135,13 @@ fn http_api_manual_scan_and_observability_endpoints_work() {
     assert!(
         wait_for_file_visible(port, &late, 5),
         "manual /scan should make late file searchable"
+    );
+    let dir_results = common::fd_rdd_client::search(port, "type:dir manual_scan_dir_probe", 10);
+    assert!(
+        dir_results
+            .iter()
+            .any(|r| r.path == late_dir && r.entry_type == "dir"),
+        "HTTP /search should return type=dir for directory results: {dir_results:?}"
     );
 
     process.kill();
