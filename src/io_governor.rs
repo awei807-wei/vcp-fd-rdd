@@ -48,6 +48,8 @@ fn default_max_backoff_ms() -> u64 {
     1_000
 }
 
+const PRESSURE_SAMPLE_INTERVAL_OPS: u64 = 1024;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct IoPressure {
     pub some_avg10: f32,
@@ -152,6 +154,8 @@ pub struct IoGovernor {
     enabled: bool,
     bucket: Mutex<TokenBucket>,
     backoff: Mutex<BackoffState>,
+    pressure_policy: BackoffPolicy,
+    pressure_sample_interval_ops: u64,
     last_pressure: Mutex<Option<IoPressure>>,
     operations: AtomicU64,
     backoff_count: AtomicU64,
@@ -161,10 +165,34 @@ pub struct IoGovernor {
 
 impl IoGovernor {
     pub fn from_config(config: &IoGovernorConfig) -> Self {
-        Self::new(config.enabled, config.stat_rate_per_sec)
+        Self::with_policy(
+            config.enabled,
+            config.stat_rate_per_sec,
+            BackoffPolicy {
+                some_threshold: config.psi_some_avg10_threshold,
+                full_threshold: config.psi_full_avg10_threshold,
+                base_delay: Duration::from_millis(5),
+                max_delay: Duration::from_millis(config.max_backoff_ms.max(1)),
+            },
+            PRESSURE_SAMPLE_INTERVAL_OPS,
+        )
     }
 
     pub fn new(enabled: bool, stat_rate_per_sec: u64) -> Self {
+        Self::with_policy(
+            enabled,
+            stat_rate_per_sec,
+            BackoffPolicy::default(),
+            PRESSURE_SAMPLE_INTERVAL_OPS,
+        )
+    }
+
+    fn with_policy(
+        enabled: bool,
+        stat_rate_per_sec: u64,
+        pressure_policy: BackoffPolicy,
+        pressure_sample_interval_ops: u64,
+    ) -> Self {
         Self {
             enabled,
             bucket: Mutex::new(TokenBucket::new(
@@ -172,6 +200,8 @@ impl IoGovernor {
                 stat_rate_per_sec.max(1),
             )),
             backoff: Mutex::new(BackoffState::default()),
+            pressure_policy,
+            pressure_sample_interval_ops: pressure_sample_interval_ops.max(1),
             last_pressure: Mutex::new(None),
             operations: AtomicU64::new(0),
             backoff_count: AtomicU64::new(0),
@@ -185,10 +215,14 @@ impl IoGovernor {
     }
 
     pub fn before_io(&self) {
+        self.before_io_with_pressure_reader(read_linux_io_pressure);
+    }
+
+    fn before_io_with_pressure_reader(&self, read_pressure: impl FnOnce() -> Option<IoPressure>) {
         if !self.enabled {
             return;
         }
-        self.operations.fetch_add(1, Ordering::Relaxed);
+        let operation = self.operations.fetch_add(1, Ordering::Relaxed) + 1;
         loop {
             if self.bucket.lock().unwrap().try_take_at(Instant::now(), 1) {
                 break;
@@ -196,6 +230,15 @@ impl IoGovernor {
             self.token_bucket_limited_count
                 .fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(1));
+        }
+        if operation.is_multiple_of(self.pressure_sample_interval_ops) {
+            self.sample_pressure_with(read_pressure);
+        }
+    }
+
+    fn sample_pressure_with(&self, read_pressure: impl FnOnce() -> Option<IoPressure>) {
+        if let Some(pressure) = read_pressure() {
+            self.observe_pressure(pressure, self.pressure_policy);
         }
     }
 
@@ -350,6 +393,61 @@ mod tests {
         );
 
         assert_eq!(governor.last_pressure(), Some(pressure));
+        assert_eq!(governor.backoff_count(), 0);
+    }
+
+    #[test]
+    fn governor_samples_pressure_on_configured_operation_interval() {
+        let governor = IoGovernor::with_policy(
+            true,
+            1_000,
+            BackoffPolicy {
+                some_threshold: 10.0,
+                full_threshold: 5.0,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            2,
+        );
+        let pressure = IoPressure {
+            some_avg10: 20.0,
+            full_avg10: 0.0,
+        };
+
+        governor.before_io_with_pressure_reader(|| Some(pressure));
+        assert_eq!(governor.last_pressure(), None);
+        assert_eq!(governor.backoff_count(), 0);
+
+        governor.before_io_with_pressure_reader(|| Some(pressure));
+        assert_eq!(governor.last_pressure(), Some(pressure));
+        assert_eq!(governor.backoff_count(), 1);
+    }
+
+    #[test]
+    fn governor_config_controls_pressure_thresholds() {
+        let config = IoGovernorConfig {
+            enabled: true,
+            stat_rate_per_sec: 1_000,
+            psi_some_avg10_threshold: 50.0,
+            psi_full_avg10_threshold: 50.0,
+            max_backoff_ms: 1,
+        };
+        let governor = IoGovernor::from_config(&config);
+
+        governor.sample_pressure_with(|| {
+            Some(IoPressure {
+                some_avg10: 20.0,
+                full_avg10: 0.0,
+            })
+        });
+
+        assert_eq!(
+            governor.last_pressure(),
+            Some(IoPressure {
+                some_avg10: 20.0,
+                full_avg10: 0.0,
+            })
+        );
         assert_eq!(governor.backoff_count(), 0);
     }
 
