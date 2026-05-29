@@ -2,6 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::index::case_policy::unicode_case_fold_lookup;
+
 /// Glob 匹配模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobMode {
@@ -163,15 +165,11 @@ fn is_literal_delim(b: u8) -> bool {
     matches!(b, b'/' | b'\\' | b'*' | b'?')
 }
 
-fn fold_ascii_char(c: char) -> char {
-    c.to_ascii_lowercase()
-}
-
 fn chars_equal(a: char, b: char, case_sensitive: bool) -> bool {
     if case_sensitive {
         a == b
     } else {
-        fold_ascii_char(a) == fold_ascii_char(b)
+        unicode_case_fold_lookup(&a.to_string()) == unicode_case_fold_lookup(&b.to_string())
     }
 }
 
@@ -243,28 +241,19 @@ fn glob_matches(pattern: &[char], input: &str, case_sensitive: bool) -> bool {
     pattern_idx == pattern.len()
 }
 
-fn fold_ascii_byte(b: u8) -> u8 {
-    b.to_ascii_lowercase()
-}
-
 fn contains_ascii_insensitive(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    let h = haystack.as_bytes();
-    let n = needle.as_bytes();
+    let folded_haystack = unicode_case_fold_lookup(haystack);
+    let folded_needle = unicode_case_fold_lookup(needle);
+    let h = folded_haystack.as_bytes();
+    let n = folded_needle.as_bytes();
     if n.len() > h.len() {
         return false;
     }
     for i in 0..=h.len() - n.len() {
-        let mut ok = true;
-        for j in 0..n.len() {
-            if fold_ascii_byte(h[i + j]) != fold_ascii_byte(n[j]) {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
+        if &h[i..i + n.len()] == n {
             return true;
         }
     }

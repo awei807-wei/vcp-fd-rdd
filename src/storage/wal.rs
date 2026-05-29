@@ -211,6 +211,7 @@ pub struct WalStore {
     file: Mutex<File>,
     durability: Mutex<WalDurability>,
     sync_state: Mutex<WalSyncState>,
+    last_seal_id: Mutex<u64>,
 }
 
 impl WalStore {
@@ -218,6 +219,7 @@ impl WalStore {
         std::fs::create_dir_all(&dir)?;
         let current = dir.join("events.wal");
         let f = open_or_init(&current)?;
+        let last_seal_id = max_existing_seal_id(&dir).max(now_seal_id());
         Ok(Self {
             dir,
             current,
@@ -227,6 +229,7 @@ impl WalStore {
                 records_since_sync: 0,
                 last_sync: Instant::now(),
             }),
+            last_seal_id: Mutex::new(last_seal_id),
         })
     }
 
@@ -295,7 +298,12 @@ impl WalStore {
         let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
         f.flush()?;
 
-        let id = now_seal_id();
+        let id = {
+            let mut last = self.last_seal_id.lock().unwrap_or_else(|e| e.into_inner());
+            let id = now_seal_id().max(last.saturating_add(1));
+            *last = id;
+            id
+        };
         let sealed = self.dir.join(format!("events.wal.seal-{id:016x}"));
         // 关闭当前句柄后再 rename（避免平台差异）。
         drop(f);
@@ -539,6 +547,17 @@ fn parse_seal_id(path: &Path) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(&hex, 16).ok()
+}
+
+fn max_existing_seal_id(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| parse_seal_id(entry.path().as_path()))
+        .max()
+        .unwrap_or(0)
 }
 
 fn sealed_id_gap_detected(ids: &[u64]) -> bool {

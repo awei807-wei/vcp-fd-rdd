@@ -186,6 +186,19 @@ fn wal_replay_reports_checkpoint_and_small_id_gap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn wal_seal_ids_are_strictly_monotonic() {
+    let dir = unique_tmp_dir("monotonic-seal");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let wal = WalStore::open_in_dir(dir.clone()).unwrap();
+    let first = wal.seal().unwrap();
+    let second = wal.seal().unwrap();
+    assert!(second > first);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 16. 版本兼容：v1 WAL 正确加载（升级到 v3）
 #[test]
 fn wal_v1_compat_loads_after_upgrade() {

@@ -533,6 +533,14 @@ async fn scan_handler(
     }
 
     let dirs: Vec<PathBuf> = params.paths.iter().take(10).map(PathBuf::from).collect();
+    for dir in &dirs {
+        if !crate::security::path_within_roots(dir, &state.index.roots) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("scan path is outside configured roots: {}", dir.display()),
+            ));
+        }
+    }
 
     let index = state.index.clone();
     let (scanned, elapsed_ms) =

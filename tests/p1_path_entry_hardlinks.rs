@@ -1,0 +1,138 @@
+//! P1 — path-entry hardlink alias behavior.
+
+use std::path::{Path, PathBuf};
+
+use fd_rdd::core::{BuildRDD, EventRecord, EventType, FileIdentifier, FsScanRDD};
+use fd_rdd::index::l2_partition::PersistentIndex;
+use fd_rdd::query::matcher::create_matcher;
+use fd_rdd::storage::snapshot::{stable_v7_path_for, write_stable_v7_atomic};
+use fd_rdd::storage::snapshot_v7::try_load_v7_cold;
+
+fn unique_tmp_dir(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("fd-rdd-hardlinks-{}-{}", tag, nanos))
+}
+
+fn build_index(root: &Path) -> PersistentIndex {
+    let idx = PersistentIndex::new_with_roots(vec![root.to_path_buf()]);
+    let rdd = FsScanRDD::from_roots(vec![root.to_path_buf()]).with_hidden(true);
+    rdd.for_each(|meta| idx.upsert(meta));
+    idx
+}
+
+#[test]
+fn full_build_indexes_same_inode_multiple_paths() {
+    let root = unique_tmp_dir("full-build");
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    let a = root.join("a/alias-a.txt");
+    let b = root.join("b/alias-b.txt");
+    std::fs::write(&a, b"same").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+
+    let idx = build_index(&root);
+    assert_eq!(idx.file_count(), 2);
+
+    let qa = create_matcher("alias-a", false);
+    let qb = create_matcher("alias-b", false);
+    assert_eq!(idx.query(qa.as_ref(), 10).len(), 1);
+    assert_eq!(idx.query(qb.as_ref(), 10).len(), 1);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn delete_one_hardlink_path_keeps_other_alias_live() {
+    let root = unique_tmp_dir("delete-one");
+    std::fs::create_dir_all(&root).unwrap();
+    let a = root.join("keep-a.txt");
+    let b = root.join("drop-b.txt");
+    std::fs::write(&a, b"same").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+
+    let idx = build_index(&root);
+    idx.mark_deleted_by_path(&b);
+
+    let qa = create_matcher("keep-a", false);
+    let qb = create_matcher("drop-b", false);
+    assert_eq!(idx.query(qa.as_ref(), 10).len(), 1);
+    assert!(idx.query(qb.as_ref(), 10).is_empty());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn hardlink_rename_updates_only_renamed_path() {
+    let root = unique_tmp_dir("rename-one");
+    std::fs::create_dir_all(&root).unwrap();
+    let a = root.join("stable-a.txt");
+    let b = root.join("old-b.txt");
+    let c = root.join("new-c.txt");
+    std::fs::write(&a, b"same").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+
+    let idx = build_index(&root);
+    std::fs::rename(&b, &c).unwrap();
+    idx.apply_events(&[EventRecord {
+        seq: 1,
+        timestamp: std::time::SystemTime::now(),
+        event_type: EventType::Rename {
+            from: FileIdentifier::Path(b.clone()),
+            from_path_hint: Some(b.clone()),
+        },
+        id: FileIdentifier::Path(c.clone()),
+        path_hint: Some(c.clone()),
+    }]);
+
+    assert_eq!(
+        idx.query(create_matcher("stable-a", false).as_ref(), 10)
+            .len(),
+        1
+    );
+    assert_eq!(
+        idx.query(create_matcher("new-c", false).as_ref(), 10).len(),
+        1
+    );
+    assert!(idx
+        .query(create_matcher("old-b", false).as_ref(), 10)
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn hardlink_aliases_survive_v7_snapshot_reload() {
+    let root = unique_tmp_dir("snapshot");
+    std::fs::create_dir_all(&root).unwrap();
+    let a = root.join("snap-a.txt");
+    let b = root.join("snap-b.txt");
+    std::fs::write(&a, b"same").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+
+    let idx = build_index(&root);
+    let base = idx.to_base_index_data();
+    let snap_path = root.join("index.db");
+    write_stable_v7_atomic(&snap_path, &base).unwrap();
+
+    let loaded = try_load_v7_cold(&stable_v7_path_for(&snap_path), std::slice::from_ref(&root))
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.file_count(), 2);
+    assert_eq!(
+        loaded
+            .query_metas(create_matcher("snap-a", false).as_ref())
+            .len(),
+        1
+    );
+    assert_eq!(
+        loaded
+            .query_metas(create_matcher("snap-b", false).as_ref())
+            .len(),
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}

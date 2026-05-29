@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::fs_policy::FsPolicy;
 use crate::util::path_has_excluded_component;
 
 /// 文件身份：Linux 上用 (dev, ino, generation) 做主键，rename 时 ino 不变，
@@ -241,8 +242,6 @@ impl BuildRDD<FileMeta> for FsScanRDD {
     fn compute(&self, part: &Partition) -> Box<dyn Iterator<Item = FileMeta> + Send> {
         use ignore::WalkBuilder;
 
-        let mut visited: std::collections::HashSet<FileKey> = std::collections::HashSet::new();
-
         let mut builder = WalkBuilder::new(&part.root);
         builder
             .max_depth(Some(part.max_depth))
@@ -252,12 +251,20 @@ impl BuildRDD<FileMeta> for FsScanRDD {
             .git_ignore(self.ignore_enabled)
             .git_global(self.ignore_enabled)
             .git_exclude(self.ignore_enabled);
+        let fs_policy = FsPolicy::current_default();
+        let root = part.root.clone();
         let exclude_dirs = self.exclude_dirs.clone();
-        if !exclude_dirs.is_empty() {
-            builder.filter_entry(move |entry| {
-                !path_has_excluded_component(entry.path(), &exclude_dirs)
-            });
-        }
+        builder.filter_entry(move |entry| {
+            (exclude_dirs.is_empty() || !path_has_excluded_component(entry.path(), &exclude_dirs))
+                && fs_policy
+                    .as_ref()
+                    .map(|policy| {
+                        policy
+                            .check_path(entry.path(), Some(root.as_path()))
+                            .is_allowed()
+                    })
+                    .unwrap_or(true)
+        });
         let walker = builder.build();
 
         let iter = walker
@@ -278,10 +285,6 @@ impl BuildRDD<FileMeta> for FsScanRDD {
                     }
                 };
                 let file_key = FileKey::from_path_and_metadata(e.path(), &meta)?;
-                // ino+dev 去重：同一文件可能通过多条符号链接路径到达
-                if !visited.insert(file_key) {
-                    return None;
-                }
                 Some(FileMeta {
                     file_key,
                     path: e.path().to_path_buf(),
@@ -307,8 +310,6 @@ fn scan_partition_parallel(
 ) {
     use ignore::{WalkBuilder, WalkState};
 
-    let visited: Arc<dashmap::DashSet<FileKey>> = Arc::new(dashmap::DashSet::new());
-
     let mut builder = WalkBuilder::new(&part.root);
     builder
         .max_depth(Some(part.max_depth))
@@ -319,15 +320,23 @@ fn scan_partition_parallel(
         .git_global(ignore_enabled)
         .git_exclude(ignore_enabled)
         .threads(parallelism);
-    if !exclude_dirs.is_empty() {
-        builder
-            .filter_entry(move |entry| !path_has_excluded_component(entry.path(), &exclude_dirs));
-    }
+    let fs_policy = FsPolicy::current_default();
+    let root = part.root.clone();
+    builder.filter_entry(move |entry| {
+        (exclude_dirs.is_empty() || !path_has_excluded_component(entry.path(), &exclude_dirs))
+            && fs_policy
+                .as_ref()
+                .map(|policy| {
+                    policy
+                        .check_path(entry.path(), Some(root.as_path()))
+                        .is_allowed()
+                })
+                .unwrap_or(true)
+    });
     let walker = builder.build_parallel();
 
     walker.run(|| {
         let sink = sink.clone();
-        let visited = visited.clone();
         Box::new(move |entry| {
             let e = match entry {
                 Ok(e) => e,
@@ -349,10 +358,6 @@ fn scan_partition_parallel(
             let Some(file_key) = FileKey::from_path_and_metadata(e.path(), &meta) else {
                 return WalkState::Continue;
             };
-            // ino+dev 去重：避免符号链接导致同一文件被多次索引
-            if !visited.insert(file_key) {
-                return WalkState::Continue;
-            }
 
             sink(FileMeta {
                 file_key,

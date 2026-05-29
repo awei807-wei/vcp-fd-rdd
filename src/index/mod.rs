@@ -1,4 +1,5 @@
 pub mod base_index;
+pub mod case_policy;
 pub mod content_filter;
 pub mod delta_buffer;
 pub mod file_entry_v2;

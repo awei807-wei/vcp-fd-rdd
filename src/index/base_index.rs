@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::{FileKey, FileMeta};
+use crate::index::case_policy::{folded_lookup_bytes_lossy, unicode_case_fold_lookup};
 pub use crate::index::file_entry_v2::{FileEntry, FileEntryIndex};
 use crate::index::parent_index::ParentIndex;
 use crate::index::path_table_v2::PathTableV2;
@@ -55,8 +56,8 @@ impl Default for ColdNameFilter {
 
 impl ColdNameFilter {
     fn insert_path_bytes(&mut self, path_bytes: &[u8]) {
-        let lower = String::from_utf8_lossy(path_bytes).to_lowercase();
-        let bytes = lower.as_bytes();
+        let folded = folded_lookup_bytes_lossy(path_bytes);
+        let bytes = folded.as_slice();
         if bytes.len() < 3 {
             return;
         }
@@ -75,8 +76,8 @@ impl ColdNameFilter {
         let Some(hint) = hint else {
             return true;
         };
-        let lower = String::from_utf8_lossy(hint).to_lowercase();
-        let bytes = lower.as_bytes();
+        let folded = folded_lookup_bytes_lossy(hint);
+        let bytes = folded.as_slice();
         if bytes.len() < 3 {
             return true;
         }
@@ -669,13 +670,11 @@ impl BaseIndexData {
 
     pub fn parent_query_metas(&self, parent_path: &str) -> Vec<BaseQueryMatch> {
         let mut out = Vec::new();
-        for key in self.resident_parent_candidates(parent_path) {
-            if let Some(meta) = self.resident_get_meta(key) {
-                out.push(BaseQueryMatch {
-                    meta,
-                    manifest_only: false,
-                });
-            }
+        for meta in self.resident_parent_metas(parent_path) {
+            out.push(BaseQueryMatch {
+                meta,
+                manifest_only: false,
+            });
         }
         out.extend(
             self.cold_segments
@@ -757,6 +756,34 @@ impl BaseIndexData {
         keys
     }
 
+    fn resident_parent_metas(&self, parent_path: &str) -> Vec<FileMeta> {
+        let parent_bytes = PathBuf::from(parent_path)
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec();
+        let dir_idx = match self.path_table.lookup(&parent_bytes) {
+            Some(idx) => idx,
+            None => return Vec::new(),
+        };
+
+        let bitmap = match self.parent_index.files_in_dir(dir_idx) {
+            Some(b) => b,
+            None => return Vec::new(),
+        };
+
+        let mut metas = Vec::with_capacity(bitmap.len());
+        for &doc_id in bitmap {
+            let Some(entry) = self.entries_by_key.get(doc_id as usize) else {
+                continue;
+            };
+            let Some(path_bytes) = self.path_table.resolve(entry.path_idx) else {
+                continue;
+            };
+            metas.push(entry_to_meta(entry, &path_bytes));
+        }
+        metas
+    }
+
     pub fn build_parent_index(&self) -> ParentIndex {
         // Since BaseIndexData's path_table only contains file paths and not directories,
         // we cannot fully rebuild ParentIndex from scratch using PathTableV2.
@@ -766,7 +793,7 @@ impl BaseIndexData {
 
     fn trigram_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringBitmap> {
         let hint = matcher.literal_hint()?;
-        let lower = String::from_utf8_lossy(hint).to_lowercase();
+        let lower = unicode_case_fold_lookup(&String::from_utf8_lossy(hint));
         let bytes = lower.as_bytes();
         if bytes.len() < 3 {
             return None;

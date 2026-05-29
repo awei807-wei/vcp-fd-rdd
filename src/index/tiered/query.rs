@@ -135,8 +135,6 @@ impl TieredIndex {
         let overlay_deleted = Arc::new(del);
         let mut blocked_paths = PathArenaSet::default();
         let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
-        let mut seen: std::collections::HashSet<FileKey> =
-            std::collections::HashSet::with_capacity(base.file_count().saturating_add(256));
         let mut results: Vec<FileMeta> = Vec::with_capacity(base.file_count().saturating_add(256));
 
         for ev in &live_events {
@@ -149,9 +147,6 @@ impl TieredIndex {
             {
                 continue;
             }
-            if !seen.insert(meta.file_key) {
-                continue;
-            }
             let _ = blocked_paths.insert(path_bytes);
             results.push(meta);
         }
@@ -161,7 +156,6 @@ impl TieredIndex {
                 meta,
                 None,
                 deleted_sources.as_slice(),
-                &mut seen,
                 &mut blocked_paths,
                 &mut results,
             );
@@ -183,8 +177,6 @@ impl TieredIndex {
         let overlay_deleted = Arc::new(del);
         let mut blocked_paths = PathArenaSet::default();
         let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
-        let mut seen: std::collections::HashSet<FileKey> =
-            std::collections::HashSet::with_capacity(base.file_count().saturating_add(256));
         let mut metas: Vec<FileMeta> = Vec::with_capacity(base.file_count().saturating_add(256));
 
         for ev in &live_events {
@@ -197,9 +189,6 @@ impl TieredIndex {
             {
                 continue;
             }
-            if !seen.insert(meta.file_key) {
-                continue;
-            }
             let _ = blocked_paths.insert(path_bytes);
             metas.push(meta);
         }
@@ -209,7 +198,6 @@ impl TieredIndex {
                 meta,
                 None,
                 deleted_sources.as_slice(),
-                &mut seen,
                 &mut blocked_paths,
                 &mut metas,
             );
@@ -217,7 +205,7 @@ impl TieredIndex {
 
         let compact = PersistentIndex::new_with_roots(self.roots.clone());
         for meta in metas {
-            compact.upsert_rename(meta);
+            compact.upsert_path_alias(meta);
         }
         let new_base = Arc::new(compact.to_base_index_data());
         self.base.store(new_base.clone());
@@ -239,8 +227,6 @@ impl TieredIndex {
         let overlay_deleted = Arc::new(del);
         let mut blocked_paths = PathArenaSet::default();
         let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
-        let mut overlay_live_keys: std::collections::HashSet<FileKey> =
-            std::collections::HashSet::with_capacity(live_events.len());
         let mut overlay_live_metas: Vec<FileMeta> = Vec::with_capacity(live_events.len());
         for ev in &live_events {
             let Some(meta) = self.overlay_meta_for_event(ev) else {
@@ -252,11 +238,8 @@ impl TieredIndex {
             {
                 continue;
             }
-            let _ = overlay_live_keys.insert(meta.file_key);
             overlay_live_metas.push(meta);
         }
-        let mut seen: std::collections::HashSet<FileKey> =
-            std::collections::HashSet::with_capacity(base.file_count().saturating_add(256));
         let mut results: Vec<QueryResultMeta> = Vec::with_capacity(limit.min(128));
 
         // Overlay upserts take precedence over the immutable base. This keeps
@@ -277,9 +260,6 @@ impl TieredIndex {
             {
                 continue;
             }
-            if !seen.insert(meta.file_key) {
-                continue;
-            }
             let _ = blocked_paths.insert(path_bytes);
             if plan.matches(meta) {
                 results.push(QueryResultMeta::hot(meta.clone()));
@@ -290,18 +270,9 @@ impl TieredIndex {
             return results;
         }
 
-        // Even if an overlay rename target does not match this query, its
-        // file_key must shadow the immutable base entry. Otherwise q=old_dir
-        // can still return the stale pre-rename path until the next snapshot.
-        seen.extend(overlay_live_keys);
-
         // ParentIndex fast path: if query has a parent filter, get exact candidates from base
         if let Some(ref parent_path) = plan.parent_filter() {
             for hit in base.parent_query_metas(parent_path) {
-                let key = hit.meta.file_key;
-                if !seen.insert(key) {
-                    continue;
-                }
                 let meta = hit.meta;
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
                 let blocked = blocked_paths.contains(path_bytes)
@@ -332,7 +303,6 @@ impl TieredIndex {
             base.as_ref(),
             None,
             deleted_sources.as_slice(),
-            &mut seen,
             &mut blocked_paths,
             &mut results,
             limit,
@@ -368,18 +338,12 @@ impl TieredIndex {
         layer: &BaseIndexData,
         layer_deleted: Option<&PathArenaSet>,
         deleted_sources: &[Arc<PathArenaSet>],
-        seen: &mut std::collections::HashSet<FileKey>,
         blocked_paths: &mut PathArenaSet,
         results: &mut Vec<QueryResultMeta>,
         limit: usize,
     ) -> bool {
         for anchor in plan.anchors() {
             for hit in layer.query_metas(anchor.as_ref()) {
-                let key = hit.meta.file_key;
-                if !seen.insert(key) {
-                    continue;
-                }
-
                 let meta = hit.meta;
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
                 let blocked = blocked_paths.contains(path_bytes)
@@ -594,14 +558,9 @@ fn collect_live_meta(
     meta: FileMeta,
     layer_deleted: Option<&PathArenaSet>,
     deleted_sources: &[Arc<PathArenaSet>],
-    seen: &mut std::collections::HashSet<FileKey>,
     blocked_paths: &mut PathArenaSet,
     results: &mut Vec<FileMeta>,
 ) {
-    if !seen.insert(meta.file_key) {
-        return;
-    }
-
     let path_bytes = meta.path.as_os_str().as_encoded_bytes();
     if blocked_paths.contains(path_bytes)
         || layer_deleted.is_some_and(|paths| paths.contains(path_bytes))

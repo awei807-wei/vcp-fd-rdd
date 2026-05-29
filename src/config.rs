@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::fs_policy::FsPolicyConfig;
+use crate::io_governor::IoGovernorConfig;
 use crate::util::{default_exclude_dirs, normalize_exclude_dirs};
 
 pub const DEFAULT_L3_SCAN_INTERVAL_SECS: u64 = 21_600;
@@ -178,6 +180,10 @@ pub struct Config {
     pub wal_sync_interval_ms: u64,
     /// WAL sync batch size when `wal_durability = "sync-interval"`.
     pub wal_sync_batch_records: usize,
+    /// Background scan I/O governor.
+    pub io_governor: IoGovernorConfig,
+    /// Filesystem boundary policy for mount traversal.
+    pub fs_policy: FsPolicyConfig,
     /// Directory names that are never indexed, regardless of .gitignore rules.
     pub exclude_dirs: Vec<String>,
 }
@@ -413,6 +419,8 @@ impl Default for Config {
             wal_durability: "flush-only".to_string(),
             wal_sync_interval_ms: 1000,
             wal_sync_batch_records: 1024,
+            io_governor: IoGovernorConfig::default(),
+            fs_policy: FsPolicyConfig::default(),
             exclude_dirs: default_exclude_dirs(),
         }
     }

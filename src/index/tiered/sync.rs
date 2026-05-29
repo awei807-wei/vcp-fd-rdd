@@ -245,6 +245,7 @@ impl TieredIndex {
     fn run_rebuild_background(self: &Arc<Self>, reason: &'static str) {
         let idx = self.clone();
         std::thread::spawn(move || {
+            let _ = crate::io_governor::set_current_thread_idle_io_priority_best_effort();
             let strategy = {
                 let mut sched = idx.scheduler.lock();
                 sched.adjust_parallelism();
@@ -282,6 +283,7 @@ impl TieredIndex {
 
         let idx = self.clone();
         std::thread::spawn(move || {
+            let _ = crate::io_governor::set_current_thread_idle_io_priority_best_effort();
             let strategy = {
                 let mut sched = idx.scheduler.lock();
                 sched.adjust_parallelism();
@@ -327,6 +329,7 @@ impl TieredIndex {
 
         let idx = self.clone();
         std::thread::spawn(move || {
+            let _ = crate::io_governor::set_current_thread_idle_io_priority_best_effort();
             let _permit = permit;
             let report = idx.fast_sync(scope, &ignore_prefixes);
             tracing::warn!(
@@ -529,12 +532,21 @@ impl TieredIndex {
                 .git_ignore(self.ignore_enabled)
                 .git_global(self.ignore_enabled)
                 .git_exclude(self.ignore_enabled);
+            let fs_policy = crate::fs_policy::FsPolicy::current_default();
+            let root = dir.clone();
             let exclude_dirs = self.exclude_dirs.clone();
-            if !exclude_dirs.is_empty() {
-                builder.filter_entry(move |entry| {
-                    !path_has_excluded_component(entry.path(), &exclude_dirs)
-                });
-            }
+            builder.filter_entry(move |entry| {
+                (exclude_dirs.is_empty()
+                    || !path_has_excluded_component(entry.path(), &exclude_dirs))
+                    && fs_policy
+                        .as_ref()
+                        .map(|policy| {
+                            policy
+                                .check_path(entry.path(), Some(root.as_path()))
+                                .is_allowed()
+                        })
+                        .unwrap_or(true)
+            });
 
             for ent in builder.build() {
                 let ent = match ent {
@@ -658,12 +670,21 @@ impl TieredIndex {
                 .git_ignore(self.ignore_enabled)
                 .git_global(self.ignore_enabled)
                 .git_exclude(self.ignore_enabled);
+            let fs_policy = crate::fs_policy::FsPolicy::current_default();
+            let root = (*dir).clone();
             let exclude_dirs = self.exclude_dirs.clone();
-            if !exclude_dirs.is_empty() {
-                builder.filter_entry(move |entry| {
-                    !path_has_excluded_component(entry.path(), &exclude_dirs)
-                });
-            }
+            builder.filter_entry(move |entry| {
+                (exclude_dirs.is_empty()
+                    || !path_has_excluded_component(entry.path(), &exclude_dirs))
+                    && fs_policy
+                        .as_ref()
+                        .map(|policy| {
+                            policy
+                                .check_path(entry.path(), Some(root.as_path()))
+                                .is_allowed()
+                        })
+                        .unwrap_or(true)
+            });
             for ent in builder.build() {
                 let ent = match ent {
                     Ok(e) => e,

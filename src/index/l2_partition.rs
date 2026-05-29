@@ -10,6 +10,7 @@ use std::sync::Arc;
 #[cfg(feature = "rkyv")]
 use crate::core::FileKeyEntry;
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta};
+use crate::index::case_policy::{folded_lookup_bytes_lossy, for_each_folded_trigram};
 use crate::index::file_entry_v2::FileEntry;
 use crate::index::parent_index::PathTable as PathTableTrait;
 use crate::index::{IndexLayer, PathFreshness};
@@ -21,7 +22,7 @@ use crate::util::{compose_abs_path_bytes, pathbuf_from_encoded_vec, root_bytes_f
 type Trigram = [u8; 3];
 
 fn normalize_short_hint(hint: &[u8]) -> Option<Vec<u8>> {
-    let normalized = String::from_utf8_lossy(hint).to_lowercase().into_bytes();
+    let normalized = folded_lookup_bytes_lossy(hint);
     if (1..=2).contains(&normalized.len()) {
         Some(normalized)
     } else {
@@ -63,9 +64,9 @@ pub type DocId = u64;
 
 /// 从查询词中提取 trigram 列表
 fn query_trigrams(query: &str) -> Vec<Trigram> {
-    let lower = query.to_lowercase();
-    let bytes = lower.as_bytes();
     let mut tris = Vec::new();
+    let folded = crate::index::case_policy::unicode_case_fold_lookup(query);
+    let bytes = folded.as_bytes();
     if bytes.len() >= 3 {
         for w in bytes.windows(3) {
             tris.push([w[0], w[1], w[2]]);
@@ -76,20 +77,13 @@ fn query_trigrams(query: &str) -> Vec<Trigram> {
 
 /// 从路径的 basename（`path.file_name()`）中枚举 trigram（可能重复）。
 ///
-/// - 标准化：lossy UTF-8 + to_lowercase
+/// - 标准化：lossy UTF-8 + Unicode lookup case-fold
 /// - 目的：让 trigram 候选集成为 basename 精确匹配的严格超集（避免假阴性）
-fn for_each_basename_trigram(path: &Path, mut f: impl FnMut(Trigram)) {
+fn for_each_basename_trigram(path: &Path, f: impl FnMut(Trigram)) {
     let Some(os) = path.file_name() else {
         return;
     };
-    let lower = os.to_string_lossy().to_lowercase();
-    let bytes = lower.as_bytes();
-    if bytes.len() < 3 {
-        return;
-    }
-    for w in bytes.windows(3) {
-        f([w[0], w[1], w[2]]);
-    }
+    for_each_folded_trigram(os.as_encoded_bytes(), f);
 }
 
 /// Path blob arena：所有路径的连续字节存储
@@ -342,7 +336,10 @@ pub struct PersistentIndex {
     entries: RwLock<Vec<FileEntry>>,
     /// DocId -> absolute path bytes
     paths: RwLock<Vec<Vec<u8>>>,
-    /// FileKey -> DocId
+    /// FileKey -> representative DocId.
+    ///
+    /// This is not the search primary key. Multiple live paths may share the
+    /// same FileKey when hardlinks are present.
     filekey_to_docid: RwLock<HashMap<FileKey, DocId>>,
 
     /// 路径反查：hash(path_bytes) -> DocId（或少量冲突列表）
@@ -567,7 +564,7 @@ impl PersistentIndex {
                 continue;
             }
 
-            filekey_to_docid.insert(entry.file_key(), docid);
+            filekey_to_docid.entry(entry.file_key()).or_insert(docid);
 
             let Some(abs_bytes) = paths.get(docid_usize) else {
                 continue;
@@ -587,12 +584,11 @@ impl PersistentIndex {
         }
     }
 
-    /// 插入/更新一条文件记录
+    /// 插入/更新一条文件记录。
     ///
-    /// ## 单路径策略 (first-seen wins)
-    /// 如果该 FileKey 已存在且路径不同（hardlink 场景），
-    /// 保留最先发现的路径，仅更新 size/mtime 等元数据。
-    /// 只有显式 rename 事件，或补扫时检测到旧路径已消失的 reconcile 场景，才会更新路径。
+    /// 搜索主键是 path/docid，不是 FileKey。相同 FileKey 的不同路径
+    /// 会作为 hardlink aliases 分别入库；只有旧路径已消失的 reconcile
+    /// 或显式 rename 才会移动现有 docid。
     pub fn upsert(&self, meta: FileMeta) {
         self.upsert_inner(meta, false);
     }
@@ -602,29 +598,50 @@ impl PersistentIndex {
         self.upsert_inner(meta, true);
     }
 
+    /// Insert a path as an independent search entry even if another live path
+    /// has the same FileKey. Used when materializing already-resolved visible
+    /// metas where path alias preservation is mandatory.
+    pub fn upsert_path_alias(&self, mut meta: FileMeta) {
+        meta.path = crate::index::tiered::normalize_path(&meta.path);
+        let fkey = meta.file_key;
+        let mtime_ns = mtime_to_ns(meta.mtime);
+        if let Some(docid) = self.lookup_docid_by_path(meta.path.as_path()) {
+            self.update_entry_metadata(docid, mtime_ns);
+            self.tombstones.write().remove(docid);
+            self.filekey_to_docid.write().entry(fkey).or_insert(docid);
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        let bytes = meta.path.as_os_str().as_encoded_bytes().to_vec();
+        let Some(docid) = self.alloc_docid(fkey, &bytes, mtime_ns) else {
+            return;
+        };
+        self.insert_trigrams(docid, meta.path.as_path());
+        self.insert_path_hash(docid, meta.path.as_path());
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     fn upsert_inner(&self, mut meta: FileMeta, force_path_update: bool) {
         meta.path = crate::index::tiered::normalize_path(&meta.path);
         let fkey = meta.file_key;
         let new_abs_bytes = meta.path.as_os_str().as_encoded_bytes().to_vec();
         let new_mtime_ns = mtime_to_ns(meta.mtime);
 
-        // 先查 docid（只持有 mapping 的读锁）
+        if let Some(docid) = self.lookup_docid_by_path(meta.path.as_path()) {
+            self.update_entry_metadata(docid, new_mtime_ns);
+            self.filekey_to_docid.write().entry(fkey).or_insert(docid);
+            self.tombstones.write().remove(docid);
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+
+        // 先查代表 docid（只持有 mapping 的读锁）。这只用于 rename/reconcile，
+        // 不能阻止 hardlink alias 以新 path 入库。
         let existing_docid = { self.filekey_to_docid.read().get(&fkey).copied() };
 
         if let Some(docid) = existing_docid {
             // 读旧路径 bytes（不持有 trigram/path_hash 锁）
             let old_path_bytes = { self.paths.read().get(docid as usize).cloned() };
-            let same_path = old_path_bytes
-                .as_deref()
-                .map(|old| old == new_abs_bytes.as_slice())
-                .unwrap_or(false);
-
-            if same_path {
-                // 同路径重复上报：只更新元数据，避免 posting 重复写入
-                self.update_entry_metadata(docid, new_mtime_ns);
-                self.dirty.store(true, std::sync::atomic::Ordering::Release);
-                return;
-            }
 
             let old_path_missing = if force_path_update {
                 false
@@ -640,10 +657,13 @@ impl PersistentIndex {
                     .unwrap_or(false)
             };
 
-            // 路径不同：hardlink、rename，或旧路径已消失后的 reconcile
+            // 路径不同且旧路径仍存在：这是 hardlink alias，追加新 docid。
             if !force_path_update && !old_path_missing {
-                // hardlink/重复发现：保留旧路径，仅更新元数据
-                self.update_entry_metadata(docid, new_mtime_ns);
+                let Some(docid_new) = self.alloc_docid(fkey, &new_abs_bytes, new_mtime_ns) else {
+                    return;
+                };
+                self.insert_trigrams(docid_new, meta.path.as_path());
+                self.insert_path_hash(docid_new, meta.path.as_path());
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
                 return;
             }
@@ -667,8 +687,9 @@ impl PersistentIndex {
                 }
             }
 
-            // rename 视为“存在且活跃”
+            // rename/reconcile 视为“存在且活跃”
             self.tombstones.write().remove(docid);
+            self.filekey_to_docid.write().insert(fkey, docid);
             self.dirty.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
@@ -694,29 +715,21 @@ impl PersistentIndex {
         entries.push(FileEntry::from_file_key(file_key, path_idx, mtime_ns));
         self.paths.write().push(abs_path_bytes.to_vec());
 
-        self.filekey_to_docid.write().insert(file_key, docid);
+        self.filekey_to_docid
+            .write()
+            .entry(file_key)
+            .or_insert(docid);
         self.tombstones.write().remove(docid);
         Some(docid)
     }
 
     /// 标记删除（tombstone）
     pub fn mark_deleted(&self, file_key: FileKey) {
-        let docid = { self.filekey_to_docid.read().get(&file_key).copied() };
-        let Some(docid) = docid else {
-            return;
-        };
-
-        let path = { self.path_buf_for_docid(docid) };
-
-        // Atomicity: mark tombstone first so queries see deleted before trigrams are removed.
-        self.filekey_to_docid.write().remove(&file_key);
-        self.tombstones.write().insert(docid);
-        self.dirty.store(true, std::sync::atomic::Ordering::Release);
-
-        if let Some(p) = path {
-            self.remove_trigrams(docid, &p);
-            self.remove_path_hash(docid, &p);
+        let docids = self.docids_for_filekey(file_key);
+        for docid in docids {
+            self.mark_docid_deleted(docid);
         }
+        self.rebuild_filekey_representative(file_key);
     }
 
     /// 按路径删除
@@ -726,8 +739,9 @@ impl PersistentIndex {
                 let entries = self.entries.read();
                 entries.get(docid as usize).map(|e| e.file_key())
             };
+            self.mark_docid_deleted(docid);
             if let Some(k) = file_key {
-                self.mark_deleted(k);
+                self.rebuild_filekey_representative(k);
             }
         }
     }
@@ -1102,13 +1116,10 @@ impl PersistentIndex {
             None
         };
 
-        let docid_opt = if let Some(fk) = from_fid {
-            self.filekey_to_docid.read().get(&fk).copied()
-        } else {
-            from_best_path
-                .as_deref()
-                .and_then(|p| self.lookup_docid_by_path(p))
-        };
+        let docid_opt = from_best_path
+            .as_deref()
+            .and_then(|p| self.lookup_docid_by_path(p))
+            .or_else(|| from_fid.and_then(|fk| self.filekey_to_docid.read().get(&fk).copied()));
 
         if let Some(docid) = docid_opt {
             if let Some(old_path) = self.path_buf_for_docid(docid) {
@@ -1146,6 +1157,11 @@ impl PersistentIndex {
 
             if (self.entries.read().get(docid as usize)).is_some() {
                 self.tombstones.write().remove(docid);
+                if let Some(entry) = self.entries.read().get(docid as usize) {
+                    self.filekey_to_docid
+                        .write()
+                        .insert(entry.file_key(), docid);
+                }
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
             }
             return;
@@ -1188,7 +1204,7 @@ impl PersistentIndex {
     /// 用途：段合并/replace-base 时做“真·Tombstone GC”，让段文件尺寸随真实文件系统状态收敛。
     pub fn export_segments_v6_compacted(&self) -> V6Segments {
         let compact = PersistentIndex::new_with_roots(self.roots.clone());
-        self.for_each_live_meta(|m| compact.upsert_rename(m));
+        self.for_each_live_meta(|m| compact.upsert_path_alias(m));
         compact.export_segments_v6()
     }
 
@@ -1495,7 +1511,7 @@ impl PersistentIndex {
         writer: &mut impl std::io::Write,
     ) -> std::io::Result<()> {
         let compact = PersistentIndex::new_with_roots(self.roots.clone());
-        self.for_each_live_meta(|m| compact.upsert_rename(m));
+        self.for_each_live_meta(|m| compact.upsert_path_alias(m));
         compact.export_segments_v6_to_writer(writer)
     }
 
@@ -1726,6 +1742,55 @@ impl PersistentIndex {
         };
         *path = abs_path_bytes.to_vec();
         true
+    }
+
+    fn docids_for_filekey(&self, file_key: FileKey) -> Vec<DocId> {
+        let entries = self.entries.read();
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(docid, entry)| {
+                if entry.file_key() == file_key {
+                    Some(docid as DocId)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn rebuild_filekey_representative(&self, file_key: FileKey) {
+        let entries = self.entries.read();
+        let tombstones = self.tombstones.read();
+        let next = entries.iter().enumerate().find_map(|(docid, entry)| {
+            let docid = docid as DocId;
+            if entry.file_key() == file_key && !tombstones.contains(docid) {
+                Some(docid)
+            } else {
+                None
+            }
+        });
+        let mut map = self.filekey_to_docid.write();
+        match next {
+            Some(docid) => {
+                map.insert(file_key, docid);
+            }
+            None => {
+                map.remove(&file_key);
+            }
+        }
+    }
+
+    fn mark_docid_deleted(&self, docid: DocId) {
+        let path = { self.path_buf_for_docid(docid) };
+
+        self.tombstones.write().insert(docid);
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
+
+        if let Some(p) = path {
+            self.remove_trigrams(docid, &p);
+            self.remove_path_hash(docid, &p);
+        }
     }
 
     fn build_legacy_metas(&self, live_only: bool) -> (PathArena, Vec<CompactMeta>) {
