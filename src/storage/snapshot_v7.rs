@@ -7,7 +7,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::core::{FileKey, FileKind, FileMeta};
+use crate::core::{FileKey, FileMeta};
 use crate::index::base_index::{BaseIndexData, FileEntryIndex, TrigramIndex};
 use crate::index::file_entry_v2::FileEntry;
 use crate::index::parent_index::ParentIndex;
@@ -166,7 +166,7 @@ fn decode_file_entry_index(bytes: &[u8], snapshot_version: u32) -> anyhow::Resul
         let mtime_ns = i64::from_le_bytes(bytes[off + 24..off + 32].try_into()?);
         off += rec_size;
 
-        fei.push(FileEntry::from_file_key(
+        fei.push(FileEntry::from_encoded_path_idx(
             crate::core::FileKey {
                 dev,
                 ino,
@@ -209,7 +209,7 @@ fn encode_full_path_trigram_index(data: &BaseIndexData) -> Vec<u8> {
         if data.tombstones.contains(docid as u32) {
             continue;
         }
-        let Some(path_bytes) = data.path_table.resolve(entry.path_idx) else {
+        let Some(path_bytes) = data.path_table.resolve(entry.path_index()) else {
             continue;
         };
         let lower = String::from_utf8_lossy(&path_bytes).to_lowercase();
@@ -566,7 +566,7 @@ fn entry_to_meta(entry: FileEntry, path_bytes: Vec<u8>) -> FileMeta {
         },
         ctime: None,
         atime: None,
-        kind: FileKind::File,
+        kind: entry.kind(),
     }
 }
 
@@ -877,7 +877,7 @@ impl V7Snapshot {
                 let Some(entry) = file_entry_at(entries, self.version, docid) else {
                     continue;
                 };
-                let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+                let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
                     continue;
                 };
                 let path_str = std::str::from_utf8(&path_bytes)
@@ -899,7 +899,7 @@ impl V7Snapshot {
             let Some(entry) = file_entry_at(entries, self.version, docid) else {
                 continue;
             };
-            let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+            let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
                 continue;
             };
             let path_str = std::str::from_utf8(&path_bytes)
@@ -929,7 +929,7 @@ impl V7Snapshot {
                 let Some(entry) = file_entry_at(entries, self.version, docid) else {
                     continue;
                 };
-                let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+                let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
                     continue;
                 };
                 let matched = {
@@ -954,7 +954,7 @@ impl V7Snapshot {
             let Some(entry) = file_entry_at(entries, self.version, docid) else {
                 continue;
             };
-            let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+            let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
                 continue;
             };
             let matched = {
@@ -990,7 +990,7 @@ impl V7Snapshot {
             if entry.file_key() != key {
                 continue;
             }
-            let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+            let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
                 continue;
             };
             return Ok(Some(entry_to_meta(entry, path_bytes)));
@@ -1018,7 +1018,7 @@ impl V7Snapshot {
             let Some(entry) = file_entry_at(entries, self.version, docid) else {
                 continue;
             };
-            let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+            let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
                 continue;
             };
             f(&entry, &path_bytes);
@@ -1091,7 +1091,7 @@ impl V7Snapshot {
             let Some(entry) = file_entry_at(entries, self.version, docid) else {
                 continue;
             };
-            let Some(path_bytes) = resolver.resolve(entry.path_idx) else {
+            let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
                 continue;
             };
             out.push(entry_to_meta(entry, path_bytes));
@@ -1547,7 +1547,7 @@ fn file_modified_unix_ns(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::FileKey;
+    use crate::core::{FileKey, FileKind};
     use crate::query::ExactMatcher;
     use std::path::PathBuf;
 
@@ -1639,6 +1639,45 @@ mod tests {
 
         assert_eq!(decoded.entries_by_key.len(), 1);
         assert!(decoded.tombstones.contains(42));
+    }
+
+    #[test]
+    fn v7_roundtrip_preserves_directory_entry_kind() {
+        let path = tmp_v7_path("directory-kind");
+        let key = FileKey {
+            dev: 3,
+            ino: 44,
+            generation: 0,
+        };
+        let mut paths = PathTableBuilder::new();
+        paths.push(0, b"/tmp/dirprobe");
+        let mut entries = FileEntryIndex::new();
+        entries.push(FileEntry::from_file_key_and_kind(
+            key,
+            0,
+            789,
+            FileKind::Directory,
+        ));
+        let data = BaseIndexData {
+            path_table: paths.build(),
+            entries_by_key: entries.build(),
+            ..BaseIndexData::default()
+        };
+
+        write_v7_snapshot_atomic(&path, &data).unwrap();
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+        let decoded = loaded.to_base_index_data().unwrap();
+        let entry = decoded.entries_by_key.get(0).unwrap();
+
+        assert_eq!(entry.file_key(), key);
+        assert_eq!(entry.path_index(), 0);
+        assert_eq!(entry.kind(), FileKind::Directory);
+
+        let meta = loaded.get_meta(key).unwrap().unwrap();
+        assert_eq!(meta.path, PathBuf::from("/tmp/dirprobe"));
+        assert_eq!(meta.kind, FileKind::Directory);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -42,6 +42,7 @@ fn trigram_matches_short_hint(tri: Trigram, hint: &[u8]) -> bool {
 struct ResolvedFsMeta {
     file_key: FileKey,
     mtime: Option<std::time::SystemTime>,
+    kind: FileKind,
 }
 
 pub(crate) fn mtime_to_ns(mtime: Option<std::time::SystemTime>) -> i64 {
@@ -302,6 +303,9 @@ fn group_paths_by_file_key(
     let mut groups: HashMap<FileKey, Vec<PathBuf>> = HashMap::new();
 
     for meta in metas {
+        if !meta.kind.is_file() {
+            continue;
+        }
         if normalized_prefix
             .as_ref()
             .is_some_and(|prefix| !meta.path.starts_with(prefix))
@@ -542,10 +546,11 @@ impl PersistentIndex {
                         )
                     })
                     .unwrap_or_default();
-                entries.push(FileEntry::from_file_key(
+                entries.push(FileEntry::from_file_key_and_kind(
                     meta.file_key,
                     docid,
                     meta.mtime_ns,
+                    FileKind::File,
                 ));
                 paths.push(abs_bytes);
             }
@@ -580,7 +585,12 @@ impl PersistentIndex {
             };
             let docid = entries.len() as u32;
             let mtime_ns = mtime_to_ns(m.mtime);
-            entries.push(FileEntry::from_file_key(m.file_key, docid, mtime_ns));
+            entries.push(FileEntry::from_file_key_and_kind(
+                m.file_key,
+                docid,
+                mtime_ns,
+                FileKind::File,
+            ));
             paths.push(abs_path.as_os_str().as_encoded_bytes().to_vec());
         }
 
@@ -675,14 +685,14 @@ impl PersistentIndex {
         let fkey = meta.file_key;
         let mtime_ns = mtime_to_ns(meta.mtime);
         if let Some(docid) = self.lookup_docid_by_path(meta.path.as_path()) {
-            self.update_entry_metadata(docid, mtime_ns);
+            self.update_entry_metadata(docid, mtime_ns, meta.kind);
             self.tombstones.write().remove(docid);
             self.filekey_to_docid.write().entry(fkey).or_insert(docid);
             self.dirty.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
         let bytes = meta.path.as_os_str().as_encoded_bytes().to_vec();
-        let Some(docid) = self.alloc_docid(fkey, &bytes, mtime_ns) else {
+        let Some(docid) = self.alloc_docid(fkey, &bytes, mtime_ns, meta.kind) else {
             return;
         };
         self.insert_trigrams(docid, meta.path.as_path());
@@ -697,7 +707,7 @@ impl PersistentIndex {
         let new_mtime_ns = mtime_to_ns(meta.mtime);
 
         if let Some(docid) = self.lookup_docid_by_path(meta.path.as_path()) {
-            self.update_entry_metadata(docid, new_mtime_ns);
+            self.update_entry_metadata(docid, new_mtime_ns, meta.kind);
             self.filekey_to_docid.write().entry(fkey).or_insert(docid);
             self.tombstones.write().remove(docid);
             self.dirty.store(true, std::sync::atomic::Ordering::Release);
@@ -728,7 +738,9 @@ impl PersistentIndex {
 
             // 路径不同且旧路径仍存在：这是 hardlink alias，追加新 docid。
             if !force_path_update && !old_path_missing {
-                let Some(docid_new) = self.alloc_docid(fkey, &new_abs_bytes, new_mtime_ns) else {
+                let Some(docid_new) =
+                    self.alloc_docid(fkey, &new_abs_bytes, new_mtime_ns, meta.kind)
+                else {
                     return;
                 };
                 self.insert_trigrams(docid_new, meta.path.as_path());
@@ -748,9 +760,11 @@ impl PersistentIndex {
             self.insert_trigrams(docid, meta.path.as_path());
             self.insert_path_hash(docid, meta.path.as_path());
 
-            if !self.update_entry_path(docid, &new_abs_bytes, new_mtime_ns) {
+            if !self.update_entry_path(docid, &new_abs_bytes, new_mtime_ns, meta.kind) {
                 // 极端情况：docid 槽位不存在，降级为 append
-                if let Some(docid_new) = self.alloc_docid(fkey, &new_abs_bytes, new_mtime_ns) {
+                if let Some(docid_new) =
+                    self.alloc_docid(fkey, &new_abs_bytes, new_mtime_ns, meta.kind)
+                {
                     self.insert_trigrams(docid_new, meta.path.as_path());
                     self.insert_path_hash(docid_new, meta.path.as_path());
                 }
@@ -764,7 +778,7 @@ impl PersistentIndex {
         }
 
         // 新文件：分配 docid 并写入
-        let Some(docid) = self.alloc_docid(fkey, &new_abs_bytes, new_mtime_ns) else {
+        let Some(docid) = self.alloc_docid(fkey, &new_abs_bytes, new_mtime_ns, meta.kind) else {
             return;
         };
         self.insert_trigrams(docid, meta.path.as_path());
@@ -777,11 +791,14 @@ impl PersistentIndex {
         file_key: FileKey,
         abs_path_bytes: &[u8],
         mtime_ns: i64,
+        kind: FileKind,
     ) -> Option<DocId> {
         let mut entries = self.entries.write();
         let docid: DocId = entries.len() as DocId;
         let path_idx: u32 = docid.try_into().ok()?;
-        entries.push(FileEntry::from_file_key(file_key, path_idx, mtime_ns));
+        entries.push(FileEntry::from_file_key_and_kind(
+            file_key, path_idx, mtime_ns, kind,
+        ));
         self.paths.write().push(abs_path_bytes.to_vec());
 
         self.filekey_to_docid
@@ -1060,6 +1077,7 @@ impl PersistentIndex {
         Some(ResolvedFsMeta {
             file_key: FileKey::from_path_and_metadata(path, &meta)?,
             mtime: meta.modified().ok(),
+            kind: FileKind::from_metadata(&meta),
         })
     }
 
@@ -1164,7 +1182,7 @@ impl PersistentIndex {
                 mtime: meta.mtime,
                 ctime: None,
                 atime: None,
-                kind: FileKind::File,
+                kind: meta.kind,
             });
         }
 
@@ -1185,7 +1203,7 @@ impl PersistentIndex {
                 mtime: meta.mtime,
                 ctime: None,
                 atime: None,
-                kind: FileKind::File,
+                kind: meta.kind,
             });
         }
     }
@@ -1237,9 +1255,10 @@ impl PersistentIndex {
                 self.insert_trigrams(docid, &to_path_owned);
                 self.insert_path_hash(docid, &to_path_owned);
                 let abs_path_bytes = to_path_owned.as_os_str().as_encoded_bytes().to_vec();
-                self.update_entry_path(docid, &abs_path_bytes, mtime_ns);
+                let kind = to_meta.map(|meta| meta.kind).unwrap_or(FileKind::File);
+                self.update_entry_path(docid, &abs_path_bytes, mtime_ns, kind);
             } else if let Some(meta) = fallback_meta {
-                self.update_entry_metadata(docid, mtime_to_ns(meta.mtime));
+                self.update_entry_metadata(docid, mtime_to_ns(meta.mtime), meta.kind);
                 if let Some(old_path) = self.path_buf_for_docid(docid) {
                     self.insert_trigrams(docid, &old_path);
                     self.insert_path_hash(docid, &old_path);
@@ -1273,7 +1292,7 @@ impl PersistentIndex {
                 mtime: meta.mtime,
                 ctime: None,
                 atime: None,
-                kind: FileKind::File,
+                kind: meta.kind,
             });
         }
     }
@@ -1797,7 +1816,7 @@ impl PersistentIndex {
             mtime: mtime_from_ns(entry.mtime_ns),
             ctime: None,
             atime: None,
-            kind: FileKind::File,
+            kind: entry.kind(),
         }
     }
 
@@ -1811,6 +1830,9 @@ impl PersistentIndex {
         for (docid_usize, entry) in entries.iter().enumerate() {
             let docid = docid_usize as DocId;
             if tombstones.contains(docid) {
+                continue;
+            }
+            if !entry.kind().is_file() {
                 continue;
             }
             let Some(path_bytes) = paths.get(docid_usize) else {
@@ -1842,25 +1864,34 @@ impl PersistentIndex {
         Some(entry.mtime_ns)
     }
 
-    fn update_entry_metadata(&self, docid: DocId, mtime_ns: i64) -> bool {
+    fn update_entry_metadata(&self, docid: DocId, mtime_ns: i64, kind: FileKind) -> bool {
         let mut entries = self.entries.write();
         let Some(entry) = entries.get_mut(docid as usize) else {
             return false;
         };
+        let path_idx = entry.path_index();
+        entry.set_path_index_and_kind(path_idx, kind);
         entry.mtime_ns = mtime_ns;
         true
     }
 
-    fn update_entry_path(&self, docid: DocId, abs_path_bytes: &[u8], mtime_ns: i64) -> bool {
+    fn update_entry_path(
+        &self,
+        docid: DocId,
+        abs_path_bytes: &[u8],
+        mtime_ns: i64,
+        kind: FileKind,
+    ) -> bool {
         {
             let mut entries = self.entries.write();
             let Some(entry) = entries.get_mut(docid as usize) else {
                 return false;
             };
-            entry.path_idx = match docid.try_into() {
+            let path_idx = match docid.try_into() {
                 Ok(path_idx) => path_idx,
                 Err(_) => return false,
             };
+            entry.set_path_index_and_kind(path_idx, kind);
             entry.mtime_ns = mtime_ns;
         }
         let mut paths = self.paths.write();
@@ -2093,10 +2124,11 @@ impl PersistentIndex {
             let Some(&path_idx) = entry_path_idxs.get(docid_usize) else {
                 continue;
             };
-            let new_entry = crate::index::file_entry_v2::FileEntry::from_file_key(
+            let new_entry = crate::index::file_entry_v2::FileEntry::from_file_key_and_kind(
                 entry.file_key(),
                 path_idx,
                 entry.mtime_ns,
+                entry.kind(),
             );
             entry_index.push(new_entry);
         }

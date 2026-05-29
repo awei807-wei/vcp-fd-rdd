@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::core::{FileKey, FileKind, FileMeta};
+use crate::core::{FileKey, FileMeta};
 use crate::index::case_policy::{folded_lookup_bytes_lossy, unicode_case_fold_lookup};
 pub use crate::index::file_entry_v2::{FileEntry, FileEntryIndex};
 use crate::index::parent_index::ParentIndex;
@@ -490,7 +490,7 @@ impl BaseIndexData {
             if self.tombstones.contains(docid as u32) {
                 continue;
             }
-            let Some(path_bytes) = self.path_table.resolve(entry.path_idx) else {
+            let Some(path_bytes) = self.path_table.resolve(entry.path_index()) else {
                 continue;
             };
             f(entry_to_meta(entry, &path_bytes));
@@ -537,7 +537,7 @@ impl BaseIndexData {
                     let Some(entry) = self.entries_by_key.get(docid as usize) else {
                         continue;
                     };
-                    let Some(path_bytes) = self.path_table.resolve(entry.path_idx) else {
+                    let Some(path_bytes) = self.path_table.resolve(entry.path_index()) else {
                         continue;
                     };
                     let path_str = match std::str::from_utf8(&path_bytes) {
@@ -554,7 +554,7 @@ impl BaseIndexData {
                     if self.tombstones.contains(docid as u32) {
                         continue;
                     }
-                    let Some(path_bytes) = self.path_table.resolve(entry.path_idx) else {
+                    let Some(path_bytes) = self.path_table.resolve(entry.path_index()) else {
                         continue;
                     };
                     let path_str = match std::str::from_utf8(&path_bytes) {
@@ -584,7 +584,7 @@ impl BaseIndexData {
                     let Some(entry) = self.entries_by_key.get(docid as usize) else {
                         continue;
                     };
-                    let Some(path_bytes) = self.path_table.resolve(entry.path_idx) else {
+                    let Some(path_bytes) = self.path_table.resolve(entry.path_index()) else {
                         continue;
                     };
                     let matched = {
@@ -604,7 +604,7 @@ impl BaseIndexData {
                     if self.tombstones.contains(docid as u32) {
                         continue;
                     }
-                    let Some(path_bytes) = self.path_table.resolve(entry.path_idx) else {
+                    let Some(path_bytes) = self.path_table.resolve(entry.path_index()) else {
                         continue;
                     };
                     let matched = {
@@ -635,7 +635,7 @@ impl BaseIndexData {
             return None;
         }
         let entry = self.entries_by_key.get(docid as usize)?;
-        let path_bytes = self.path_table.resolve(entry.path_idx)?;
+        let path_bytes = self.path_table.resolve(entry.path_index())?;
         Some(entry_to_meta(entry, &path_bytes))
     }
 
@@ -706,7 +706,7 @@ impl BaseIndexData {
             let Some(entry) = self.entries_by_key.get(doc_id as usize) else {
                 continue;
             };
-            let Some(path_bytes) = self.path_table.resolve(entry.path_idx) else {
+            let Some(path_bytes) = self.path_table.resolve(entry.path_index()) else {
                 continue;
             };
             let path = pathbuf_from_encoded_vec(path_bytes);
@@ -776,7 +776,7 @@ impl BaseIndexData {
             let Some(entry) = self.entries_by_key.get(doc_id as usize) else {
                 continue;
             };
-            let Some(path_bytes) = self.path_table.resolve(entry.path_idx) else {
+            let Some(path_bytes) = self.path_table.resolve(entry.path_index()) else {
                 continue;
             };
             metas.push(entry_to_meta(entry, &path_bytes));
@@ -839,7 +839,7 @@ fn entry_to_meta(entry: &FileEntry, path_bytes: &[u8]) -> FileMeta {
         },
         ctime: None,
         atime: None,
-        kind: FileKind::File,
+        kind: entry.kind(),
     }
 }
 

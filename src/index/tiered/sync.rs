@@ -573,7 +573,10 @@ impl TieredIndex {
                 let Some(ft) = ent.file_type() else {
                     continue;
                 };
-                if ft.is_dir() {
+                if !ft.is_file() && !ft.is_dir() {
+                    continue;
+                }
+                if ft.is_dir() && ent.path() == dir.as_path() {
                     continue;
                 }
 
@@ -597,7 +600,7 @@ impl TieredIndex {
                     mtime: meta.modified().ok(),
                     ctime: meta.created().ok(),
                     atime: meta.accessed().ok(),
-                    kind: FileKind::File,
+                    kind: FileKind::from_metadata(&meta),
                 });
                 upsert_events.push(EventRecord {
                     seq,
@@ -721,7 +724,10 @@ impl TieredIndex {
                 let Some(ft) = ent.file_type() else {
                     continue;
                 };
-                if ft.is_dir() {
+                if !ft.is_file() && !ft.is_dir() {
+                    continue;
+                }
+                if ft.is_dir() && ent.path() == dir.as_path() {
                     continue;
                 }
                 if dir_count >= max_entries_per_dir {
@@ -758,7 +764,7 @@ impl TieredIndex {
                     mtime,
                     ctime: meta.created().ok(),
                     atime: meta.accessed().ok(),
-                    kind: FileKind::File,
+                    kind: FileKind::from_metadata(&meta),
                 });
                 upsert_events.push(EventRecord {
                     seq,

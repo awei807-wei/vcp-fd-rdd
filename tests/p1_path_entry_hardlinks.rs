@@ -50,7 +50,7 @@ fn full_build_indexes_same_inode_multiple_paths() {
     std::fs::hard_link(&a, &b).unwrap();
 
     let idx = build_index(&root);
-    assert_eq!(idx.file_count(), 2);
+    assert_eq!(idx.physical_dedupe_stats().live_path_count, 2);
 
     let qa = create_matcher("alias-a", false);
     let qb = create_matcher("alias-b", false);

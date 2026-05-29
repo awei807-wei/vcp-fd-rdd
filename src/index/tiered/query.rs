@@ -370,7 +370,7 @@ impl TieredIndex {
                 mtime: m.modified().ok(),
                 ctime: m.created().ok(),
                 atime: m.accessed().ok(),
-                kind: FileKind::File,
+                kind: FileKind::from_metadata(&m),
             });
         }
 
@@ -460,7 +460,7 @@ impl TieredIndex {
         self.stats.record_cold_validate(1);
 
         let fs_meta = match std::fs::metadata(&meta.path) {
-            Ok(m) if m.is_file() => m,
+            Ok(m) if m.is_file() || m.is_dir() => m,
             Ok(_) => {
                 self.apply_query_delete(meta.path.as_path());
                 self.enqueue_dirty_parent(meta.path.as_path(), DirtyReason::QueryHitStale);
@@ -514,7 +514,7 @@ impl TieredIndex {
                 mtime: current_mtime,
                 ctime: fs_meta.created().ok(),
                 atime: fs_meta.accessed().ok(),
-                kind: FileKind::File,
+                kind: FileKind::from_metadata(&fs_meta),
             };
             return Some(QueryResultMeta::cold(
                 current,

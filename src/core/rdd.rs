@@ -120,6 +120,14 @@ impl FileKind {
     pub fn is_directory(self) -> bool {
         matches!(self, Self::Directory)
     }
+
+    pub fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        if meta.is_dir() {
+            Self::Directory
+        } else {
+            Self::File
+        }
+    }
 }
 
 /// 文件元数据
@@ -300,6 +308,7 @@ impl BuildRDD<FileMeta> for FsScanRDD {
         let exclude_dirs = self.exclude_dirs.clone();
         let mount_policy_counters = self.mount_policy_counters.clone();
         let io_governor = self.io_governor.clone();
+        let scan_root = part.root.clone();
         builder.filter_entry(move |entry| {
             (exclude_dirs.is_empty() || !path_has_excluded_component(entry.path(), &exclude_dirs))
                 && fs_policy
@@ -327,8 +336,14 @@ impl BuildRDD<FileMeta> for FsScanRDD {
                     None
                 }
             })
-            .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
             .filter_map(move |e| {
+                let file_type = e.file_type()?;
+                if !file_type.is_file() && !file_type.is_dir() {
+                    return None;
+                }
+                if file_type.is_dir() && e.path() == scan_root.as_path() {
+                    return None;
+                }
                 if let Some(governor) = io_governor.as_ref() {
                     governor.before_io();
                 }
@@ -347,7 +362,7 @@ impl BuildRDD<FileMeta> for FsScanRDD {
                     mtime: meta.modified().ok(),
                     ctime: meta.created().ok(),
                     atime: meta.accessed().ok(),
-                    kind: FileKind::File,
+                    kind: FileKind::from_metadata(&meta),
                 })
             });
 
@@ -380,7 +395,8 @@ fn scan_partition_parallel(
         .git_exclude(ignore_enabled)
         .threads(parallelism);
     let fs_policy = FsPolicy::current_with_config(fs_policy_config);
-    let root = part.root.clone();
+    let filter_root = part.root.clone();
+    let scan_root = part.root.clone();
     builder.filter_entry(move |entry| {
         (exclude_dirs.is_empty() || !path_has_excluded_component(entry.path(), &exclude_dirs))
             && fs_policy
@@ -388,11 +404,11 @@ fn scan_partition_parallel(
                 .map(|policy| {
                     if let Some(counters) = mount_policy_counters.as_ref() {
                         policy
-                            .check_path_counted(entry.path(), Some(root.as_path()), counters)
+                            .check_path_counted(entry.path(), Some(filter_root.as_path()), counters)
                             .is_allowed()
                     } else {
                         policy
-                            .check_path(entry.path(), Some(root.as_path()))
+                            .check_path(entry.path(), Some(filter_root.as_path()))
                             .is_allowed()
                     }
                 })
@@ -403,6 +419,7 @@ fn scan_partition_parallel(
     walker.run(|| {
         let sink = sink.clone();
         let io_governor = io_governor.clone();
+        let scan_root = scan_root.clone();
         Box::new(move |entry| {
             let e = match entry {
                 Ok(e) => e,
@@ -411,7 +428,13 @@ fn scan_partition_parallel(
                     return WalkState::Continue;
                 }
             };
-            if !e.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            let Some(file_type) = e.file_type() else {
+                return WalkState::Continue;
+            };
+            if !file_type.is_file() && !file_type.is_dir() {
+                return WalkState::Continue;
+            }
+            if file_type.is_dir() && e.path() == scan_root.as_path() {
                 return WalkState::Continue;
             }
             if let Some(governor) = io_governor.as_ref() {
@@ -435,7 +458,7 @@ fn scan_partition_parallel(
                 mtime: meta.modified().ok(),
                 ctime: meta.created().ok(),
                 atime: meta.accessed().ok(),
-                kind: FileKind::File,
+                kind: FileKind::from_metadata(&meta),
             });
 
             WalkState::Continue

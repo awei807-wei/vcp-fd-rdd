@@ -1,6 +1,9 @@
 //! FileEntry v2: fixed-size 32-byte struct + file-key lookup index.
 
-use crate::core::FileKey;
+use crate::core::{FileKey, FileKind};
+
+const PATH_IDX_KIND_DIR_FLAG: u32 = 1 << 31;
+const PATH_IDX_VALUE_MASK: u32 = !PATH_IDX_KIND_DIR_FLAG;
 
 /// Fixed-size file metadata entry (32 bytes).
 ///
@@ -8,7 +11,7 @@ use crate::core::FileKey;
 /// - dev:      8 bytes
 /// - ino:      8 bytes
 /// - generation: 4 bytes
-/// - path_idx: 4 bytes
+/// - path_idx: 4 bytes (low 31 bits path table index, high bit entry kind)
 /// - mtime_ns: 8 bytes
 ///
 /// Total: 32 bytes
@@ -36,13 +39,59 @@ impl FileEntry {
     }
 
     pub fn from_file_key(file_key: FileKey, path_idx: u32, mtime_ns: i64) -> Self {
+        Self::from_file_key_and_kind(file_key, path_idx, mtime_ns, FileKind::File)
+    }
+
+    pub fn from_file_key_and_kind(
+        file_key: FileKey,
+        path_idx: u32,
+        mtime_ns: i64,
+        kind: FileKind,
+    ) -> Self {
+        debug_assert!(path_idx <= PATH_IDX_VALUE_MASK);
         Self {
             dev: file_key.dev,
             ino: file_key.ino,
             generation: file_key.generation,
-            path_idx,
+            path_idx: encode_path_idx(path_idx, kind),
             mtime_ns,
         }
+    }
+
+    pub fn from_encoded_path_idx(file_key: FileKey, encoded_path_idx: u32, mtime_ns: i64) -> Self {
+        Self {
+            dev: file_key.dev,
+            ino: file_key.ino,
+            generation: file_key.generation,
+            path_idx: encoded_path_idx,
+            mtime_ns,
+        }
+    }
+
+    pub fn path_index(&self) -> u32 {
+        self.path_idx & PATH_IDX_VALUE_MASK
+    }
+
+    pub fn kind(&self) -> FileKind {
+        if (self.path_idx & PATH_IDX_KIND_DIR_FLAG) != 0 {
+            FileKind::Directory
+        } else {
+            FileKind::File
+        }
+    }
+
+    pub fn set_path_index_and_kind(&mut self, path_idx: u32, kind: FileKind) {
+        debug_assert!(path_idx <= PATH_IDX_VALUE_MASK);
+        self.path_idx = encode_path_idx(path_idx, kind);
+    }
+}
+
+fn encode_path_idx(path_idx: u32, kind: FileKind) -> u32 {
+    let idx = path_idx & PATH_IDX_VALUE_MASK;
+    if kind.is_directory() {
+        idx | PATH_IDX_KIND_DIR_FLAG
+    } else {
+        idx
     }
 }
 

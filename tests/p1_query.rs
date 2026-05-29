@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use fd_rdd::core::{FileKey, FileMeta};
-use fd_rdd::index::TieredIndex;
+use fd_rdd::core::{FileKey, FileKind, FileMeta};
+use fd_rdd::index::{IndexBuilder, TieredIndex};
 use fd_rdd::query::{execute_query, QueryMode, SortColumn, SortOrder};
 
 fn unique_tmp_dir(tag: &str) -> PathBuf {
@@ -592,6 +592,38 @@ fn depth_len_and_type_filters_work() {
         "type:file should match indexed files"
     );
     assert_eq!(type_results[0].path, type_file);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn full_build_indexes_directory_entries_for_type_filters() {
+    let root = unique_tmp_dir("query-full-build-type-dir");
+    let dir = root.join("dirprobe");
+    let file = root.join("fileprobe.txt");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&file, "probe").unwrap();
+
+    let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    let l2 = index.l2.load_full();
+    IndexBuilder::new(vec![root.clone()]).full_build(l2.as_ref());
+    index.refresh_base();
+
+    let dirs = index.query("type:dir dirprobe");
+    assert_eq!(dirs.len(), 1, "type:dir should match the scanned directory");
+    assert_eq!(dirs[0].path, dir);
+    assert_eq!(dirs[0].kind, FileKind::Directory);
+
+    let files = index.query("type:file fileprobe");
+    assert_eq!(files.len(), 1, "type:file should match the scanned file");
+    assert_eq!(files[0].path, file);
+    assert_eq!(files[0].kind, FileKind::File);
+
+    let wrong_kind = index.query("type:file dirprobe");
+    assert!(
+        wrong_kind.iter().all(|meta| meta.path != dir),
+        "type:file must not match scanned directories"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
