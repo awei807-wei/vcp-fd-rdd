@@ -229,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(SnapshotStore::new(snapshot_path));
 
     // 3) 从快照加载或空索引启动
-    let index = TieredIndex::load_with_options_follow_excludes_and_fs_policy(
+    let index = TieredIndex::load_with_options_follow_excludes_fs_policy_and_io_governor(
         store.as_ref(),
         roots,
         include_hidden,
@@ -237,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
         follow_symlinks,
         exclude_dirs.clone(),
         cfg.fs_policy.clone(),
+        cfg.io_governor.clone(),
     )
     .await?;
     let _ = index.attach_wal(store.as_ref());

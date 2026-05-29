@@ -217,6 +217,7 @@ pub struct TieredIndex {
     pub(self) ioprio_set_failed: AtomicBool,
     pub(self) stable_snapshot_enabled: AtomicBool,
     pub(self) mount_policy_counters: Arc<SharedMountPolicyCounters>,
+    pub(self) io_governor: Arc<crate::io_governor::IoGovernor>,
     pub(self) stats: Arc<StatsCollector>,
 }
 
@@ -404,6 +405,14 @@ impl DiagnosticSource for TieredIndex {
             "unset".to_string()
         };
         report.io.ioprio_set_failed = report.io.ioprio_set_failed || ioprio_failed;
+        report.io.backoff_count = report
+            .io
+            .backoff_count
+            .saturating_add(self.io_governor.backoff_count());
+        report.io.token_bucket_limited_count = report
+            .io
+            .token_bucket_limited_count
+            .saturating_add(self.io_governor.token_bucket_limited_count());
 
         let mount = self.mount_policy_counters.snapshot();
         report.watchers.fstype_blocked_count = report

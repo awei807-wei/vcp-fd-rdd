@@ -4,6 +4,7 @@ use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::{DirtyReason, DirtyScope};
 use crate::fs_policy::{FsPolicyDecision, MountTable};
 use crate::index::tiered::events::event_record_estimated_bytes;
+use crate::io_governor::{BackoffPolicy, IoGovernor, IoPressure};
 use crate::stats::EventPipelineStats;
 use crate::storage::quarantine::{
     FreezeGate, MountIdentity, QuarantineRoot, QuarantineRootState, QuarantineSidecar,
@@ -120,6 +121,49 @@ fn tiered_diagnostics_include_ioprio_status() {
     idx.collect(&mut report);
     assert_eq!(report.io.ioprio_class, "idle");
     assert!(report.io.ioprio_set_failed);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn tiered_diagnostics_include_io_governor_counters() {
+    let root = unique_tmp_dir("io-governor-diag");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let l1 = L1Cache::with_capacity(1000);
+    let l2 = Arc::new(PersistentIndex::new_with_roots(vec![root.clone()]));
+    let l3 = IndexBuilder::new(vec![root.clone()]);
+    let governor = Arc::new(IoGovernor::new(true, 1_000_000));
+    let idx = TieredIndex::new_with_base_and_io_governor(
+        l1,
+        l2,
+        l3,
+        vec![root.clone()],
+        false,
+        true,
+        false,
+        Vec::new(),
+        None,
+        governor,
+    );
+
+    idx.io_governor.observe_pressure(
+        IoPressure {
+            some_avg10: 20.0,
+            full_avg10: 0.0,
+        },
+        BackoffPolicy {
+            some_threshold: 10.0,
+            full_threshold: 5.0,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(1),
+        },
+    );
+
+    let mut report = DiagnosticReport::default();
+    idx.collect(&mut report);
+    assert_eq!(report.io.backoff_count, 1);
+    assert_eq!(report.io.token_bucket_limited_count, 0);
 
     let _ = std::fs::remove_dir_all(&root);
 }

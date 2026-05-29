@@ -6,6 +6,7 @@ use crate::index::base_index::BaseIndexData;
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
+use crate::io_governor::{IoGovernor, IoGovernorConfig};
 use crate::storage::recovery_audit::{
     audit_recovery_ledger, choose_checkpoint, RecoveryAuditReport, SnapshotCheckpointSource,
 };
@@ -78,6 +79,33 @@ impl TieredIndex {
         exclude_dirs: Vec<String>,
         base_data: Option<BaseIndexData>,
     ) -> Self {
+        Self::new_with_base_and_io_governor(
+            l1,
+            l2,
+            l3,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            exclude_dirs,
+            base_data,
+            Arc::new(IoGovernor::disabled()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_with_base_and_io_governor(
+        l1: L1Cache,
+        l2: Arc<PersistentIndex>,
+        l3: IndexBuilder,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+        exclude_dirs: Vec<String>,
+        base_data: Option<BaseIndexData>,
+        io_governor: Arc<IoGovernor>,
+    ) -> Self {
         use arc_swap::ArcSwap;
         use parking_lot::Mutex;
         use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -139,6 +167,7 @@ impl TieredIndex {
             ioprio_set_failed: AtomicBool::new(false),
             stable_snapshot_enabled: AtomicBool::new(true),
             mount_policy_counters,
+            io_governor,
             stats: Arc::new(crate::stats::StatsCollector::new()),
         }
     }
@@ -280,8 +309,34 @@ impl TieredIndex {
         exclude_dirs: Vec<String>,
         fs_policy_config: FsPolicyConfig,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::load_with_options_follow_excludes_fs_policy_and_io_governor(
+            store,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            exclude_dirs,
+            fs_policy_config,
+            IoGovernorConfig::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_with_options_follow_excludes_fs_policy_and_io_governor<
+        S: StorageBackend + ?Sized,
+    >(
+        store: &S,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+        exclude_dirs: Vec<String>,
+        fs_policy_config: FsPolicyConfig,
+        io_governor_config: IoGovernorConfig,
+    ) -> anyhow::Result<Arc<Self>> {
         let index = Arc::new(
-            Self::load_or_empty_with_options_follow_excludes_and_fs_policy(
+            Self::load_or_empty_with_options_follow_excludes_fs_policy_and_io_governor(
                 store,
                 roots,
                 include_hidden,
@@ -289,6 +344,7 @@ impl TieredIndex {
                 follow_symlinks,
                 exclude_dirs,
                 fs_policy_config,
+                io_governor_config,
             )
             .await?,
         );
@@ -387,6 +443,32 @@ impl TieredIndex {
         exclude_dirs: Vec<String>,
         fs_policy_config: FsPolicyConfig,
     ) -> anyhow::Result<Self> {
+        Self::load_or_empty_with_options_follow_excludes_fs_policy_and_io_governor(
+            store,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            exclude_dirs,
+            fs_policy_config,
+            IoGovernorConfig::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_or_empty_with_options_follow_excludes_fs_policy_and_io_governor<
+        S: StorageBackend + ?Sized,
+    >(
+        store: &S,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+        exclude_dirs: Vec<String>,
+        fs_policy_config: FsPolicyConfig,
+        io_governor_config: IoGovernorConfig,
+    ) -> anyhow::Result<Self> {
         let l1 = L1Cache::with_capacity(1000);
         let l3 = IndexBuilder::new_with_options_follow_and_excludes(
             roots.clone(),
@@ -396,6 +478,7 @@ impl TieredIndex {
             exclude_dirs.clone(),
         )
         .with_fs_policy_config(fs_policy_config);
+        let io_governor = Arc::new(IoGovernor::from_config(&io_governor_config));
 
         let runtime_state = read_recovery_runtime_state(store.path()).unwrap_or_else(|e| {
             tracing::warn!("recovery runtime state read failed: {}", e);
@@ -423,7 +506,7 @@ impl TieredIndex {
                         v7_data.cold_segments.len()
                     );
                     let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
-                    let idx = Self::new_with_base(
+                    let idx = Self::new_with_base_and_io_governor(
                         l1,
                         l2,
                         l3,
@@ -433,6 +516,7 @@ impl TieredIndex {
                         follow_symlinks,
                         exclude_dirs,
                         Some(v7_data),
+                        io_governor.clone(),
                     );
                     idx.attach_wal(store)?;
                     let sidecar_path = quarantine_sidecar_path_for(store.path());
@@ -462,7 +546,7 @@ impl TieredIndex {
 
         // 无可用快照：回退到空索引启动（由上层触发 rebuild）。
         let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
-        let idx = Self::new_with_excludes(
+        let idx = Self::new_with_base_and_io_governor(
             l1,
             l2,
             l3,
@@ -471,6 +555,8 @@ impl TieredIndex {
             ignore_enabled,
             follow_symlinks,
             exclude_dirs,
+            None,
+            io_governor,
         );
         idx.attach_wal(store)?;
         let sidecar_path = quarantine_sidecar_path_for(store.path());

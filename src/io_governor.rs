@@ -159,6 +159,10 @@ pub struct IoGovernor {
 }
 
 impl IoGovernor {
+    pub fn from_config(config: &IoGovernorConfig) -> Self {
+        Self::new(config.enabled, config.stat_rate_per_sec)
+    }
+
     pub fn new(enabled: bool, stat_rate_per_sec: u64) -> Self {
         Self {
             enabled,
