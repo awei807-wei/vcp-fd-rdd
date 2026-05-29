@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/memory`、`/metrics` 与 metrics JSONL 暴露 query generation guard active/hold/slow 统计，便于观察查询是否延长 ArcSwap 旧代存活。
 - 新增 `runtime_profile = "memory_light"` 与 `--runtime-profile memory_light`：降低 overlay/周期 flush 门槛，增加周期 flush 最大滞留时间，缩短 rebuild 合并冷却，并在 WAL 体积超过阈值时请求 snapshot 边界；默认 profile 保持原策略不变。
 - `scripts/fs-churn.py --auto-spawn-fd` 更新为当前 daemon CLI，并支持 `--fd-runtime-profile memory_light`，可直接生成默认 profile 与低内存 profile 的 churn/RSS 对照。
+- 新增 hardlink physical grouping 派生视图：`PersistentIndex::hardlink_groups()` 与 physical dedupe stats 会按当前可见 path/docid 临时聚合同一 `FileKey` 的多路径，不改变搜索主键；`/health.diagnostics.storage` 同步暴露 `hardlink_group_count` 与 `hardlink_max_group_size`。
 - 补齐 case policy 自动探测基础、mount policy 拒绝原因矩阵、clock skew dirty window 和 root/system daemon 默认禁用未认证 HTTP query/scan 的安全策略测试。
 - 测试补强：新增 daemon API/UDS E2E、真实 watcher create/rename/delete、abrupt kill 与坏 stable snapshot 启动修复组合测试，补齐此前偏模块级的关键真实链路缺口。
 - 仓库清理：将本地运行生成的 `reports/`/`report/` 加入忽略，并停止追踪历史报告产物，避免测试与 daemon 运行污染提交。
