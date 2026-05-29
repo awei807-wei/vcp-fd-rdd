@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Task};
 use crate::event::sync::{now_ns, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyScope};
@@ -14,6 +14,13 @@ use super::{
     pathbuf_from_bytes, DirtyProcessReport, DirtyScanOutcome, ScanOutcome, StartupRepairStats,
     TieredIndex, REBUILD_COOLDOWN,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RebuildAdmission {
+    StartNow,
+    Scheduled(Duration),
+    Coalesced,
+}
 
 fn visit_dirs_since(
     roots: &[PathBuf],
@@ -143,6 +150,7 @@ pub(crate) struct FastSyncReport {
 }
 
 impl TieredIndex {
+    #[cfg(test)]
     pub(super) fn try_start_rebuild_force(&self) -> bool {
         let mut st = self.rebuild_state.lock();
         if st.in_progress {
@@ -155,51 +163,59 @@ impl TieredIndex {
         true
     }
 
-    fn try_start_rebuild_with_cooldown(self: &Arc<Self>, reason: &'static str) -> bool {
-        let mut schedule_after: Option<std::time::Duration> = None;
-        {
-            let mut st = self.rebuild_state.lock();
-            st.requested = true;
+    pub(super) fn reserve_rebuild_with_cooldown(&self, reason: &'static str) -> RebuildAdmission {
+        let mut st = self.rebuild_state.lock();
+        st.requested = true;
 
-            if st.in_progress {
-                tracing::debug!(
-                    "Rebuild merge: already in progress, coalescing ({})",
-                    reason
-                );
-                return false;
-            }
+        if st.in_progress {
+            tracing::debug!(
+                "Rebuild merge: already in progress, coalescing ({})",
+                reason
+            );
+            return RebuildAdmission::Coalesced;
+        }
 
-            let now = Instant::now();
-            if let Some(last) = st.last_started_at {
-                let elapsed = now.saturating_duration_since(last);
-                if elapsed < REBUILD_COOLDOWN {
-                    let wait = REBUILD_COOLDOWN - elapsed;
-                    if !st.scheduled {
-                        st.scheduled = true;
-                        schedule_after = Some(wait);
-                    }
+        let now = Instant::now();
+        if let Some(last) = st.last_started_at {
+            let elapsed = now.saturating_duration_since(last);
+            if elapsed < REBUILD_COOLDOWN {
+                if st.scheduled {
+                    tracing::debug!(
+                        "Rebuild merge: cooldown already scheduled, coalescing ({})",
+                        reason
+                    );
+                    return RebuildAdmission::Coalesced;
                 }
-            }
 
-            if schedule_after.is_none() {
-                // 立即开始：复位合并标记。
-                st.in_progress = true;
-                st.requested = false;
-                st.scheduled = false;
-                st.last_started_at = Some(now);
+                let wait = REBUILD_COOLDOWN - elapsed;
+                st.scheduled = true;
+                return RebuildAdmission::Scheduled(wait);
             }
         }
 
-        if let Some(wait) = schedule_after {
-            let idx = self.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(wait);
-                let _ = idx.try_start_rebuild_with_cooldown("cooldown elapsed (merged)");
-            });
-            false
-        } else {
-            self.run_rebuild_background(reason);
-            true
+        // 立即开始：复位合并标记。
+        st.in_progress = true;
+        st.requested = false;
+        st.scheduled = false;
+        st.last_started_at = Some(now);
+        RebuildAdmission::StartNow
+    }
+
+    fn try_start_rebuild_with_cooldown(self: &Arc<Self>, reason: &'static str) -> bool {
+        match self.reserve_rebuild_with_cooldown(reason) {
+            RebuildAdmission::StartNow => {
+                self.run_rebuild_background(reason);
+                true
+            }
+            RebuildAdmission::Scheduled(wait) => {
+                let idx = self.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(wait);
+                    let _ = idx.try_start_rebuild_with_cooldown("cooldown elapsed (merged)");
+                });
+                false
+            }
+            RebuildAdmission::Coalesced => false,
         }
     }
 
@@ -282,40 +298,9 @@ impl TieredIndex {
 
     /// 后台全量构建
     pub fn spawn_full_build(self: &Arc<Self>) {
-        if !self.try_start_rebuild_force() {
-            tracing::debug!("Background build already in progress, skipping");
-            return;
+        if !self.try_start_rebuild_with_cooldown("full build requested") {
+            tracing::debug!("Background full build request coalesced or scheduled");
         }
-
-        let idx = self.clone();
-        std::thread::spawn(move || {
-            idx.set_current_thread_idle_io_priority_for_scan();
-            let strategy = {
-                let mut sched = idx.scheduler.lock();
-                sched.adjust_parallelism();
-                sched.select_strategy(&Task::ColdBuild {
-                    total_dirs: idx.roots.len(),
-                })
-            };
-
-            tracing::info!(
-                "Starting background full build (strategy={:?})...",
-                strategy
-            );
-            let new_l2 = Arc::new(PersistentIndex::new_with_roots(idx.roots.clone()));
-            idx.l3.full_build_with_strategy(&new_l2, strategy);
-            let again = idx.finish_rebuild(new_l2.clone());
-            tracing::warn!("Full build complete, triggering manual RSS trim...");
-            maybe_trim_rss();
-            tracing::info!(
-                "Background full build complete: {} files",
-                idx.base.load_full().file_count()
-            );
-            if again {
-                let _ =
-                    idx.try_start_rebuild_with_cooldown("merged rebuild request after full build");
-            }
-        });
     }
 
     /// overflow 兜底：dirty region + cooldown/max-staleness 触发后执行一次 fast-sync（best-effort）。

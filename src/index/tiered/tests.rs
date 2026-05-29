@@ -4,6 +4,7 @@ use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::{DirtyReason, DirtyScope};
 use crate::fs_policy::{FsPolicyDecision, MountTable};
 use crate::index::tiered::events::event_record_estimated_bytes;
+use crate::index::tiered::sync::RebuildAdmission;
 use crate::io_governor::{BackoffPolicy, IoGovernor, IoPressure};
 use crate::stats::EventPipelineStats;
 use crate::storage::quarantine::{
@@ -457,6 +458,52 @@ fn rebuild_in_progress_does_not_publish_partial_l2_as_ready() {
     idx.finish_rebuild(partial_l2);
     assert_eq!(idx.file_count(), 1);
     assert!(!idx.query("partial_ready").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rebuild_request_coalesces_while_rebuild_in_progress() {
+    let root = unique_tmp_dir("rebuild-coalesce-in-progress");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    assert!(idx.try_start_rebuild_force());
+
+    assert_eq!(
+        idx.reserve_rebuild_with_cooldown("test full build"),
+        RebuildAdmission::Coalesced
+    );
+    assert!(idx.rebuild_in_progress());
+
+    let st = idx.rebuild_state.lock();
+    assert!(st.requested);
+    assert!(!st.scheduled);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rebuild_cooldown_coalesces_duplicate_requests() {
+    let root = unique_tmp_dir("rebuild-coalesce-cooldown");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    assert!(idx.try_start_rebuild_force());
+    let new_l2 = Arc::new(PersistentIndex::new_with_roots(vec![root.clone()]));
+    assert!(!idx.finish_rebuild(new_l2));
+    assert!(!idx.rebuild_in_progress());
+
+    let first = idx.reserve_rebuild_with_cooldown("test full build");
+    assert!(matches!(first, RebuildAdmission::Scheduled(wait) if wait <= REBUILD_COOLDOWN));
+
+    let second = idx.reserve_rebuild_with_cooldown("test rebuild");
+    assert_eq!(second, RebuildAdmission::Coalesced);
+
+    let st = idx.rebuild_state.lock();
+    assert!(st.requested);
+    assert!(st.scheduled);
+    assert!(!st.in_progress);
 
     let _ = std::fs::remove_dir_all(&root);
 }
