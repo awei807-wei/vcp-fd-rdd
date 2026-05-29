@@ -363,6 +363,22 @@ impl TieredIndex {
         self.stats.record_query(elapsed_us);
     }
 
+    pub(crate) fn record_exact_query_metric(&self) {
+        self.stats.record_exact_query();
+    }
+
+    pub(crate) fn record_fuzzy_query_metric(&self) {
+        self.stats.record_fuzzy_query();
+    }
+
+    pub(crate) fn record_query_no_trigram_hint_metric(&self) {
+        self.stats.record_query_no_trigram_hint();
+    }
+
+    pub(crate) fn record_fuzzy_full_scan_metric(&self, candidates: u64, elapsed_us: u64) {
+        self.stats.record_fuzzy_full_scan(candidates, elapsed_us);
+    }
+
     pub fn stats_report(&self) -> StatsReport {
         self.stats.report()
     }

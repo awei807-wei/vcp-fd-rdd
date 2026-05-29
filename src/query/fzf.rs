@@ -4,6 +4,7 @@ use crate::index::TieredIndex;
 use crate::query::scoring::{score_result, ScoreConfig};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use std::time::Instant;
 
 const FUZZY_CANDIDATE_MULTIPLIER: usize = 20;
 const FUZZY_MIN_CANDIDATES: usize = 512;
@@ -123,8 +124,14 @@ pub fn execute_query_with_metadata_result(
     order: SortOrder,
 ) -> Result<Vec<QueryResultMeta>, crate::query::dsl::QueryCompileError> {
     let mut results = match mode {
-        QueryMode::Exact => index.query_limit_detailed_strict(keyword, limit)?,
-        QueryMode::Fuzzy => FzfIntegration::new().query_index_strict(index, keyword, limit)?,
+        QueryMode::Exact => {
+            index.record_exact_query_metric();
+            index.query_limit_detailed_strict(keyword, limit)?
+        }
+        QueryMode::Fuzzy => {
+            index.record_fuzzy_query_metric();
+            FzfIntegration::new().query_index_strict(index, keyword, limit)?
+        }
     };
 
     sort_query_results(&mut results, keyword, sort, order);
@@ -275,7 +282,12 @@ impl FzfIntegration {
         let candidate_limit = fuzzy_candidate_limit(index.file_count(), limit);
         let mut candidates = index.query_limit_strict(keyword, candidate_limit)?;
         if candidates.is_empty() {
+            let started = Instant::now();
             candidates = index.collect_all_live_metas();
+            index.record_fuzzy_full_scan_metric(
+                candidates.len() as u64,
+                started.elapsed().as_micros() as u64,
+            );
         }
 
         let metas = self
@@ -343,6 +355,32 @@ mod tests {
     }
 
     #[test]
+    fn exact_short_query_records_no_trigram_hint_metric() -> anyhow::Result<()> {
+        let root = unique_tmp_dir("short-hint");
+        let path = root.join("abacus.txt");
+        fs::write(&path, b"a")?;
+
+        let index = TieredIndex::empty(vec![root.clone()]);
+        index.apply_events(&[ev(1, path.clone())]);
+
+        let results = execute_query(
+            &index,
+            "ab",
+            10,
+            QueryMode::Exact,
+            SortColumn::default(),
+            SortOrder::default(),
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, path);
+
+        let stats = index.stats_report();
+        assert_eq!(stats.exact_queries_total, 1);
+        assert_eq!(stats.query_no_trigram_hint_count, 1);
+        Ok(())
+    }
+
+    #[test]
     fn fuzzy_query_can_fallback_to_match_all_candidates() -> anyhow::Result<()> {
         let root = unique_tmp_dir("fallback");
         let wanted = root.join("main_document.txt");
@@ -373,6 +411,11 @@ mod tests {
         );
         assert_eq!(fuzzy.len(), 1);
         assert_eq!(fuzzy[0].path, wanted);
+        let stats = index.stats_report();
+        assert_eq!(stats.exact_queries_total, 1);
+        assert_eq!(stats.fuzzy_queries_total, 1);
+        assert_eq!(stats.fuzzy_full_scan_count, 1);
+        assert_eq!(stats.fuzzy_full_scan_last_candidates, 2);
         Ok(())
     }
 

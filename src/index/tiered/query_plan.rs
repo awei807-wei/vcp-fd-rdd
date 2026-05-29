@@ -33,6 +33,12 @@ impl QueryPlan {
         &self.anchors
     }
 
+    pub(super) fn has_trigram_hint(&self) -> bool {
+        self.anchors
+            .iter()
+            .any(|anchor| anchor.literal_hint().is_some_and(|hint| hint.len() >= 3))
+    }
+
     pub(super) fn matches(&self, meta: &FileMeta) -> bool {
         match &self.evaluator {
             QueryEvaluator::Legacy(matcher) => matcher.matches(&meta.path.to_string_lossy()),

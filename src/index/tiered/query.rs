@@ -103,6 +103,10 @@ impl TieredIndex {
             }
         };
 
+        if !plan.has_trigram_hint() {
+            self.record_query_no_trigram_hint_metric();
+        }
+
         let results = self.execute_query_plan(&plan, limit);
         if !results.is_empty() {
             tracing::debug!("Query hit: {} results", results.len());

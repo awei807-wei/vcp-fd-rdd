@@ -728,6 +728,14 @@ impl fmt::Display for MemoryReport {
 pub struct StatsReport {
     pub queries_total: u64,
     pub queries_avg_us: u64,
+    pub exact_queries_total: u64,
+    pub fuzzy_queries_total: u64,
+    pub query_no_trigram_hint_count: u64,
+    pub fuzzy_full_scan_count: u64,
+    pub fuzzy_full_scan_candidates_total: u64,
+    pub fuzzy_full_scan_elapsed_us_total: u64,
+    pub fuzzy_full_scan_last_candidates: u64,
+    pub fuzzy_full_scan_last_elapsed_us: u64,
     pub cold_validate_count: u64,
     pub query_stale_hit_count: u64,
     pub events_applied: u64,
@@ -741,6 +749,14 @@ pub struct StatsReport {
 pub struct StatsCollector {
     queries_total: std::sync::atomic::AtomicU64,
     queries_total_us: std::sync::atomic::AtomicU64,
+    exact_queries_total: std::sync::atomic::AtomicU64,
+    fuzzy_queries_total: std::sync::atomic::AtomicU64,
+    query_no_trigram_hint_count: std::sync::atomic::AtomicU64,
+    fuzzy_full_scan_count: std::sync::atomic::AtomicU64,
+    fuzzy_full_scan_candidates_total: std::sync::atomic::AtomicU64,
+    fuzzy_full_scan_elapsed_us_total: std::sync::atomic::AtomicU64,
+    fuzzy_full_scan_last_candidates: std::sync::atomic::AtomicU64,
+    fuzzy_full_scan_last_elapsed_us: std::sync::atomic::AtomicU64,
     cold_validate_count: std::sync::atomic::AtomicU64,
     query_stale_hit_count: std::sync::atomic::AtomicU64,
     events_applied: std::sync::atomic::AtomicU64,
@@ -759,6 +775,34 @@ impl StatsCollector {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.queries_total_us
             .fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_exact_query(&self) {
+        self.exact_queries_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_fuzzy_query(&self) {
+        self.fuzzy_queries_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_query_no_trigram_hint(&self) {
+        self.query_no_trigram_hint_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_fuzzy_full_scan(&self, candidates: u64, elapsed_us: u64) {
+        self.fuzzy_full_scan_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.fuzzy_full_scan_candidates_total
+            .fetch_add(candidates, std::sync::atomic::Ordering::Relaxed);
+        self.fuzzy_full_scan_elapsed_us_total
+            .fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+        self.fuzzy_full_scan_last_candidates
+            .store(candidates, std::sync::atomic::Ordering::Relaxed);
+        self.fuzzy_full_scan_last_elapsed_us
+            .store(elapsed_us, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn record_cold_validate(&self, count: u64) {
@@ -807,6 +851,30 @@ impl StatsCollector {
         StatsReport {
             queries_total: total,
             queries_avg_us: total_us.checked_div(total).unwrap_or(0),
+            exact_queries_total: self
+                .exact_queries_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            fuzzy_queries_total: self
+                .fuzzy_queries_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            query_no_trigram_hint_count: self
+                .query_no_trigram_hint_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            fuzzy_full_scan_count: self
+                .fuzzy_full_scan_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            fuzzy_full_scan_candidates_total: self
+                .fuzzy_full_scan_candidates_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            fuzzy_full_scan_elapsed_us_total: self
+                .fuzzy_full_scan_elapsed_us_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            fuzzy_full_scan_last_candidates: self
+                .fuzzy_full_scan_last_candidates
+                .load(std::sync::atomic::Ordering::Relaxed),
+            fuzzy_full_scan_last_elapsed_us: self
+                .fuzzy_full_scan_last_elapsed_us
+                .load(std::sync::atomic::Ordering::Relaxed),
             cold_validate_count: self
                 .cold_validate_count
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -855,6 +923,10 @@ mod tests {
         let stats = StatsCollector::new();
         stats.record_query(10);
         stats.record_query(30);
+        stats.record_exact_query();
+        stats.record_fuzzy_query();
+        stats.record_query_no_trigram_hint();
+        stats.record_fuzzy_full_scan(128, 42);
         stats.record_cold_validate(4);
         stats.record_query_stale_hits(3);
         stats.record_events_applied(7);
@@ -865,6 +937,14 @@ mod tests {
         let report = stats.report();
         assert_eq!(report.queries_total, 2);
         assert_eq!(report.queries_avg_us, 20);
+        assert_eq!(report.exact_queries_total, 1);
+        assert_eq!(report.fuzzy_queries_total, 1);
+        assert_eq!(report.query_no_trigram_hint_count, 1);
+        assert_eq!(report.fuzzy_full_scan_count, 1);
+        assert_eq!(report.fuzzy_full_scan_candidates_total, 128);
+        assert_eq!(report.fuzzy_full_scan_elapsed_us_total, 42);
+        assert_eq!(report.fuzzy_full_scan_last_candidates, 128);
+        assert_eq!(report.fuzzy_full_scan_last_elapsed_us, 42);
         assert_eq!(report.cold_validate_count, 4);
         assert_eq!(report.query_stale_hit_count, 3);
         assert_eq!(report.events_applied, 7);
