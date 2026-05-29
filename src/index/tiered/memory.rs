@@ -1,6 +1,6 @@
 use crate::stats::{
     infer_heap_high_water, EventPipelineStats, GenerationStats, MemoryReport, OverlayStats,
-    RebuildStats,
+    QueryGuardStats, RebuildStats,
 };
 use crate::util::maybe_trim_rss;
 use std::collections::VecDeque;
@@ -80,6 +80,15 @@ impl TieredIndex {
             disk_deleted_estimated_bytes,
             disk_deleted_estimated_bytes_max,
         ) = (0, 0, 0, 0, 0);
+        let stats = self.stats_report();
+        let query_guard = QueryGuardStats {
+            active_count: stats.query_guard_active_count,
+            hold_count: stats.query_guard_hold_count,
+            hold_avg_us: stats.query_guard_hold_avg_us,
+            hold_max_us: stats.query_guard_hold_max_us,
+            last_hold_us: stats.query_guard_last_hold_us,
+            slow_count: stats.query_guard_slow_count,
+        };
 
         let index_estimated_bytes = l1.estimated_bytes
             + base.estimated_bytes
@@ -115,6 +124,7 @@ impl TieredIndex {
                 base_strong_refs,
                 l2_strong_refs,
             },
+            query_guard,
             process_rss_bytes: MemoryReport::read_process_rss(),
             process_swap_bytes: MemoryReport::read_process_swap(),
             process_smaps_rollup,

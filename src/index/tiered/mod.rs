@@ -363,6 +363,18 @@ impl TieredIndex {
         self.stats.record_query(elapsed_us);
     }
 
+    pub(crate) fn begin_query_guard_metric(&self) {
+        self.stats.begin_query_guard();
+    }
+
+    pub(crate) fn finish_query_guard_metric(
+        &self,
+        elapsed_us: u64,
+        slow_threshold_us: u64,
+    ) -> bool {
+        self.stats.finish_query_guard(elapsed_us, slow_threshold_us)
+    }
+
     pub(crate) fn record_exact_query_metric(&self) {
         self.stats.record_exact_query();
     }

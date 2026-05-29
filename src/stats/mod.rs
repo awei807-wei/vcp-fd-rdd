@@ -35,6 +35,8 @@ pub struct MemoryReport {
     pub rebuild: RebuildStats,
     /// ArcSwap 当前 generation 的强引用观测
     pub generation: GenerationStats,
+    /// 查询持有 ArcSwap generation guard 的观测
+    pub query_guard: QueryGuardStats,
     /// 进程级 RSS（从 /proc/self/statm 读取）
     pub process_rss_bytes: u64,
     /// 进程级 swap（从 /proc/self/status 的 VmSwap 读取；Linux-only）
@@ -290,6 +292,16 @@ pub struct GenerationStats {
     pub l2_strong_refs: usize,
 }
 
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct QueryGuardStats {
+    pub active_count: u64,
+    pub hold_count: u64,
+    pub hold_avg_us: u64,
+    pub hold_max_us: u64,
+    pub last_hold_us: u64,
+    pub slow_count: u64,
+}
+
 impl MemoryReport {
     /// 从 /proc/self/statm 读取进程 RSS
     pub fn read_process_rss() -> u64 {
@@ -451,6 +463,13 @@ impl fmt::Display for MemoryReport {
             f,
             "║ Generation refs: base={:<8} l2={:<8}       ║",
             self.generation.base_strong_refs, self.generation.l2_strong_refs
+        )?;
+        writeln!(
+            f,
+            "║ Query guards: active={:<6} avg={:<8} slow={:<6} ║",
+            self.query_guard.active_count,
+            self.query_guard.hold_avg_us,
+            self.query_guard.slow_count
         )?;
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ L1 Cache:                                        ║")?;
@@ -728,6 +747,12 @@ impl fmt::Display for MemoryReport {
 pub struct StatsReport {
     pub queries_total: u64,
     pub queries_avg_us: u64,
+    pub query_guard_active_count: u64,
+    pub query_guard_hold_count: u64,
+    pub query_guard_hold_avg_us: u64,
+    pub query_guard_hold_max_us: u64,
+    pub query_guard_last_hold_us: u64,
+    pub query_guard_slow_count: u64,
     pub exact_queries_total: u64,
     pub fuzzy_queries_total: u64,
     pub query_no_trigram_hint_count: u64,
@@ -749,6 +774,12 @@ pub struct StatsReport {
 pub struct StatsCollector {
     queries_total: std::sync::atomic::AtomicU64,
     queries_total_us: std::sync::atomic::AtomicU64,
+    query_guard_active_count: std::sync::atomic::AtomicU64,
+    query_guard_hold_count: std::sync::atomic::AtomicU64,
+    query_guard_hold_total_us: std::sync::atomic::AtomicU64,
+    query_guard_hold_max_us: std::sync::atomic::AtomicU64,
+    query_guard_last_hold_us: std::sync::atomic::AtomicU64,
+    query_guard_slow_count: std::sync::atomic::AtomicU64,
     exact_queries_total: std::sync::atomic::AtomicU64,
     fuzzy_queries_total: std::sync::atomic::AtomicU64,
     query_no_trigram_hint_count: std::sync::atomic::AtomicU64,
@@ -775,6 +806,30 @@ impl StatsCollector {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.queries_total_us
             .fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn begin_query_guard(&self) {
+        self.query_guard_active_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn finish_query_guard(&self, elapsed_us: u64, slow_threshold_us: u64) -> bool {
+        self.query_guard_active_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.query_guard_hold_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.query_guard_hold_total_us
+            .fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+        self.query_guard_hold_max_us
+            .fetch_max(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+        self.query_guard_last_hold_us
+            .store(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+        let slow = elapsed_us >= slow_threshold_us;
+        if slow {
+            self.query_guard_slow_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        slow
     }
 
     pub fn record_exact_query(&self) {
@@ -848,9 +903,31 @@ impl StatsCollector {
         let total_us = self
             .queries_total_us
             .load(std::sync::atomic::Ordering::Relaxed);
+        let query_guard_hold_count = self
+            .query_guard_hold_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let query_guard_hold_total_us = self
+            .query_guard_hold_total_us
+            .load(std::sync::atomic::Ordering::Relaxed);
         StatsReport {
             queries_total: total,
             queries_avg_us: total_us.checked_div(total).unwrap_or(0),
+            query_guard_active_count: self
+                .query_guard_active_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            query_guard_hold_count,
+            query_guard_hold_avg_us: query_guard_hold_total_us
+                .checked_div(query_guard_hold_count)
+                .unwrap_or(0),
+            query_guard_hold_max_us: self
+                .query_guard_hold_max_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+            query_guard_last_hold_us: self
+                .query_guard_last_hold_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+            query_guard_slow_count: self
+                .query_guard_slow_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             exact_queries_total: self
                 .exact_queries_total
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -923,6 +1000,9 @@ mod tests {
         let stats = StatsCollector::new();
         stats.record_query(10);
         stats.record_query(30);
+        stats.begin_query_guard();
+        assert_eq!(stats.report().query_guard_active_count, 1);
+        assert!(stats.finish_query_guard(50, 40));
         stats.record_exact_query();
         stats.record_fuzzy_query();
         stats.record_query_no_trigram_hint();
@@ -937,6 +1017,12 @@ mod tests {
         let report = stats.report();
         assert_eq!(report.queries_total, 2);
         assert_eq!(report.queries_avg_us, 20);
+        assert_eq!(report.query_guard_active_count, 0);
+        assert_eq!(report.query_guard_hold_count, 1);
+        assert_eq!(report.query_guard_hold_avg_us, 50);
+        assert_eq!(report.query_guard_hold_max_us, 50);
+        assert_eq!(report.query_guard_last_hold_us, 50);
+        assert_eq!(report.query_guard_slow_count, 1);
         assert_eq!(report.exact_queries_total, 1);
         assert_eq!(report.fuzzy_queries_total, 1);
         assert_eq!(report.query_no_trigram_hint_count, 1);

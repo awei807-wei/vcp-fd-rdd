@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use crate::core::{EventRecord, FileKey, FileMeta};
 use crate::event::sync::DirtyReason;
@@ -11,6 +11,8 @@ use crate::query::matcher::create_matcher;
 use super::arena::{path_deleted_by_any, PathArenaSet};
 use super::query_plan::QueryPlan;
 use super::{QueryResultFreshness, QueryResultIndexTier, QueryResultMeta, TieredIndex};
+
+const QUERY_GUARD_SLOW_THRESHOLD_US: u64 = 50_000;
 
 impl TieredIndex {
     /// 查询入口：L1 → L2 → DiskSegments（mmap），不扫真实文件系统
@@ -129,6 +131,7 @@ impl TieredIndex {
     }
 
     pub(crate) fn collect_all_live_metas(&self) -> Vec<FileMeta> {
+        let _guard = QueryGenerationGuard::new(self);
         let base = self.base.load_full();
         let db = self.delta_buffer.lock();
         let mut del = PathArenaSet::default();
@@ -230,6 +233,7 @@ impl TieredIndex {
     }
 
     fn execute_query_plan(&self, plan: &QueryPlan, limit: usize) -> Vec<QueryResultMeta> {
+        let _guard = QueryGenerationGuard::new(self);
         let base = self.base.load_full();
         let db = self.delta_buffer.lock();
         let mut del = PathArenaSet::default();
@@ -553,6 +557,37 @@ impl TieredIndex {
         }
         self.enqueue_dirty_dirs(dirs, DirtyReason::QueryMiss);
         tracing::debug!("query miss enqueued dirty compensation for {}", keyword);
+    }
+}
+
+struct QueryGenerationGuard<'a> {
+    index: &'a TieredIndex,
+    started: Instant,
+}
+
+impl<'a> QueryGenerationGuard<'a> {
+    fn new(index: &'a TieredIndex) -> Self {
+        index.begin_query_guard_metric();
+        Self {
+            index,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for QueryGenerationGuard<'_> {
+    fn drop(&mut self) {
+        let elapsed_us = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        if self
+            .index
+            .finish_query_guard_metric(elapsed_us, QUERY_GUARD_SLOW_THRESHOLD_US)
+        {
+            tracing::warn!(
+                "query generation guard held for {}us (threshold={}us)",
+                elapsed_us,
+                QUERY_GUARD_SLOW_THRESHOLD_US
+            );
+        }
     }
 }
 

@@ -559,6 +559,27 @@ fn memory_report_tracks_dirty_queue_pending_scopes() {
 }
 
 #[test]
+fn memory_report_tracks_query_guard_holds() {
+    let root = unique_tmp_dir("query-guard");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("guard_probe.txt");
+    std::fs::write(&path, b"guard").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, path.clone())]);
+
+    let before = idx.memory_report(EventPipelineStats::default()).query_guard;
+    assert!(!idx.query("guard_probe").is_empty());
+    let after = idx.memory_report(EventPipelineStats::default()).query_guard;
+
+    assert_eq!(after.active_count, 0);
+    assert!(after.hold_count > before.hold_count);
+    assert!(after.last_hold_us <= after.hold_max_us);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn overlay_rename_tracks_from_as_delete_and_to_as_upsert() {
     let root = unique_tmp_dir("overlay-rename");
     std::fs::create_dir_all(&root).unwrap();
