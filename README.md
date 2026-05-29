@@ -382,6 +382,7 @@ fd-rdd --show-config
 | `dm:` / `dc:` / `da:` | `dm:today` / `dc:2024-01-01` | 修改/创建/访问日期 |
 | `depth:` | `depth:<=3` | 路径深度 |
 | `type:` | `type:file` | 文件类型 |
+| `empty:` | `type:dir empty:` | 真实空目录 |
 | `doc:` / `pic:` / `video:` | `pic:十一` | 按扩展名集合 |
 | `len:` | `len:>50` | 文件名字节长度 |
 

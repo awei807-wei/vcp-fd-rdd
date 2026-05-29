@@ -629,6 +629,45 @@ fn full_build_indexes_directory_entries_for_type_filters() {
 }
 
 #[test]
+fn empty_filter_matches_only_real_empty_directories() {
+    let root = unique_tmp_dir("query-empty-dir");
+    let empty_dir = root.join("emptyprobe");
+    let file_child_dir = root.join("filechildprobe");
+    let hidden_child_dir = root.join("hiddenchildprobe");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    std::fs::create_dir_all(&file_child_dir).unwrap();
+    std::fs::create_dir_all(&hidden_child_dir).unwrap();
+    std::fs::write(file_child_dir.join("child.txt"), b"child").unwrap();
+    std::fs::write(hidden_child_dir.join(".hidden"), b"hidden").unwrap();
+
+    let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    let l2 = index.l2.load_full();
+    IndexBuilder::new(vec![root.clone()]).full_build(l2.as_ref());
+    index.refresh_base();
+
+    let empty_results = index.query("type:dir empty: emptyprobe");
+    assert_eq!(empty_results.len(), 1);
+    assert_eq!(empty_results[0].path, empty_dir);
+    assert_eq!(empty_results[0].kind, FileKind::Directory);
+
+    let nonempty_results = index.query("type:dir empty: filechildprobe");
+    assert!(
+        nonempty_results
+            .iter()
+            .all(|meta| meta.path != file_child_dir),
+        "empty: must reject directories with indexed children"
+    );
+
+    let hidden_results = index.query("type:dir empty: hiddenchildprobe");
+    assert!(
+        hidden_results.iter().all(|meta| meta.path != hidden_child_dir),
+        "empty: must reject directories with real hidden children even when hidden entries are not indexed"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn execute_query_sorts_by_modified_time() {
     let root = unique_tmp_dir("query-sort");
     std::fs::create_dir_all(&root).unwrap();

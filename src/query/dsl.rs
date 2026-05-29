@@ -52,6 +52,8 @@ pub enum Atom {
     NameLen(CmpOp, usize),
     /// type:file / type:folder
     EntryType(FileKind),
+    /// empty: true empty directory (verified against the filesystem)
+    EmptyDir,
     /// content:keyword (全文搜索，占位)
     Content(String),
 }
@@ -155,6 +157,7 @@ enum Filter {
     Depth(CmpOp, usize),
     NameLen(CmpOp, usize),
     EntryType(FileKind),
+    EmptyDir,
     Content(String),
 }
 
@@ -202,6 +205,15 @@ impl Filter {
                 apply_cmp(*op, len as u64, *n as u64)
             }
             Filter::EntryType(kind) => meta.kind == *kind,
+            Filter::EmptyDir => {
+                if !meta.kind.is_directory() {
+                    return false;
+                }
+                match std::fs::read_dir(&meta.path) {
+                    Ok(mut entries) => entries.next().is_none(),
+                    Err(_) => false,
+                }
+            }
             Filter::Content(_) => {
                 // TODO: 接入全文索引后实现真正的内容匹配
                 false
@@ -234,6 +246,7 @@ fn is_path_initials_query(input: &str) -> bool {
         || input.starts_with("depth:")
         || input.starts_with("len:")
         || input.starts_with("type:")
+        || input.starts_with("empty:")
         || input.starts_with("case:")
         || input.starts_with("content:");
     if !has_separator || has_glob || has_special_prefix {
@@ -381,6 +394,7 @@ fn compile_atom(atom: &Atom, case_sensitive: bool) -> Result<CompiledExpr, Query
         Atom::Depth(op, n) => Ok(CompiledExpr::Filter(Filter::Depth(*op, *n))),
         Atom::NameLen(op, n) => Ok(CompiledExpr::Filter(Filter::NameLen(*op, *n))),
         Atom::EntryType(k) => Ok(CompiledExpr::Filter(Filter::EntryType(*k))),
+        Atom::EmptyDir => Ok(CompiledExpr::Filter(Filter::EmptyDir)),
         Atom::Content(s) => Ok(CompiledExpr::Filter(Filter::Content(s.clone()))),
     }
 }
@@ -507,6 +521,7 @@ fn best_anchor_for_atom(
         | Atom::Depth(_, _)
         | Atom::NameLen(_, _)
         | Atom::EntryType(_)
+        | Atom::EmptyDir
         | Atom::Content(_) => Ok(None),
     }
 }
@@ -698,6 +713,7 @@ fn parse_atom_expr(word: &str, case_sensitive: &mut bool) -> Result<Expr, QueryC
             };
             Ok(Expr::Atom(Atom::EntryType(kind)))
         }
+        Some("empty") => Ok(Expr::Atom(Atom::EmptyDir)),
         Some("content") => {
             let v = unquote(tail)?;
             if v.is_empty() {
@@ -1185,6 +1201,41 @@ mod tests {
         let folder_query = compile_query("type:folder").unwrap();
         assert!(!folder_query.matches(&file));
         assert!(folder_query.matches(&dir));
+    }
+
+    #[test]
+    fn empty_filter_uses_real_directory_contents() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fd-rdd-dsl-empty-{nanos}"));
+        let empty_dir = root.join("empty_probe");
+        let nonempty_dir = root.join("nonempty_probe");
+        let hidden_child_dir = root.join("hidden_child_probe");
+        let file = root.join("file_probe.txt");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        std::fs::create_dir_all(&nonempty_dir).unwrap();
+        std::fs::create_dir_all(&hidden_child_dir).unwrap();
+        std::fs::write(nonempty_dir.join("child.txt"), b"child").unwrap();
+        std::fs::write(hidden_child_dir.join(".hidden"), b"hidden").unwrap();
+        std::fs::write(&file, b"file").unwrap();
+
+        let mut empty_meta = meta(&empty_dir.to_string_lossy(), 0, None);
+        empty_meta.kind = FileKind::Directory;
+        let mut nonempty_meta = meta(&nonempty_dir.to_string_lossy(), 0, None);
+        nonempty_meta.kind = FileKind::Directory;
+        let mut hidden_child_meta = meta(&hidden_child_dir.to_string_lossy(), 0, None);
+        hidden_child_meta.kind = FileKind::Directory;
+        let file_meta = meta(&file.to_string_lossy(), 1, None);
+
+        let q = compile_query("empty:").unwrap();
+        assert!(q.matches(&empty_meta));
+        assert!(!q.matches(&nonempty_meta));
+        assert!(!q.matches(&hidden_child_meta));
+        assert!(!q.matches(&file_meta));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
