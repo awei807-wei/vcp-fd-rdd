@@ -17,7 +17,7 @@ use fd_rdd::stats::{
     MetricsRuntimeSnapshot, MetricsSnapshot, WatchStateReport,
 };
 use fd_rdd::storage::snapshot::{
-    write_recovery_runtime_state, RecoveryRuntimeState, SnapshotStore,
+    quarantine_sidecar_path_for, write_recovery_runtime_state, RecoveryRuntimeState, SnapshotStore,
 };
 use fd_rdd::storage::wal::WalDurability;
 use fd_rdd::util::{estimate_notify_recursive_watch_count, normalize_exclude_dirs};
@@ -229,13 +229,14 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(SnapshotStore::new(snapshot_path));
 
     // 3) 从快照加载或空索引启动
-    let index = TieredIndex::load_with_options_follow_and_excludes(
+    let index = TieredIndex::load_with_options_follow_excludes_and_fs_policy(
         store.as_ref(),
         roots,
         include_hidden,
         ignore_enabled,
         follow_symlinks,
         exclude_dirs.clone(),
+        cfg.fs_policy.clone(),
     )
     .await?;
     let _ = index.attach_wal(store.as_ref());
@@ -264,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
         &index.recovery_status().report.snapshot_source,
         "running",
     );
+    index.spawn_quarantine_verify_worker(quarantine_sidecar_path_for(store.path()));
 
     // 4) 若没有可信快照，或启动 repair 判断差异过大，后台全量构建。
     let needs_full_build =

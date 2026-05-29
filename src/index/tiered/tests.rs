@@ -1,10 +1,16 @@
 use super::*;
 use crate::core::{EventRecord, EventType, FileIdentifier};
+use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::{DirtyReason, DirtyScope};
+use crate::fs_policy::{FsPolicyDecision, MountTable};
 use crate::index::tiered::events::event_record_estimated_bytes;
 use crate::stats::EventPipelineStats;
-use crate::storage::quarantine::{FreezeGate, MountIdentity, RootStateRecord};
-use crate::storage::snapshot::SnapshotStore;
+use crate::storage::quarantine::{
+    FreezeGate, MountIdentity, QuarantineRoot, QuarantineRootState, QuarantineSidecar,
+    RootStateKind, RootStateRecord,
+};
+use crate::storage::snapshot::{quarantine_sidecar_path_for, SnapshotStore};
+use crate::storage::traits::WalFactory;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -34,6 +40,59 @@ fn test_mount_identity() -> MountIdentity {
         source: "/dev/sda1".to_string(),
         fstype: "ext4".to_string(),
     }
+}
+
+fn quarantine_sidecar(root: PathBuf, affected_prefixes: Vec<PathBuf>) -> QuarantineSidecar {
+    QuarantineSidecar {
+        version: crate::storage::quarantine::QUARANTINE_SIDECAR_VERSION,
+        roots: vec![QuarantineRoot {
+            root_path: root,
+            identity: MountIdentity {
+                fs_uuid: None,
+                ..test_mount_identity()
+            },
+            affected_prefixes,
+            state: QuarantineRootState::Offline,
+            reason: Some("probe_timeout".to_string()),
+            last_observed_unix_ns: 1,
+        }],
+    }
+}
+
+fn mount_table_for(root: &std::path::Path, major_minor: &str, source: &str) -> MountTable {
+    MountTable::parse(&format!(
+        "42 1 {major_minor} / {} rw,relatime - ext4 {source} rw\n",
+        root.display()
+    ))
+}
+
+#[test]
+fn tiered_diagnostics_include_shared_mount_policy_counters() {
+    let root = unique_tmp_dir("mount-policy-diag");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    let counters = idx.mount_policy_counters();
+    counters.record_decision(&FsPolicyDecision::Deny {
+        reason: "deny_fstype:fuse.rclone".to_string(),
+    });
+    counters.record_decision(&FsPolicyDecision::Deny {
+        reason: "one_file_system".to_string(),
+    });
+    counters.record_fuse_probe_timeout();
+    counters.record_allowed_override();
+
+    let mut report = DiagnosticReport::default();
+    idx.collect(&mut report);
+
+    assert_eq!(report.watchers.denied_mount_count, 2);
+    assert_eq!(report.watchers.fstype_blocked_count, 1);
+    assert_eq!(report.watchers.network_fs_ignored_count, 1);
+    assert_eq!(report.watchers.one_file_system_boundary_count, 1);
+    assert_eq!(report.watchers.fuse_probe_timeout_count, 1);
+    assert_eq!(report.watchers.allowed_override_count, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -105,6 +164,159 @@ fn online_root_record_unfreezes_and_queues_prefix_reconciliation() {
 
     assert_eq!(idx.freeze_gate.lock().frozen_root_count(), 0);
     assert_eq!(idx.dirty_queue_len(), 1);
+}
+
+#[tokio::test]
+async fn quarantine_sidecar_restore_installs_freeze_gate_before_events() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("quarantine-restore");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let prefix = content_root.join("project");
+    let restored_file = prefix.join("restored_after_online.txt");
+    std::fs::create_dir_all(&prefix)?;
+    std::fs::write(&restored_file, b"restored")?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = SnapshotStore::new(state_root.join("index.db"));
+    let sidecar_path = quarantine_sidecar_path_for(store.path());
+    quarantine_sidecar(content_root.clone(), vec![prefix.clone()]).write_to(&sidecar_path)?;
+
+    let idx = TieredIndex::load_or_empty(&store, vec![content_root.clone()]).await?;
+
+    assert!(idx.path_is_frozen(&prefix));
+    assert_eq!(idx.quarantine_verify_pending.load(Ordering::Relaxed), 1);
+
+    let deleted = prefix.join("blocked_delete.txt");
+    idx.apply_events(&[mk_event(1, EventType::Delete, deleted)]);
+    assert_eq!(idx.delta_buffer.lock().len(), 0);
+    assert_eq!(idx.freeze_gate.lock().blocked_events(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn quarantine_verify_online_appends_wal_unfreezes_and_queues_scan() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("quarantine-verify-online");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let prefix = content_root.join("project");
+    let restored_file = prefix.join("restored_after_online.txt");
+    std::fs::create_dir_all(&prefix)?;
+    std::fs::write(&restored_file, b"restored")?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = SnapshotStore::new(state_root.join("index.db"));
+    let sidecar_path = quarantine_sidecar_path_for(store.path());
+    let sidecar = quarantine_sidecar(content_root.clone(), vec![prefix.clone()]);
+    sidecar.write_to(&sidecar_path)?;
+
+    let idx = TieredIndex::empty(vec![content_root.clone()]);
+    idx.attach_wal(&store)?;
+    idx.restore_quarantine_from_sidecar(sidecar.clone());
+    assert!(idx.path_is_frozen(&prefix));
+
+    let table = mount_table_for(&content_root, "8:1", "/dev/sda1");
+    idx.verify_quarantine_sidecar_once_with_mount_table(sidecar_path.clone(), &table, sidecar);
+
+    assert!(!idx.path_is_frozen(&prefix));
+    assert_eq!(idx.dirty_queue_len(), 1);
+    assert_eq!(idx.quarantine_verify_pending.load(Ordering::Relaxed), 0);
+    assert_eq!(idx.quarantine_verified_roots.load(Ordering::Relaxed), 1);
+
+    let dirty_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let report = idx.process_dirty_entry(dirty_entry, &[]);
+    assert!(!report.failed);
+    assert!(!idx.query("restored_after_online").is_empty());
+
+    let updated = QuarantineSidecar::read_from(&sidecar_path)?;
+    assert_eq!(updated.active_roots().count(), 0);
+
+    let replay = store.open_wal()?.replay_since_seal(0)?;
+    assert_eq!(replay.root_events_replayed, 1);
+    assert_eq!(replay.root_events[0].kind, RootStateKind::OnlineRoot);
+    assert_eq!(replay.root_events[0].root_path, content_root);
+    assert_eq!(replay.root_events[0].affected_prefixes, vec![prefix]);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn quarantine_verify_identity_mismatch_keeps_freeze() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("quarantine-verify-mismatch");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let prefix = content_root.join("project");
+    std::fs::create_dir_all(&prefix)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = SnapshotStore::new(state_root.join("index.db"));
+    let sidecar_path = quarantine_sidecar_path_for(store.path());
+    let sidecar = quarantine_sidecar(content_root.clone(), vec![prefix.clone()]);
+    sidecar.write_to(&sidecar_path)?;
+
+    let idx = TieredIndex::empty(vec![content_root.clone()]);
+    idx.attach_wal(&store)?;
+    idx.restore_quarantine_from_sidecar(sidecar.clone());
+
+    let table = mount_table_for(&content_root, "9:9", "/dev/other");
+    idx.verify_quarantine_sidecar_once_with_mount_table(sidecar_path.clone(), &table, sidecar);
+
+    assert!(idx.path_is_frozen(&prefix));
+    assert_eq!(idx.dirty_queue_len(), 0);
+    assert_eq!(idx.quarantine_verify_pending.load(Ordering::Relaxed), 1);
+    assert_eq!(idx.quarantine_verified_roots.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        QuarantineSidecar::read_from(&sidecar_path)?
+            .active_roots()
+            .count(),
+        1
+    );
+    assert_eq!(
+        store.open_wal()?.replay_since_seal(0)?.root_events_replayed,
+        0
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wal_online_root_replay_unfreezes_before_following_file_events() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("quarantine-wal-order");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let prefix = content_root.join("project");
+    let restored_file = prefix.join("wal_restored_after_online.txt");
+    std::fs::create_dir_all(&prefix)?;
+    std::fs::write(&restored_file, b"restored")?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = SnapshotStore::new(state_root.join("index.db"));
+    quarantine_sidecar(content_root.clone(), vec![prefix.clone()])
+        .write_to(&quarantine_sidecar_path_for(store.path()))?;
+    let wal = store.open_wal()?;
+    wal.append_root_events(&[RootStateRecord::online(
+        1,
+        content_root.clone(),
+        MountIdentity {
+            fs_uuid: None,
+            ..test_mount_identity()
+        },
+        vec![prefix.clone()],
+    )])?;
+    wal.append(&[mk_event(2, EventType::Create, restored_file.clone())])?;
+    drop(wal);
+
+    let idx = TieredIndex::load_or_empty(&store, vec![content_root.clone()]).await?;
+
+    assert!(!idx.path_is_frozen(&prefix));
+    assert!(!idx.query("wal_restored_after_online").is_empty());
+    assert_eq!(idx.freeze_gate.lock().blocked_events(), 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }
 
 #[test]

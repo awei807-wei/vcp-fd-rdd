@@ -537,9 +537,11 @@ impl TieredIndex {
                 .git_ignore(self.ignore_enabled)
                 .git_global(self.ignore_enabled)
                 .git_exclude(self.ignore_enabled);
-            let fs_policy = crate::fs_policy::FsPolicy::current_default();
+            let fs_policy =
+                crate::fs_policy::FsPolicy::current_with_config(self.fs_policy_config());
             let root = dir.clone();
             let exclude_dirs = self.exclude_dirs.clone();
+            let mount_policy_counters = self.mount_policy_counters();
             builder.filter_entry(move |entry| {
                 (exclude_dirs.is_empty()
                     || !path_has_excluded_component(entry.path(), &exclude_dirs))
@@ -547,7 +549,11 @@ impl TieredIndex {
                         .as_ref()
                         .map(|policy| {
                             policy
-                                .check_path(entry.path(), Some(root.as_path()))
+                                .check_path_counted(
+                                    entry.path(),
+                                    Some(root.as_path()),
+                                    mount_policy_counters.as_ref(),
+                                )
                                 .is_allowed()
                         })
                         .unwrap_or(true)
@@ -676,9 +682,11 @@ impl TieredIndex {
                 .git_ignore(self.ignore_enabled)
                 .git_global(self.ignore_enabled)
                 .git_exclude(self.ignore_enabled);
-            let fs_policy = crate::fs_policy::FsPolicy::current_default();
+            let fs_policy =
+                crate::fs_policy::FsPolicy::current_with_config(self.fs_policy_config());
             let root = (*dir).clone();
             let exclude_dirs = self.exclude_dirs.clone();
+            let mount_policy_counters = self.mount_policy_counters();
             builder.filter_entry(move |entry| {
                 (exclude_dirs.is_empty()
                     || !path_has_excluded_component(entry.path(), &exclude_dirs))
@@ -686,7 +694,11 @@ impl TieredIndex {
                         .as_ref()
                         .map(|policy| {
                             policy
-                                .check_path(entry.path(), Some(root.as_path()))
+                                .check_path_counted(
+                                    entry.path(),
+                                    Some(root.as_path()),
+                                    mount_policy_counters.as_ref(),
+                                )
                                 .is_allowed()
                         })
                         .unwrap_or(true)

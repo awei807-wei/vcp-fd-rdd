@@ -1,4 +1,5 @@
 use crate::core::{BuildRDD, ExecutionStrategy, FileMeta, FsScanRDD};
+use crate::fs_policy::{FsPolicyConfig, SharedMountPolicyCounters};
 use crate::index::l2_partition::PersistentIndex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,6 +12,8 @@ pub struct IndexBuilder {
     pub ignore_enabled: bool,
     pub follow_symlinks: bool,
     pub exclude_dirs: Vec<String>,
+    pub mount_policy_counters: Option<Arc<SharedMountPolicyCounters>>,
+    pub fs_policy_config: FsPolicyConfig,
 }
 
 impl IndexBuilder {
@@ -58,16 +61,32 @@ impl IndexBuilder {
             ignore_enabled,
             follow_symlinks,
             exclude_dirs,
+            mount_policy_counters: None,
+            fs_policy_config: FsPolicyConfig::default(),
         }
+    }
+
+    pub fn with_mount_policy_counters(mut self, counters: Arc<SharedMountPolicyCounters>) -> Self {
+        self.mount_policy_counters = Some(counters);
+        self
+    }
+
+    pub fn with_fs_policy_config(mut self, config: FsPolicyConfig) -> Self {
+        self.fs_policy_config = config;
+        self
     }
 
     /// 全量构建：扫描所有 roots，流式灌入 PersistentIndex
     pub fn full_build(&self, index: &PersistentIndex) {
-        let rdd = FsScanRDD::from_roots(self.roots.clone())
+        let mut rdd = FsScanRDD::from_roots(self.roots.clone())
             .with_hidden(self.include_hidden)
             .with_ignore_rules(self.ignore_enabled)
             .with_follow_links(self.follow_symlinks)
-            .with_exclude_dirs(self.exclude_dirs.clone());
+            .with_exclude_dirs(self.exclude_dirs.clone())
+            .with_fs_policy_config(self.fs_policy_config.clone());
+        if let Some(counters) = self.mount_policy_counters.as_ref() {
+            rdd = rdd.with_mount_policy_counters(counters.clone());
+        }
         let mut count = 0usize;
 
         rdd.for_each(|meta: FileMeta| {
@@ -95,12 +114,16 @@ impl IndexBuilder {
         let max_threads = num_cpus::get().saturating_mul(2).max(1);
         parallelism = parallelism.clamp(1, max_threads);
 
-        let rdd = FsScanRDD::from_roots(self.roots.clone())
+        let mut rdd = FsScanRDD::from_roots(self.roots.clone())
             .with_hidden(self.include_hidden)
             .with_ignore_rules(self.ignore_enabled)
             .with_follow_links(self.follow_symlinks)
             .with_exclude_dirs(self.exclude_dirs.clone())
-            .with_parallelism(parallelism);
+            .with_parallelism(parallelism)
+            .with_fs_policy_config(self.fs_policy_config.clone());
+        if let Some(counters) = self.mount_policy_counters.as_ref() {
+            rdd = rdd.with_mount_policy_counters(counters.clone());
+        }
         let count = Arc::new(AtomicUsize::new(0));
         let idx = index.clone();
         let c = count.clone();
@@ -127,11 +150,15 @@ impl IndexBuilder {
 
     /// 增量补扫：扫描指定目录，补充缺失条目
     pub fn incremental_scan(&self, index: &PersistentIndex, dirs: Vec<PathBuf>) {
-        let rdd = FsScanRDD::from_roots(dirs)
+        let mut rdd = FsScanRDD::from_roots(dirs)
             .with_hidden(self.include_hidden)
             .with_ignore_rules(self.ignore_enabled)
             .with_follow_links(self.follow_symlinks)
-            .with_exclude_dirs(self.exclude_dirs.clone());
+            .with_exclude_dirs(self.exclude_dirs.clone())
+            .with_fs_policy_config(self.fs_policy_config.clone());
+        if let Some(counters) = self.mount_policy_counters.as_ref() {
+            rdd = rdd.with_mount_policy_counters(counters.clone());
+        }
         let mut count = 0usize;
 
         rdd.for_each(|meta: FileMeta| {

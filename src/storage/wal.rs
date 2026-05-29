@@ -204,6 +204,7 @@ fn unix_to_system_time(secs: u64, nanos: u32) -> std::time::SystemTime {
 
 #[derive(Clone, Debug)]
 pub struct WalReplayResult {
+    pub records: Vec<WalReplayRecord>,
     pub events: Vec<EventRecord>,
     pub root_events: Vec<RootStateRecord>,
     pub events_replayed: usize,
@@ -212,6 +213,12 @@ pub struct WalReplayResult {
     pub truncated_tail_records: usize,
     pub gap_detected: bool,
     pub checkpoint_used: u64,
+}
+
+#[derive(Clone, Debug)]
+pub enum WalReplayRecord {
+    File(EventRecord),
+    Root(RootStateRecord),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -444,47 +451,63 @@ impl WalStore {
         sealed.sort_by_key(|(id, _)| *id);
         let gap_detected = sealed_id_gap_detected(&sealed_ids);
 
-        let mut events: Vec<EventRecord> = Vec::new();
-        let mut root_events: Vec<RootStateRecord> = Vec::new();
+        let mut records: Vec<WalReplayRecord> = Vec::new();
         let mut truncated = 0usize;
         for (_, p) in sealed.iter() {
-            let (mut evs, mut roots, t) = read_wal_file(p)?;
+            let (mut recs, t) = read_wal_file(p)?;
             truncated += t;
-            events.append(&mut evs);
-            root_events.append(&mut roots);
+            records.append(&mut recs);
         }
-        let (mut cur, mut cur_roots, t) = read_wal_file(&self.current)?;
+        let (mut cur_records, t) = read_wal_file(&self.current)?;
         truncated += t;
-        events.append(&mut cur);
-        root_events.append(&mut cur_roots);
+        records.append(&mut cur_records);
 
         // Deduplicate by (id, timestamp), keeping the last occurrence.
         // This prevents duplicate index entries when WAL contains duplicate
         // records from abnormal writes or partial flushes.
         let mut last_pos = std::collections::HashMap::new();
-        for (idx, ev) in events.iter().enumerate() {
-            last_pos.insert((ev.id.clone(), ev.timestamp), idx);
+        for (idx, record) in records.iter().enumerate() {
+            if let WalReplayRecord::File(ev) = record {
+                last_pos.insert((ev.id.clone(), ev.timestamp), idx);
+            }
         }
-        let mut keep = vec![false; events.len()];
+        let mut keep = vec![true; records.len()];
+        for (idx, record) in records.iter().enumerate() {
+            if matches!(record, WalReplayRecord::File(_)) {
+                keep[idx] = false;
+            }
+        }
         for &idx in last_pos.values() {
             keep[idx] = true;
         }
-        let mut retained = Vec::with_capacity(last_pos.len());
-        for (idx, ev) in events.drain(..).enumerate() {
+
+        let mut retained = Vec::with_capacity(keep.iter().filter(|v| **v).count());
+        for (idx, record) in records.drain(..).enumerate() {
             if keep[idx] {
-                retained.push(ev);
+                retained.push(record);
             }
         }
-        events = retained;
+        records = retained;
 
-        // 统一为单调 seq（WAL 内部 seq 只用于排序/回放稳定性）。
-        for (i, e) in events.iter_mut().enumerate() {
-            e.seq = i as u64 + 1;
+        let mut events: Vec<EventRecord> = Vec::new();
+        let mut root_events: Vec<RootStateRecord> = Vec::new();
+        let mut next_event_seq = 1u64;
+        for record in &mut records {
+            match record {
+                WalReplayRecord::File(ev) => {
+                    // 统一为单调 seq（WAL 内部 seq 只用于排序/回放稳定性）。
+                    ev.seq = next_event_seq;
+                    next_event_seq = next_event_seq.saturating_add(1);
+                    events.push(ev.clone());
+                }
+                WalReplayRecord::Root(root) => root_events.push(root.clone()),
+            }
         }
 
         let events_replayed = events.len();
         let root_events_replayed = root_events.len();
         Ok(WalReplayResult {
+            records,
             events,
             root_events,
             events_replayed,
@@ -681,21 +704,21 @@ fn sealed_id_gap_detected(ids: &[u64]) -> bool {
     ids.windows(2).any(|pair| pair[1] > pair[0] + 1)
 }
 
-fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, Vec<RootStateRecord>, usize)> {
+fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<WalReplayRecord>, usize)> {
     if !path.exists() {
-        return Ok((Vec::new(), Vec::new(), 0));
+        return Ok((Vec::new(), 0));
     }
     let mut f = File::open(path)?;
     let file_len = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
 
     let mut hdr = [0u8; 8];
     if f.read_exact(&mut hdr).is_err() {
-        return Ok((Vec::new(), Vec::new(), 0));
+        return Ok((Vec::new(), 0));
     }
     let magic = u32::from_le_bytes(hdr[0..4].try_into()?);
     let ver = u32::from_le_bytes(hdr[4..8].try_into()?);
     if magic != WAL_MAGIC || !(1..=WAL_VERSION).contains(&ver) {
-        return Ok((Vec::new(), Vec::new(), 0));
+        return Ok((Vec::new(), 0));
     }
 
     if ver < WAL_VERSION {
@@ -708,7 +731,6 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, Vec<RootState
     }
 
     let mut out = Vec::new();
-    let mut root_out = Vec::new();
     let mut truncated_tail = 0usize;
     let mut pos: u64 = 8; // header consumed
     loop {
@@ -748,13 +770,10 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, Vec<RootState
         }
 
         if let Some(record) = decode_wal_record(ver, &buf) {
-            match record {
-                DecodedWalRecord::File(ev) => out.push(ev),
-                DecodedWalRecord::Root(root) => root_out.push(root),
-            }
+            out.push(record);
         }
     }
-    Ok((out, root_out, truncated_tail))
+    Ok((out, truncated_tail))
 }
 
 fn encode_event(ev: &EventRecord) -> Vec<u8> {
@@ -850,17 +869,12 @@ fn encode_root_state_record(record: &RootStateRecord) -> Vec<u8> {
     out
 }
 
-enum DecodedWalRecord {
-    File(EventRecord),
-    Root(RootStateRecord),
-}
-
-fn decode_wal_record(ver: u32, buf: &[u8]) -> Option<DecodedWalRecord> {
+fn decode_wal_record(ver: u32, buf: &[u8]) -> Option<WalReplayRecord> {
     match *buf.first()? {
-        101 | 102 if ver >= 3 => decode_root_state_record(buf).map(DecodedWalRecord::Root),
+        101 | 102 if ver >= 3 => decode_root_state_record(buf).map(WalReplayRecord::Root),
         _ => {
             let decode_ver = if ver >= 3 { 2 } else { ver };
-            decode_event(decode_ver, buf).map(DecodedWalRecord::File)
+            decode_event(decode_ver, buf).map(WalReplayRecord::File)
         }
     }
 }

@@ -1,8 +1,10 @@
 //! Mount table parsing and default filesystem boundary policy.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +109,8 @@ pub struct FsPolicyConfig {
     pub allow_remote: bool,
     #[serde(default)]
     pub one_file_system: bool,
+    #[serde(default = "default_fuse_probe_timeout_ms")]
+    pub fuse_probe_timeout_ms: u64,
     #[serde(default)]
     pub allow_fstypes: Vec<String>,
     #[serde(default)]
@@ -122,6 +126,7 @@ impl Default for FsPolicyConfig {
         Self {
             allow_remote: false,
             one_file_system: false,
+            fuse_probe_timeout_ms: default_fuse_probe_timeout_ms(),
             allow_fstypes: Vec::new(),
             deny_fstypes: default_deny_fstypes(),
             allow_mounts: Vec::new(),
@@ -132,6 +137,10 @@ impl Default for FsPolicyConfig {
             ],
         }
     }
+}
+
+fn default_fuse_probe_timeout_ms() -> u64 {
+    50
 }
 
 fn default_deny_fstypes() -> Vec<String> {
@@ -180,6 +189,8 @@ impl MountPolicyCounters {
             if fstype.starts_with("fuse.") {
                 self.fstype_blocked_count = self.fstype_blocked_count.saturating_add(1);
             }
+        } else if reason.starts_with("fuse_probe_") {
+            self.fstype_blocked_count = self.fstype_blocked_count.saturating_add(1);
         } else if reason.starts_with("deny_fstype:") {
             self.fstype_blocked_count = self.fstype_blocked_count.saturating_add(1);
             if let Some(fstype) = reason.strip_prefix("deny_fstype:") {
@@ -199,6 +210,176 @@ impl MountPolicyCounters {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct SharedMountPolicyCounters {
+    fstype_blocked_count: AtomicU64,
+    network_fs_ignored_count: AtomicU64,
+    one_file_system_boundary_count: AtomicU64,
+    fuse_probe_timeout_count: AtomicU64,
+    denied_mount_count: AtomicU64,
+    allowed_override_count: AtomicU64,
+    fuse_probe_cache: MountProbeCache,
+}
+
+impl SharedMountPolicyCounters {
+    pub fn record_decision(&self, decision: &FsPolicyDecision) {
+        let FsPolicyDecision::Deny { reason } = decision else {
+            return;
+        };
+        self.denied_mount_count.fetch_add(1, Ordering::Relaxed);
+        if reason == "one_file_system" {
+            self.one_file_system_boundary_count
+                .fetch_add(1, Ordering::Relaxed);
+        } else if let Some(fstype) = reason.strip_prefix("remote_fstype:") {
+            self.network_fs_ignored_count
+                .fetch_add(1, Ordering::Relaxed);
+            if fstype.starts_with("fuse.") {
+                self.fstype_blocked_count.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if reason.starts_with("fuse_probe_") {
+            self.fstype_blocked_count.fetch_add(1, Ordering::Relaxed);
+        } else if reason.starts_with("deny_fstype:") {
+            self.fstype_blocked_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(fstype) = reason.strip_prefix("deny_fstype:") {
+                if is_remote_fstype(fstype) {
+                    self.network_fs_ignored_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    pub fn record_allowed_override(&self) {
+        self.allowed_override_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_fuse_probe_timeout(&self) {
+        self.fuse_probe_timeout_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> MountPolicyCounters {
+        MountPolicyCounters {
+            fstype_blocked_count: self.fstype_blocked_count.load(Ordering::Relaxed),
+            network_fs_ignored_count: self.network_fs_ignored_count.load(Ordering::Relaxed),
+            one_file_system_boundary_count: self
+                .one_file_system_boundary_count
+                .load(Ordering::Relaxed),
+            fuse_probe_timeout_count: self
+                .fuse_probe_timeout_count
+                .load(Ordering::Relaxed)
+                .saturating_add(self.fuse_probe_cache.timeout_count()),
+            denied_mount_count: self.denied_mount_count.load(Ordering::Relaxed),
+            allowed_override_count: self.allowed_override_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn fuse_probe_outcome<F>(
+        &self,
+        mount: &MountEntry,
+        timeout: Duration,
+        probe: F,
+    ) -> MountProbeOutcome
+    where
+        F: FnOnce(PathBuf) -> std::io::Result<()> + Send + 'static,
+    {
+        self.fuse_probe_cache
+            .status_or_spawn_with(mount, timeout, probe)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MountProbeKey {
+    mount_id: u32,
+    major_minor: String,
+    mount_point: PathBuf,
+    fstype: String,
+    source: String,
+}
+
+impl MountProbeKey {
+    fn from_mount(mount: &MountEntry) -> Self {
+        Self {
+            mount_id: mount.mount_id,
+            major_minor: mount.major_minor.clone(),
+            mount_point: mount.mount_point.clone(),
+            fstype: mount.fstype.clone(),
+            source: mount.source.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MountProbeState {
+    Pending,
+    Ready,
+    Failed(String),
+    TimedOut,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MountProbeOutcome {
+    Pending,
+    Ready,
+    Failed(String),
+    TimedOut,
+}
+
+#[derive(Debug, Default)]
+struct MountProbeCache {
+    states: Arc<Mutex<HashMap<MountProbeKey, MountProbeState>>>,
+    timeout_count: Arc<AtomicU64>,
+}
+
+impl MountProbeCache {
+    fn status_or_spawn_with<F>(
+        &self,
+        mount: &MountEntry,
+        timeout: Duration,
+        probe: F,
+    ) -> MountProbeOutcome
+    where
+        F: FnOnce(PathBuf) -> std::io::Result<()> + Send + 'static,
+    {
+        let key = MountProbeKey::from_mount(mount);
+        let mount_point = mount.mount_point.clone();
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.get_mut(&key) {
+            Some(MountProbeState::Pending) => return MountProbeOutcome::Pending,
+            Some(MountProbeState::Ready) => return MountProbeOutcome::Ready,
+            Some(MountProbeState::Failed(reason)) => {
+                return MountProbeOutcome::Failed(reason.clone());
+            }
+            Some(MountProbeState::TimedOut) => return MountProbeOutcome::TimedOut,
+            None => {
+                states.insert(key.clone(), MountProbeState::Pending);
+            }
+        }
+        drop(states);
+
+        let states = Arc::clone(&self.states);
+        let timeout_count = Arc::clone(&self.timeout_count);
+        std::thread::spawn(move || {
+            let state = match probe_mount_with_timeout(timeout, move || probe(mount_point)) {
+                Some(Ok(())) => MountProbeState::Ready,
+                Some(Err(err)) => MountProbeState::Failed(err.kind().to_string()),
+                None => {
+                    timeout_count.fetch_add(1, Ordering::Relaxed);
+                    MountProbeState::TimedOut
+                }
+            };
+            let mut states = states.lock().unwrap_or_else(|e| e.into_inner());
+            states.insert(key, state);
+        });
+
+        MountProbeOutcome::Pending
+    }
+
+    fn timeout_count(&self) -> u64 {
+        self.timeout_count.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FsPolicy {
     table: MountTable,
@@ -211,9 +392,13 @@ impl FsPolicy {
     }
 
     pub fn current_default() -> Option<Self> {
+        Self::current_with_config(FsPolicyConfig::default())
+    }
+
+    pub fn current_with_config(config: FsPolicyConfig) -> Option<Self> {
         MountTable::current()
             .ok()
-            .map(|table| Self::new(table, FsPolicyConfig::default()))
+            .map(|table| Self::new(table, config))
     }
 
     pub fn check_path(&self, path: &Path, scan_root: Option<&Path>) -> FsPolicyDecision {
@@ -277,10 +462,78 @@ impl FsPolicy {
         }
         FsPolicyDecision::Allow
     }
+
+    pub fn check_path_counted(
+        &self,
+        path: &Path,
+        scan_root: Option<&Path>,
+        counters: &SharedMountPolicyCounters,
+    ) -> FsPolicyDecision {
+        self.check_path_counted_with_probe(path, scan_root, counters, probe_mount_path)
+    }
+
+    fn check_path_counted_with_probe<F>(
+        &self,
+        path: &Path,
+        scan_root: Option<&Path>,
+        counters: &SharedMountPolicyCounters,
+        probe: F,
+    ) -> FsPolicyDecision
+    where
+        F: FnOnce(PathBuf) -> std::io::Result<()> + Send + 'static,
+    {
+        let mut decision = self.check_path(path, scan_root);
+        let allowed_mount_override = decision.is_allowed()
+            && self
+                .config
+                .allow_mounts
+                .iter()
+                .any(|allowed| path.starts_with(allowed));
+        if allowed_mount_override {
+            counters.record_allowed_override();
+        }
+
+        if decision.is_allowed() && !allowed_mount_override {
+            if let Some(mount) = self.fuse_probe_mount(path) {
+                decision =
+                    match counters.fuse_probe_outcome(mount, self.fuse_probe_timeout(), probe) {
+                        MountProbeOutcome::Ready => FsPolicyDecision::Allow,
+                        MountProbeOutcome::Pending => FsPolicyDecision::Deny {
+                            reason: format!("fuse_probe_pending:{}", mount.fstype),
+                        },
+                        MountProbeOutcome::TimedOut => FsPolicyDecision::Deny {
+                            reason: format!("fuse_probe_timeout:{}", mount.fstype),
+                        },
+                        MountProbeOutcome::Failed(reason) => FsPolicyDecision::Deny {
+                            reason: format!("fuse_probe_failed:{}", reason),
+                        },
+                    };
+            }
+        }
+
+        counters.record_decision(&decision);
+        decision
+    }
+
+    fn fuse_probe_mount<'a>(&'a self, path: &Path) -> Option<&'a MountEntry> {
+        let mount = self.table.best_match(path)?;
+        needs_background_probe(mount).then_some(mount)
+    }
+
+    fn fuse_probe_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.fuse_probe_timeout_ms.max(1))
+    }
 }
 
 pub fn is_remote_fstype(fstype: &str) -> bool {
     matches!(fstype, "nfs" | "nfs4" | "cifs" | "smb3") || fstype.starts_with("fuse.")
+}
+
+fn needs_background_probe(mount: &MountEntry) -> bool {
+    mount.fstype == "fuse"
+        || mount.fstype == "fuseblk"
+        || mount.fstype.starts_with("fuse.")
+        || mount.source.to_ascii_lowercase().contains("sshfs")
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -318,6 +571,12 @@ where
         let _ = tx.send(f());
     });
     rx.recv_timeout(timeout).ok()
+}
+
+fn probe_mount_path(path: PathBuf) -> std::io::Result<()> {
+    let mut entries = std::fs::read_dir(path)?;
+    let _ = entries.next();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -412,5 +671,114 @@ mod tests {
         assert_eq!(counters.network_fs_ignored_count, 2);
         assert_eq!(counters.fstype_blocked_count, 2);
         assert_eq!(counters.fuse_probe_timeout_count, 1);
+    }
+
+    #[test]
+    fn shared_mount_policy_counters_accumulate_rejections() {
+        let policy = FsPolicy::new(MountTable::parse(SAMPLE), FsPolicyConfig::default());
+        let counters = SharedMountPolicyCounters::default();
+
+        let _ = policy.check_path_counted(Path::new("/home/user/remote/a"), None, &counters);
+        let _ = policy.check_path_counted(Path::new("/home/user/rclone/a"), None, &counters);
+        counters.record_fuse_probe_timeout();
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.denied_mount_count, 2);
+        assert_eq!(snapshot.network_fs_ignored_count, 2);
+        assert_eq!(snapshot.fstype_blocked_count, 2);
+        assert_eq!(snapshot.fuse_probe_timeout_count, 1);
+    }
+
+    #[test]
+    fn fuse_probe_runs_in_background_and_then_allows_cached_ready_mount() {
+        let cfg = FsPolicyConfig {
+            allow_fstypes: vec!["fuse.rclone".to_string()],
+            ..FsPolicyConfig::default()
+        };
+        let policy = FsPolicy::new(MountTable::parse(SAMPLE), cfg);
+        let counters = SharedMountPolicyCounters::default();
+        let path = Path::new("/home/user/rclone/a");
+
+        let first = policy.check_path_counted_with_probe(path, None, &counters, |_| Ok(()));
+        assert_eq!(
+            first,
+            FsPolicyDecision::Deny {
+                reason: "fuse_probe_pending:fuse.rclone".to_string(),
+            }
+        );
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(5));
+            let next = policy.check_path_counted_with_probe(path, None, &counters, |_| Ok(()));
+            if next == FsPolicyDecision::Allow {
+                assert_eq!(counters.snapshot().fuse_probe_timeout_count, 0);
+                return;
+            }
+        }
+
+        panic!("FUSE probe did not transition to ready");
+    }
+
+    #[test]
+    fn fuse_probe_timeout_is_cached_and_counted_once() {
+        let cfg = FsPolicyConfig {
+            allow_fstypes: vec!["fuse.rclone".to_string()],
+            fuse_probe_timeout_ms: 5,
+            ..FsPolicyConfig::default()
+        };
+        let policy = FsPolicy::new(MountTable::parse(SAMPLE), cfg);
+        let counters = SharedMountPolicyCounters::default();
+        let path = Path::new("/home/user/rclone/a");
+
+        let first = policy.check_path_counted_with_probe(path, None, &counters, |_| {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(())
+        });
+        assert_eq!(
+            first,
+            FsPolicyDecision::Deny {
+                reason: "fuse_probe_pending:fuse.rclone".to_string(),
+            }
+        );
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(5));
+            let next = policy.check_path_counted_with_probe(path, None, &counters, |_| Ok(()));
+            if next
+                == (FsPolicyDecision::Deny {
+                    reason: "fuse_probe_timeout:fuse.rclone".to_string(),
+                })
+            {
+                assert_eq!(counters.snapshot().fuse_probe_timeout_count, 1);
+                let again = policy.check_path_counted_with_probe(path, None, &counters, |_| Ok(()));
+                assert_eq!(again, next);
+                assert_eq!(counters.snapshot().fuse_probe_timeout_count, 1);
+                return;
+            }
+        }
+
+        panic!("FUSE probe did not transition to timeout");
+    }
+
+    #[test]
+    fn allow_mount_override_bypasses_fuse_probe() {
+        let cfg = FsPolicyConfig {
+            allow_mounts: vec![PathBuf::from("/home/user/rclone")],
+            ..FsPolicyConfig::default()
+        };
+        let policy = FsPolicy::new(MountTable::parse(SAMPLE), cfg);
+        let counters = SharedMountPolicyCounters::default();
+
+        let decision = policy.check_path_counted_with_probe(
+            Path::new("/home/user/rclone/a"),
+            None,
+            &counters,
+            |_| {
+                panic!("explicit allow_mount should not run FUSE probe");
+            },
+        );
+
+        assert_eq!(decision, FsPolicyDecision::Allow);
+        assert_eq!(counters.snapshot().allowed_override_count, 1);
     }
 }

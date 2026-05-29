@@ -95,6 +95,10 @@ pub fn runtime_state_path_for(snapshot_path: &Path) -> PathBuf {
     stable_snapshot_dir_for(snapshot_path).join("runtime-state.json")
 }
 
+pub fn quarantine_sidecar_path_for(snapshot_path: &Path) -> PathBuf {
+    stable_snapshot_dir_for(snapshot_path).join("quarantine-sidecar.json")
+}
+
 pub fn repair_meta_path_for(snapshot_path: &Path) -> PathBuf {
     stable_snapshot_dir_for(snapshot_path).join("repair-meta.json")
 }

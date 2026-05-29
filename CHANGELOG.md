@@ -7,8 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- 新增 Runtime Boundary State Contract：WAL 支持 `OFFLINE_ROOT` / `ONLINE_ROOT` root 状态记录，quarantine sidecar 使用物理 mount identity 锚定，启动回放后会恢复 quarantine state 并安装 Freeze Gate，阻断离线 root 下 Delete/Modify/Rename 脏写。
-- `/health` 新增强类型 `diagnostics` 字段，按 system/storage/security/clocks/watchers/io 固定板块暴露 WAL、snapshot、quarantine、freeze、HTTP policy、UDS peer policy、scan reject、clock skew 与 mount policy 诊断，同时保留既有 summary 字段兼容旧客户端。
+- 新增 Runtime Boundary State Contract：WAL 支持 `OFFLINE_ROOT` / `ONLINE_ROOT` root 状态记录，quarantine sidecar 使用物理 mount identity 锚定；启动时先恢复 sidecar 并安装 Freeze Gate，再按 WAL 原始记录顺序回放 root state 与文件事件，阻断离线 root 下 Delete/Modify/Rename 脏写。
+- quarantine sidecar verify 接入后台 worker：设备 identity 匹配后先 append `ONLINE_ROOT`，写入成功后才解除 freeze，并将 affected prefixes 入队局部 scan；identity 不匹配或设备仍离线时保持冻结。
+- `/health` 新增强类型 `diagnostics` 字段，按 system/storage/security/clocks/watchers/io 固定板块暴露 WAL、snapshot、quarantine verify、freeze、HTTP policy、UDS peer policy、scan reject、clock skew 与 mount policy 诊断，同时保留既有 summary 字段兼容旧客户端。
+- mount policy 诊断收口到共享计数器：full build、rebuild、fast-sync、immediate scan、dynamic watch 和 ephemeral watch 入口统一记录拒绝原因，watcher 动态注册前会先执行 mount policy，拒绝时回滚 tiered/ephemeral reservation 并跳过 `watch()` 与后续深扫；FUSE/SSHFS 可疑 mount 通过后台 probe timeout cache 避免扫描线程直接执行可能挂起的 `readdir`。
 - 配置支持结构化 `[[roots]]`，兼容旧 `roots = []`；`detected_policy`、`conflict_count`、mount state、freeze gate 等运行时探测状态不会写回 `config.toml`。
 - 补齐 case policy 自动探测基础、mount policy 拒绝原因矩阵、clock skew dirty window 和 root/system daemon 默认禁用未认证 HTTP query/scan 的安全策略测试。
 - 测试补强：新增 daemon API/UDS E2E、真实 watcher create/rename/delete、abrupt kill 与坏 stable snapshot 启动修复组合测试，补齐此前偏模块级的关键真实链路缺口。

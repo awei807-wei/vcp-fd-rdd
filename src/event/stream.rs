@@ -1,6 +1,6 @@
 use notify::Watcher;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -10,6 +10,7 @@ use crate::event::ignore_filter::IgnoreFilter;
 use crate::event::sync::{now_ns, DirtyReason, DirtyScope};
 use crate::event::tiered_watch::{TieredWatchRuntime, WatchTier};
 use crate::event::watcher::{check_inotify_limit, watch_roots_enhanced, EventWatcher};
+use crate::fs_policy::{FsPolicy, SharedMountPolicyCounters};
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
 use crate::util::{
@@ -33,6 +34,29 @@ where
         return true;
     }
     false
+}
+
+fn longest_configured_root<'a>(roots: &'a [PathBuf], path: &Path) -> Option<&'a Path> {
+    roots
+        .iter()
+        .filter(|root| path.starts_with(root.as_path()))
+        .max_by_key(|root| root.as_os_str().as_encoded_bytes().len())
+        .map(PathBuf::as_path)
+}
+
+fn mount_policy_allows_dynamic_watch(
+    fs_policy: Option<&FsPolicy>,
+    counters: &SharedMountPolicyCounters,
+    roots: &[PathBuf],
+    path: &Path,
+) -> bool {
+    fs_policy
+        .map(|policy| {
+            policy
+                .check_path_counted(path, longest_configured_root(roots, path), counters)
+                .is_allowed()
+        })
+        .unwrap_or(true)
 }
 
 #[derive(Clone, Debug)]
@@ -265,6 +289,9 @@ impl EventPipeline {
         let raw_events_capacity = self.raw_events_capacity.clone();
         let merged_map_capacity = self.merged_map_capacity.clone();
         let records_capacity = self.records_capacity.clone();
+        let fs_policy = FsPolicy::current_with_config(index.fs_policy_config());
+        let mount_policy_counters = index.mount_policy_counters();
+        let configured_roots = index.roots.clone();
         let pending_moves: Arc<tokio::sync::Mutex<PendingMoveMap>> =
             Arc::new(tokio::sync::Mutex::new(PendingMoveMap::new()));
         let pending_moves_cleaner = pending_moves.clone();
@@ -312,6 +339,18 @@ impl EventPipeline {
                     cmd = watch_command_rx.recv() => {
                         match cmd {
                             Some(WatchCommand::Add(path)) => {
+                                if !mount_policy_allows_dynamic_watch(
+                                    fs_policy.as_ref(),
+                                    mount_policy_counters.as_ref(),
+                                    &configured_roots,
+                                    path.as_path(),
+                                ) {
+                                    if let Some(runtime) = tiered_runtime.as_ref() {
+                                        runtime.rollback_promote(path.as_path());
+                                    }
+                                    tracing::warn!("tiered watcher add denied by mount policy for {:?}", path);
+                                    continue;
+                                }
                                 match watcher.watch(path.as_path(), notify::RecursiveMode::Recursive) {
                                     Ok(()) => {
                                         if let Some(runtime) = tiered_runtime.as_ref() {
@@ -333,6 +372,18 @@ impl EventPipeline {
                                 }
                             }
                             Some(WatchCommand::AddEphemeral(path)) => {
+                                if !mount_policy_allows_dynamic_watch(
+                                    fs_policy.as_ref(),
+                                    mount_policy_counters.as_ref(),
+                                    &configured_roots,
+                                    path.as_path(),
+                                ) {
+                                    if let Some(runtime) = tiered_runtime.as_ref() {
+                                        runtime.rollback_ephemeral_add(path.as_path());
+                                    }
+                                    tracing::warn!("tiered ephemeral watcher add denied by mount policy for {:?}", path);
+                                    continue;
+                                }
                                 match watcher.watch(path.as_path(), notify::RecursiveMode::Recursive) {
                                     Ok(()) => {
                                         if let Some(runtime) = tiered_runtime.as_ref() {
@@ -424,6 +475,21 @@ impl EventPipeline {
                                 }
                             }
                             Some(WatchCommand::Replace { demote, promote }) => {
+                                if !mount_policy_allows_dynamic_watch(
+                                    fs_policy.as_ref(),
+                                    mount_policy_counters.as_ref(),
+                                    &configured_roots,
+                                    promote.as_path(),
+                                ) {
+                                    if let Some(runtime) = tiered_runtime.as_ref() {
+                                        runtime.rollback_replacement(
+                                            demote.as_path(),
+                                            promote.as_path(),
+                                        );
+                                    }
+                                    tracing::warn!("tiered watcher replacement add denied by mount policy for {:?}", promote);
+                                    continue;
+                                }
                                 let child_watches = dynamic_watches
                                     .iter()
                                     .filter(|child| child.as_path() != demote.as_path() && child.starts_with(&demote))
@@ -518,6 +584,21 @@ impl EventPipeline {
                                 }
                             }
                             Some(WatchCommand::ReplaceEphemeral { remove, add }) => {
+                                if !mount_policy_allows_dynamic_watch(
+                                    fs_policy.as_ref(),
+                                    mount_policy_counters.as_ref(),
+                                    &configured_roots,
+                                    add.as_path(),
+                                ) {
+                                    if let Some(runtime) = tiered_runtime.as_ref() {
+                                        runtime.rollback_ephemeral_replace(
+                                            remove.as_path(),
+                                            add.as_path(),
+                                        );
+                                    }
+                                    tracing::warn!("tiered ephemeral replacement add denied by mount policy for {:?}", add);
+                                    continue;
+                                }
                                 match watcher.unwatch(remove.as_path()) {
                                     Ok(()) => {
                                         ephemeral_watches.remove(&remove);
@@ -702,6 +783,18 @@ impl EventPipeline {
                             .map(|m| m.is_dir())
                             .unwrap_or(false)
                         {
+                            continue;
+                        }
+                        if !mount_policy_allows_dynamic_watch(
+                            fs_policy.as_ref(),
+                            mount_policy_counters.as_ref(),
+                            &configured_roots,
+                            path.as_path(),
+                        ) {
+                            tracing::warn!(
+                                "dynamic watcher add denied by mount policy for {:?}",
+                                path
+                            );
                             continue;
                         }
                         if let Some(runtime) = tiered_runtime.as_ref() {

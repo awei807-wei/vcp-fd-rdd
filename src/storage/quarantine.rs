@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::core::{EventRecord, EventType};
+use crate::fs_policy::MountEntry;
 
 pub const QUARANTINE_SIDECAR_VERSION: u32 = 1;
 
@@ -80,6 +81,27 @@ impl QuarantineSidecar {
             .iter()
             .filter(|root| !matches!(root.state, QuarantineRootState::Online))
     }
+
+    pub fn mark_online(&mut self, root_path: &Path) {
+        for root in &mut self.roots {
+            if root.root_path == root_path {
+                root.state = QuarantineRootState::Online;
+                root.reason = None;
+            }
+        }
+    }
+}
+
+impl From<&MountEntry> for MountIdentity {
+    fn from(entry: &MountEntry) -> Self {
+        Self {
+            mount_id: entry.mount_id,
+            major_minor: entry.major_minor.clone(),
+            fs_uuid: None,
+            source: entry.source.clone(),
+            fstype: entry.fstype.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -105,6 +127,11 @@ impl QuarantineRoot {
         }
 
         RecoveryConfidence::None
+    }
+
+    pub fn verify_online(&self, current: &MountIdentity) -> Option<RecoveryConfidence> {
+        let confidence = self.recovery_confidence(current);
+        (confidence != RecoveryConfidence::None).then_some(confidence)
     }
 }
 
@@ -179,6 +206,12 @@ impl QuarantineState {
     pub fn from_sidecar(sidecar: QuarantineSidecar) -> Self {
         Self {
             roots: sidecar.active_roots().cloned().collect(),
+        }
+    }
+
+    pub fn apply_wal_records(&mut self, records: &[RootStateRecord]) {
+        for record in records {
+            self.apply_wal_record(record.clone());
         }
     }
 

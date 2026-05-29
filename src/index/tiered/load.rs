@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::fs_policy::FsPolicyConfig;
 use crate::index::base_index::BaseIndexData;
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
@@ -9,9 +10,11 @@ use crate::storage::recovery_audit::{
     audit_recovery_ledger, choose_checkpoint, RecoveryAuditReport, SnapshotCheckpointSource,
 };
 use crate::storage::snapshot::{
-    read_recovery_runtime_state, stable_prev_v7_path_for, stable_v7_path_for,
+    quarantine_sidecar_path_for, read_recovery_runtime_state, stable_prev_v7_path_for,
+    stable_v7_path_for,
 };
 use crate::storage::traits::StorageBackend;
+use crate::storage::wal::WalReplayRecord;
 use crate::util::maybe_trim_rss;
 
 use super::{StartupRecoveryReport, TieredIndex};
@@ -82,9 +85,13 @@ impl TieredIndex {
 
         use super::rebuild::RebuildState;
         use crate::core::AdaptiveScheduler;
+        use crate::fs_policy::SharedMountPolicyCounters;
 
         let base_data = base_data.unwrap_or_else(|| l2.to_base_index_data());
         let base = ArcSwap::from(Arc::new(base_data));
+        let fs_policy_config = l3.fs_policy_config.clone();
+        let mount_policy_counters = Arc::new(SharedMountPolicyCounters::default());
+        let l3 = l3.with_mount_policy_counters(mount_policy_counters.clone());
 
         Self {
             l1,
@@ -115,17 +122,21 @@ impl TieredIndex {
             ignore_enabled,
             follow_symlinks,
             exclude_dirs,
+            fs_policy_config,
             fast_sync_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             dirty_queue: Mutex::new(crate::event::sync::DirtyQueue::default()),
             dirty_notify: Notify::new(),
             recovery_status: Mutex::new(super::RecoveryStatus::default()),
             quarantine_state: Mutex::new(crate::storage::quarantine::QuarantineState::default()),
             freeze_gate: Mutex::new(crate::storage::quarantine::FreezeGate::default()),
+            quarantine_verify_pending: AtomicU64::new(0),
+            quarantine_verified_roots: AtomicU64::new(0),
             clock_skew: Mutex::new(crate::clock::ClockSkewDetector::new(
                 std::time::Duration::from_secs(1),
             )),
             clock_reconciliation_count: AtomicU64::new(0),
             stable_snapshot_enabled: AtomicBool::new(true),
+            mount_policy_counters,
             stats: Arc::new(crate::stats::StatsCollector::new()),
         }
     }
@@ -245,14 +256,37 @@ impl TieredIndex {
         follow_symlinks: bool,
         exclude_dirs: Vec<String>,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::load_with_options_follow_excludes_and_fs_policy(
+            store,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            exclude_dirs,
+            FsPolicyConfig::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_with_options_follow_excludes_and_fs_policy<S: StorageBackend + ?Sized>(
+        store: &S,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+        exclude_dirs: Vec<String>,
+        fs_policy_config: FsPolicyConfig,
+    ) -> anyhow::Result<Arc<Self>> {
         let index = Arc::new(
-            Self::load_or_empty_with_options_follow_and_excludes(
+            Self::load_or_empty_with_options_follow_excludes_and_fs_policy(
                 store,
                 roots,
                 include_hidden,
                 ignore_enabled,
                 follow_symlinks,
                 exclude_dirs,
+                fs_policy_config,
             )
             .await?,
         );
@@ -327,6 +361,30 @@ impl TieredIndex {
         follow_symlinks: bool,
         exclude_dirs: Vec<String>,
     ) -> anyhow::Result<Self> {
+        Self::load_or_empty_with_options_follow_excludes_and_fs_policy(
+            store,
+            roots,
+            include_hidden,
+            ignore_enabled,
+            follow_symlinks,
+            exclude_dirs,
+            FsPolicyConfig::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_or_empty_with_options_follow_excludes_and_fs_policy<
+        S: StorageBackend + ?Sized,
+    >(
+        store: &S,
+        roots: Vec<PathBuf>,
+        include_hidden: bool,
+        ignore_enabled: bool,
+        follow_symlinks: bool,
+        exclude_dirs: Vec<String>,
+        fs_policy_config: FsPolicyConfig,
+    ) -> anyhow::Result<Self> {
         let l1 = L1Cache::with_capacity(1000);
         let l3 = IndexBuilder::new_with_options_follow_and_excludes(
             roots.clone(),
@@ -334,7 +392,8 @@ impl TieredIndex {
             ignore_enabled,
             follow_symlinks,
             exclude_dirs.clone(),
-        );
+        )
+        .with_fs_policy_config(fs_policy_config);
 
         let runtime_state = read_recovery_runtime_state(store.path()).unwrap_or_else(|e| {
             tracing::warn!("recovery runtime state read failed: {}", e);
@@ -374,6 +433,14 @@ impl TieredIndex {
                         Some(v7_data),
                     );
                     idx.attach_wal(store)?;
+                    let sidecar_path = quarantine_sidecar_path_for(store.path());
+                    if let Err(e) = idx.restore_quarantine_from_sidecar_path(&sidecar_path) {
+                        tracing::warn!(
+                            "quarantine sidecar restore failed for {}: {}",
+                            sidecar_path.display(),
+                            e
+                        );
+                    }
                     let checkpoint =
                         choose_checkpoint(SnapshotCheckpointSource::from_label(source), &audit);
                     let replay = idx.replay_wal_if_any(checkpoint);
@@ -404,6 +471,14 @@ impl TieredIndex {
             exclude_dirs,
         );
         idx.attach_wal(store)?;
+        let sidecar_path = quarantine_sidecar_path_for(store.path());
+        if let Err(e) = idx.restore_quarantine_from_sidecar_path(&sidecar_path) {
+            tracing::warn!(
+                "quarantine sidecar restore failed for {}: {}",
+                sidecar_path.display(),
+                e
+            );
+        }
         let replay = idx.replay_wal_if_any(0);
         idx.set_startup_recovery_report(startup_report("empty", &runtime_state, &audit, replay));
         Ok(idx)
@@ -432,21 +507,30 @@ impl TieredIndex {
                     gap_detected: r.gap_detected,
                     checkpoint_used: r.checkpoint_used,
                 };
-                if !r.events.is_empty() {
+                if !r.records.is_empty() {
                     tracing::info!(
-                        "WAL replay: events={} sealed_used={} truncated_tail={}",
-                        r.events.len(),
+                        "WAL replay: events={} root_state_events={} sealed_used={} truncated_tail={}",
+                        r.events_replayed,
+                        r.root_events_replayed,
                         r.sealed_used,
                         r.truncated_tail_records
                     );
-                    self.apply_events_inner(&r.events, false);
-                }
-                if !r.root_events.is_empty() {
-                    tracing::info!(
-                        "WAL replay: root_state_events={} active_freeze_gates_restored",
-                        r.root_events_replayed
-                    );
-                    self.restore_quarantine_from_wal(&r.root_events);
+                    let mut pending_events = Vec::new();
+                    for record in &r.records {
+                        match record {
+                            WalReplayRecord::File(event) => pending_events.push(event.clone()),
+                            WalReplayRecord::Root(root) => {
+                                if !pending_events.is_empty() {
+                                    self.apply_events_inner(&pending_events, false);
+                                    pending_events.clear();
+                                }
+                                self.restore_quarantine_from_wal(std::slice::from_ref(root));
+                            }
+                        }
+                    }
+                    if !pending_events.is_empty() {
+                        self.apply_events_inner(&pending_events, false);
+                    }
                 }
                 summary
             }

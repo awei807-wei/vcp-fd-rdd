@@ -2,6 +2,7 @@ pub(crate) mod arena;
 pub(crate) mod events;
 pub(crate) mod load;
 mod memory;
+mod quarantine;
 mod query;
 mod query_plan;
 pub(crate) mod rebuild;
@@ -23,6 +24,7 @@ use tokio::sync::Notify;
 use crate::core::AdaptiveScheduler;
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::DirtyQueue;
+use crate::fs_policy::{FsPolicyConfig, SharedMountPolicyCounters};
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
@@ -200,15 +202,19 @@ pub struct TieredIndex {
     pub ignore_enabled: bool,
     pub follow_symlinks: bool,
     pub exclude_dirs: Vec<String>,
+    pub fs_policy_config: FsPolicyConfig,
     pub(self) fast_sync_semaphore: Arc<tokio::sync::Semaphore>,
     pub(self) dirty_queue: Mutex<DirtyQueue>,
     pub(self) dirty_notify: Notify,
     pub(self) recovery_status: Mutex<RecoveryStatus>,
     pub(self) quarantine_state: Mutex<QuarantineState>,
     pub(self) freeze_gate: Mutex<FreezeGate>,
+    pub(self) quarantine_verify_pending: AtomicU64,
+    pub(self) quarantine_verified_roots: AtomicU64,
     pub(self) clock_skew: Mutex<crate::clock::ClockSkewDetector>,
     pub(self) clock_reconciliation_count: AtomicU64,
     pub(self) stable_snapshot_enabled: AtomicBool,
+    pub(self) mount_policy_counters: Arc<SharedMountPolicyCounters>,
     pub(self) stats: Arc<StatsCollector>,
 }
 
@@ -253,10 +259,14 @@ impl TieredIndex {
     }
 
     pub fn restore_quarantine_from_wal(&self, records: &[RootStateRecord]) {
-        let state = QuarantineState::from_wal_records(records);
-        let gate = state.freeze_gate();
-        *self.quarantine_state.lock() = state;
+        let (gate, pending) = {
+            let mut state = self.quarantine_state.lock();
+            state.apply_wal_records(records);
+            (state.freeze_gate(), state.active_root_count() as u64)
+        };
         self.install_freeze_gate(gate);
+        self.quarantine_verify_pending
+            .store(pending, Ordering::Relaxed);
     }
 
     pub fn apply_root_state_record(&self, record: RootStateRecord) {
@@ -266,13 +276,31 @@ impl TieredIndex {
             }
         }
 
-        {
+        self.apply_root_state_record_in_memory(record);
+    }
+
+    fn try_apply_root_state_record_after_wal(&self, record: RootStateRecord) -> bool {
+        let Some(wal) = self.wal.lock().clone() else {
+            tracing::warn!("WAL root-state append skipped: WAL is not attached");
+            return false;
+        };
+        if let Err(e) = wal.append_root_events(std::slice::from_ref(&record)) {
+            tracing::warn!("WAL root-state append failed: {}", e);
+            return false;
+        }
+        self.apply_root_state_record_in_memory(record);
+        true
+    }
+
+    fn apply_root_state_record_in_memory(&self, record: RootStateRecord) {
+        let (gate, pending) = {
             let mut state = self.quarantine_state.lock();
             state.apply_wal_record(record.clone());
-            let gate = state.freeze_gate();
-            drop(state);
-            self.install_freeze_gate(gate);
-        }
+            (state.freeze_gate(), state.active_root_count() as u64)
+        };
+        self.install_freeze_gate(gate);
+        self.quarantine_verify_pending
+            .store(pending, Ordering::Relaxed);
 
         if matches!(
             record.kind,
@@ -317,6 +345,14 @@ impl TieredIndex {
     pub fn stats_report(&self) -> StatsReport {
         self.stats.report()
     }
+
+    pub fn mount_policy_counters(&self) -> Arc<SharedMountPolicyCounters> {
+        self.mount_policy_counters.clone()
+    }
+
+    pub fn fs_policy_config(&self) -> FsPolicyConfig {
+        self.fs_policy_config.clone()
+    }
 }
 
 impl DiagnosticSource for TieredIndex {
@@ -328,12 +364,42 @@ impl DiagnosticSource for TieredIndex {
         report.storage.quarantine_roots = quarantine.active_root_count();
         report.storage.freeze_gates = gate.frozen_root_count();
         report.storage.freeze_blocked_events = gate.blocked_events();
+        report.storage.quarantine_verify_pending =
+            self.quarantine_verify_pending.load(Ordering::Relaxed) as usize;
+        report.storage.quarantine_verified_roots =
+            self.quarantine_verified_roots.load(Ordering::Relaxed);
         report.clocks.skew_count = clock.skew_count();
         report.clocks.last_drift_ms = clock.last_negative_drift().as_millis() as u64;
         report.clocks.cutoff_trusted = clock.cutoff_trusted();
         report.clocks.reconciliation_count =
             self.clock_reconciliation_count.load(Ordering::Relaxed);
         report.clocks.reconciliation_window_active = !clock.cutoff_trusted();
+
+        let mount = self.mount_policy_counters.snapshot();
+        report.watchers.fstype_blocked_count = report
+            .watchers
+            .fstype_blocked_count
+            .saturating_add(mount.fstype_blocked_count);
+        report.watchers.network_fs_ignored_count = report
+            .watchers
+            .network_fs_ignored_count
+            .saturating_add(mount.network_fs_ignored_count);
+        report.watchers.fuse_probe_timeout_count = report
+            .watchers
+            .fuse_probe_timeout_count
+            .saturating_add(mount.fuse_probe_timeout_count);
+        report.watchers.one_file_system_boundary_count = report
+            .watchers
+            .one_file_system_boundary_count
+            .saturating_add(mount.one_file_system_boundary_count);
+        report.watchers.denied_mount_count = report
+            .watchers
+            .denied_mount_count
+            .saturating_add(mount.denied_mount_count);
+        report.watchers.allowed_override_count = report
+            .watchers
+            .allowed_override_count
+            .saturating_add(mount.allowed_override_count);
     }
 }
 

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::fs_policy::FsPolicy;
+use crate::fs_policy::{FsPolicy, FsPolicyConfig, SharedMountPolicyCounters};
 use crate::util::path_has_excluded_component;
 
 /// 文件身份：Linux 上用 (dev, ino, generation) 做主键，rename 时 ino 不变，
@@ -151,6 +151,8 @@ pub struct FsScanRDD {
     follow_links: bool,
     ignore_enabled: bool,
     exclude_dirs: Vec<String>,
+    mount_policy_counters: Option<Arc<SharedMountPolicyCounters>>,
+    fs_policy_config: FsPolicyConfig,
 }
 
 impl FsScanRDD {
@@ -171,6 +173,8 @@ impl FsScanRDD {
             follow_links: false,
             ignore_enabled: true,
             exclude_dirs: Vec::new(),
+            mount_policy_counters: None,
+            fs_policy_config: FsPolicyConfig::default(),
         }
     }
 
@@ -204,6 +208,16 @@ impl FsScanRDD {
         self
     }
 
+    pub fn with_mount_policy_counters(mut self, counters: Arc<SharedMountPolicyCounters>) -> Self {
+        self.mount_policy_counters = Some(counters);
+        self
+    }
+
+    pub fn with_fs_policy_config(mut self, config: FsPolicyConfig) -> Self {
+        self.fs_policy_config = config;
+        self
+    }
+
     /// 按指定并行度遍历所有文件元数据（用于冷启动/重建的弹性构建）。
     ///
     /// 注意：这是 FsScanRDD 的专用入口，不改变 `BuildRDD` 的 Iterator 抽象，
@@ -228,6 +242,8 @@ impl FsScanRDD {
                 self.follow_links,
                 self.ignore_enabled,
                 self.exclude_dirs.clone(),
+                self.mount_policy_counters.clone(),
+                self.fs_policy_config.clone(),
                 sink.clone(),
             );
         }
@@ -251,17 +267,24 @@ impl BuildRDD<FileMeta> for FsScanRDD {
             .git_ignore(self.ignore_enabled)
             .git_global(self.ignore_enabled)
             .git_exclude(self.ignore_enabled);
-        let fs_policy = FsPolicy::current_default();
+        let fs_policy = FsPolicy::current_with_config(self.fs_policy_config.clone());
         let root = part.root.clone();
         let exclude_dirs = self.exclude_dirs.clone();
+        let mount_policy_counters = self.mount_policy_counters.clone();
         builder.filter_entry(move |entry| {
             (exclude_dirs.is_empty() || !path_has_excluded_component(entry.path(), &exclude_dirs))
                 && fs_policy
                     .as_ref()
                     .map(|policy| {
-                        policy
-                            .check_path(entry.path(), Some(root.as_path()))
-                            .is_allowed()
+                        if let Some(counters) = mount_policy_counters.as_ref() {
+                            policy
+                                .check_path_counted(entry.path(), Some(root.as_path()), counters)
+                                .is_allowed()
+                        } else {
+                            policy
+                                .check_path(entry.path(), Some(root.as_path()))
+                                .is_allowed()
+                        }
                     })
                     .unwrap_or(true)
         });
@@ -306,6 +329,8 @@ fn scan_partition_parallel(
     follow_links: bool,
     ignore_enabled: bool,
     exclude_dirs: Vec<String>,
+    mount_policy_counters: Option<Arc<SharedMountPolicyCounters>>,
+    fs_policy_config: FsPolicyConfig,
     sink: Arc<dyn Fn(FileMeta) + Send + Sync>,
 ) {
     use ignore::{WalkBuilder, WalkState};
@@ -320,16 +345,22 @@ fn scan_partition_parallel(
         .git_global(ignore_enabled)
         .git_exclude(ignore_enabled)
         .threads(parallelism);
-    let fs_policy = FsPolicy::current_default();
+    let fs_policy = FsPolicy::current_with_config(fs_policy_config);
     let root = part.root.clone();
     builder.filter_entry(move |entry| {
         (exclude_dirs.is_empty() || !path_has_excluded_component(entry.path(), &exclude_dirs))
             && fs_policy
                 .as_ref()
                 .map(|policy| {
-                    policy
-                        .check_path(entry.path(), Some(root.as_path()))
-                        .is_allowed()
+                    if let Some(counters) = mount_policy_counters.as_ref() {
+                        policy
+                            .check_path_counted(entry.path(), Some(root.as_path()), counters)
+                            .is_allowed()
+                    } else {
+                        policy
+                            .check_path(entry.path(), Some(root.as_path()))
+                            .is_allowed()
+                    }
                 })
                 .unwrap_or(true)
     });
