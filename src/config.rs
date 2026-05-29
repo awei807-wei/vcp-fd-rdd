@@ -315,6 +315,21 @@ impl RuntimeProfile {
             Self::MemoryLight => "memory_light",
         }
     }
+
+    pub fn settings(self) -> RuntimeProfileSettings {
+        match self {
+            Self::Default => RuntimeProfileSettings::default(),
+            Self::MemoryLight => RuntimeProfileSettings {
+                auto_flush_overlay_paths: 50_000,
+                auto_flush_overlay_bytes: 16 * 1024 * 1024,
+                periodic_flush_min_events: 1_024,
+                periodic_flush_min_bytes: 1024 * 1024,
+                periodic_flush_max_staleness_secs: 30,
+                rebuild_cooldown_secs: 15,
+                wal_seal_bytes: 16 * 1024 * 1024,
+            },
+        }
+    }
 }
 
 impl std::str::FromStr for RuntimeProfile {
@@ -327,6 +342,31 @@ impl std::str::FromStr for RuntimeProfile {
             other => Err(format!(
                 "unsupported runtime profile {other:?}; expected default or memory_light"
             )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeProfileSettings {
+    pub auto_flush_overlay_paths: u64,
+    pub auto_flush_overlay_bytes: u64,
+    pub periodic_flush_min_events: u64,
+    pub periodic_flush_min_bytes: u64,
+    pub periodic_flush_max_staleness_secs: u64,
+    pub rebuild_cooldown_secs: u64,
+    pub wal_seal_bytes: u64,
+}
+
+impl Default for RuntimeProfileSettings {
+    fn default() -> Self {
+        Self {
+            auto_flush_overlay_paths: 250_000,
+            auto_flush_overlay_bytes: 64 * 1024 * 1024,
+            periodic_flush_min_events: 4_096,
+            periodic_flush_min_bytes: 4 * 1024 * 1024,
+            periodic_flush_max_staleness_secs: 0,
+            rebuild_cooldown_secs: 60,
+            wal_seal_bytes: 0,
         }
     }
 }

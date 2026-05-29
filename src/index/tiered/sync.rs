@@ -12,7 +12,7 @@ use crate::util::{maybe_trim_rss, path_has_excluded_component};
 
 use super::{
     pathbuf_from_bytes, DirtyProcessReport, DirtyScanOutcome, ScanOutcome, StartupRepairStats,
-    TieredIndex, REBUILD_COOLDOWN,
+    TieredIndex,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,7 +178,9 @@ impl TieredIndex {
         let now = Instant::now();
         if let Some(last) = st.last_started_at {
             let elapsed = now.saturating_duration_since(last);
-            if elapsed < REBUILD_COOLDOWN {
+            let cooldown =
+                Duration::from_secs(self.rebuild_cooldown_secs.load(Ordering::Relaxed).max(1));
+            if elapsed < cooldown {
                 if st.scheduled {
                     tracing::debug!(
                         "Rebuild merge: cooldown already scheduled, coalescing ({})",
@@ -187,7 +189,7 @@ impl TieredIndex {
                     return RebuildAdmission::Coalesced;
                 }
 
-                let wait = REBUILD_COOLDOWN - elapsed;
+                let wait = cooldown - elapsed;
                 st.scheduled = true;
                 return RebuildAdmission::Scheduled(wait);
             }

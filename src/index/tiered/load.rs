@@ -18,7 +18,7 @@ use crate::storage::traits::StorageBackend;
 use crate::storage::wal::WalReplayRecord;
 use crate::util::maybe_trim_rss;
 
-use super::{StartupRecoveryReport, TieredIndex};
+use super::{StartupRecoveryReport, TieredIndex, REBUILD_COOLDOWN};
 
 impl TieredIndex {
     #[allow(dead_code, clippy::too_many_arguments)]
@@ -144,6 +144,10 @@ impl TieredIndex {
             // not rebuild a 400K+ file base every interval.
             periodic_flush_min_events: AtomicU64::new(4_096),
             periodic_flush_min_bytes: AtomicU64::new(4 * 1024 * 1024),
+            periodic_flush_max_staleness_secs: AtomicU64::new(0),
+            pending_flush_since_unix_secs: AtomicU64::new(0),
+            rebuild_cooldown_secs: AtomicU64::new(REBUILD_COOLDOWN.as_secs()),
+            wal_seal_bytes: AtomicU64::new(0),
             pending_flush_events: AtomicU64::new(0),
             pending_flush_bytes: AtomicU64::new(0),
             last_snapshot_time: AtomicU64::new(0),

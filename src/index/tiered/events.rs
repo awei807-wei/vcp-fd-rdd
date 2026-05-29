@@ -64,6 +64,13 @@ impl TieredIndex {
         self.pending_flush_events
             .fetch_add(events.len() as u64, Ordering::Relaxed);
         self.pending_flush_bytes.fetch_add(bytes, Ordering::Relaxed);
+        let now = unix_secs();
+        let _ = self.pending_flush_since_unix_secs.compare_exchange(
+            0,
+            now,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
     }
 
     pub(super) fn note_pending_flush_rebuild(&self, idx: &PersistentIndex) {
@@ -71,11 +78,15 @@ impl TieredIndex {
             .store(idx.file_count() as u64, Ordering::Relaxed);
         self.pending_flush_bytes
             .store(idx.memory_stats().estimated_bytes, Ordering::Relaxed);
+        self.pending_flush_since_unix_secs
+            .store(unix_secs(), Ordering::Relaxed);
     }
 
     pub(super) fn reset_pending_flush_batch(&self) {
         self.pending_flush_events.store(0, Ordering::Relaxed);
         self.pending_flush_bytes.store(0, Ordering::Relaxed);
+        self.pending_flush_since_unix_secs
+            .store(0, Ordering::Relaxed);
     }
 
     pub(super) fn periodic_flush_batch_ready(&self) -> bool {
@@ -86,8 +97,17 @@ impl TieredIndex {
         }
         let pending_events = self.pending_flush_events.load(Ordering::Relaxed);
         let pending_bytes = self.pending_flush_bytes.load(Ordering::Relaxed);
-        (min_events > 0 && pending_events >= min_events)
-            || (min_bytes > 0 && pending_bytes >= min_bytes)
+        let hit_batch = (min_events > 0 && pending_events >= min_events)
+            || (min_bytes > 0 && pending_bytes >= min_bytes);
+        if hit_batch {
+            return true;
+        }
+
+        let max_staleness = self
+            .periodic_flush_max_staleness_secs
+            .load(Ordering::Relaxed);
+        let since = self.pending_flush_since_unix_secs.load(Ordering::Relaxed);
+        max_staleness > 0 && since > 0 && unix_secs().saturating_sub(since) >= max_staleness
     }
 
     pub(super) fn maybe_request_flush(&self, overlay_paths: usize, overlay_arena_bytes: u64) {
@@ -119,6 +139,24 @@ impl TieredIndex {
             if let Err(e) = wal.append(events) {
                 tracing::warn!("WAL append failed (continuing without durability): {}", e);
             }
+            self.maybe_request_flush_for_wal_size(wal.dir());
+        }
+    }
+
+    fn maybe_request_flush_for_wal_size(&self, wal_dir: &std::path::Path) {
+        let limit = self.wal_seal_bytes.load(Ordering::Relaxed);
+        if limit == 0 {
+            return;
+        }
+        let current = wal_dir.join("events.wal");
+        let Ok(meta) = std::fs::metadata(&current) else {
+            return;
+        };
+        if meta.len() < limit {
+            return;
+        }
+        if !self.flush_requested.swap(true, Ordering::AcqRel) {
+            self.flush_notify.notify_one();
         }
     }
 
@@ -359,4 +397,11 @@ pub(crate) fn event_record_estimated_bytes(ev: &EventRecord) -> u64 {
         }
     }
     bytes
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

@@ -249,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.io_governor.clone(),
     )
     .await?;
+    index.apply_runtime_profile_settings(runtime_profile.settings());
     let _ = index.attach_wal(store.as_ref());
     index.set_wal_durability(wal_durability);
     index.set_stable_snapshot_enabled(cfg.stable_snapshot_enabled);

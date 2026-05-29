@@ -21,6 +21,7 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
+use crate::config::RuntimeProfileSettings;
 use crate::core::AdaptiveScheduler;
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::DirtyQueue;
@@ -194,6 +195,10 @@ pub struct TieredIndex {
     pub(self) auto_flush_overlay_bytes: AtomicU64,
     pub(self) periodic_flush_min_events: AtomicU64,
     pub(self) periodic_flush_min_bytes: AtomicU64,
+    pub(self) periodic_flush_max_staleness_secs: AtomicU64,
+    pub(self) pending_flush_since_unix_secs: AtomicU64,
+    pub(self) rebuild_cooldown_secs: AtomicU64,
+    pub(self) wal_seal_bytes: AtomicU64,
     pub(self) pending_flush_events: AtomicU64,
     pub(self) pending_flush_bytes: AtomicU64,
     pub(self) last_snapshot_time: AtomicU64,
@@ -241,6 +246,25 @@ impl TieredIndex {
     pub fn set_stable_snapshot_enabled(&self, enabled: bool) {
         self.stable_snapshot_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn apply_runtime_profile_settings(&self, settings: RuntimeProfileSettings) {
+        self.set_auto_flush_limits(
+            settings.auto_flush_overlay_paths,
+            settings.auto_flush_overlay_bytes,
+        );
+        self.set_periodic_flush_batch_limits(
+            settings.periodic_flush_min_events,
+            settings.periodic_flush_min_bytes,
+        );
+        self.periodic_flush_max_staleness_secs.store(
+            settings.periodic_flush_max_staleness_secs,
+            Ordering::Relaxed,
+        );
+        self.rebuild_cooldown_secs
+            .store(settings.rebuild_cooldown_secs.max(1), Ordering::Relaxed);
+        self.wal_seal_bytes
+            .store(settings.wal_seal_bytes, Ordering::Relaxed);
     }
 
     pub fn set_wal_durability(&self, durability: WalDurability) {

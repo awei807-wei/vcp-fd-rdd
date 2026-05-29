@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::RuntimeProfile;
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::{DirtyReason, DirtyScope};
@@ -32,6 +33,13 @@ fn unique_tmp_dir(tag: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("fd-rdd-{}-{}", tag, nanos))
+}
+
+fn unix_secs_for_test() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn test_mount_identity() -> MountIdentity {
@@ -506,6 +514,156 @@ fn rebuild_cooldown_coalesces_duplicate_requests() {
     assert!(!st.in_progress);
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn memory_light_profile_applies_runtime_flush_and_rebuild_controls() {
+    let root = unique_tmp_dir("memory-light-settings");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let settings = RuntimeProfile::MemoryLight.settings();
+    idx.apply_runtime_profile_settings(settings);
+
+    assert_eq!(
+        idx.auto_flush_overlay_paths
+            .load(std::sync::atomic::Ordering::Relaxed),
+        settings.auto_flush_overlay_paths
+    );
+    assert_eq!(
+        idx.auto_flush_overlay_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        settings.auto_flush_overlay_bytes
+    );
+    assert_eq!(
+        idx.periodic_flush_min_events
+            .load(std::sync::atomic::Ordering::Relaxed),
+        settings.periodic_flush_min_events
+    );
+    assert_eq!(
+        idx.periodic_flush_min_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        settings.periodic_flush_min_bytes
+    );
+    assert_eq!(
+        idx.periodic_flush_max_staleness_secs
+            .load(std::sync::atomic::Ordering::Relaxed),
+        settings.periodic_flush_max_staleness_secs
+    );
+    assert_eq!(
+        idx.rebuild_cooldown_secs
+            .load(std::sync::atomic::Ordering::Relaxed),
+        settings.rebuild_cooldown_secs
+    );
+    assert_eq!(
+        idx.wal_seal_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        settings.wal_seal_bytes
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn default_profile_settings_preserve_existing_flush_controls() {
+    let defaults = RuntimeProfile::Default.settings();
+
+    assert_eq!(defaults.auto_flush_overlay_paths, 250_000);
+    assert_eq!(defaults.auto_flush_overlay_bytes, 64 * 1024 * 1024);
+    assert_eq!(defaults.periodic_flush_min_events, 4_096);
+    assert_eq!(defaults.periodic_flush_min_bytes, 4 * 1024 * 1024);
+    assert_eq!(defaults.periodic_flush_max_staleness_secs, 0);
+    assert_eq!(defaults.rebuild_cooldown_secs, REBUILD_COOLDOWN.as_secs());
+    assert_eq!(defaults.wal_seal_bytes, 0);
+}
+
+#[test]
+fn memory_light_rebuild_cooldown_is_shorter_than_default() {
+    let root = unique_tmp_dir("memory-light-rebuild-cooldown");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_runtime_profile_settings(RuntimeProfile::MemoryLight.settings());
+    assert!(idx.try_start_rebuild_force());
+    let new_l2 = Arc::new(PersistentIndex::new_with_roots(vec![root.clone()]));
+    assert!(!idx.finish_rebuild(new_l2));
+
+    let admission = idx.reserve_rebuild_with_cooldown("memory light test");
+    assert!(matches!(
+        admission,
+        RebuildAdmission::Scheduled(wait) if wait <= std::time::Duration::from_secs(15)
+    ));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn periodic_flush_max_staleness_can_force_ready_batch() {
+    let root = unique_tmp_dir("periodic-staleness");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.set_auto_flush_limits(0, 0);
+    idx.set_periodic_flush_batch_limits(10_000, 10_000_000);
+    idx.periodic_flush_max_staleness_secs
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+
+    let p = root.join("stale.txt");
+    std::fs::write(&p, b"stale").unwrap();
+    idx.apply_events(&[mk_event(1, EventType::Create, p)]);
+    assert!(!idx.periodic_flush_batch_ready());
+
+    idx.pending_flush_since_unix_secs.store(
+        unix_secs_for_test().saturating_sub(31),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    assert!(idx.periodic_flush_batch_ready());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn wal_size_threshold_requests_snapshot_seal() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("wal-size-threshold");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.attach_wal(store.as_ref())?;
+    idx.set_auto_flush_limits(0, 0);
+    idx.set_periodic_flush_batch_limits(10_000, 10_000_000);
+    idx.wal_seal_bytes
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+
+    let p = content_root.join("wal-trigger.txt");
+    std::fs::write(&p, b"wal")?;
+    idx.apply_events(&[mk_event(1, EventType::Create, p.clone())]);
+    assert!(
+        idx.flush_requested
+            .load(std::sync::atomic::Ordering::Acquire),
+        "WAL size threshold should request a snapshot boundary"
+    );
+    assert!(
+        !idx.query("wal-trigger").is_empty(),
+        "WAL-triggered flush request must not block normal event visibility"
+    );
+
+    idx.snapshot_now(store.clone()).await?;
+    assert!(
+        !idx.flush_requested
+            .load(std::sync::atomic::Ordering::Acquire),
+        "snapshot should clear the WAL-triggered flush request"
+    );
+    assert!(store.path().with_extension("v7").exists());
+
+    let loaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    assert!(!loaded.query("wal-trigger").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }
 
 #[test]
