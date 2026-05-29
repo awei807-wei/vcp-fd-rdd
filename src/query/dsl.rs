@@ -1,4 +1,4 @@
-use crate::core::FileMeta;
+use crate::core::{FileKind, FileMeta};
 use crate::query::matcher::{
     contains_path_separator, create_matcher, ExtMatcher, MatchAllMatcher, Matcher,
     PathInitialsMatcher, PathScope, RegexMatcher, WfnMatcher,
@@ -51,15 +51,9 @@ pub enum Atom {
     /// len:>30 (filename byte length)
     NameLen(CmpOp, usize),
     /// type:file / type:folder
-    EntryType(EntryKind),
+    EntryType(FileKind),
     /// content:keyword (全文搜索，占位)
     Content(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntryKind {
-    File,
-    Folder,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,7 +154,7 @@ enum Filter {
     Parent(String),
     Depth(CmpOp, usize),
     NameLen(CmpOp, usize),
-    EntryType(EntryKind),
+    EntryType(FileKind),
     Content(String),
 }
 
@@ -207,11 +201,7 @@ impl Filter {
                 let len = meta.path.file_name().map(|f| f.len()).unwrap_or(0);
                 apply_cmp(*op, len as u64, *n as u64)
             }
-            Filter::EntryType(kind) => match kind {
-                // We only index files currently; folder matches always false
-                EntryKind::File => true,
-                EntryKind::Folder => false,
-            },
+            Filter::EntryType(kind) => meta.kind == *kind,
             Filter::Content(_) => {
                 // TODO: 接入全文索引后实现真正的内容匹配
                 false
@@ -703,8 +693,8 @@ fn parse_atom_expr(word: &str, case_sensitive: &mut bool) -> Result<Expr, QueryC
         Some("type") => {
             let v = unquote(tail)?.to_lowercase();
             let kind = match v.as_str() {
-                "folder" | "dir" | "directory" => EntryKind::Folder,
-                _ => EntryKind::File,
+                "folder" | "dir" | "directory" => FileKind::Directory,
+                _ => FileKind::File,
             };
             Ok(Expr::Atom(Atom::EntryType(kind)))
         }
@@ -1118,7 +1108,7 @@ fn time_t_to_system_time(t: libc::time_t) -> std::time::SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{FileKey, FileMeta};
+    use crate::core::{FileKey, FileKind, FileMeta};
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
@@ -1134,6 +1124,7 @@ mod tests {
             mtime,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         }
     }
 
@@ -1175,6 +1166,25 @@ mod tests {
         assert!(q.matches(&m1));
         let m2 = meta("/a/十一.txt", 1, None);
         assert!(!q.matches(&m2));
+    }
+
+    #[test]
+    fn type_filter_uses_entry_kind() {
+        let file = meta("/work/report.txt", 1, None);
+        let mut dir = meta("/work/reports", 0, None);
+        dir.kind = FileKind::Directory;
+
+        let file_query = compile_query("type:file").unwrap();
+        assert!(file_query.matches(&file));
+        assert!(!file_query.matches(&dir));
+
+        let dir_query = compile_query("type:dir").unwrap();
+        assert!(!dir_query.matches(&file));
+        assert!(dir_query.matches(&dir));
+
+        let folder_query = compile_query("type:folder").unwrap();
+        assert!(!folder_query.matches(&file));
+        assert!(folder_query.matches(&dir));
     }
 
     #[test]

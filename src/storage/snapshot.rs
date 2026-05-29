@@ -1705,6 +1705,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
         idx.upsert(FileMeta {
             file_key: FileKey {
@@ -1717,6 +1718,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         let store = SnapshotStore::new(root.join("index.db"));
@@ -1766,6 +1768,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         let store = SnapshotStore::new(root.join("index.db"));
@@ -1812,6 +1815,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         let store = SnapshotStore::new(root.join("index.db"));
@@ -1842,6 +1846,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         let store = SnapshotStore::new(root.join("index.db"));
@@ -1922,6 +1927,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
         let base = idx.export_segments_v6();
         store
@@ -1943,6 +1949,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
         let delta = delta_idx.export_segments_v6();
         let appended = store
@@ -1977,6 +1984,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
         let segs = idx.export_segments_v6();
         let appended = store

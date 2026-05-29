@@ -19,6 +19,7 @@ fn unicode_casefold_query_handles_sharp_s_length_jump() {
         mtime: None,
         ctime: None,
         atime: None,
+        kind: Default::default(),
     });
 
     let matcher = create_matcher("strasse", false);
@@ -41,6 +42,7 @@ fn case_sensitive_query_does_not_merge_distinct_sensitive_paths() {
         mtime: None,
         ctime: None,
         atime: None,
+        kind: Default::default(),
     });
     idx.upsert(FileMeta {
         file_key: FileKey {
@@ -53,6 +55,7 @@ fn case_sensitive_query_does_not_merge_distinct_sensitive_paths() {
         mtime: None,
         ctime: None,
         atime: None,
+        kind: Default::default(),
     });
 
     let matcher = create_matcher("Test.txt", true);

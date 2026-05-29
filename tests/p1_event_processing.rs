@@ -72,6 +72,7 @@ fn rename_event_updates_index() {
         mtime: None,
         ctime: None,
         atime: None,
+        kind: Default::default(),
     });
 
     // L2 被外部直接修改后需要刷新 base 索引

@@ -1412,6 +1412,7 @@ fn query_same_path_different_filekey_prefers_delta_overlay() {
         mtime: None,
         ctime: None,
         atime: None,
+        kind: Default::default(),
     });
     idx.refresh_base();
     idx.apply_events(&[mk_event(2, EventType::Create, a.clone())]);
@@ -1521,6 +1522,7 @@ async fn lsm_offline_dir_mtime_change_skips_disk_segments() {
         mtime: None,
         ctime: None,
         atime: None,
+        kind: Default::default(),
     });
     store
         .lsm_replace_base_v6(

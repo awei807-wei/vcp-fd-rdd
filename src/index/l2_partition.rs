@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "rkyv")]
 use crate::core::FileKeyEntry;
-use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta};
+use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta};
 use crate::index::case_policy::{folded_lookup_bytes_lossy, for_each_folded_trigram};
 use crate::index::file_entry_v2::FileEntry;
 use crate::index::parent_index::PathTable as PathTableTrait;
@@ -1164,6 +1164,7 @@ impl PersistentIndex {
                 mtime: meta.mtime,
                 ctime: None,
                 atime: None,
+                kind: FileKind::File,
             });
         }
 
@@ -1184,6 +1185,7 @@ impl PersistentIndex {
                 mtime: meta.mtime,
                 ctime: None,
                 atime: None,
+                kind: FileKind::File,
             });
         }
     }
@@ -1271,6 +1273,7 @@ impl PersistentIndex {
                 mtime: meta.mtime,
                 ctime: None,
                 atime: None,
+                kind: FileKind::File,
             });
         }
     }
@@ -1794,6 +1797,7 @@ impl PersistentIndex {
             mtime: mtime_from_ns(entry.mtime_ns),
             ctime: None,
             atime: None,
+            kind: FileKind::File,
         }
     }
 
@@ -2266,6 +2270,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
         idx.upsert(FileMeta {
             file_key: FileKey {
@@ -2278,6 +2283,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         let m = create_matcher("alpha", true);
@@ -2300,6 +2306,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
         idx.upsert(FileMeta {
             file_key: FileKey {
@@ -2312,6 +2319,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         let m = create_matcher("ab", true);
@@ -2338,6 +2346,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         assert_eq!(idx.file_count(), 1);
@@ -2361,6 +2370,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         let long_path = PathBuf::from(format!("/tmp/{}", "b".repeat(u16::MAX as usize + 1)));
@@ -2375,6 +2385,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         assert_eq!(idx.file_count(), 1);
@@ -2416,6 +2427,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         let new_project = root.join("new_project");
@@ -2429,6 +2441,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         let meta = idx.get_meta(file_key).expect("file should remain indexed");
@@ -2462,6 +2475,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         let m = create_matcher("中文", true);

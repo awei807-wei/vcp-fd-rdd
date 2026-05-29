@@ -35,6 +35,7 @@ fn fast_compaction_equivalence() {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         };
         idx.upsert(meta);
     }

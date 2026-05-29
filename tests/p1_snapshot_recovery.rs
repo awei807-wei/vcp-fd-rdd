@@ -36,6 +36,7 @@ fn one_file_base(root: &std::path::Path, name: &str) -> fd_rdd::index::base_inde
         mtime: None,
         ctime: None,
         atime: None,
+        kind: Default::default(),
     });
     idx.to_base_index_data()
 }

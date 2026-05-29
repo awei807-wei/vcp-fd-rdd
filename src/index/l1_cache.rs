@@ -299,6 +299,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         }
     }
 

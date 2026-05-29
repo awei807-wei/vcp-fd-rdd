@@ -5,4 +5,6 @@ pub mod rdd;
 
 pub use adaptive::{AdaptiveScheduler, ExecutionStrategy, Task};
 pub use lineage::{EventRecord, EventType, FileIdentifier};
-pub use rdd::{BuildLineage, BuildRDD, FileKey, FileKeyEntry, FileMeta, FsScanRDD, Partition};
+pub use rdd::{
+    BuildLineage, BuildRDD, FileKey, FileKeyEntry, FileKind, FileMeta, FsScanRDD, Partition,
+};

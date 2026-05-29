@@ -35,6 +35,7 @@ fn one_file_base(root: &Path, name: &str) -> fd_rdd::index::base_index::BaseInde
         mtime: meta.modified().ok(),
         ctime: meta.created().ok(),
         atime: meta.accessed().ok(),
+        kind: Default::default(),
     });
     idx.to_base_index_data()
 }
@@ -123,6 +124,7 @@ async fn audit_missing_lsm_segment_requires_rebuild() {
         mtime: meta.modified().ok(),
         ctime: None,
         atime: None,
+        kind: Default::default(),
     });
     let segment = store
         .lsm_append_delta_v6(

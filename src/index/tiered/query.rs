@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Instant};
 
-use crate::core::{EventRecord, FileKey, FileMeta};
+use crate::core::{EventRecord, FileKey, FileKind, FileMeta};
 use crate::event::sync::DirtyReason;
 use crate::index::base_index::BaseIndexData;
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
@@ -370,6 +370,7 @@ impl TieredIndex {
                 mtime: m.modified().ok(),
                 ctime: m.created().ok(),
                 atime: m.accessed().ok(),
+                kind: FileKind::File,
             });
         }
 
@@ -513,6 +514,7 @@ impl TieredIndex {
                 mtime: current_mtime,
                 ctime: fs_meta.created().ok(),
                 atime: fs_meta.accessed().ok(),
+                kind: FileKind::File,
             };
             return Some(QueryResultMeta::cold(
                 current,

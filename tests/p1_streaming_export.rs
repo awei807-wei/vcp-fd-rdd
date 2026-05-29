@@ -35,6 +35,7 @@ fn streaming_export_byte_identical() {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         };
         idx.upsert(meta);
     }

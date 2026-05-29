@@ -35,6 +35,7 @@ fn build_index_with_files(root: &Path, files: &[(&str, u64)]) -> Arc<TieredIndex
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
     }
     index
@@ -125,6 +126,7 @@ fn smart_case_handles_case_distinct_siblings() {
                 mtime: None,
                 ctime: None,
                 atime: None,
+                kind: Default::default(),
             },
             FileMeta {
                 file_key: FileKey {
@@ -137,6 +139,7 @@ fn smart_case_handles_case_distinct_siblings() {
                 mtime: None,
                 ctime: None,
                 atime: None,
+                kind: Default::default(),
             },
         ],
     );
@@ -185,6 +188,7 @@ fn score_sort_prefers_basename_match_over_path_segment_match() {
                 mtime: None,
                 ctime: None,
                 atime: None,
+                kind: Default::default(),
             },
             FileMeta {
                 file_key: FileKey {
@@ -197,6 +201,7 @@ fn score_sort_prefers_basename_match_over_path_segment_match() {
                 mtime: None,
                 ctime: None,
                 atime: None,
+                kind: Default::default(),
             },
         ],
     );
@@ -235,6 +240,7 @@ fn score_sort_prefers_boundary_hit_for_env_style_files() {
                 mtime: None,
                 ctime: None,
                 atime: None,
+                kind: Default::default(),
             },
             FileMeta {
                 file_key: FileKey {
@@ -247,6 +253,7 @@ fn score_sort_prefers_boundary_hit_for_env_style_files() {
                 mtime: None,
                 ctime: None,
                 atime: None,
+                kind: Default::default(),
             },
         ],
     );
@@ -285,6 +292,7 @@ fn score_sort_demotes_node_modules_when_query_has_no_node_hint() {
                 mtime: None,
                 ctime: None,
                 atime: None,
+                kind: Default::default(),
             },
             FileMeta {
                 file_key: FileKey {
@@ -297,6 +305,7 @@ fn score_sort_demotes_node_modules_when_query_has_no_node_hint() {
                 mtime: None,
                 ctime: None,
                 atime: None,
+                kind: Default::default(),
             },
         ],
     );
@@ -335,6 +344,7 @@ fn score_sort_uses_shorter_basename_as_tiebreaker() {
                 mtime: None,
                 ctime: None,
                 atime: None,
+                kind: Default::default(),
             },
             FileMeta {
                 file_key: FileKey {
@@ -347,6 +357,7 @@ fn score_sort_uses_shorter_basename_as_tiebreaker() {
                 mtime: None,
                 ctime: None,
                 atime: None,
+                kind: Default::default(),
             },
         ],
     );
@@ -388,6 +399,7 @@ fn large_result_set_query_does_not_oom() {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
     }
 
@@ -495,6 +507,7 @@ fn depth_len_and_type_filters_work() {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         },
         FileMeta {
             file_key: FileKey {
@@ -507,6 +520,7 @@ fn depth_len_and_type_filters_work() {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         },
         FileMeta {
             file_key: FileKey {
@@ -519,6 +533,7 @@ fn depth_len_and_type_filters_work() {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         },
         FileMeta {
             file_key: FileKey {
@@ -531,6 +546,7 @@ fn depth_len_and_type_filters_work() {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         },
         FileMeta {
             file_key: FileKey {
@@ -543,6 +559,7 @@ fn depth_len_and_type_filters_work() {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         },
     ];
     let index = build_index_with_metas(&root, &metas);
@@ -599,6 +616,7 @@ fn execute_query_sorts_by_modified_time() {
             mtime: Some(oldest),
             ctime: Some(older),
             atime: Some(oldest),
+            kind: Default::default(),
         },
         FileMeta {
             file_key: FileKey {
@@ -611,6 +629,7 @@ fn execute_query_sorts_by_modified_time() {
             mtime: Some(older),
             ctime: Some(oldest),
             atime: Some(older),
+            kind: Default::default(),
         },
         FileMeta {
             file_key: FileKey {
@@ -623,6 +642,7 @@ fn execute_query_sorts_by_modified_time() {
             mtime: Some(now),
             ctime: Some(now),
             atime: Some(now),
+            kind: Default::default(),
         },
     ];
     let index = build_index_with_metas(&root, &metas);

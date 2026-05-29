@@ -7,7 +7,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::core::{FileKey, FileMeta};
+use crate::core::{FileKey, FileKind, FileMeta};
 use crate::index::base_index::{BaseIndexData, FileEntryIndex, TrigramIndex};
 use crate::index::file_entry_v2::FileEntry;
 use crate::index::parent_index::ParentIndex;
@@ -566,6 +566,7 @@ fn entry_to_meta(entry: FileEntry, path_bytes: Vec<u8>) -> FileMeta {
         },
         ctime: None,
         atime: None,
+        kind: FileKind::File,
     }
 }
 

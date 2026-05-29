@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta, Task};
+use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta, Task};
 use crate::event::sync::{now_ns, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyScope};
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
 use crate::index::PathFreshness;
@@ -597,6 +597,7 @@ impl TieredIndex {
                     mtime: meta.modified().ok(),
                     ctime: meta.created().ok(),
                     atime: meta.accessed().ok(),
+                    kind: FileKind::File,
                 });
                 upsert_events.push(EventRecord {
                     seq,
@@ -757,6 +758,7 @@ impl TieredIndex {
                     mtime,
                     ctime: meta.created().ok(),
                     atime: meta.accessed().ok(),
+                    kind: FileKind::File,
                 });
                 upsert_events.push(EventRecord {
                     seq,

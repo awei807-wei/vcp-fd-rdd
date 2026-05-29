@@ -584,6 +584,7 @@ mod tests {
             mtime,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         }
     }
 

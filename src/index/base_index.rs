@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::core::{FileKey, FileMeta};
+use crate::core::{FileKey, FileKind, FileMeta};
 use crate::index::case_policy::{folded_lookup_bytes_lossy, unicode_case_fold_lookup};
 pub use crate::index::file_entry_v2::{FileEntry, FileEntryIndex};
 use crate::index::parent_index::ParentIndex;
@@ -839,6 +839,7 @@ fn entry_to_meta(entry: &FileEntry, path_bytes: &[u8]) -> FileMeta {
         },
         ctime: None,
         atime: None,
+        kind: FileKind::File,
     }
 }
 

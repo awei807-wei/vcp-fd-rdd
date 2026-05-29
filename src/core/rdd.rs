@@ -105,6 +105,23 @@ pub struct FileKeyEntry {
     pub doc_id: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FileKind {
+    #[default]
+    File,
+    Directory,
+}
+
+impl FileKind {
+    pub fn is_file(self) -> bool {
+        matches!(self, Self::File)
+    }
+
+    pub fn is_directory(self) -> bool {
+        matches!(self, Self::Directory)
+    }
+}
+
 /// 文件元数据
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileMeta {
@@ -118,6 +135,8 @@ pub struct FileMeta {
     /// 最近访问时间（不持久化到快照）
     #[serde(default, skip_serializing)]
     pub atime: Option<std::time::SystemTime>,
+    #[serde(default)]
+    pub kind: FileKind,
 }
 
 /// 分区定义（用于构建流水线）
@@ -328,6 +347,7 @@ impl BuildRDD<FileMeta> for FsScanRDD {
                     mtime: meta.modified().ok(),
                     ctime: meta.created().ok(),
                     atime: meta.accessed().ok(),
+                    kind: FileKind::File,
                 })
             });
 
@@ -415,6 +435,7 @@ fn scan_partition_parallel(
                 mtime: meta.modified().ok(),
                 ctime: meta.created().ok(),
                 atime: meta.accessed().ok(),
+                kind: FileKind::File,
             });
 
             WalkState::Continue

@@ -34,6 +34,7 @@ fn one_physical_file_base(
         mtime: meta.modified().ok(),
         ctime: meta.created().ok(),
         atime: meta.accessed().ok(),
+        kind: Default::default(),
     });
     idx.to_base_index_data()
 }

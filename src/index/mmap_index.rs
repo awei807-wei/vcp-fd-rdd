@@ -6,7 +6,7 @@ use roaring::RoaringTreemap;
 
 #[cfg(feature = "rkyv")]
 use crate::core::FileKeyEntry;
-use crate::core::{FileKey, FileMeta};
+use crate::core::{FileKey, FileKind, FileMeta};
 use crate::index::IndexLayer;
 use crate::query::matcher::Matcher;
 use crate::storage::snapshot::MmapSnapshotV6;
@@ -579,6 +579,7 @@ impl MmapIndex {
             mtime,
             ctime: None,
             atime: None,
+            kind: FileKind::File,
         })
     }
 
@@ -625,6 +626,7 @@ impl MmapIndex {
                     mtime,
                     ctime: None,
                     atime: None,
+                    kind: FileKind::File,
                 });
             }
             return out;
@@ -655,6 +657,7 @@ impl MmapIndex {
                 mtime,
                 ctime: None,
                 atime: None,
+                kind: FileKind::File,
             });
         }
 
@@ -685,6 +688,7 @@ impl MmapIndex {
                 mtime,
                 ctime: None,
                 atime: None,
+                kind: FileKind::File,
             });
         }
     }
@@ -792,6 +796,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         let store = SnapshotStore::new(root.join("index.db"));
@@ -887,6 +892,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
         idx.upsert(FileMeta {
             file_key: FileKey {
@@ -899,6 +905,7 @@ mod tests {
             mtime: None,
             ctime: None,
             atime: None,
+            kind: Default::default(),
         });
 
         // 模拟“旧段”：仅 basename 建 trigram，且无哨兵 key。
@@ -954,6 +961,7 @@ mod tests {
                 mtime: None,
                 ctime: None,
                 atime: None,
+                kind: Default::default(),
             });
         }
 
