@@ -405,6 +405,10 @@ impl DiagnosticSource for TieredIndex {
             "unset".to_string()
         };
         report.io.ioprio_set_failed = report.io.ioprio_set_failed || ioprio_failed;
+        if let Some(pressure) = self.io_governor.last_pressure() {
+            report.io.psi_some_avg10 = Some(pressure.some_avg10);
+            report.io.psi_full_avg10 = Some(pressure.full_avg10);
+        }
         report.io.backoff_count = report
             .io
             .backoff_count

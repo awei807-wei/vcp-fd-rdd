@@ -152,6 +152,7 @@ pub struct IoGovernor {
     enabled: bool,
     bucket: Mutex<TokenBucket>,
     backoff: Mutex<BackoffState>,
+    last_pressure: Mutex<Option<IoPressure>>,
     operations: AtomicU64,
     backoff_count: AtomicU64,
     backoff_millis: AtomicU64,
@@ -171,6 +172,7 @@ impl IoGovernor {
                 stat_rate_per_sec.max(1),
             )),
             backoff: Mutex::new(BackoffState::default()),
+            last_pressure: Mutex::new(None),
             operations: AtomicU64::new(0),
             backoff_count: AtomicU64::new(0),
             backoff_millis: AtomicU64::new(0),
@@ -201,6 +203,7 @@ impl IoGovernor {
         if !self.enabled {
             return;
         }
+        *self.last_pressure.lock().unwrap() = Some(pressure);
         let delay = self.backoff.lock().unwrap().observe(pressure, policy);
         if delay.is_zero() {
             return;
@@ -217,6 +220,10 @@ impl IoGovernor {
 
     pub fn backoff_count(&self) -> u64 {
         self.backoff_count.load(Ordering::Relaxed)
+    }
+
+    pub fn last_pressure(&self) -> Option<IoPressure> {
+        *self.last_pressure.lock().unwrap()
     }
 
     pub fn token_bucket_limited_count(&self) -> u64 {
@@ -323,6 +330,27 @@ mod tests {
 
         assert_eq!(governor.operations(), 0);
         assert_eq!(governor.token_bucket_limited_count(), 0);
+    }
+
+    #[test]
+    fn governor_records_last_pressure() {
+        let governor = IoGovernor::new(true, 1_000);
+        let pressure = IoPressure {
+            some_avg10: 18.5,
+            full_avg10: 1.25,
+        };
+        governor.observe_pressure(
+            pressure,
+            BackoffPolicy {
+                some_threshold: 100.0,
+                full_threshold: 100.0,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+        );
+
+        assert_eq!(governor.last_pressure(), Some(pressure));
+        assert_eq!(governor.backoff_count(), 0);
     }
 
     #[test]

@@ -150,7 +150,7 @@ fn tiered_diagnostics_include_io_governor_counters() {
     idx.io_governor.observe_pressure(
         IoPressure {
             some_avg10: 20.0,
-            full_avg10: 0.0,
+            full_avg10: 1.5,
         },
         BackoffPolicy {
             some_threshold: 10.0,
@@ -162,6 +162,8 @@ fn tiered_diagnostics_include_io_governor_counters() {
 
     let mut report = DiagnosticReport::default();
     idx.collect(&mut report);
+    assert_eq!(report.io.psi_some_avg10, Some(20.0));
+    assert_eq!(report.io.psi_full_avg10, Some(1.5));
     assert_eq!(report.io.backoff_count, 1);
     assert_eq!(report.io.token_bucket_limited_count, 0);
 
