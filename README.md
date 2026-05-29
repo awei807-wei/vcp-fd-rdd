@@ -191,7 +191,7 @@ DirtyQueue 是冷层补偿的统一入口，会合并来自 inotify 冷层事件
 
 Runtime Boundary State Contract 规定了远程/虚拟文件系统离线时的状态顺序：先加载 snapshot 并 attach WAL，再从 quarantine sidecar 恢复 root state 并安装 Freeze Gate，随后按 WAL 原始记录顺序回放 root state 与文件事件，最后才启动 DeltaBuffer/event pipeline 和旁车校验。WAL 支持 `OFFLINE_ROOT` / `ONLINE_ROOT` 根状态记录；quarantine sidecar 使用 `root_path + mount_id + major:minor + fs_uuid? + source + fstype + affected_prefixes` 作为物理锚点，不使用 PathId/DocId 作为持久主键。Freeze Gate 会阻止离线 root 下的 Delete/Modify/Rename 进入 DeltaBuffer，查询默认隐藏离线 root 结果；设备恢复后先写入 `ONLINE_ROOT`，再解除 freeze 并把 affected prefixes 加入局部对账队列。
 
-`/health` 保留既有 summary 字段，同时新增强类型 `diagnostics`：`system`、`storage`、`security`、`clocks`、`watchers`、`io`。`diagnostics.storage` 暴露 `quarantine_verify_pending`、`quarantine_verified_roots`、`freeze_gates`、`freeze_blocked_events`、`hardlink_group_count` 和 `hardlink_max_group_size`；hardlink 统计来自当前可见 path/docid 的临时物理分组视图，不改变搜索主键。`diagnostics.watchers` 会汇总 full build、rebuild、fast-sync、immediate scan、dynamic watch 和 ephemeral watch 入口的 mount policy 拒绝原因，包括 `denied_mount_count`、`fstype_blocked_count`、`network_fs_ignored_count`、`one_file_system_boundary_count`、`fuse_probe_timeout_count` 和 `allowed_override_count`。FUSE/SSHFS 可疑 mount 会先进入后台 probe timeout cache；扫描线程只消费缓存状态，pending/timeout/failed 时保守拒绝，不在扫描线程直接执行可能挂起的 `readdir`。运行时探测状态只出现在 diagnostics/runtime state 中，不写回用户配置。结构化 roots 配置使用对象数组：
+`/health` 保留既有 summary 字段，同时新增强类型 `diagnostics`：`system`、`storage`、`security`、`clocks`、`watchers`、`io`。`diagnostics.storage` 暴露 `quarantine_verify_pending`、`quarantine_verified_roots`、`freeze_gates`、`freeze_blocked_events`、`hardlink_group_count`、`hardlink_max_group_size`、`content_index_enabled`、`content_indexed_paths`、`content_indexed_bytes` 和 `content_index_last_elapsed_ms`；hardlink 统计来自当前可见 path/docid 的临时物理分组视图，不改变搜索主键。`diagnostics.watchers` 会汇总 full build、rebuild、fast-sync、immediate scan、dynamic watch 和 ephemeral watch 入口的 mount policy 拒绝原因，包括 `denied_mount_count`、`fstype_blocked_count`、`network_fs_ignored_count`、`one_file_system_boundary_count`、`fuse_probe_timeout_count` 和 `allowed_override_count`。FUSE/SSHFS 可疑 mount 会先进入后台 probe timeout cache；扫描线程只消费缓存状态，pending/timeout/failed 时保守拒绝，不在扫描线程直接执行可能挂起的 `readdir`。运行时探测状态只出现在 diagnostics/runtime state 中，不写回用户配置。结构化 roots 配置使用对象数组：
 
 ```toml
 [[roots]]
@@ -340,7 +340,7 @@ jq '{
 
 `runtime_profile = "memory_light"` 适合更关注常驻内存上限、可接受更频繁 snapshot/flush 的环境。该模式会降低 DeltaBuffer 触发 flush 的路径数/字节门槛，给周期 flush 增加最大滞留时间，缩短 rebuild 合并冷却，并在 WAL 体积超过阈值时请求 snapshot 边界；强制 flush、退出前 final snapshot、WAL replay 和离线 root 的 Freeze Gate 保护不变。CLI 可用 `--runtime-profile memory_light` 临时覆盖。
 
-内容索引默认关闭，`content:` / `text:` 查询会返回明确的 unsupported 错误，避免默认文件名查询热路径读取文件内容。启用前需配置 `[content_index]` 的文件大小和后缀策略。
+内容索引默认关闭，`content:` / `text:` 查询会返回明确的 unsupported 错误，避免默认文件名查询热路径读取文件内容。启用 `[content_index]` 后，后台低优先级 worker 会按 `max_file_size`、`include_ext`、`exclude_ext`、exclude 目录、mount policy 和 I/O governor 维护轻量文本索引；查询只读取该索引，不在热路径打开文件。
 
 可用 `scripts/fs-churn.py` 做默认 profile 与 `memory_light` 的 churn 对照：
 
@@ -390,7 +390,7 @@ fd-rdd --show-config
 | `type:` | `type:file` | 文件类型 |
 | `empty:` | `type:dir empty:` | 真实空目录 |
 | `dupe:` | `dupe: hardlink` / `dupe:content` | hardlink 重复路径；显式 `dupe:content` 使用 size + partial/full hash 查找同内容副本 |
-| `content:` / `text:` | `content:needle` | 内容查询，默认关闭时返回 unsupported |
+| `content:` / `text:` | `content:needle` | 内容查询；默认关闭时返回 unsupported，启用 `[content_index]` 后查询已索引文本 |
 | `doc:` / `pic:` / `video:` | `pic:十一` | 按扩展名集合 |
 | `len:` | `len:>50` | 文件名字节长度 |
 

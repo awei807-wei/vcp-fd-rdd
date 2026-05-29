@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use crate::core::FileMeta;
 use crate::query::dsl::CompiledQuery;
@@ -46,6 +46,18 @@ impl QueryPlan {
         }
     }
 
+    pub(super) fn matches_with_content<F>(&self, meta: &FileMeta, content_matches: &F) -> bool
+    where
+        F: Fn(&Path, &str) -> bool + ?Sized,
+    {
+        match &self.evaluator {
+            QueryEvaluator::Legacy(matcher) => matcher.matches(&meta.path.to_string_lossy()),
+            QueryEvaluator::Compiled(compiled) => {
+                compiled.matches_with_content(meta, content_matches)
+            }
+        }
+    }
+
     pub(super) fn parent_filter(&self) -> Option<String> {
         match &self.evaluator {
             QueryEvaluator::Compiled(compiled) => compiled.extract_parent_filter(),
@@ -71,6 +83,13 @@ impl QueryPlan {
         match &self.evaluator {
             QueryEvaluator::Compiled(compiled) => compiled.requires_content_index(),
             QueryEvaluator::Legacy(_) => false,
+        }
+    }
+
+    pub(super) fn content_terms(&self) -> &[String] {
+        match &self.evaluator {
+            QueryEvaluator::Compiled(compiled) => compiled.content_terms(),
+            QueryEvaluator::Legacy(_) => &[],
         }
     }
 }

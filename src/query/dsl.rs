@@ -4,7 +4,7 @@ use crate::query::matcher::{
     PathInitialsMatcher, PathScope, RegexMatcher, WfnMatcher,
 };
 use regex::{Regex, RegexBuilder};
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
@@ -93,6 +93,7 @@ pub struct CompiledQuery {
     hardlink_dupe: bool,
     content_dupe: bool,
     content_query: bool,
+    content_terms: Vec<String>,
 }
 
 impl CompiledQuery {
@@ -106,6 +107,21 @@ impl CompiledQuery {
         }
         for ex in &self.excludes {
             if ex.matches(meta) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn matches_with_content<F>(&self, meta: &FileMeta, content_matches: &F) -> bool
+    where
+        F: Fn(&Path, &str) -> bool + ?Sized,
+    {
+        if !self.include.matches_with_content(meta, content_matches) {
+            return false;
+        }
+        for ex in &self.excludes {
+            if ex.matches_with_content(meta, content_matches) {
                 return false;
             }
         }
@@ -126,6 +142,10 @@ impl CompiledQuery {
 
     pub fn requires_content_index(&self) -> bool {
         self.content_query
+    }
+
+    pub fn content_terms(&self) -> &[String] {
+        &self.content_terms
     }
 
     fn find_parent_in_expr(expr: &CompiledExpr) -> Option<String> {
@@ -159,6 +179,26 @@ impl CompiledExpr {
                 m.matches(&s)
             }
             CompiledExpr::Filter(f) => f.matches(meta),
+        }
+    }
+
+    fn matches_with_content<F>(&self, meta: &FileMeta, content_matches: &F) -> bool
+    where
+        F: Fn(&Path, &str) -> bool + ?Sized,
+    {
+        match self {
+            CompiledExpr::Or(v) => v
+                .iter()
+                .any(|e| e.matches_with_content(meta, content_matches)),
+            CompiledExpr::And(v) => v
+                .iter()
+                .all(|e| e.matches_with_content(meta, content_matches)),
+            CompiledExpr::True => true,
+            CompiledExpr::Path(m) => {
+                let s = meta.path.to_string_lossy();
+                m.matches(&s)
+            }
+            CompiledExpr::Filter(f) => f.matches_with_content(meta, content_matches),
         }
     }
 }
@@ -234,9 +274,19 @@ impl Filter {
                 }
             }
             Filter::Content(_) => {
-                // TODO: 接入全文索引后实现真正的内容匹配
+                // Content filters require an explicit content-index matcher.
                 false
             }
+        }
+    }
+
+    fn matches_with_content<F>(&self, meta: &FileMeta, content_matches: &F) -> bool
+    where
+        F: Fn(&Path, &str) -> bool + ?Sized,
+    {
+        match self {
+            Filter::Content(term) => content_matches(meta.path.as_path(), term),
+            _ => self.matches(meta),
         }
     }
 }
@@ -319,7 +369,10 @@ pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
     // 编译表达式
     let hardlink_dupe = expr_contains_hardlink_dupe(&include_expr);
     let content_dupe = expr_contains_content_dupe(&include_expr);
-    let content_query = expr_contains_content_query(&include_expr);
+    let content_query = expr_contains_content_query(&include_expr)
+        || exclude_exprs.iter().any(expr_contains_content_query);
+    let content_terms =
+        expr_content_terms(std::iter::once(&include_expr).chain(exclude_exprs.iter()));
     let mut include = compile_expr(&include_expr, case_sensitive)?;
     let excludes = exclude_exprs
         .iter()
@@ -346,6 +399,7 @@ pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
         hardlink_dupe,
         content_dupe,
         content_query,
+        content_terms,
     })
 }
 
@@ -370,6 +424,26 @@ fn expr_contains_content_query(expr: &Expr) -> bool {
         Expr::Or(v) | Expr::And(v) => v.iter().any(expr_contains_content_query),
         Expr::Atom(Atom::Content(_)) => true,
         Expr::True | Expr::Atom(_) => false,
+    }
+}
+
+fn expr_content_terms<'a>(exprs: impl IntoIterator<Item = &'a Expr>) -> Vec<String> {
+    let mut terms = Vec::new();
+    for expr in exprs {
+        collect_content_terms(expr, &mut terms);
+    }
+    terms
+}
+
+fn collect_content_terms(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Or(v) | Expr::And(v) => {
+            for child in v {
+                collect_content_terms(child, out);
+            }
+        }
+        Expr::Atom(Atom::Content(term)) => out.push(term.clone()),
+        Expr::True | Expr::Atom(_) => {}
     }
 }
 
@@ -1328,6 +1402,10 @@ mod tests {
 
         let text = compile_query("text:needle").unwrap();
         assert!(text.requires_content_index());
+
+        let exclude = compile_query("readme !content:secret").unwrap();
+        assert!(exclude.requires_content_index());
+        assert_eq!(exclude.content_terms(), &["secret".to_string()]);
     }
 
     #[test]

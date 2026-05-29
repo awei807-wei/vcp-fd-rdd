@@ -250,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     index.apply_runtime_profile_settings(runtime_profile.settings());
+    index.apply_content_index_config(cfg.content_index.clone());
     let _ = index.attach_wal(store.as_ref());
     index.set_wal_durability(wal_durability);
     index.set_stable_snapshot_enabled(cfg.stable_snapshot_enabled);
@@ -353,6 +354,10 @@ async fn main() -> anyhow::Result<()> {
         exclude_dirs.clone(),
         startup_ignore_paths.clone(),
     );
+    if cfg.content_index.enable {
+        index
+            .spawn_content_index_worker(Duration::from_secs(snapshot_interval_secs.clamp(30, 300)));
+    }
     if effective_watch_mode == WatchMode::Tiered {
         if let Some(runtime) = tiered_runtime.clone() {
             spawn_tiered_scan_loop(

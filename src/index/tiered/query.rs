@@ -28,6 +28,7 @@ const CONTENT_DUPE_CONFIDENCE: f32 = 0.99;
 const CONTENT_DUPE_PARTIAL_BYTES: usize = 4096;
 const CONTENT_INDEX_UNSUPPORTED: &str =
     "content index is disabled; enable content_index before using content:/text:";
+type ContentMatcher<'a> = dyn Fn(&Path, &str) -> bool + 'a;
 
 impl TieredIndex {
     /// 查询入口：L1 → L2 → DiskSegments（mmap），不扫真实文件系统
@@ -123,11 +124,21 @@ impl TieredIndex {
         if !plan.has_trigram_hint() {
             self.record_query_no_trigram_hint_metric();
         }
-        if plan.requires_content_index() {
-            return Err(QueryCompileError::Filter(CONTENT_INDEX_UNSUPPORTED.into()));
-        }
+        let content_query_context = if plan.requires_content_index() {
+            let Some(context) = self.content_query_context(plan.content_terms()) else {
+                return Err(QueryCompileError::Filter(CONTENT_INDEX_UNSUPPORTED.into()));
+            };
+            Some(context)
+        } else {
+            None
+        };
 
-        let results = self.execute_query_plan(&plan, limit);
+        let results = if let Some(context) = content_query_context.as_ref() {
+            let content_matches = |path: &Path, term: &str| context.matches(path, term);
+            self.execute_query_plan(&plan, limit, Some(&content_matches as &ContentMatcher<'_>))
+        } else {
+            self.execute_query_plan(&plan, limit, None)
+        };
         if !results.is_empty() {
             tracing::debug!("Query hit: {} results", results.len());
             for meta in results.iter().take(10) {
@@ -269,7 +280,12 @@ impl TieredIndex {
         new_base
     }
 
-    fn execute_query_plan(&self, plan: &QueryPlan, limit: usize) -> Vec<QueryResultMeta> {
+    fn execute_query_plan(
+        &self,
+        plan: &QueryPlan,
+        limit: usize,
+        content_matches: Option<&ContentMatcher<'_>>,
+    ) -> Vec<QueryResultMeta> {
         let _guard = QueryGenerationGuard::new(self);
         let base = self.base.load_full();
         let db = self.delta_buffer.lock();
@@ -346,7 +362,7 @@ impl TieredIndex {
                 continue;
             }
             let _ = blocked_paths.insert(path_bytes);
-            if plan.matches(meta) {
+            if self.plan_matches(plan, meta, content_matches) {
                 results.push(QueryResultMeta::hot(meta.clone()));
             }
         }
@@ -375,7 +391,7 @@ impl TieredIndex {
                     continue;
                 }
                 let _ = blocked_paths.insert(path_bytes);
-                if plan.matches(&meta) {
+                if self.plan_matches(plan, &meta, content_matches) {
                     let index_tier = if hit.manifest_only {
                         QueryResultIndexTier::FrozenManifestOnly
                     } else {
@@ -404,6 +420,7 @@ impl TieredIndex {
             &mut blocked_paths,
             &mut results,
             scan_limit,
+            content_matches,
         ) {
             return filter_dupe_results(
                 results,
@@ -450,6 +467,7 @@ impl TieredIndex {
         blocked_paths: &mut PathArenaSet,
         results: &mut Vec<QueryResultMeta>,
         limit: usize,
+        content_matches: Option<&ContentMatcher<'_>>,
     ) -> bool {
         for anchor in plan.anchors() {
             for hit in layer.query_metas(anchor.as_ref()) {
@@ -467,7 +485,7 @@ impl TieredIndex {
                 }
 
                 let _ = blocked_paths.insert(path_bytes);
-                if plan.matches(&meta) {
+                if self.plan_matches(plan, &meta, content_matches) {
                     let index_tier = if hit.manifest_only {
                         QueryResultIndexTier::FrozenManifestOnly
                     } else {
@@ -484,6 +502,18 @@ impl TieredIndex {
         }
 
         false
+    }
+
+    fn plan_matches(
+        &self,
+        plan: &QueryPlan,
+        meta: &FileMeta,
+        content_matches: Option<&ContentMatcher<'_>>,
+    ) -> bool {
+        match content_matches {
+            Some(content_matches) => plan.matches_with_content(meta, content_matches),
+            None => plan.matches(meta),
+        }
     }
 
     fn annotate_query_result(&self, meta: FileMeta) -> Option<QueryResultMeta> {

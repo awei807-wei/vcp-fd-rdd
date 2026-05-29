@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::RuntimeProfile;
+use crate::config::{ContentIndexConfig, RuntimeProfile};
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::{DirtyReason, DirtyScope};
@@ -1156,6 +1156,78 @@ fn content_filter_is_explicitly_unsupported_until_index_enabled() -> anyhow::Res
         .unwrap_err()
         .to_string();
     assert!(text_err.contains("content index is disabled"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn enabled_content_index_supports_content_and_text_filters() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("query-content-enabled");
+    std::fs::create_dir_all(&root)?;
+
+    let hit = root.join("body_only.txt");
+    let md_hit = root.join("body_only.md");
+    let wrong_ext = root.join("body_only.log");
+    let too_large = root.join("oversized.txt");
+    std::fs::write(&hit, b"needle appears only inside this file")?;
+    std::fs::write(&md_hit, b"another unique needle payload")?;
+    std::fs::write(&wrong_ext, b"needle should not be indexed")?;
+    std::fs::write(&too_large, vec![b'n'; 80])?;
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    let l2 = idx.l2.load_full();
+    IndexBuilder::new(vec![root.clone()]).full_build(l2.as_ref());
+    idx.refresh_base();
+    idx.apply_content_index_config(ContentIndexConfig {
+        enable: true,
+        max_file_size: 40,
+        include_ext: vec!["txt".to_string(), ".md".to_string()],
+        exclude_ext: vec!["log".to_string()],
+    });
+
+    let report = idx.rebuild_content_index_now();
+    assert_eq!(report.indexed_paths, 2);
+    assert!(report.indexed_bytes > 0);
+
+    let content_results = idx.query_limit_detailed_strict("content:needle", 10)?;
+    let paths = content_results
+        .iter()
+        .map(|result| result.meta.path.clone())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&hit));
+    assert!(paths.contains(&md_hit));
+    assert!(!paths.contains(&wrong_ext));
+    assert!(!paths.contains(&too_large));
+
+    let text_results = idx.query_limit_detailed_strict("text:another", 10)?;
+    assert_eq!(text_results.len(), 1);
+    assert_eq!(text_results[0].meta.path, md_hit);
+
+    let or_results = idx.query_limit_detailed_strict("content:missing | text:another", 10)?;
+    assert_eq!(or_results.len(), 1);
+    assert_eq!(or_results[0].meta.path, md_hit);
+
+    let exclude_results = idx.query_limit_detailed_strict("content:needle !text:another", 10)?;
+    assert_eq!(exclude_results.len(), 1);
+    assert_eq!(exclude_results[0].meta.path, hit);
+
+    let filename_results = idx.query_limit_detailed_strict("content:needle body_only", 10)?;
+    assert!(filename_results
+        .iter()
+        .any(|result| result.meta.path == hit));
+    assert!(filename_results
+        .iter()
+        .any(|result| result.meta.path == md_hit));
+
+    let mut diagnostics = DiagnosticReport::default();
+    idx.collect(&mut diagnostics);
+    assert!(diagnostics.storage.content_index_enabled);
+    assert_eq!(diagnostics.storage.content_indexed_paths, 2);
+    assert_eq!(
+        diagnostics.storage.content_indexed_bytes,
+        report.indexed_bytes
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())

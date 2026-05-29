@@ -1,4 +1,5 @@
 pub(crate) mod arena;
+mod content;
 pub(crate) mod events;
 pub(crate) mod load;
 mod memory;
@@ -21,7 +22,7 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use crate::config::RuntimeProfileSettings;
+use crate::config::{ContentIndexConfig, RuntimeProfileSettings};
 use crate::core::AdaptiveScheduler;
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::DirtyQueue;
@@ -230,6 +231,12 @@ pub struct TieredIndex {
     pub(self) mount_policy_counters: Arc<SharedMountPolicyCounters>,
     pub(self) io_governor: Arc<crate::io_governor::IoGovernor>,
     pub(self) stats: Arc<StatsCollector>,
+    pub(self) content_index_enabled: AtomicBool,
+    pub(self) content_index_config: Mutex<ContentIndexConfig>,
+    pub(self) content_index_docs: Mutex<std::collections::HashMap<PathBuf, String>>,
+    pub(self) content_indexed_paths: AtomicU64,
+    pub(self) content_indexed_bytes: AtomicU64,
+    pub(self) content_index_last_elapsed_ms: AtomicU64,
     pub(self) content_hash_queue_pending: AtomicU64,
     pub(self) content_hash_candidate_count: AtomicU64,
     pub(self) content_hash_confirmed_groups: AtomicU64,
@@ -474,6 +481,12 @@ impl DiagnosticSource for TieredIndex {
             physical_dedupe_stats_from_metas(self.collect_live_metas_for_diagnostics(), None);
         report.storage.hardlink_group_count = physical.hardlink_group_count;
         report.storage.hardlink_max_group_size = physical.max_group_size;
+        report.storage.content_index_enabled = self.content_index_enabled.load(Ordering::Relaxed);
+        report.storage.content_indexed_paths =
+            self.content_indexed_paths.load(Ordering::Relaxed) as usize;
+        report.storage.content_indexed_bytes = self.content_indexed_bytes.load(Ordering::Relaxed);
+        report.storage.content_index_last_elapsed_ms =
+            self.content_index_last_elapsed_ms.load(Ordering::Relaxed);
         report.storage.content_hash_queue_pending =
             self.content_hash_queue_pending.load(Ordering::Relaxed) as usize;
         report.storage.content_hash_candidate_count =
