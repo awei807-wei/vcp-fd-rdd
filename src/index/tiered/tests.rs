@@ -537,6 +537,28 @@ fn memory_report_tracks_generation_strong_refs() {
 }
 
 #[test]
+fn memory_report_tracks_dirty_queue_pending_scopes() {
+    let root = unique_tmp_dir("dirty-memory");
+    let dirty_dir = root.join("project");
+    std::fs::create_dir_all(&dirty_dir).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.enqueue_dirty_dirs(vec![dirty_dir.clone()], DirtyReason::QueryMiss);
+    let report = idx.memory_report(EventPipelineStats::default());
+
+    assert_eq!(report.dirty_queue.pending_scopes, 1);
+    assert_eq!(report.dirty_queue.pending_dirs, 1);
+    assert!(!report.dirty_queue.all_scope_pending);
+    assert!(
+        report.dirty_queue.pending_path_bytes
+            >= dirty_dir.as_os_str().as_encoded_bytes().len() as u64
+    );
+    assert!(report.dirty_queue.estimated_bytes > 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn overlay_rename_tracks_from_as_delete_and_to_as_upsert() {
     let root = unique_tmp_dir("overlay-rename");
     std::fs::create_dir_all(&root).unwrap();

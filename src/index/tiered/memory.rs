@@ -38,6 +38,7 @@ impl TieredIndex {
         let l2_generation = self.l2.load_full();
         let l2_strong_refs = Arc::strong_count(&l2_generation);
         let l2 = l2_generation.memory_stats();
+        let dirty_queue = self.dirty_queue.lock().memory_stats();
         let overlay = {
             let db = self.delta_buffer.lock();
             let deleted_count = db.deleted_paths().count();
@@ -84,6 +85,7 @@ impl TieredIndex {
             + base.estimated_bytes
             + l2.estimated_bytes
             + disk_deleted_estimated_bytes
+            + dirty_queue.estimated_bytes
             + overlay.estimated_bytes
             + rebuild.estimated_bytes;
         let process_smaps_rollup = MemoryReport::read_smaps_rollup();
@@ -106,6 +108,7 @@ impl TieredIndex {
             disk_deleted_estimated_bytes,
             disk_deleted_estimated_bytes_max,
             event_pipeline: pipeline_stats,
+            dirty_queue,
             overlay,
             rebuild,
             generation: GenerationStats {

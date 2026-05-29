@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::stats::DirtyQueueStats;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirtyScope {
     /// 无法定位具体目录（例如严重风暴/采样上限触发），按全局 dirty 处理。
@@ -161,6 +163,42 @@ impl DirtyQueue {
         self.entries.is_empty()
     }
 
+    pub fn memory_stats(&self) -> DirtyQueueStats {
+        use std::mem::size_of;
+
+        let pending_scopes = self.entries.len();
+        let map_capacity = self.entries.capacity();
+        let mut pending_dirs = 0usize;
+        let mut pending_path_bytes = 0u64;
+        let mut all_scope_pending = false;
+
+        for entry in self.entries.values() {
+            match &entry.scope {
+                DirtyScope::All { .. } => {
+                    all_scope_pending = true;
+                }
+                DirtyScope::Dirs { dirs, .. } => {
+                    pending_dirs = pending_dirs.saturating_add(dirs.len());
+                    pending_path_bytes = pending_path_bytes.saturating_add(path_bytes(dirs));
+                }
+            }
+        }
+
+        let map_bytes = map_capacity as u64
+            * (size_of::<(DirtyScopeKey, DirtyQueueEntry)>() as u64 + 1)
+            + size_of::<HashMap<DirtyScopeKey, DirtyQueueEntry>>() as u64;
+        let estimated_bytes = map_bytes.saturating_add(pending_path_bytes.saturating_mul(2));
+
+        DirtyQueueStats {
+            pending_scopes,
+            pending_dirs,
+            all_scope_pending,
+            pending_path_bytes,
+            map_capacity,
+            estimated_bytes,
+        }
+    }
+
     pub fn enqueue(
         &mut self,
         scope: DirtyScope,
@@ -265,6 +303,13 @@ fn normalize_dirs(mut dirs: Vec<PathBuf>) -> Vec<PathBuf> {
     dirs
 }
 
+fn path_bytes(paths: &[PathBuf]) -> u64 {
+    paths
+        .iter()
+        .map(|path| path.as_os_str().as_encoded_bytes().len() as u64)
+        .sum()
+}
+
 fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
@@ -356,6 +401,32 @@ mod tests {
         assert_eq!(ready.len(), 2);
         assert_eq!(ready[0].priority, DirtyPriority::Critical);
         assert_eq!(ready[0].scope.dir_paths(), &[PathBuf::from("/tmp/high")]);
+    }
+
+    #[test]
+    fn dirty_queue_memory_stats_counts_pending_scopes() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        q.enqueue(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]),
+            DirtyReason::InotifyEvent,
+            DirtyPriority::Normal,
+            1,
+        );
+        q.enqueue(
+            DirtyScope::All { cutoff_ns: 0 },
+            DirtyReason::OverflowRecovery,
+            DirtyPriority::Critical,
+            2,
+        );
+
+        let stats = q.memory_stats();
+        assert_eq!(stats.pending_scopes, 2);
+        assert_eq!(stats.pending_dirs, 2);
+        assert!(stats.all_scope_pending);
+        let expected_path_bytes = "/tmp/a".len() + "/tmp/b".len();
+        assert!(stats.pending_path_bytes >= expected_path_bytes as u64);
+        assert!(stats.map_capacity >= stats.pending_scopes);
+        assert!(stats.estimated_bytes >= stats.pending_path_bytes);
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub struct MemoryReport {
     pub disk_deleted_estimated_bytes_max: u64,
     /// 事件管道
     pub event_pipeline: EventPipelineStats,
+    /// dirty queue（待局部对账/补扫的 scope）
+    pub dirty_queue: DirtyQueueStats,
     /// overlay（跨段 delete/upsert 屏蔽集合）
     pub overlay: OverlayStats,
     /// rebuild（pending 事件队列）
@@ -265,6 +267,18 @@ pub struct RebuildStats {
     /// rename-from 路径字节总量（下界估算）
     pub pending_from_bytes: u64,
     /// rebuild pending 估算堆占用（HashMap 结构 + 下界路径字节；粗估、偏保守）
+    pub estimated_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct DirtyQueueStats {
+    pub pending_scopes: usize,
+    pub pending_dirs: usize,
+    pub all_scope_pending: bool,
+    /// dirty scope 路径字节总量（下界估算：len，不含 PathBuf/allocator 开销）
+    pub pending_path_bytes: u64,
+    pub map_capacity: usize,
+    /// dirty queue 估算堆占用（HashMap 结构 + scope 路径下界；粗估、偏保守）
     pub estimated_bytes: u64,
 }
 
@@ -643,6 +657,17 @@ impl fmt::Display for MemoryReport {
         )?;
         writeln!(f, "╠──────────────────────────────────────────────────╣")?;
         writeln!(f, "║ Shadow Memory (Overlay/Rebuild):                 ║")?;
+        writeln!(
+            f,
+            "║   dirty queue: {:>10}  (dirs={:>10})      ║",
+            self.dirty_queue.pending_scopes, self.dirty_queue.pending_dirs
+        )?;
+        writeln!(
+            f,
+            "║   dirty bytes: {:>10}  (all_scope={})      ║",
+            human_bytes(self.dirty_queue.estimated_bytes),
+            self.dirty_queue.all_scope_pending
+        )?;
         writeln!(
             f,
             "║   overlay del:  {:>10}  (logic={:>10})     ║",
