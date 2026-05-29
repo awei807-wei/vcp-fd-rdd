@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::core::EventRecord;
 use crate::index::l2_partition::V6Segments;
 use crate::storage::snapshot::{LoadedSnapshot, LsmLoadedLayers, LsmSegmentLoaded, MmapSnapshotV6};
-use crate::storage::wal::WalReplayResult;
+use crate::storage::wal::{WalDurability, WalReplayResult};
 
 pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -82,6 +82,15 @@ pub trait WriteAheadLog {
     /// Replay all events from sealed WALs with id > `checkpoint_seal_id`,
     /// plus the current WAL.
     fn replay_since_seal(&self, checkpoint_seal_id: u64) -> anyhow::Result<WalReplayResult>;
+
+    /// Configure WAL fsync behavior. Implementations that do not support this
+    /// may keep the default flush-only semantics.
+    fn set_durability(&self, _durability: WalDurability) {}
+
+    /// Return current WAL fsync behavior.
+    fn durability(&self) -> WalDurability {
+        WalDurability::FlushOnly
+    }
 }
 
 // ---------------------------------------------------------------------------

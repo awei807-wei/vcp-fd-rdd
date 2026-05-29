@@ -98,7 +98,13 @@ pub struct MetricsHealthSnapshot {
     pub last_snapshot_time: u64,
     pub snapshot_source: String,
     pub wal_events_replayed: usize,
+    pub wal_sealed_used: usize,
     pub wal_truncated_tail_records: usize,
+    pub wal_gap_detected: bool,
+    pub wal_checkpoint_used: u64,
+    pub wal_durability: String,
+    pub recovery_requires_repair: bool,
+    pub recovery_requires_rebuild: bool,
     pub startup_repair_ran: bool,
     pub startup_repair_escalated: bool,
     pub startup_repair_scanned: usize,
@@ -263,6 +269,14 @@ impl MetricsDiagnostics {
         }
         if health.startup_repair_escalated {
             issues.push("startup_repair_escalated=true".to_string());
+        }
+        if health.wal_gap_detected {
+            issues.push("wal_gap_detected=true".to_string());
+        }
+        if health.recovery_requires_rebuild {
+            issues.push("recovery_requires_rebuild=true".to_string());
+        } else if health.recovery_requires_repair {
+            issues.push("recovery_requires_repair=true".to_string());
         }
         if memory.heap_high_water_suspected {
             issues.push("heap_high_water_suspected=true".to_string());

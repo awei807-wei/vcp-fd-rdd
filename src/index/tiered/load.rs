@@ -5,6 +5,9 @@ use crate::index::base_index::BaseIndexData;
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
+use crate::storage::recovery_audit::{
+    audit_recovery_ledger, choose_checkpoint, RecoveryAuditReport, SnapshotCheckpointSource,
+};
 use crate::storage::snapshot::{
     read_recovery_runtime_state, stable_prev_v7_path_for, stable_v7_path_for,
 };
@@ -331,6 +334,7 @@ impl TieredIndex {
             tracing::warn!("recovery runtime state read failed: {}", e);
             Default::default()
         });
+        let audit = audit_recovery_ledger(store.path(), roots.as_slice(), &runtime_state);
 
         // 优先加载 stable.v7 / stable.prev.v7，再回退到 legacy v7 单文件快照。
         let stable_path = stable_v7_path_for(store.path());
@@ -364,15 +368,15 @@ impl TieredIndex {
                         Some(v7_data),
                     );
                     idx.attach_wal(store)?;
-                    let replay = idx.replay_wal_if_any(0);
-                    idx.set_startup_recovery_report(StartupRecoveryReport {
-                        snapshot_source: source.to_string(),
-                        wal_events_replayed: replay.events_replayed,
-                        wal_truncated_tail_records: replay.truncated_tail_records,
-                        requires_repair: !runtime_state.last_clean_shutdown
-                            || replay.truncated_tail_records > 0,
-                        previous_clean_shutdown: runtime_state.last_clean_shutdown,
-                    });
+                    let checkpoint =
+                        choose_checkpoint(SnapshotCheckpointSource::from_label(source), &audit);
+                    let replay = idx.replay_wal_if_any(checkpoint);
+                    idx.set_startup_recovery_report(startup_report(
+                        source,
+                        &runtime_state,
+                        &audit,
+                        replay,
+                    ));
                     maybe_trim_rss();
                     return Ok(idx);
                 }
@@ -395,13 +399,7 @@ impl TieredIndex {
         );
         idx.attach_wal(store)?;
         let replay = idx.replay_wal_if_any(0);
-        idx.set_startup_recovery_report(StartupRecoveryReport {
-            snapshot_source: "empty".to_string(),
-            wal_events_replayed: replay.events_replayed,
-            wal_truncated_tail_records: replay.truncated_tail_records,
-            requires_repair: true,
-            previous_clean_shutdown: runtime_state.last_clean_shutdown,
-        });
+        idx.set_startup_recovery_report(startup_report("empty", &runtime_state, &audit, replay));
         Ok(idx)
     }
 
@@ -422,8 +420,11 @@ impl TieredIndex {
         match wal.replay_since_seal(checkpoint_seal_id) {
             Ok(r) => {
                 let summary = WalReplaySummary {
-                    events_replayed: r.events.len(),
+                    events_replayed: r.events_replayed,
+                    sealed_used: r.sealed_used,
                     truncated_tail_records: r.truncated_tail_records,
+                    gap_detected: r.gap_detected,
+                    checkpoint_used: r.checkpoint_used,
                 };
                 if !r.events.is_empty() {
                     tracing::info!(
@@ -440,7 +441,10 @@ impl TieredIndex {
                 tracing::warn!("WAL replay failed, ignoring: {}", e);
                 WalReplaySummary {
                     events_replayed: 0,
+                    sealed_used: 0,
                     truncated_tail_records: 1,
+                    gap_detected: false,
+                    checkpoint_used: checkpoint_seal_id,
                 }
             }
         }
@@ -450,5 +454,57 @@ impl TieredIndex {
 #[derive(Clone, Copy, Debug, Default)]
 struct WalReplaySummary {
     events_replayed: usize,
+    sealed_used: usize,
     truncated_tail_records: usize,
+    gap_detected: bool,
+    checkpoint_used: u64,
+}
+
+fn startup_report(
+    source: &str,
+    runtime_state: &crate::storage::snapshot::RecoveryRuntimeState,
+    audit: &RecoveryAuditReport,
+    replay: WalReplaySummary,
+) -> StartupRecoveryReport {
+    let mut audit = audit.clone();
+    audit.wal_checkpoint = replay.checkpoint_used;
+    audit.sealed_wal_used_after_checkpoint = audit
+        .sealed_wal_ids
+        .iter()
+        .filter(|id| **id > replay.checkpoint_used)
+        .count();
+
+    let mut reasons = audit.reasons.clone();
+    if !runtime_state.last_clean_shutdown {
+        reasons.push("unclean_shutdown".to_string());
+    }
+    if replay.truncated_tail_records > 0 {
+        reasons.push("wal_tail_truncated".to_string());
+    }
+    if replay.gap_detected {
+        reasons.push("wal_gap".to_string());
+    }
+    if source == "empty" {
+        reasons.push("no_snapshot".to_string());
+    }
+    reasons.sort();
+    reasons.dedup();
+
+    StartupRecoveryReport {
+        snapshot_source: source.to_string(),
+        wal_events_replayed: replay.events_replayed,
+        wal_sealed_used: replay.sealed_used,
+        wal_truncated_tail_records: replay.truncated_tail_records,
+        wal_gap_detected: audit.wal_gap_detected || replay.gap_detected,
+        wal_checkpoint_used: replay.checkpoint_used,
+        requires_repair: source == "empty"
+            || audit.requires_repair
+            || !runtime_state.last_clean_shutdown
+            || replay.truncated_tail_records > 0
+            || replay.gap_detected,
+        requires_rebuild: audit.requires_rebuild,
+        previous_clean_shutdown: runtime_state.last_clean_shutdown,
+        reasons,
+        audit,
+    }
 }

@@ -1147,15 +1147,15 @@ const MAX_LSM_DELETED_PATHS: usize = 500_000;
 const MAX_LSM_DELETED_TOTAL_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 
 #[derive(Clone, Debug, Default)]
-struct LsmManifest {
-    next_id: u64,
-    base_id: u64,
-    delta_ids: Vec<u64>,
-    wal_seal_id: u64,
+pub(crate) struct LsmManifest {
+    pub(crate) next_id: u64,
+    pub(crate) base_id: u64,
+    pub(crate) delta_ids: Vec<u64>,
+    pub(crate) wal_seal_id: u64,
     /// 上次认为“索引与磁盘现实一致”的时间戳（Unix epoch nanos）。
     ///
     /// 用途：冷启动时用于检测停机期间的离线变更（目录 mtime crawl）。
-    last_build_ns: u64,
+    pub(crate) last_build_ns: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1230,7 +1230,7 @@ fn lsm_decode_manifest_body(body: &[u8]) -> anyhow::Result<LsmManifest> {
     })
 }
 
-fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
+pub(crate) fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
     use crate::storage::checksum::crc32c_checksum;
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
@@ -1349,7 +1349,7 @@ fn lsm_write_deleted_paths_atomic(path: &Path, deleted_paths: &[Vec<u8>]) -> any
     Ok(())
 }
 
-fn lsm_read_deleted_paths(path: &Path) -> anyhow::Result<Vec<Vec<u8>>> {
+pub(crate) fn lsm_read_deleted_paths(path: &Path) -> anyhow::Result<Vec<Vec<u8>>> {
     if !path.exists() {
         return Ok(Vec::new());
     }

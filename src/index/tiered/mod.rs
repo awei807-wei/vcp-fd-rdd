@@ -26,7 +26,9 @@ use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::stats::{StatsCollector, StatsReport};
+use crate::storage::recovery_audit::RecoveryAuditReport;
 use crate::storage::traits::WriteAheadLog;
+use crate::storage::wal::WalDurability;
 
 use self::rebuild::RebuildState;
 
@@ -43,9 +45,15 @@ pub struct ScanOutcome {
 pub struct StartupRecoveryReport {
     pub snapshot_source: String,
     pub wal_events_replayed: usize,
+    pub wal_sealed_used: usize,
     pub wal_truncated_tail_records: usize,
+    pub wal_gap_detected: bool,
+    pub wal_checkpoint_used: u64,
     pub requires_repair: bool,
+    pub requires_rebuild: bool,
     pub previous_clean_shutdown: bool,
+    pub reasons: Vec<String>,
+    pub audit: RecoveryAuditReport,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -218,6 +226,20 @@ impl TieredIndex {
     pub fn set_stable_snapshot_enabled(&self, enabled: bool) {
         self.stable_snapshot_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_wal_durability(&self, durability: WalDurability) {
+        if let Some(wal) = self.wal.lock().as_ref() {
+            wal.set_durability(durability);
+        }
+    }
+
+    pub fn wal_durability(&self) -> WalDurability {
+        self.wal
+            .lock()
+            .as_ref()
+            .map(|wal| wal.durability())
+            .unwrap_or_default()
     }
 
     pub fn record_query_metric(&self, elapsed_us: u64) {

@@ -163,6 +163,29 @@ fn wal_truncated_tail_sets_repair_signal() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn wal_replay_reports_checkpoint_and_small_id_gap() {
+    let dir = unique_tmp_dir("gap-summary");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let header = {
+        let mut data = Vec::new();
+        data.extend_from_slice(&WAL_MAGIC.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data
+    };
+    std::fs::write(dir.join("events.wal.seal-0000000000000001"), &header).unwrap();
+    std::fs::write(dir.join("events.wal.seal-0000000000000003"), &header).unwrap();
+
+    let wal = WalStore::open_in_dir(dir.clone()).unwrap();
+    let replay = wal.replay_since_seal(1).unwrap();
+    assert_eq!(replay.checkpoint_used, 1);
+    assert_eq!(replay.sealed_used, 1);
+    assert!(replay.gap_detected);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 16. 版本兼容：v1 WAL 正确加载（升级到 v3）
 #[test]
 fn wal_v1_compat_loads_after_upgrade() {

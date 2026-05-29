@@ -19,6 +19,7 @@ use fd_rdd::stats::{
 use fd_rdd::storage::snapshot::{
     write_recovery_runtime_state, RecoveryRuntimeState, SnapshotStore,
 };
+use fd_rdd::storage::wal::WalDurability;
 use fd_rdd::util::{estimate_notify_recursive_watch_count, normalize_exclude_dirs};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -98,6 +99,18 @@ struct Args {
     /// watcher 模式：recursive（现有递归监听）、tiered（预算受控热点监听）、off（关闭）。
     #[arg(long, value_parser = ["recursive", "tiered", "off"])]
     watch_mode: Option<String>,
+
+    /// WAL 持久化模式：flush-only、sync-interval、sync-always。
+    #[arg(long, value_parser = ["flush-only", "sync-interval", "sync-always"])]
+    wal_durability: Option<String>,
+
+    /// sync-interval 模式下的最大 sync 间隔（毫秒）。
+    #[arg(long)]
+    wal_sync_interval_ms: Option<u64>,
+
+    /// sync-interval 模式下的最大批量记录数。
+    #[arg(long)]
+    wal_sync_batch_records: Option<usize>,
 }
 
 #[tokio::main]
@@ -186,6 +199,23 @@ async fn main() -> anyhow::Result<()> {
     let snapshot_interval_secs = args
         .snapshot_interval_secs
         .unwrap_or(cfg.snapshot_interval_secs);
+    let wal_durability_mode = args
+        .wal_durability
+        .as_deref()
+        .unwrap_or(cfg.wal_durability.as_str());
+    let wal_sync_interval_ms = args
+        .wal_sync_interval_ms
+        .unwrap_or(cfg.wal_sync_interval_ms)
+        .max(1);
+    let wal_sync_batch_records = args
+        .wal_sync_batch_records
+        .unwrap_or(cfg.wal_sync_batch_records)
+        .max(1);
+    let wal_durability = parse_wal_durability(
+        wal_durability_mode,
+        wal_sync_interval_ms,
+        wal_sync_batch_records,
+    )?;
     let report_interval_secs = args.report_interval_secs.unwrap_or(60);
     let event_channel_size = args.event_channel_size.unwrap_or(65_536);
     let debounce_ms = args.debounce_ms.unwrap_or(10);
@@ -209,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     let _ = index.attach_wal(store.as_ref());
+    index.set_wal_durability(wal_durability);
     index.set_stable_snapshot_enabled(cfg.stable_snapshot_enabled);
     let loaded_from_empty_snapshot = index.recovery_status().report.snapshot_source == "empty";
     let repair_stats = index.startup_repair_if_needed(
@@ -355,7 +386,17 @@ async fn main() -> anyhow::Result<()> {
                 rescan_signals: stats.rescan_signals,
                 snapshot_source: recovery.report.snapshot_source,
                 wal_events_replayed: recovery.report.wal_events_replayed,
+                wal_sealed_used: recovery.report.wal_sealed_used,
                 wal_truncated_tail_records: recovery.report.wal_truncated_tail_records,
+                wal_gap_detected: recovery.report.wal_gap_detected,
+                wal_checkpoint_used: recovery.report.wal_checkpoint_used,
+                wal_durability: index.wal_durability().label().to_string(),
+                wal_sync_interval_ms: index.wal_durability().sync_interval_ms(),
+                wal_sync_batch_records: index.wal_durability().sync_batch_records(),
+                recovery_requires_repair: recovery.report.requires_repair,
+                recovery_requires_rebuild: recovery.report.requires_rebuild,
+                recovery_reasons: recovery.report.reasons,
+                recovery_audit: recovery.report.audit,
                 startup_repair_ran: recovery.repair.ran,
                 startup_repair_escalated: recovery.repair.escalated,
                 startup_repair_scanned: recovery.repair.scanned,
@@ -513,7 +554,13 @@ async fn main() -> anyhow::Result<()> {
                     last_snapshot_time: health.last_snapshot_time,
                     snapshot_source: health.snapshot_source,
                     wal_events_replayed: health.wal_events_replayed,
+                    wal_sealed_used: health.wal_sealed_used,
                     wal_truncated_tail_records: health.wal_truncated_tail_records,
+                    wal_gap_detected: health.wal_gap_detected,
+                    wal_checkpoint_used: health.wal_checkpoint_used,
+                    wal_durability: health.wal_durability,
+                    recovery_requires_repair: health.recovery_requires_repair,
+                    recovery_requires_rebuild: health.recovery_requires_rebuild,
                     startup_repair_ran: health.startup_repair_ran,
                     startup_repair_escalated: health.startup_repair_escalated,
                     startup_repair_scanned: health.startup_repair_scanned,
@@ -557,10 +604,12 @@ fn mark_runtime_state(
     startup_source: &str,
     recovery_mode: &str,
 ) {
+    let previous =
+        fd_rdd::storage::snapshot::read_recovery_runtime_state(snapshot_path).unwrap_or_default();
     let state = RecoveryRuntimeState {
         last_clean_shutdown: clean_shutdown,
         last_snapshot_unix_secs: unix_secs(),
-        last_wal_seal_id: 0,
+        last_wal_seal_id: previous.last_wal_seal_id,
         last_startup_source: startup_source.to_string(),
         last_recovery_mode: recovery_mode.to_string(),
     };
@@ -629,6 +678,21 @@ fn parse_watch_mode(value: Option<&str>) -> anyhow::Result<Option<WatchMode>> {
         "tiered" => Ok(Some(WatchMode::Tiered)),
         "off" => Ok(Some(WatchMode::Off)),
         _ => anyhow::bail!("invalid watch mode: {value}"),
+    }
+}
+
+fn parse_wal_durability(
+    mode: &str,
+    interval_ms: u64,
+    batch_records: usize,
+) -> anyhow::Result<WalDurability> {
+    match mode {
+        "flush-only" => Ok(WalDurability::flush_only()),
+        "sync-interval" => Ok(WalDurability::sync_interval(interval_ms, batch_records)),
+        "sync-always" => Ok(WalDurability::sync_always()),
+        other => anyhow::bail!(
+            "invalid wal_durability: {other}; expected flush-only, sync-interval, or sync-always"
+        ),
     }
 }
 

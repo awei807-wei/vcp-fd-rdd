@@ -811,7 +811,9 @@ impl TieredIndex {
             .take(max_dirs.max(1))
             .cloned()
             .collect::<Vec<_>>();
-        let outcome = self.scan_dirs_immediate_outcome(&roots);
+        let dirs = roots.iter().collect::<Vec<_>>();
+        let outcome = self.scan_dirs_with_depth(&dirs, None, 50_000);
+        let delete_count = self.align_missing_base_paths_for_roots(&roots);
         let changed_ratio = if outcome.scanned == 0 {
             0.0
         } else {
@@ -819,12 +821,44 @@ impl TieredIndex {
         };
         let stats = StartupRepairStats {
             ran: true,
-            escalated: self.file_count() == 0 || changed_ratio > force_rebuild_ratio,
+            escalated: report.requires_rebuild
+                || self.file_count() == 0
+                || changed_ratio > force_rebuild_ratio,
             scanned: outcome.scanned,
-            changed: outcome.changed,
+            changed: outcome.changed.saturating_add(delete_count),
             elapsed_ms: outcome.elapsed_ms,
         };
         self.set_startup_repair_stats(stats.clone());
         stats
+    }
+
+    fn align_missing_base_paths_for_roots(&self, roots: &[PathBuf]) -> usize {
+        let base = self.base.load_full();
+        let mut delete_events = Vec::new();
+        let mut seq = 0u64;
+        base.for_each_live_meta(|meta| {
+            if !roots.iter().any(|root| meta.path.starts_with(root)) {
+                return;
+            }
+            match std::fs::symlink_metadata(&meta.path) {
+                Ok(_) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return,
+            }
+            seq = seq.wrapping_add(1);
+            delete_events.push(EventRecord {
+                seq,
+                timestamp: std::time::SystemTime::now(),
+                event_type: EventType::Delete,
+                id: FileIdentifier::Path(meta.path),
+                path_hint: None,
+            });
+        });
+
+        let count = delete_events.len();
+        for chunk in delete_events.chunks(2048) {
+            self.apply_events(chunk);
+        }
+        count
     }
 }

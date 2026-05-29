@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::storage::checksum::crc32c_checksum;
@@ -137,15 +138,67 @@ fn unix_to_system_time(secs: u64, nanos: u32) -> std::time::SystemTime {
 #[derive(Clone, Debug)]
 pub struct WalReplayResult {
     pub events: Vec<EventRecord>,
+    pub events_replayed: usize,
     pub sealed_used: usize,
     pub truncated_tail_records: usize,
+    pub gap_detected: bool,
+    pub checkpoint_used: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum WalDurability {
     #[default]
     FlushOnly,
+    SyncInterval {
+        interval_ms: u64,
+        batch_records: usize,
+    },
     SyncDataAlways,
+}
+
+impl WalDurability {
+    pub fn flush_only() -> Self {
+        Self::FlushOnly
+    }
+
+    pub fn sync_interval(interval_ms: u64, batch_records: usize) -> Self {
+        Self::SyncInterval {
+            interval_ms: interval_ms.max(1),
+            batch_records: batch_records.max(1),
+        }
+    }
+
+    pub fn sync_always() -> Self {
+        Self::SyncDataAlways
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FlushOnly => "flush-only",
+            Self::SyncInterval { .. } => "sync-interval",
+            Self::SyncDataAlways => "sync-always",
+        }
+    }
+
+    pub fn sync_interval_ms(self) -> u64 {
+        match self {
+            Self::SyncInterval { interval_ms, .. } => interval_ms,
+            _ => 0,
+        }
+    }
+
+    pub fn sync_batch_records(self) -> usize {
+        match self {
+            Self::SyncInterval { batch_records, .. } => batch_records,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WalSyncState {
+    records_since_sync: usize,
+    last_sync: Instant,
 }
 
 /// Append-only 事件日志（WAL）。
@@ -157,6 +210,7 @@ pub struct WalStore {
     current: PathBuf,
     file: Mutex<File>,
     durability: Mutex<WalDurability>,
+    sync_state: Mutex<WalSyncState>,
 }
 
 impl WalStore {
@@ -169,6 +223,10 @@ impl WalStore {
             current,
             file: Mutex::new(f),
             durability: Mutex::new(WalDurability::FlushOnly),
+            sync_state: Mutex::new(WalSyncState {
+                records_since_sync: 0,
+                last_sync: Instant::now(),
+            }),
         })
     }
 
@@ -190,16 +248,45 @@ impl WalStore {
             f.write_all(&payload[..len as usize])?;
         }
         f.flush()?;
-        if *self.durability.lock().unwrap_or_else(|e| e.into_inner())
-            == WalDurability::SyncDataAlways
-        {
-            f.sync_data()?;
+        let durability = *self.durability.lock().unwrap_or_else(|e| e.into_inner());
+        match durability {
+            WalDurability::FlushOnly => {}
+            WalDurability::SyncDataAlways => {
+                f.sync_data()?;
+                self.mark_synced();
+            }
+            WalDurability::SyncInterval {
+                interval_ms,
+                batch_records,
+            } => {
+                let mut state = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
+                state.records_since_sync = state.records_since_sync.saturating_add(events.len());
+                let due_by_batch = state.records_since_sync >= batch_records.max(1);
+                let due_by_time =
+                    state.last_sync.elapsed() >= Duration::from_millis(interval_ms.max(1));
+                if due_by_batch || due_by_time {
+                    f.sync_data()?;
+                    state.records_since_sync = 0;
+                    state.last_sync = Instant::now();
+                }
+            }
         }
         Ok(())
     }
 
     pub fn set_durability(&self, durability: WalDurability) {
         *self.durability.lock().unwrap_or_else(|e| e.into_inner()) = durability;
+        self.mark_synced();
+    }
+
+    pub fn durability(&self) -> WalDurability {
+        *self.durability.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn mark_synced(&self) {
+        let mut state = self.sync_state.lock().unwrap_or_else(|e| e.into_inner());
+        state.records_since_sync = 0;
+        state.last_sync = Instant::now();
     }
 
     /// seal：把当前 WAL rename 成 sealed 文件，并创建新的空 WAL。
@@ -248,16 +335,20 @@ impl WalStore {
     /// 回放：只读取 seal_id > checkpoint 的 sealed WAL + 当前 WAL。
     pub fn replay_since_seal(&self, checkpoint_seal_id: u64) -> anyhow::Result<WalReplayResult> {
         let mut sealed = Vec::new();
+        let mut sealed_ids = Vec::new();
         for ent in std::fs::read_dir(&self.dir)? {
             let Ok(ent) = ent else { continue };
             let p = ent.path();
             if let Some(id) = parse_seal_id(&p) {
+                sealed_ids.push(id);
                 if id > checkpoint_seal_id {
                     sealed.push((id, p));
                 }
             }
         }
+        sealed_ids.sort_unstable();
         sealed.sort_by_key(|(id, _)| *id);
+        let gap_detected = sealed_id_gap_detected(&sealed_ids);
 
         let mut events: Vec<EventRecord> = Vec::new();
         let mut truncated = 0usize;
@@ -294,10 +385,14 @@ impl WalStore {
             e.seq = i as u64 + 1;
         }
 
+        let events_replayed = events.len();
         Ok(WalReplayResult {
             events,
+            events_replayed,
             sealed_used: sealed.len(),
             truncated_tail_records: truncated,
+            gap_detected,
+            checkpoint_used: checkpoint_seal_id,
         })
     }
 }
@@ -325,6 +420,14 @@ impl crate::storage::traits::WriteAheadLog for WalStore {
 
     fn replay_since_seal(&self, checkpoint_seal_id: u64) -> anyhow::Result<WalReplayResult> {
         self.replay_since_seal(checkpoint_seal_id)
+    }
+
+    fn set_durability(&self, durability: WalDurability) {
+        self.set_durability(durability)
+    }
+
+    fn durability(&self) -> WalDurability {
+        self.durability()
     }
 }
 
@@ -436,6 +539,26 @@ fn parse_seal_id(path: &Path) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(&hex, 16).ok()
+}
+
+fn sealed_id_gap_detected(ids: &[u64]) -> bool {
+    if ids.len() < 2 {
+        return false;
+    }
+    let mut prev = None;
+    for &id in ids {
+        if prev == Some(id) {
+            return true;
+        }
+        prev = Some(id);
+    }
+    let Some(max_id) = ids.iter().copied().max() else {
+        return false;
+    };
+    if max_id > 1_000_000 {
+        return false;
+    }
+    ids.windows(2).any(|pair| pair[1] > pair[0] + 1)
 }
 
 fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, usize)> {

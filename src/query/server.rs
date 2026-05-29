@@ -3,6 +3,7 @@ use crate::index::TieredIndex;
 use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
 use crate::query::{execute_query_with_metadata_result, QueryMode, SortColumn, SortOrder};
 use crate::stats::{EventPipelineStats, MemoryReport, StatsReport, WatchStateReport};
+use crate::storage::recovery_audit::RecoveryAuditReport;
 use crate::util::maybe_trim_rss;
 use axum::{
     extract::{Query, State},
@@ -36,7 +37,17 @@ pub struct HealthTelemetry {
     pub rescan_signals: u64,
     pub snapshot_source: String,
     pub wal_events_replayed: usize,
+    pub wal_sealed_used: usize,
     pub wal_truncated_tail_records: usize,
+    pub wal_gap_detected: bool,
+    pub wal_checkpoint_used: u64,
+    pub wal_durability: String,
+    pub wal_sync_interval_ms: u64,
+    pub wal_sync_batch_records: usize,
+    pub recovery_requires_repair: bool,
+    pub recovery_requires_rebuild: bool,
+    pub recovery_reasons: Vec<String>,
+    pub recovery_audit: RecoveryAuditReport,
     pub startup_repair_ran: bool,
     pub startup_repair_escalated: bool,
     pub startup_repair_scanned: usize,
@@ -113,7 +124,17 @@ pub struct HealthResponse {
     pub rescan_signals: u64,
     pub snapshot_source: String,
     pub wal_events_replayed: usize,
+    pub wal_sealed_used: usize,
     pub wal_truncated_tail_records: usize,
+    pub wal_gap_detected: bool,
+    pub wal_checkpoint_used: u64,
+    pub wal_durability: String,
+    pub wal_sync_interval_ms: u64,
+    pub wal_sync_batch_records: usize,
+    pub recovery_requires_repair: bool,
+    pub recovery_requires_rebuild: bool,
+    pub recovery_reasons: Vec<String>,
+    pub recovery_audit: RecoveryAuditReport,
     pub startup_repair_ran: bool,
     pub startup_repair_escalated: bool,
     pub startup_repair_scanned: usize,
@@ -394,6 +415,14 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
             health.wal_truncated_tail_records
         ));
     }
+    if health.wal_gap_detected {
+        issues.push("wal_recovery: gap_detected=true".to_string());
+    }
+    if health.recovery_requires_rebuild {
+        issues.push("recovery_audit: rebuild_required".to_string());
+    } else if health.recovery_requires_repair {
+        issues.push("recovery_audit: repair_required".to_string());
+    }
     if health.startup_repair_escalated {
         issues.push("startup_repair: escalated to rebuild policy".to_string());
     }
@@ -430,7 +459,17 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         rescan_signals: health.rescan_signals,
         snapshot_source: health.snapshot_source,
         wal_events_replayed: health.wal_events_replayed,
+        wal_sealed_used: health.wal_sealed_used,
         wal_truncated_tail_records: health.wal_truncated_tail_records,
+        wal_gap_detected: health.wal_gap_detected,
+        wal_checkpoint_used: health.wal_checkpoint_used,
+        wal_durability: health.wal_durability,
+        wal_sync_interval_ms: health.wal_sync_interval_ms,
+        wal_sync_batch_records: health.wal_sync_batch_records,
+        recovery_requires_repair: health.recovery_requires_repair,
+        recovery_requires_rebuild: health.recovery_requires_rebuild,
+        recovery_reasons: health.recovery_reasons,
+        recovery_audit: health.recovery_audit,
         startup_repair_ran: health.startup_repair_ran,
         startup_repair_escalated: health.startup_repair_escalated,
         startup_repair_scanned: health.startup_repair_scanned,

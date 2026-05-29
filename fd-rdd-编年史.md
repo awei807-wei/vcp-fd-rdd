@@ -1,4 +1,4 @@
-# fd-rdd 编年史（立项 -> 2026-05-04）
+# fd-rdd 编年史（立项 -> 2026-05-22）
 
 > 目的：把”为什么这么做、先后顺序、关键分歧与落地结果”按时间线写清楚，便于对外讨论。
 >
@@ -254,7 +254,7 @@ v0.5.8 积累的 P0 问题促成了这一轮大重构：
 
 ## 15. 2026-05-03：v0.6.15 —— 断电恢复 + Tiered Watcher 闭环
 
-当前版本。主题：把 v0.6.14 的"预览"推进到"CI 覆盖可验证"的完成态。
+这一阶段的主题：把 v0.6.14 的"预览"推进到"CI 覆盖可验证"的完成态。
 
 - **稳定快照恢复**：`stable.v7` / `stable.prev.v7` / `stable.next.v7` 三文件轮转协议 + fsync + 加载验证；`runtime-state.json` 记录 clean shutdown 标记；`repair-meta.json` 记录 repair scan 元数据；startup recovery 决策链：snapshot → WAL replay → repair scan → rebuild fallback。
 - **Tiered watcher 预算闭环**：`Create(Folder)` / rename-in 产生的新目录不再绕过 `max_watch_dirs` 直接注册 watcher，而是先进入 TieredWatchRuntime 按递归目录估算 cost 申请 L0；watch 注册失败释放预留预算；父级 L0 降级同步释放动态子目录状态。
@@ -262,19 +262,52 @@ v0.5.8 积累的 P0 问题促成了这一轮大重构：
 - **CI 覆盖扩展**：新增 `p1_poweroff_resume` 测试覆盖 SIGTERM final snapshot + clean shutdown 标记 + 重启增量可见；CI `Poweroff recovery regression` job 显式执行四组恢复测试；Stress CI 降噪（轮询替代固定 sleep）。
 - **仓库清理**：`helloagents` 从 git 跟踪中移除，仅保留本地工作知识库。
 
-## 16. 截至 2026-05-04 的系统形态
+## 16. 2026-05-05~10：v0.6.16 —— Tiered Watcher 从运行时到策略系统
 
-- **查询链路**：L1 cache → DeltaBuffer（按路径去重）→ BaseIndexData（mmap PathTableV2 + Trigram + ParentIndex）
-- **一致性闭环**：notify watcher → bounded channel + debounce → 事件应用；溢出 → fast-sync 增量修复；必要时 → rebuild 兜底
-- **持久化**：v7 stable snapshot（CRC32C + 轮转） + events.wal + runtime-state.json
-- **Watcher**：tiered 模式——L0 预算受控热点监听 + L1 有界 warm scan + 动态升降级
-- **内存模型**：Base mmap（OS 按需触页）+ DeltaBuffer（硬容量上限）+ heap high-water 主动 trim
-- **对外接口**：HTTP `/search` + UDS 流式协议 + `/scan` + `/health` + `/metrics` + `/memory` + `/watch-state` + `/trim`
+这一轮的主题是：tiered watcher 不再只是“预算受控地少监听一些目录”，而是升级成可观测、可仿真、可调参的运行时策略系统。
 
-## 17. 仍待推进的方向
+- **L0/L1/L2/L3 热度调度**：引入 `event_score`、分层扫描队列、空扫降级、变化回升、冷 L0 替换与预算阻塞统计。`/watch-state` 与 `/debug/tiered-watch` 能直接展示目录层级、dirty/freshness、next scan、promotion/demotion 与预算原因。
+- **DirtyQueue 闭环**：把冷层 inotify 事件、查询 stale hit、路径形态 query miss、周期冷层扫描、启动修复和 overflow recovery 统一汇入 DirtyQueue；支持 reason、priority、debounce、失败重试和父级 scope 扩大，局部补扫优先处理叶子目录。
+- **冷层查询语义**：`/search` 结果增加 `freshness`、`index_tier`、`validated`；冷层/base 命中执行 `stat` 校验，删除或非文件命中写 tombstone，mtime/身份变化则返回当前 metadata 并把父目录加入 DirtyQueue。
+- **L3 策略明确化**：新增 `interval`、`validate_on_query`、`disabled` 三类 L3 scan policy；runtime、daemon 调度和 sim 配置回填对齐，避免把 L3 周期隐式绑定到 L2。
+- **Ephemeral Watch**：重复 dirty scope 可申请独立预算的临时 watcher 租约，并按 TTL、idle、无变化补扫、L0 覆盖和低价值驱逐自动释放；这让“短时间强一致关注某个冷目录”有了独立机制。
+- **fd-rdd-sim**：新增 synthetic 压测/策略仿真框架，支持 single、grid、evolve、adversarial、optimize；输出 SLA、发现延迟、watch/scan 成本和策略动作计数，并能从 benchmark report 生成可审阅的 `[tiered_watch]` TOML patch。
+- **runtime/sim parity**：用固定 seed workload 和 golden regression 检查热 L0 保留、BudgetBlocked 排序、祖先 L0 替换保护、watch budget 上限、扫描量与最终层级分布，避免策略只在模拟器里成立。
+- **索引常驻体积继续收敛**：移除公开 `FileEntry.size` 常驻字段，降低 mtime 精度，合并 PathTableV2 内部 Vec，移除短组件索引；trigram 改为 basename-only 候选，路径字面查询不再误加 PathInitialsMatcher。
+- **v7 manifest-only 冷挂载**：启动时把 v7 快照挂载为 manifest-only cold segment，常驻 segment manifest、路径过滤、mtime range 与 dirty/freshness 状态；metadata/postings 通过 mmap 按需加载，`/memory` 拆出 hot entries、manifest-only entries、cold segment 与 cold mmap 字节。
 
-- **段级过滤（Bloom/bitset）**：减少无效段触页，降低 page fault 与 CPU
-- **更工业化 compaction**：leveled/代际策略平滑写放大与合并抖动
-- **更强 WAL 语义**：fsync 策略、序列号去重、gap verify、与 watcher 边界精确定义
-- **Benchmark 持续追踪**：当前 BENCHMARK.md 数据多为 TBD，需要 CI 自动化采集
-- **多平台支持**：Linux 为主，macOS 实验性，尚无 Windows 计划
+小结：v0.6.16 的核心价值不只是“watcher 更省”，而是把“实时性、预算、补扫成本、查询校验、用户可见 stale 风险”放进同一个可解释模型里。
+
+## 17. 2026-05-10~22：v0.6.16 后修 —— 查询契约、冷层 RSS 与 strict watcher
+
+这一段主要来自 review、实机诊断和策略边界修复。主题是：把 v0.6.16 的策略系统从“功能完成”推向“语义清楚、成本口径真实、RSS 可解释”。
+
+- **`size` 查询契约移除**：HTTP `/search` 响应正式删除 `size` 字段；`size:` 过滤器与 `sort=size` 显式返回 400，不再回退到文本匹配或 score 排序。v7 单文件快照 header version 升级到 2，新写 entry 为 32B，同时继续兼容旧 version 1 的 40B entry。
+- **冷段查询补漏**：新写 v7 段持久化完整路径 trigram posting 与 `[0,0,0]` sentinel，使 manifest-only cold segment 能直接使用 mmap postings；旧 basename-only 段或 posting 无法证明候选完整时回退全段精确过滤，避免目录组件命中漏查。
+- **冷层 metadata 直读**：manifest-only cold segment 的 query、metadata lookup、parent candidates 改为直接按需读取 v7 mmap 段，避免每次冷查询 `to_base_index_data()` 全量 hydration。
+- **metrics JSONL 诊断快照**：metrics 输出保留 `/watch-state` 顶层字段兼容旧 jq，同时新增 `runtime`、`memory`、`health`、`diagnostics` 嵌套对象；`/health` 拆分底层 event watcher 降级与 tiered 非 L0 冷层口径，`/memory` 增加 process swap 字段。
+- **snapshot 后 cold remount**：`snapshot_now()` 写出 v7 后立即以 manifest-only cold segment 重新挂载，避免当前进程把 50 万级路径表重新留在 hot memory。
+- **RSS 归因与 mmap 回吐**：实机定位 125MB RSS 主要来自 `/run/user/1000/fd-rdd/index.d/stable.v7` tmpfs mmap 校验页；v7 mmap 完整 CRC 校验和冷查询后执行 `MADV_DONTNEED`，降低校验/查询触页长期计入 RSS 的概率。
+- **watch 成本口径修正**：tiered L0、动态 watcher、临时 watcher 的预算改按 notify 真实递归目录数估算，而不是按排除后的扫描目录数低估。单根超过预算时返回 `cap + 1` 并拒绝进入 L0，避免 inotify wd 真实消耗和策略账本分裂。
+- **strict/balanced/low_power profile**：新增 tiered watcher profile；strict 模式默认更高 watch 预算，并要求 `strict_required_hot_dirs` 全部进入 L0。预算不足时 `/watch-state` 输出 required cost、shortfall 与 uncovered dirs，`/health` 可按 fail-hard 配置返回 degraded 或 warning。
+- **CI 与真实链路补强**：新增 daemon API/UDS E2E、真实 watcher create/rename/delete、abrupt kill、坏 stable snapshot 启动修复等组合测试；stress-large-scale workflow 显式运行 100K 文件扫描与高负载事件处理 ignored 测试。
+
+小结：这轮后修把几个容易混淆的概念拆清楚了：冷层一致性不是 watcher 故障，预算不足不是底层 watcher 降级，file-backed RSS 不是堆泄漏，扫描成本也不是 inotify watch 成本。
+
+## 18. 截至 2026-05-22 的系统形态
+
+- **查询链路**：L1 cache → DeltaBuffer（按路径去重）→ BaseIndexData / v7 manifest-only cold segment（metadata/postings mmap 按需读取）→ ParentIndex 候选裁剪。
+- **一致性闭环**：notify watcher → bounded channel + debounce → DeltaBuffer；冷层事件、查询 stale hit、query miss 与周期扫描统一进入 DirtyQueue；overflow 优先 fast-sync/局部补扫，必要时 rebuild 兜底。
+- **持久化**：v7 stable snapshot version 2（CRC32C + 轮转 + cold remount）+ events.wal + runtime-state.json；旧 v7 version 1 兼容读取。
+- **Watcher**：tiered L0/L1/L2/L3 分层调度，支持 strict/balanced/low_power profile、真实递归 watch 成本估算、临时 Ephemeral Watch 租约与 required hot dirs fail-hard。
+- **内存模型**：hot BaseIndexData 尽量收缩，冷段通过 mmap demand paging；snapshot 校验/冷查询后主动 `MADV_DONTNEED`；DeltaBuffer 硬容量上限；heap high-water 主动 trim；`/memory` 暴露 swap 与 cold mmap 归因。
+- **策略验证**：`fd-rdd-sim` 覆盖策略搜索、固定 seed 回归、runtime/sim parity 与 TOML patch 回填，把 watcher 策略从经验参数推进到可复现实验。
+- **对外接口**：HTTP `/search` + UDS 流式协议 + `/scan` + `/health` + `/metrics` + `/memory` + `/watch-state` + `/debug/tiered-watch` + `/trim`；`size` 字段、`size:` 与 `sort=size` 已从公开查询契约中移除。
+
+## 19. 仍待推进的方向
+
+- **冷层过滤继续精细化**：manifest-only cold segment 已能 mmap 直读，但仍可继续评估更强的段级过滤/统计，减少无效触页和全段回退。
+- **WAL 语义工业化**：fsync 策略、序列号去重、gap verify、与 watcher/DirtyQueue 边界的精确定义仍可继续收紧。
+- **策略自动化落地**：`fd-rdd-sim` 已能搜索和回填配置，后续可以把真实 metrics report 自动接入长期 profile 推荐。
+- **Benchmark 持续追踪**：已有 stress workflow 和 sim regression，但发布级 benchmark 数据仍需要更系统地自动归档。
+- **多平台支持**：Linux 为主，macOS 实验性，Windows 暂无计划。

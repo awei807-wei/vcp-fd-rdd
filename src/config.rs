@@ -172,6 +172,12 @@ pub struct Config {
     pub startup_repair_budget_ms: u64,
     /// If repair failure ratio exceeds this value, full rebuild may be scheduled.
     pub startup_repair_force_rebuild_ratio: f32,
+    /// WAL durability mode: `flush-only`, `sync-interval`, or `sync-always`.
+    pub wal_durability: String,
+    /// WAL sync interval in milliseconds when `wal_durability = "sync-interval"`.
+    pub wal_sync_interval_ms: u64,
+    /// WAL sync batch size when `wal_durability = "sync-interval"`.
+    pub wal_sync_batch_records: usize,
     /// Directory names that are never indexed, regardless of .gitignore rules.
     pub exclude_dirs: Vec<String>,
 }
@@ -404,6 +410,9 @@ impl Default for Config {
             startup_repair_max_dirs: 16,
             startup_repair_budget_ms: 10_000,
             startup_repair_force_rebuild_ratio: 0.25,
+            wal_durability: "flush-only".to_string(),
+            wal_sync_interval_ms: 1000,
+            wal_sync_batch_records: 1024,
             exclude_dirs: default_exclude_dirs(),
         }
     }
