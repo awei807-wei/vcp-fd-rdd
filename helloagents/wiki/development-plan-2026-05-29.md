@@ -64,7 +64,7 @@
 
 ### 状态
 
-2026-05-29 已完成 1.1 mount policy / FUSE probe 小批次中的共享计数和 watcher 注册前拒绝：full build、rebuild、fast-sync、immediate scan、dynamic watch、ephemeral watch 使用同一 mount policy counters 并进入 `/health.diagnostics.watchers`。随后已完成 1.2 quarantine verify：启动时从 sidecar 安装 Freeze Gate，WAL 按原始 root/file 记录顺序回放，后台 worker 在 mount identity 匹配后先 append `ONLINE_ROOT`，再解除 freeze 并入队 affected prefixes 局部 scan。case/pathconf、clock/io diagnostics 仍待后续小提交。
+2026-05-29 已完成 1.1 mount policy / FUSE probe 小批次中的共享计数和 watcher 注册前拒绝：full build、rebuild、fast-sync、immediate scan、dynamic watch、ephemeral watch 使用同一 mount policy counters 并进入 `/health.diagnostics.watchers`。随后已完成 1.2 quarantine verify：启动时从 sidecar 安装 Freeze Gate，WAL 按原始 root/file 记录顺序回放，后台 worker 在 mount identity 匹配后先 append `ONLINE_ROOT`，再解除 freeze 并入队 affected prefixes 局部 scan。1.3 case/pathconf 已补齐 pathconf fallback、`Unknown` 语义和 Unicode fold byte-window 回归；clock/io diagnostics 仍待后续小提交。
 
 ### 工作项
 

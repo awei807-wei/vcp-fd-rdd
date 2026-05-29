@@ -20,12 +20,12 @@
 
 ## C. Case Policy 探测补完
 
-- [ ] 接入 pathconf 探测。
-- [ ] pathconf 返回 `EINVAL` 时 fallback 到受控副作用探测。
-- [ ] 只读 root / 无权限 root / 缺失 root 返回 `Unknown`。
+- [√] 接入 pathconf 探测。
+- [√] pathconf 返回 `EINVAL` 时 fallback 到受控副作用探测。
+- [√] 只读 root / 无权限 root / 缺失 root 返回 `Unknown`。
 - [ ] runtime detected policy / conflict count 只进入 runtime state 与 `/health.diagnostics`。
-- [ ] Unicode fold trigram offset 使用 byte len，不使用 char len。
-- [ ] 保留 `ß -> ss` 长度变化回归，防止索引越界 panic。
+- [√] Unicode fold trigram offset 使用 byte len，不使用 char len。
+- [√] 保留 `ß -> ss` 长度变化回归，防止索引越界 panic。
 
 ## D. Clock Skew Reconciliation
 
@@ -60,9 +60,9 @@
 - [√] FUSE probe timeout helper 单元测试。
 - [√] Sidecar identity confidence 单元测试。
 - [√] Freeze Gate 阻止 Delete / Modify / Rename 单元测试。
-- [ ] pathconf `EINVAL` fallback 单元测试。
-- [ ] 只读 root `Unknown` 单元测试。
-- [ ] Unicode fold byte offset 回归测试：`ß -> ss` 不 panic。
+- [√] pathconf `EINVAL` fallback 单元测试。
+- [√] 只读 root `Unknown` 单元测试。
+- [√] Unicode fold byte offset 回归测试：`ß -> ss` 不 panic。
 - [ ] ioprio `EPERM` / unsupported best-effort 单元测试。
 - [ ] clock skew threshold 单元测试。
 

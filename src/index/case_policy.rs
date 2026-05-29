@@ -67,7 +67,56 @@ pub fn fstype_case_policy_hint(fstype: &str) -> Option<CasePolicy> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+enum PathconfCasePolicyProbe {
+    Known(CasePolicy),
+    Unsupported,
+    Unknown,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn pathconf_case_sensitive_result(raw: libc::c_long, errno: i32) -> PathconfCasePolicyProbe {
+    match (raw, errno) {
+        (0, _) => PathconfCasePolicyProbe::Known(CasePolicy::Insensitive),
+        (1, _) => PathconfCasePolicyProbe::Known(CasePolicy::Sensitive),
+        (-1, libc::EINVAL) => PathconfCasePolicyProbe::Unsupported,
+        (-1, _) => PathconfCasePolicyProbe::Unknown,
+        _ => PathconfCasePolicyProbe::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn probe_case_policy_with_pathconf(root: &Path) -> PathconfCasePolicyProbe {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = CString::new(root.as_os_str().as_bytes()) else {
+        return PathconfCasePolicyProbe::Unknown;
+    };
+
+    unsafe {
+        *libc::__error() = 0;
+    }
+    let raw = unsafe { libc::pathconf(c_path.as_ptr(), libc::_PC_CASE_SENSITIVE) };
+    let errno = unsafe { *libc::__error() };
+    pathconf_case_sensitive_result(raw, errno)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn probe_case_policy_with_pathconf(_root: &Path) -> PathconfCasePolicyProbe {
+    PathconfCasePolicyProbe::Unsupported
+}
+
 pub fn detect_root_case_policy(root: &Path, fstype_hint: Option<&str>) -> CasePolicyProbeResult {
+    detect_root_case_policy_with_pathconf(root, fstype_hint, probe_case_policy_with_pathconf)
+}
+
+fn detect_root_case_policy_with_pathconf(
+    root: &Path,
+    fstype_hint: Option<&str>,
+    pathconf_probe: impl FnOnce(&Path) -> PathconfCasePolicyProbe,
+) -> CasePolicyProbeResult {
     if let Some(policy) = fstype_hint.and_then(fstype_case_policy_hint) {
         return CasePolicyProbeResult {
             detected_policy: policy,
@@ -86,6 +135,22 @@ pub fn detect_root_case_policy(root: &Path, fstype_hint: Option<&str>) -> CasePo
             detected_policy: CasePolicy::Unknown,
             conflict_count: 0,
         };
+    }
+
+    match pathconf_probe(root) {
+        PathconfCasePolicyProbe::Known(policy) => {
+            return CasePolicyProbeResult {
+                detected_policy: policy,
+                conflict_count: 0,
+            };
+        }
+        PathconfCasePolicyProbe::Unsupported => {}
+        PathconfCasePolicyProbe::Unknown => {
+            return CasePolicyProbeResult {
+                detected_policy: CasePolicy::Unknown,
+                conflict_count: 0,
+            };
+        }
     }
 
     let probe_dir = root.join(format!(
@@ -141,6 +206,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn temp_probe_root(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fd-rdd-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir(&dir).expect("create temp probe root");
+        dir
+    }
 
     #[test]
     fn sharp_s_fold_changes_byte_len_and_still_trigrams_by_bytes() {
@@ -170,10 +249,89 @@ mod tests {
     }
 
     #[test]
+    fn pathconf_result_maps_case_sensitivity_and_einval() {
+        assert_eq!(
+            pathconf_case_sensitive_result(1, 0),
+            PathconfCasePolicyProbe::Known(CasePolicy::Sensitive)
+        );
+        assert_eq!(
+            pathconf_case_sensitive_result(0, 0),
+            PathconfCasePolicyProbe::Known(CasePolicy::Insensitive)
+        );
+        assert_eq!(
+            pathconf_case_sensitive_result(-1, libc::EINVAL),
+            PathconfCasePolicyProbe::Unsupported
+        );
+        assert_eq!(
+            pathconf_case_sensitive_result(-1, libc::EACCES),
+            PathconfCasePolicyProbe::Unknown
+        );
+    }
+
+    #[test]
+    fn pathconf_known_policy_short_circuits_side_effect_probe() {
+        let root = temp_probe_root("case-policy-pathconf-known");
+        let result = detect_root_case_policy_with_pathconf(&root, None, |_| {
+            PathconfCasePolicyProbe::Known(CasePolicy::Insensitive)
+        });
+        fs::remove_dir(&root).expect("remove temp probe root");
+
+        assert_eq!(result.detected_policy, CasePolicy::Insensitive);
+    }
+
+    #[test]
+    fn pathconf_einval_falls_back_to_side_effect_probe() {
+        let root = temp_probe_root("case-policy-pathconf-einval");
+        let result = detect_root_case_policy_with_pathconf(&root, None, |_| {
+            pathconf_case_sensitive_result(-1, libc::EINVAL)
+        });
+        fs::remove_dir(&root).expect("remove temp probe root");
+
+        assert!(matches!(
+            result.detected_policy,
+            CasePolicy::Sensitive | CasePolicy::Insensitive
+        ));
+    }
+
+    #[test]
+    fn pathconf_unknown_error_keeps_policy_unknown_without_side_effects() {
+        let root = temp_probe_root("case-policy-pathconf-unknown");
+        let result = detect_root_case_policy_with_pathconf(&root, None, |_| {
+            pathconf_case_sensitive_result(-1, libc::EACCES)
+        });
+        fs::remove_dir(&root).expect("remove temp probe root");
+
+        assert_eq!(result.detected_policy, CasePolicy::Unknown);
+    }
+
+    #[test]
     fn unreadable_or_missing_root_returns_unknown() {
         let missing =
             std::env::temp_dir().join(format!("fd-rdd-missing-case-policy-{}", std::process::id()));
         let result = detect_root_case_policy(&missing, None);
+        assert_eq!(result.detected_policy, CasePolicy::Unknown);
+    }
+
+    #[test]
+    fn readonly_root_returns_unknown() {
+        let root = temp_probe_root("case-policy-readonly");
+        let mut perms = fs::metadata(&root)
+            .expect("stat temp probe root")
+            .permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&root, perms).expect("set readonly temp probe root");
+
+        let result = detect_root_case_policy_with_pathconf(&root, None, |_| {
+            panic!("readonly roots must not run pathconf or side-effect probes")
+        });
+
+        let mut perms = fs::metadata(&root)
+            .expect("stat readonly temp probe root")
+            .permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(&root, perms).expect("restore temp probe root permissions");
+        fs::remove_dir(&root).expect("remove temp probe root");
+
         assert_eq!(result.detected_policy, CasePolicy::Unknown);
     }
 

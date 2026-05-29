@@ -171,7 +171,7 @@
 - **Freeze Gate / Sidecar Verify**：启动恢复顺序固定为 snapshot -> attach WAL -> restore quarantine sidecar -> install freeze gates -> ordered WAL replay -> event pipeline；离线 root 下 Delete/Modify/Rename 在写 WAL/DeltaBuffer/L2 前被阻断，查询默认隐藏 frozen path。后台 verify 在 mount identity 匹配后先 append `ONLINE_ROOT`，再解除 freeze，并把 affected prefixes 入队局部 scan。
 - **DiagnosticReport**：新增强类型 `DiagnosticReport` 与 `DiagnosticSource`，`/health` 保留 summary 字段并新增 `diagnostics.system/storage/security/clocks/watchers/io`。
 - **结构化 roots 配置**：兼容旧 `roots = []`，新增 `[[roots]]` 对象数组与 `RootConfig`；`detected_policy`、`conflict_count` 等运行时字段不写回 config。
-- **Case policy 自动探测基础**：新增 fstype hint、受控临时对象副作用探测、只读/缺失 root 返回 Unknown、folded conflict count helper；Unicode fold 继续按 byte window 生成 trigram。
+- **Case policy 自动探测**：新增 fstype hint、平台 `pathconf(_PC_CASE_SENSITIVE)` 探测、`EINVAL`/unsupported 回落到受控临时对象副作用探测；只读、无权限或缺失 root 返回 Unknown；folded conflict count helper 与 Unicode fold 继续按 byte window 生成 trigram。
 - **Clock / security / mount 可观测性**：WAL 写入边界接入 clock skew detector，dirty crawl 在 cutoff 不可信时转全量窗口；HTTP root/system daemon 默认禁用未认证 HTTP 服务，`/scan` 拒绝计数进入 diagnostics；mount policy reason matrix 支持 watcher 侧计数。
 - **Mount policy 共享计数闭环**：full build、rebuild、fast-sync、immediate scan、dynamic watch 和 ephemeral watch 入口共享 `SharedMountPolicyCounters`；watcher 动态注册前先执行 mount policy，拒绝时回滚 tiered/ephemeral reservation，并把 deny reason 累加到 `/health.diagnostics.watchers`。
 - **FUSE/SSHFS probe cache**：可疑 mount 初始化探测进入后台线程和 timeout cache，扫描线程只消费缓存状态；pending/timeout/failed 时保守拒绝，`fs_policy.fuse_probe_timeout_ms` 贯穿 full build、rebuild、fast-sync、immediate scan、dynamic watch 和 ephemeral watch。
@@ -179,4 +179,4 @@
 仍需后续增强：
 
 - I/O governor 尚未把真实 token bucket/backoff 计数贯穿到扫描 loop；当前 diagnostics schema 已预留字段。
-- case/pathconf 与 clock/io diagnostics 仍需按 Runtime Boundary 批次继续收口。
+- clock/io diagnostics 仍需按 Runtime Boundary 批次继续收口。

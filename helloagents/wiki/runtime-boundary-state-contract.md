@@ -76,6 +76,17 @@ one_file_system = true
 
 这些状态只通过 runtime state 与 `/health.diagnostics` 暴露。
 
+## Case Policy 探测
+
+`case_policy = "Auto"` 的 root 使用分层探测：
+
+- 先消费明确的 fstype hint。
+- 支持 `_PC_CASE_SENSITIVE` 的平台先调用 `pathconf`。
+- `pathconf` 返回 `EINVAL` 或平台不支持该常量时，回落到受控临时对象副作用探测。
+- 只读、无权限、缺失或非目录 root 返回 `Unknown`，不把探测副作用写入 root。
+
+Unicode fold 只用于 lookup key。原始 path bytes 仍是展示、PathTable 和持久化事实；fold 后 trigram 必须按 byte window 生成，避免 `ß -> ss` 这类长度变化污染原始 offset。
+
 ## Diagnostics
 
 `/health` 保留旧 summary 字段，并新增强类型 `DiagnosticReport`：
