@@ -37,6 +37,12 @@ pub struct StorageDiagnostics {
     pub case_policy_conflict_count: u64,
     pub hardlink_group_count: usize,
     pub hardlink_max_group_size: usize,
+    pub content_hash_queue_pending: usize,
+    pub content_hash_candidate_count: usize,
+    pub content_hash_confirmed_groups: usize,
+    pub content_hash_skipped_count: usize,
+    pub content_hash_last_skip_reason: String,
+    pub content_hash_last_elapsed_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

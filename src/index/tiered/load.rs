@@ -175,6 +175,12 @@ impl TieredIndex {
             mount_policy_counters,
             io_governor,
             stats: Arc::new(crate::stats::StatsCollector::new()),
+            content_hash_queue_pending: AtomicU64::new(0),
+            content_hash_candidate_count: AtomicU64::new(0),
+            content_hash_confirmed_groups: AtomicU64::new(0),
+            content_hash_skipped_count: AtomicU64::new(0),
+            content_hash_last_elapsed_ms: AtomicU64::new(0),
+            content_hash_last_skip_reason: Mutex::new(String::new()),
         }
     }
 

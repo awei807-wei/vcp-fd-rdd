@@ -230,6 +230,12 @@ pub struct TieredIndex {
     pub(self) mount_policy_counters: Arc<SharedMountPolicyCounters>,
     pub(self) io_governor: Arc<crate::io_governor::IoGovernor>,
     pub(self) stats: Arc<StatsCollector>,
+    pub(self) content_hash_queue_pending: AtomicU64,
+    pub(self) content_hash_candidate_count: AtomicU64,
+    pub(self) content_hash_confirmed_groups: AtomicU64,
+    pub(self) content_hash_skipped_count: AtomicU64,
+    pub(self) content_hash_last_elapsed_ms: AtomicU64,
+    pub(self) content_hash_last_skip_reason: Mutex<String>,
 }
 
 impl TieredIndex {
@@ -468,6 +474,18 @@ impl DiagnosticSource for TieredIndex {
             physical_dedupe_stats_from_metas(self.collect_live_metas_for_diagnostics(), None);
         report.storage.hardlink_group_count = physical.hardlink_group_count;
         report.storage.hardlink_max_group_size = physical.max_group_size;
+        report.storage.content_hash_queue_pending =
+            self.content_hash_queue_pending.load(Ordering::Relaxed) as usize;
+        report.storage.content_hash_candidate_count =
+            self.content_hash_candidate_count.load(Ordering::Relaxed) as usize;
+        report.storage.content_hash_confirmed_groups =
+            self.content_hash_confirmed_groups.load(Ordering::Relaxed) as usize;
+        report.storage.content_hash_skipped_count =
+            self.content_hash_skipped_count.load(Ordering::Relaxed) as usize;
+        report.storage.content_hash_last_elapsed_ms =
+            self.content_hash_last_elapsed_ms.load(Ordering::Relaxed);
+        report.storage.content_hash_last_skip_reason =
+            self.content_hash_last_skip_reason.lock().clone();
 
         report.clocks.skew_count = clock_skew_count;
         report.clocks.last_drift_ms = clock_last_drift_ms;

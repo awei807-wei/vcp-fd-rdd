@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fd_rdd::core::{FileKey, FileKind, FileMeta};
+use fd_rdd::diagnostics::{DiagnosticReport, DiagnosticSource};
 use fd_rdd::index::{IndexBuilder, TieredIndex};
 use fd_rdd::query::{execute_query, QueryMode, SortColumn, SortOrder};
 
@@ -703,6 +704,56 @@ fn dupe_filter_returns_hardlink_aliases_with_reason() {
     assert!(
         copy_results.is_empty(),
         "dupe: must reject same-content regular copies"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dupe_content_filter_returns_same_content_copies_with_reason() {
+    let root = unique_tmp_dir("query-dupe-content");
+    std::fs::create_dir_all(&root).unwrap();
+    let copy_a = root.join("content_dupe_a.txt");
+    let copy_b = root.join("content_dupe_b.txt");
+    let same_size_diff = root.join("content_dupe_same_size_diff.txt");
+    let unique = root.join("content_dupe_unique.txt");
+    std::fs::write(&copy_a, b"shared duplicate payload").unwrap();
+    std::fs::write(&copy_b, b"shared duplicate payload").unwrap();
+    std::fs::write(&same_size_diff, b"different duplicate data").unwrap();
+    std::fs::write(&unique, b"unique").unwrap();
+
+    let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    let l2 = index.l2.load_full();
+    IndexBuilder::new(vec![root.clone()]).full_build(l2.as_ref());
+    index.refresh_base();
+
+    let results = index.query_limit_detailed("dupe:content content_dupe", 10);
+    let paths = results
+        .iter()
+        .map(|result| result.meta.path.clone())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&copy_a));
+    assert!(paths.contains(&copy_b));
+    assert!(!paths.contains(&same_size_diff));
+    assert!(!paths.contains(&unique));
+    assert!(
+        results.iter().all(|result| {
+            result.reason.as_deref() == Some("content_hash_match")
+                && result.confidence == Some(0.99)
+        }),
+        "dupe:content should annotate content hash reason/confidence: {results:?}"
+    );
+
+    let mut report = DiagnosticReport::default();
+    index.collect(&mut report);
+    assert_eq!(report.storage.content_hash_confirmed_groups, 1);
+    assert!(report.storage.content_hash_candidate_count >= 3);
+    assert_eq!(report.storage.content_hash_queue_pending, 0);
+
+    let hardlink_results = index.query("dupe: content_dupe");
+    assert!(
+        hardlink_results.is_empty(),
+        "plain dupe: must keep hardlink semantics and not match same-content copies"
     );
 
     let _ = std::fs::remove_dir_all(&root);

@@ -56,6 +56,8 @@ pub enum Atom {
     EmptyDir,
     /// dupe: hardlink duplicate group filter
     HardlinkDupe,
+    /// dupe:content content hash duplicate group filter
+    ContentDupe,
     /// content:keyword (全文搜索，占位)
     Content(String),
 }
@@ -89,6 +91,7 @@ pub struct CompiledQuery {
     include: CompiledExpr,
     excludes: Vec<CompiledExpr>,
     hardlink_dupe: bool,
+    content_dupe: bool,
     content_query: bool,
 }
 
@@ -115,6 +118,10 @@ impl CompiledQuery {
 
     pub fn requires_hardlink_dupe(&self) -> bool {
         self.hardlink_dupe
+    }
+
+    pub fn requires_content_dupe(&self) -> bool {
+        self.content_dupe
     }
 
     pub fn requires_content_index(&self) -> bool {
@@ -311,6 +318,7 @@ pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
 
     // 编译表达式
     let hardlink_dupe = expr_contains_hardlink_dupe(&include_expr);
+    let content_dupe = expr_contains_content_dupe(&include_expr);
     let content_query = expr_contains_content_query(&include_expr);
     let mut include = compile_expr(&include_expr, case_sensitive)?;
     let excludes = exclude_exprs
@@ -336,6 +344,7 @@ pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
         include,
         excludes,
         hardlink_dupe,
+        content_dupe,
         content_query,
     })
 }
@@ -344,6 +353,14 @@ fn expr_contains_hardlink_dupe(expr: &Expr) -> bool {
     match expr {
         Expr::Or(v) | Expr::And(v) => v.iter().any(expr_contains_hardlink_dupe),
         Expr::Atom(Atom::HardlinkDupe) => true,
+        Expr::True | Expr::Atom(_) => false,
+    }
+}
+
+fn expr_contains_content_dupe(expr: &Expr) -> bool {
+    match expr {
+        Expr::Or(v) | Expr::And(v) => v.iter().any(expr_contains_content_dupe),
+        Expr::Atom(Atom::ContentDupe) => true,
         Expr::True | Expr::Atom(_) => false,
     }
 }
@@ -430,6 +447,7 @@ fn compile_atom(atom: &Atom, case_sensitive: bool) -> Result<CompiledExpr, Query
         Atom::EntryType(k) => Ok(CompiledExpr::Filter(Filter::EntryType(*k))),
         Atom::EmptyDir => Ok(CompiledExpr::Filter(Filter::EmptyDir)),
         Atom::HardlinkDupe => Ok(CompiledExpr::True),
+        Atom::ContentDupe => Ok(CompiledExpr::True),
         Atom::Content(s) => Ok(CompiledExpr::Filter(Filter::Content(s.clone()))),
     }
 }
@@ -558,6 +576,7 @@ fn best_anchor_for_atom(
         | Atom::EntryType(_)
         | Atom::EmptyDir
         | Atom::HardlinkDupe
+        | Atom::ContentDupe
         | Atom::Content(_) => Ok(None),
     }
 }
@@ -752,13 +771,11 @@ fn parse_atom_expr(word: &str, case_sensitive: &mut bool) -> Result<Expr, QueryC
         Some("empty") => Ok(Expr::Atom(Atom::EmptyDir)),
         Some("dupe") => {
             let v = unquote(tail)?;
-            if v.trim().is_empty()
-                || matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "hardlink" | "physical"
-                )
-            {
+            let mode = v.trim().to_ascii_lowercase();
+            if v.trim().is_empty() || matches!(mode.as_str(), "hardlink" | "physical") {
                 Ok(Expr::Atom(Atom::HardlinkDupe))
+            } else if matches!(mode.as_str(), "content" | "hash") {
+                Ok(Expr::Atom(Atom::ContentDupe))
             } else {
                 Ok(Expr::And(vec![
                     Expr::Atom(Atom::HardlinkDupe),
@@ -1307,9 +1324,23 @@ mod tests {
         let content = compile_query("content:needle").unwrap();
         assert!(content.requires_content_index());
         assert!(!content.requires_hardlink_dupe());
+        assert!(!content.requires_content_dupe());
 
         let text = compile_query("text:needle").unwrap();
         assert!(text.requires_content_index());
+    }
+
+    #[test]
+    fn dupe_content_filter_sets_content_dupe_flag() {
+        let q = compile_query("dupe:content").unwrap();
+        assert!(q.requires_content_dupe());
+        assert!(!q.requires_hardlink_dupe());
+        assert!(q.matches(&meta("/work/original.txt", 1, None)));
+
+        let filtered = compile_query("dupe:content alias").unwrap();
+        assert!(filtered.requires_content_dupe());
+        assert!(filtered.matches(&meta("/work/alias-a.txt", 1, None)));
+        assert!(!filtered.matches(&meta("/work/original.txt", 1, None)));
     }
 
     #[test]

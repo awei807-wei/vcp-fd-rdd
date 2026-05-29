@@ -60,6 +60,13 @@ impl QueryPlan {
         }
     }
 
+    pub(super) fn requires_content_dupe(&self) -> bool {
+        match &self.evaluator {
+            QueryEvaluator::Compiled(compiled) => compiled.requires_content_dupe(),
+            QueryEvaluator::Legacy(_) => false,
+        }
+    }
+
     pub(super) fn requires_content_index(&self) -> bool {
         match &self.evaluator {
             QueryEvaluator::Compiled(compiled) => compiled.requires_content_index(),

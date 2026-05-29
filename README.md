@@ -389,7 +389,7 @@ fd-rdd --show-config
 | `depth:` | `depth:<=3` | 路径深度 |
 | `type:` | `type:file` | 文件类型 |
 | `empty:` | `type:dir empty:` | 真实空目录 |
-| `dupe:` | `dupe: hardlink` | hardlink 重复路径 |
+| `dupe:` | `dupe: hardlink` / `dupe:content` | hardlink 重复路径；显式 `dupe:content` 使用 size + partial/full hash 查找同内容副本 |
 | `content:` / `text:` | `content:needle` | 内容查询，默认关闭时返回 unsupported |
 | `doc:` / `pic:` / `video:` | `pic:十一` | 按扩展名集合 |
 | `len:` | `len:>50` | 文件名字节长度 |

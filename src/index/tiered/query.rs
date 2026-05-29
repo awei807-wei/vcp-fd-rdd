@@ -1,16 +1,20 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{atomic::Ordering, Arc},
     time::Instant,
 };
 
 use crate::core::{EventRecord, FileKey, FileKind, FileMeta};
 use crate::event::sync::DirtyReason;
 use crate::index::base_index::BaseIndexData;
+use crate::index::content_filter::ContentFilter;
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
 use crate::index::IndexLayer;
 use crate::query::dsl::{compile_query, QueryCompileError};
 use crate::query::matcher::create_matcher;
+use xxhash_rust::xxh3::Xxh3;
 
 use super::arena::{path_deleted_by_any, PathArenaSet};
 use super::query_plan::QueryPlan;
@@ -19,6 +23,9 @@ use super::{QueryResultFreshness, QueryResultIndexTier, QueryResultMeta, TieredI
 const QUERY_GUARD_SLOW_THRESHOLD_US: u64 = 50_000;
 const HARDLINK_DUPE_REASON: &str = "hardlink_same_file_key";
 const HARDLINK_DUPE_CONFIDENCE: f32 = 1.0;
+const CONTENT_DUPE_REASON: &str = "content_hash_match";
+const CONTENT_DUPE_CONFIDENCE: f32 = 0.99;
+const CONTENT_DUPE_PARTIAL_BYTES: usize = 4096;
 const CONTENT_INDEX_UNSUPPORTED: &str =
     "content index is disabled; enable content_index before using content:/text:";
 
@@ -301,7 +308,17 @@ impl TieredIndex {
         } else {
             None
         };
-        let scan_limit = if hardlink_dupe_keys.is_some() {
+        let content_dupe_paths = if plan.requires_content_dupe() {
+            let outcome = content_duplicate_paths(self.collect_live_metas_for_diagnostics(), self);
+            self.record_content_dupe_outcome(&outcome);
+            if outcome.paths.is_empty() {
+                return Vec::new();
+            }
+            Some(outcome.paths)
+        } else {
+            None
+        };
+        let scan_limit = if hardlink_dupe_keys.is_some() || content_dupe_paths.is_some() {
             usize::MAX
         } else {
             limit
@@ -335,7 +352,12 @@ impl TieredIndex {
         }
 
         if results.len() >= scan_limit {
-            return filter_hardlink_dupe_results(results, hardlink_dupe_keys.as_ref(), limit);
+            return filter_dupe_results(
+                results,
+                hardlink_dupe_keys.as_ref(),
+                content_dupe_paths.as_ref(),
+                limit,
+            );
         }
 
         // ParentIndex fast path: if query has a parent filter, get exact candidates from base
@@ -362,9 +384,10 @@ impl TieredIndex {
                     if let Some(result) = self.validate_cold_result(meta, index_tier) {
                         results.push(result);
                         if results.len() >= scan_limit {
-                            return filter_hardlink_dupe_results(
+                            return filter_dupe_results(
                                 results,
                                 hardlink_dupe_keys.as_ref(),
+                                content_dupe_paths.as_ref(),
                                 limit,
                             );
                         }
@@ -382,10 +405,20 @@ impl TieredIndex {
             &mut results,
             scan_limit,
         ) {
-            return filter_hardlink_dupe_results(results, hardlink_dupe_keys.as_ref(), limit);
+            return filter_dupe_results(
+                results,
+                hardlink_dupe_keys.as_ref(),
+                content_dupe_paths.as_ref(),
+                limit,
+            );
         }
 
-        filter_hardlink_dupe_results(results, hardlink_dupe_keys.as_ref(), limit)
+        filter_dupe_results(
+            results,
+            hardlink_dupe_keys.as_ref(),
+            content_dupe_paths.as_ref(),
+            limit,
+        )
     }
 
     fn overlay_meta_for_event(&self, ev: &EventRecord) -> Option<FileMeta> {
@@ -608,6 +641,19 @@ impl TieredIndex {
         self.enqueue_dirty_dirs(dirs, DirtyReason::QueryMiss);
         tracing::debug!("query miss enqueued dirty compensation for {}", keyword);
     }
+
+    fn record_content_dupe_outcome(&self, outcome: &ContentDupeOutcome) {
+        self.content_hash_queue_pending.store(0, Ordering::Relaxed);
+        self.content_hash_candidate_count
+            .store(outcome.candidate_count as u64, Ordering::Relaxed);
+        self.content_hash_confirmed_groups
+            .store(outcome.confirmed_groups as u64, Ordering::Relaxed);
+        self.content_hash_skipped_count
+            .store(outcome.skipped_count as u64, Ordering::Relaxed);
+        self.content_hash_last_elapsed_ms
+            .store(outcome.elapsed_ms, Ordering::Relaxed);
+        *self.content_hash_last_skip_reason.lock() = outcome.last_skip_reason.clone();
+    }
 }
 
 struct QueryGenerationGuard<'a> {
@@ -684,26 +730,187 @@ fn hardlink_duplicate_keys(metas: impl IntoIterator<Item = FileMeta>) -> HashSet
         .collect()
 }
 
-fn filter_hardlink_dupe_results(
+fn filter_dupe_results(
     results: Vec<QueryResultMeta>,
     hardlink_dupe_keys: Option<&HashSet<FileKey>>,
+    content_dupe_paths: Option<&HashSet<PathBuf>>,
     limit: usize,
 ) -> Vec<QueryResultMeta> {
-    let Some(keys) = hardlink_dupe_keys else {
+    if hardlink_dupe_keys.is_none() && content_dupe_paths.is_none() {
         return results;
-    };
+    }
     results
         .into_iter()
         .filter_map(|mut result| {
-            if !keys.contains(&result.meta.file_key) {
-                return None;
+            if let Some(keys) = hardlink_dupe_keys {
+                if !keys.contains(&result.meta.file_key) {
+                    return None;
+                }
+                result.reason = Some(HARDLINK_DUPE_REASON.to_string());
+                result.confidence = Some(HARDLINK_DUPE_CONFIDENCE);
             }
-            result.reason = Some(HARDLINK_DUPE_REASON.to_string());
-            result.confidence = Some(HARDLINK_DUPE_CONFIDENCE);
+            if let Some(paths) = content_dupe_paths {
+                if !paths.contains(&result.meta.path) {
+                    return None;
+                }
+                result.reason = Some(CONTENT_DUPE_REASON.to_string());
+                result.confidence = Some(CONTENT_DUPE_CONFIDENCE);
+            }
             Some(result)
         })
         .take(limit)
         .collect()
+}
+
+#[derive(Default)]
+struct ContentDupeOutcome {
+    paths: HashSet<PathBuf>,
+    candidate_count: usize,
+    confirmed_groups: usize,
+    skipped_count: usize,
+    last_skip_reason: String,
+    elapsed_ms: u64,
+}
+
+#[derive(Clone)]
+struct ContentDupeCandidate {
+    meta: FileMeta,
+    size: u64,
+}
+
+fn content_duplicate_paths(
+    metas: impl IntoIterator<Item = FileMeta>,
+    index: &TieredIndex,
+) -> ContentDupeOutcome {
+    let started = Instant::now();
+    let mut outcome = ContentDupeOutcome::default();
+    let mut by_size: HashMap<u64, Vec<ContentDupeCandidate>> = HashMap::new();
+
+    for meta in metas {
+        let Some(candidate) = content_dupe_candidate(meta, index, &mut outcome) else {
+            continue;
+        };
+        by_size.entry(candidate.size).or_default().push(candidate);
+    }
+
+    let mut partial_groups: HashMap<(u64, u64), Vec<ContentDupeCandidate>> = HashMap::new();
+    for (size, candidates) in by_size {
+        if candidates.len() < 2 {
+            continue;
+        }
+        outcome.candidate_count += candidates.len();
+        for candidate in candidates {
+            match file_partial_hash(&candidate.meta.path, index) {
+                Ok(partial_hash) => partial_groups
+                    .entry((size, partial_hash))
+                    .or_default()
+                    .push(candidate),
+                Err(reason) => record_content_skip(&mut outcome, reason),
+            }
+        }
+    }
+
+    let mut full_groups: HashMap<(u64, u64), Vec<PathBuf>> = HashMap::new();
+    for ((size, _partial_hash), candidates) in partial_groups {
+        if candidates.len() < 2 {
+            continue;
+        }
+        for candidate in candidates {
+            match file_full_hash(&candidate.meta.path, index) {
+                Ok(full_hash) => full_groups
+                    .entry((size, full_hash))
+                    .or_default()
+                    .push(candidate.meta.path),
+                Err(reason) => record_content_skip(&mut outcome, reason),
+            }
+        }
+    }
+
+    for mut paths in full_groups.into_values() {
+        if paths.len() < 2 {
+            continue;
+        }
+        paths.sort();
+        paths.dedup();
+        if paths.len() < 2 {
+            continue;
+        }
+        outcome.confirmed_groups += 1;
+        outcome.paths.extend(paths);
+    }
+
+    outcome.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    outcome
+}
+
+fn content_dupe_candidate(
+    meta: FileMeta,
+    index: &TieredIndex,
+    outcome: &mut ContentDupeOutcome,
+) -> Option<ContentDupeCandidate> {
+    if !meta.kind.is_file() {
+        return None;
+    }
+    if index.path_is_frozen(meta.path.as_path()) {
+        record_content_skip(outcome, "frozen_path".to_string());
+        return None;
+    }
+    index.io_governor.before_io();
+    let fs_meta = match std::fs::metadata(&meta.path) {
+        Ok(fs_meta) => fs_meta,
+        Err(err) => {
+            record_content_skip(outcome, format!("metadata_error:{}", err.kind()));
+            return None;
+        }
+    };
+    if !fs_meta.is_file() {
+        record_content_skip(outcome, "not_file".to_string());
+        return None;
+    }
+    Some(ContentDupeCandidate {
+        meta,
+        size: fs_meta.len(),
+    })
+}
+
+fn file_partial_hash(path: &Path, index: &TieredIndex) -> Result<u64, String> {
+    let mut file = std::fs::File::open(path).map_err(|err| format!("open_error:{}", err.kind()))?;
+    let mut buf = vec![0u8; CONTENT_DUPE_PARTIAL_BYTES];
+    let mut read_total = 0usize;
+    while read_total < CONTENT_DUPE_PARTIAL_BYTES {
+        index.io_governor.before_io();
+        let read = file
+            .read(&mut buf[read_total..CONTENT_DUPE_PARTIAL_BYTES])
+            .map_err(|err| format!("read_error:{}", err.kind()))?;
+        if read == 0 {
+            break;
+        }
+        read_total += read;
+    }
+    buf.truncate(read_total);
+    Ok(ContentFilter::content_hash(&buf))
+}
+
+fn file_full_hash(path: &Path, index: &TieredIndex) -> Result<u64, String> {
+    let mut file = std::fs::File::open(path).map_err(|err| format!("open_error:{}", err.kind()))?;
+    let mut hasher = Xxh3::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        index.io_governor.before_io();
+        let read = file
+            .read(&mut buf)
+            .map_err(|err| format!("read_error:{}", err.kind()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher.digest())
+}
+
+fn record_content_skip(outcome: &mut ContentDupeOutcome, reason: String) {
+    outcome.skipped_count += 1;
+    outcome.last_skip_reason = reason;
 }
 
 fn collect_live_meta(
