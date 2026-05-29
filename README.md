@@ -329,12 +329,18 @@ jq '{
 | `watch_enabled` | `bool` | `true` | 启用文件监听 |
 | `watch_mode` | `String` | `"recursive"` | `recursive` / `tiered` / `off` |
 | `runtime_profile` | `String` | `"default"` | `default` / `memory_light` |
+| `content_index.enable` | `bool` | `false` | 内容索引开关，默认关闭 |
+| `content_index.max_file_size` | `u64` | `1048576` | 内容索引单文件大小上限 |
+| `content_index.include_ext` | `[String]` | `[]` | 内容索引后缀白名单 |
+| `content_index.exclude_ext` | `[String]` | `[]` | 内容索引后缀黑名单 |
 | `snapshot_interval_secs` | `u64` | `300` | 快照落盘周期 |
 | `stable_snapshot_enabled` | `bool` | `true` | 稳定快照轮转 |
 | `startup_repair_enabled` | `bool` | `true` | 启动修复扫描 |
 | `log_level` | `String` | `"info"` | trace / debug / info / warn / error |
 
 `runtime_profile = "memory_light"` 适合更关注常驻内存上限、可接受更频繁 snapshot/flush 的环境。该模式会降低 DeltaBuffer 触发 flush 的路径数/字节门槛，给周期 flush 增加最大滞留时间，缩短 rebuild 合并冷却，并在 WAL 体积超过阈值时请求 snapshot 边界；强制 flush、退出前 final snapshot、WAL replay 和离线 root 的 Freeze Gate 保护不变。CLI 可用 `--runtime-profile memory_light` 临时覆盖。
+
+内容索引默认关闭，`content:` / `text:` 查询会返回明确的 unsupported 错误，避免默认文件名查询热路径读取文件内容。启用前需配置 `[content_index]` 的文件大小和后缀策略。
 
 可用 `scripts/fs-churn.py` 做默认 profile 与 `memory_light` 的 churn 对照：
 
@@ -384,6 +390,7 @@ fd-rdd --show-config
 | `type:` | `type:file` | 文件类型 |
 | `empty:` | `type:dir empty:` | 真实空目录 |
 | `dupe:` | `dupe: hardlink` | hardlink 重复路径 |
+| `content:` / `text:` | `content:needle` | 内容查询，默认关闭时返回 unsupported |
 | `doc:` / `pic:` / `video:` | `pic:十一` | 按扩展名集合 |
 | `len:` | `len:>50` | 文件名字节长度 |
 

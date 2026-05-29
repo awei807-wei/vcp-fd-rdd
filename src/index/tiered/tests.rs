@@ -1132,6 +1132,36 @@ async fn removed_size_filter_is_not_text_matched() -> anyhow::Result<()> {
 }
 
 #[test]
+fn content_filter_is_explicitly_unsupported_until_index_enabled() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("query-content-disabled");
+    std::fs::create_dir_all(&root)?;
+
+    let p = root.join("content_probe.txt");
+    std::fs::write(&p, b"needle in body only")?;
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, p.clone())]);
+
+    let err = idx
+        .query_limit_detailed_strict("content:needle", 100)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("content index is disabled"));
+    assert!(
+        idx.query_limit("content:needle", 100).is_empty(),
+        "legacy query path must not text-match disabled content filters"
+    );
+
+    let text_err = idx
+        .query_limit_detailed_strict("text:needle", 100)
+        .unwrap_err()
+        .to_string();
+    assert!(text_err.contains("content index is disabled"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
 fn strict_dsl_preserves_path_initials_with_filename_tail() {
     let root = unique_tmp_dir("query-path-initials-tail");
     let dir = root.join("segment/client/user/search");

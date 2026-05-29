@@ -19,6 +19,8 @@ use super::{QueryResultFreshness, QueryResultIndexTier, QueryResultMeta, TieredI
 const QUERY_GUARD_SLOW_THRESHOLD_US: u64 = 50_000;
 const HARDLINK_DUPE_REASON: &str = "hardlink_same_file_key";
 const HARDLINK_DUPE_CONFIDENCE: f32 = 1.0;
+const CONTENT_INDEX_UNSUPPORTED: &str =
+    "content index is disabled; enable content_index before using content:/text:";
 
 impl TieredIndex {
     /// 查询入口：L1 → L2 → DiskSegments（mmap），不扫真实文件系统
@@ -113,6 +115,9 @@ impl TieredIndex {
 
         if !plan.has_trigram_hint() {
             self.record_query_no_trigram_hint_metric();
+        }
+        if plan.requires_content_index() {
+            return Err(QueryCompileError::Filter(CONTENT_INDEX_UNSUPPORTED.into()));
         }
 
         let results = self.execute_query_plan(&plan, limit);

@@ -89,6 +89,7 @@ pub struct CompiledQuery {
     include: CompiledExpr,
     excludes: Vec<CompiledExpr>,
     hardlink_dupe: bool,
+    content_query: bool,
 }
 
 impl CompiledQuery {
@@ -114,6 +115,10 @@ impl CompiledQuery {
 
     pub fn requires_hardlink_dupe(&self) -> bool {
         self.hardlink_dupe
+    }
+
+    pub fn requires_content_index(&self) -> bool {
+        self.content_query
     }
 
     fn find_parent_in_expr(expr: &CompiledExpr) -> Option<String> {
@@ -255,6 +260,7 @@ fn is_path_initials_query(input: &str) -> bool {
         || input.starts_with("type:")
         || input.starts_with("empty:")
         || input.starts_with("dupe:")
+        || input.starts_with("text:")
         || input.starts_with("case:")
         || input.starts_with("content:");
     if !has_separator || has_glob || has_special_prefix {
@@ -305,6 +311,7 @@ pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
 
     // 编译表达式
     let hardlink_dupe = expr_contains_hardlink_dupe(&include_expr);
+    let content_query = expr_contains_content_query(&include_expr);
     let mut include = compile_expr(&include_expr, case_sensitive)?;
     let excludes = exclude_exprs
         .iter()
@@ -329,6 +336,7 @@ pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
         include,
         excludes,
         hardlink_dupe,
+        content_query,
     })
 }
 
@@ -336,6 +344,14 @@ fn expr_contains_hardlink_dupe(expr: &Expr) -> bool {
     match expr {
         Expr::Or(v) | Expr::And(v) => v.iter().any(expr_contains_hardlink_dupe),
         Expr::Atom(Atom::HardlinkDupe) => true,
+        Expr::True | Expr::Atom(_) => false,
+    }
+}
+
+fn expr_contains_content_query(expr: &Expr) -> bool {
+    match expr {
+        Expr::Or(v) | Expr::And(v) => v.iter().any(expr_contains_content_query),
+        Expr::Atom(Atom::Content(_)) => true,
         Expr::True | Expr::Atom(_) => false,
     }
 }
@@ -750,7 +766,7 @@ fn parse_atom_expr(word: &str, case_sensitive: &mut bool) -> Result<Expr, QueryC
                 ]))
             }
         }
-        Some("content") => {
+        Some("content") | Some("text") => {
             let v = unquote(tail)?;
             if v.is_empty() {
                 return Err(QueryCompileError::Filter("content: empty keyword".into()));
@@ -1284,6 +1300,16 @@ mod tests {
         let all = compile_query("dupe:").unwrap();
         assert!(all.requires_hardlink_dupe());
         assert!(all.matches(&meta("/work/original.txt", 1, None)));
+    }
+
+    #[test]
+    fn content_and_text_filters_require_content_index() {
+        let content = compile_query("content:needle").unwrap();
+        assert!(content.requires_content_index());
+        assert!(!content.requires_hardlink_dupe());
+
+        let text = compile_query("text:needle").unwrap();
+        assert!(text.requires_content_index());
     }
 
     #[test]

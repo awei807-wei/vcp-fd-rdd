@@ -187,6 +187,8 @@ pub struct Config {
     pub wal_sync_batch_records: usize,
     /// Background scan I/O governor.
     pub io_governor: IoGovernorConfig,
+    /// Optional lightweight content index. Disabled by default to keep filename queries unaffected.
+    pub content_index: ContentIndexConfig,
     /// Filesystem boundary policy for mount traversal.
     pub fs_policy: FsPolicyConfig,
     /// Directory names that are never indexed, regardless of .gitignore rules.
@@ -228,6 +230,30 @@ impl RootConfig {
         Self {
             path,
             ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContentIndexConfig {
+    /// Enable background content indexing. Disabled by default.
+    pub enable: bool,
+    /// Maximum file size eligible for content indexing.
+    pub max_file_size: u64,
+    /// Extension allow-list. Empty means no files are indexed until configured.
+    pub include_ext: Vec<String>,
+    /// Extension deny-list applied after include_ext.
+    pub exclude_ext: Vec<String>,
+}
+
+impl Default for ContentIndexConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            max_file_size: 1024 * 1024,
+            include_ext: Vec::new(),
+            exclude_ext: Vec::new(),
         }
     }
 }
@@ -537,6 +563,7 @@ impl Default for Config {
             wal_sync_interval_ms: 1000,
             wal_sync_batch_records: 1024,
             io_governor: IoGovernorConfig::default(),
+            content_index: ContentIndexConfig::default(),
             fs_policy: FsPolicyConfig::default(),
             exclude_dirs: default_exclude_dirs(),
         }
@@ -861,6 +888,43 @@ runtime_profile = "memory_light"
 
         let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
         assert!(toml.contains("runtime_profile"));
+    }
+
+    #[test]
+    fn content_index_defaults_disabled_and_accepts_policy() {
+        let default_cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+"#,
+        )
+        .expect("config should parse without content_index table");
+
+        assert!(!default_cfg.content_index.enable);
+        assert_eq!(default_cfg.content_index.max_file_size, 1024 * 1024);
+        assert!(default_cfg.content_index.include_ext.is_empty());
+        assert!(default_cfg.content_index.exclude_ext.is_empty());
+
+        let cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+
+[content_index]
+enable = true
+max_file_size = 4096
+include_ext = ["txt", "md"]
+exclude_ext = ["log"]
+"#,
+        )
+        .expect("content_index config should parse");
+
+        assert!(cfg.content_index.enable);
+        assert_eq!(cfg.content_index.max_file_size, 4096);
+        assert_eq!(cfg.content_index.include_ext, vec!["txt", "md"]);
+        assert_eq!(cfg.content_index.exclude_ext, vec!["log"]);
+
+        let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
+        assert!(toml.contains("[content_index]"));
+        assert!(toml.contains("max_file_size"));
     }
 
     #[test]
