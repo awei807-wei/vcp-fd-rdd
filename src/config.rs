@@ -299,6 +299,8 @@ pub struct TieredWatchConfig {
     pub ephemeral_idle_secs: u64,
     /// Maximum estimated recursive watch cost allowed for one temporary root.
     pub ephemeral_max_cost_per_root: usize,
+    /// Project marker names used by balanced tiered watcher project-root detection.
+    pub project_markers: Vec<String>,
     /// Initial hot directory candidates. `~` is expanded during config load.
     pub hot_dirs: Vec<PathBuf>,
     /// Directories that must be covered by L0 when profile = "strict".
@@ -436,6 +438,7 @@ impl Default for TieredWatchConfig {
             ephemeral_watch_ttl_secs: 600,
             ephemeral_idle_secs: 120,
             ephemeral_max_cost_per_root: 64,
+            project_markers: default_project_markers(),
             hot_dirs: default_hot_dirs(),
             strict_required_hot_dirs: default_hot_dirs(),
             strict_fail_on_budget_exceeded: true,
@@ -466,6 +469,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             ephemeral_watch_ttl_secs: u64,
             ephemeral_idle_secs: u64,
             ephemeral_max_cost_per_root: usize,
+            project_markers: Vec<String>,
             hot_dirs: Vec<PathBuf>,
             strict_required_hot_dirs: Vec<PathBuf>,
             strict_fail_on_budget_exceeded: bool,
@@ -490,6 +494,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
                     ephemeral_watch_ttl_secs: defaults.ephemeral_watch_ttl_secs,
                     ephemeral_idle_secs: defaults.ephemeral_idle_secs,
                     ephemeral_max_cost_per_root: defaults.ephemeral_max_cost_per_root,
+                    project_markers: defaults.project_markers,
                     hot_dirs: defaults.hot_dirs,
                     strict_required_hot_dirs: defaults.strict_required_hot_dirs,
                     strict_fail_on_budget_exceeded: defaults.strict_fail_on_budget_exceeded,
@@ -516,11 +521,29 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             ephemeral_watch_ttl_secs: raw.ephemeral_watch_ttl_secs,
             ephemeral_idle_secs: raw.ephemeral_idle_secs,
             ephemeral_max_cost_per_root: raw.ephemeral_max_cost_per_root,
+            project_markers: raw.project_markers,
             hot_dirs: raw.hot_dirs,
             strict_required_hot_dirs: raw.strict_required_hot_dirs,
             strict_fail_on_budget_exceeded: raw.strict_fail_on_budget_exceeded,
         })
     }
+}
+
+fn default_project_markers() -> Vec<String> {
+    [
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "pnpm-workspace.yaml",
+        "go.mod",
+        "pyproject.toml",
+        "requirements.txt",
+        "deno.json",
+        "Makefile",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 fn default_hot_dirs() -> Vec<PathBuf> {
@@ -845,6 +868,10 @@ max_watch_dirs = 16
         assert_eq!(cfg.tiered_watch.ephemeral_watch_ttl_secs, 600);
         assert_eq!(cfg.tiered_watch.ephemeral_idle_secs, 120);
         assert_eq!(cfg.tiered_watch.ephemeral_max_cost_per_root, 64);
+        assert!(cfg
+            .tiered_watch
+            .project_markers
+            .contains(&"Cargo.toml".to_string()));
         assert_eq!(cfg.tiered_watch.profile, TieredWatchProfile::Balanced);
         assert_eq!(cfg.tiered_watch.l3_scan_policy, L3ScanPolicy::Interval);
         assert_eq!(
@@ -862,6 +889,7 @@ max_watch_dirs = 16
         assert!(toml.contains("ephemeral_watch_ttl_secs"));
         assert!(toml.contains("ephemeral_idle_secs"));
         assert!(toml.contains("ephemeral_max_cost_per_root"));
+        assert!(toml.contains("project_markers"));
     }
 
     #[test]
@@ -966,6 +994,10 @@ profile = "strict"
             cfg.tiered_watch.strict_required_hot_dirs,
             super::default_hot_dirs()
         );
+        assert_eq!(
+            cfg.tiered_watch.project_markers,
+            super::default_project_markers()
+        );
     }
 
     #[test]
@@ -980,6 +1012,7 @@ profile = "strict"
 max_watch_dirs = 32
 strict_required_hot_dirs = ["~/Documents"]
 strict_fail_on_budget_exceeded = false
+project_markers = [".git", "WORKSPACE"]
 "#,
         )
         .expect("strict overrides should parse");
@@ -991,6 +1024,7 @@ strict_fail_on_budget_exceeded = false
             vec![PathBuf::from("~/Documents")]
         );
         assert!(!cfg.tiered_watch.strict_fail_on_budget_exceeded);
+        assert_eq!(cfg.tiered_watch.project_markers, vec![".git", "WORKSPACE"]);
     }
 
     #[test]

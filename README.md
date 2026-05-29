@@ -213,6 +213,7 @@ watch_mode = "tiered"
 [tiered_watch]
 profile = "strict" # strict | balanced | low_power
 max_watch_dirs = 131072
+project_markers = [".git", "Cargo.toml", "package.json", "go.mod", "pyproject.toml"]
 strict_required_hot_dirs = [
   "~/Documents",
   "~/Downloads",
@@ -333,6 +334,7 @@ jq '{
 | `content_index.max_file_size` | `u64` | `1048576` | 内容索引单文件大小上限 |
 | `content_index.include_ext` | `[String]` | `[]` | 内容索引后缀白名单 |
 | `content_index.exclude_ext` | `[String]` | `[]` | 内容索引后缀黑名单 |
+| `tiered_watch.project_markers` | `[String]` | 常见项目标记 | balanced watcher 识别项目根的 marker 名称 |
 | `snapshot_interval_secs` | `u64` | `300` | 快照落盘周期 |
 | `stable_snapshot_enabled` | `bool` | `true` | 稳定快照轮转 |
 | `startup_repair_enabled` | `bool` | `true` | 启动修复扫描 |
