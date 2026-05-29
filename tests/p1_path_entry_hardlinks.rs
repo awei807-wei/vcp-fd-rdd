@@ -23,6 +23,22 @@ fn build_index(root: &Path) -> PersistentIndex {
     idx
 }
 
+fn group_paths(
+    idx: &PersistentIndex,
+    min_links: usize,
+    prefix: Option<&Path>,
+) -> Vec<Vec<PathBuf>> {
+    idx.hardlink_groups(min_links, prefix)
+        .into_iter()
+        .map(|group| group.paths)
+        .collect()
+}
+
+fn sorted_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths
+}
+
 #[test]
 fn full_build_indexes_same_inode_multiple_paths() {
     let root = unique_tmp_dir("full-build");
@@ -45,6 +61,47 @@ fn full_build_indexes_same_inode_multiple_paths() {
 }
 
 #[test]
+fn hardlink_groups_filter_copy_min_links_and_prefix() {
+    let root = unique_tmp_dir("groups");
+    let same_dir = root.join("same");
+    let other_dir = root.join("other");
+    std::fs::create_dir_all(&same_dir).unwrap();
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let original = same_dir.join("original.txt");
+    let alias_a = same_dir.join("alias-a.txt");
+    let alias_b = other_dir.join("alias-b.txt");
+    let copy = same_dir.join("copy.txt");
+    std::fs::write(&original, b"same").unwrap();
+    std::fs::hard_link(&original, &alias_a).unwrap();
+    std::fs::hard_link(&original, &alias_b).unwrap();
+    std::fs::write(&copy, b"same").unwrap();
+
+    let idx = build_index(&root);
+    let groups = group_paths(&idx, 2, None);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0],
+        sorted_paths(vec![original.clone(), alias_a.clone(), alias_b.clone()])
+    );
+    assert!(!groups[0].contains(&copy));
+
+    assert_eq!(group_paths(&idx, 3, None).len(), 1);
+    assert!(group_paths(&idx, 4, None).is_empty());
+    assert_eq!(group_paths(&idx, 2, Some(&same_dir)).len(), 1);
+    assert!(group_paths(&idx, 2, Some(&other_dir)).is_empty());
+
+    let stats = idx.physical_dedupe_stats();
+    assert_eq!(stats.live_path_count, 4);
+    assert_eq!(stats.physical_file_count, 2);
+    assert_eq!(stats.hardlink_group_count, 1);
+    assert_eq!(stats.hardlink_path_count, 3);
+    assert_eq!(stats.duplicate_path_count, 2);
+    assert_eq!(stats.max_group_size, 3);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn delete_one_hardlink_path_keeps_other_alias_live() {
     let root = unique_tmp_dir("delete-one");
     std::fs::create_dir_all(&root).unwrap();
@@ -60,6 +117,13 @@ fn delete_one_hardlink_path_keeps_other_alias_live() {
     let qb = create_matcher("drop-b", false);
     assert_eq!(idx.query(qa.as_ref(), 10).len(), 1);
     assert!(idx.query(qb.as_ref(), 10).is_empty());
+    assert!(group_paths(&idx, 2, None).is_empty());
+
+    let stats = idx.physical_dedupe_stats();
+    assert_eq!(stats.live_path_count, 1);
+    assert_eq!(stats.physical_file_count, 1);
+    assert_eq!(stats.hardlink_group_count, 0);
+    assert_eq!(stats.max_group_size, 0);
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -99,6 +163,9 @@ fn hardlink_rename_updates_only_renamed_path() {
     assert!(idx
         .query(create_matcher("old-b", false).as_ref(), 10)
         .is_empty());
+    let groups = group_paths(&idx, 2, None);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0], sorted_paths(vec![a.clone(), c.clone()]));
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -133,6 +200,11 @@ fn hardlink_aliases_survive_v7_snapshot_reload() {
             .len(),
         1
     );
+    let rehydrated = PersistentIndex::new_with_roots(vec![root.clone()]);
+    loaded.for_each_live_meta(|meta| rehydrated.upsert_path_alias(meta));
+    let groups = group_paths(&rehydrated, 2, None);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0], sorted_paths(vec![a.clone(), b.clone()]));
 
     let _ = std::fs::remove_dir_all(root);
 }

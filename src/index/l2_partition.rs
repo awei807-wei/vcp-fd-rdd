@@ -267,6 +267,26 @@ pub struct V6Segments {
     pub filekey_map_bytes: Arc<Vec<u8>>,
 }
 
+/// Derived view of live paths that point at the same physical file.
+///
+/// This is not a search primary key. Search remains path/docid based; the
+/// grouping is rebuilt from currently visible entries when requested.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HardlinkGroup {
+    pub file_key: FileKey,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PhysicalDedupeStats {
+    pub live_path_count: usize,
+    pub physical_file_count: usize,
+    pub hardlink_group_count: usize,
+    pub hardlink_path_count: usize,
+    pub duplicate_path_count: usize,
+    pub max_group_size: usize,
+}
+
 #[derive(Clone, Debug)]
 enum OneOrManyDocId {
     One(DocId),
@@ -838,6 +858,48 @@ impl PersistentIndex {
             };
             f(Self::meta_from_entry_and_path(entry, path_bytes));
         }
+    }
+
+    pub fn hardlink_groups(&self, min_links: usize, prefix: Option<&Path>) -> Vec<HardlinkGroup> {
+        let min_links = min_links.max(2);
+        let mut groups = self
+            .live_paths_by_file_key(prefix)
+            .into_iter()
+            .filter_map(|(file_key, mut paths)| {
+                if paths.len() < min_links {
+                    return None;
+                }
+                paths.sort();
+                Some(HardlinkGroup { file_key, paths })
+            })
+            .collect::<Vec<_>>();
+        groups.sort_by_key(|group| (group.file_key, group.paths.first().cloned()));
+        groups
+    }
+
+    pub fn physical_dedupe_stats(&self) -> PhysicalDedupeStats {
+        self.physical_dedupe_stats_for_prefix(None)
+    }
+
+    pub fn physical_dedupe_stats_for_prefix(&self, prefix: Option<&Path>) -> PhysicalDedupeStats {
+        let groups = self.live_paths_by_file_key(prefix);
+        let mut stats = PhysicalDedupeStats {
+            live_path_count: groups.values().map(Vec::len).sum(),
+            physical_file_count: groups.len(),
+            ..PhysicalDedupeStats::default()
+        };
+
+        for paths in groups.values() {
+            if paths.len() < 2 {
+                continue;
+            }
+            stats.hardlink_group_count += 1;
+            stats.hardlink_path_count += paths.len();
+            stats.duplicate_path_count += paths.len() - 1;
+            stats.max_group_size = stats.max_group_size.max(paths.len());
+        }
+
+        stats
     }
 
     /// 构建/重建 ParentIndex
@@ -1700,6 +1762,34 @@ impl PersistentIndex {
             ctime: None,
             atime: None,
         }
+    }
+
+    fn live_paths_by_file_key(&self, prefix: Option<&Path>) -> HashMap<FileKey, Vec<PathBuf>> {
+        let normalized_prefix = prefix.map(crate::index::tiered::normalize_path);
+        let entries = self.entries.read();
+        let paths = self.paths.read();
+        let tombstones = self.tombstones.read();
+        let mut groups: HashMap<FileKey, Vec<PathBuf>> = HashMap::new();
+
+        for (docid_usize, entry) in entries.iter().enumerate() {
+            let docid = docid_usize as DocId;
+            if tombstones.contains(docid) {
+                continue;
+            }
+            let Some(path_bytes) = paths.get(docid_usize) else {
+                continue;
+            };
+            let path = pathbuf_from_encoded_vec(path_bytes.clone());
+            if normalized_prefix
+                .as_ref()
+                .is_some_and(|prefix| !path.starts_with(prefix))
+            {
+                continue;
+            }
+            groups.entry(entry.file_key()).or_default().push(path);
+        }
+
+        groups
     }
 
     fn path_buf_for_docid(&self, docid: DocId) -> Option<PathBuf> {

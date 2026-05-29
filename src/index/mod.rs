@@ -37,7 +37,8 @@ pub trait IndexLayer: Send + Sync {
 
 pub use l1_cache::L1Cache;
 pub use l2_partition::{
-    IndexSnapshotV2, IndexSnapshotV3, IndexSnapshotV4, IndexSnapshotV5, PersistentIndex,
+    HardlinkGroup, IndexSnapshotV2, IndexSnapshotV3, IndexSnapshotV4, IndexSnapshotV5,
+    PersistentIndex, PhysicalDedupeStats,
 };
 pub use l3_cold::IndexBuilder;
 pub use mmap_index::MmapIndex;
