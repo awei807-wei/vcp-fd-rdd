@@ -96,6 +96,35 @@ fn tiered_diagnostics_include_shared_mount_policy_counters() {
 }
 
 #[test]
+fn tiered_diagnostics_include_ioprio_status() {
+    let root = unique_tmp_dir("ioprio-diag");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    let mut report = DiagnosticReport::default();
+    idx.collect(&mut report);
+    assert_eq!(report.io.ioprio_class, "unset");
+    assert!(!report.io.ioprio_set_failed);
+
+    idx.record_idle_io_priority_result(Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "denied",
+    )));
+    let mut report = DiagnosticReport::default();
+    idx.collect(&mut report);
+    assert_eq!(report.io.ioprio_class, "unavailable");
+    assert!(report.io.ioprio_set_failed);
+
+    idx.record_idle_io_priority_result(Ok(()));
+    let mut report = DiagnosticReport::default();
+    idx.collect(&mut report);
+    assert_eq!(report.io.ioprio_class, "idle");
+    assert!(report.io.ioprio_set_failed);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn freeze_gate_blocks_destructive_events_before_delta_buffer() {
     let root = unique_tmp_dir("freeze-delta");
     std::fs::create_dir_all(&root).unwrap();

@@ -245,7 +245,7 @@ impl TieredIndex {
     fn run_rebuild_background(self: &Arc<Self>, reason: &'static str) {
         let idx = self.clone();
         std::thread::spawn(move || {
-            let _ = crate::io_governor::set_current_thread_idle_io_priority_best_effort();
+            idx.set_current_thread_idle_io_priority_for_scan();
             let strategy = {
                 let mut sched = idx.scheduler.lock();
                 sched.adjust_parallelism();
@@ -283,7 +283,7 @@ impl TieredIndex {
 
         let idx = self.clone();
         std::thread::spawn(move || {
-            let _ = crate::io_governor::set_current_thread_idle_io_priority_best_effort();
+            idx.set_current_thread_idle_io_priority_for_scan();
             let strategy = {
                 let mut sched = idx.scheduler.lock();
                 sched.adjust_parallelism();
@@ -329,7 +329,7 @@ impl TieredIndex {
 
         let idx = self.clone();
         std::thread::spawn(move || {
-            let _ = crate::io_governor::set_current_thread_idle_io_priority_best_effort();
+            idx.set_current_thread_idle_io_priority_for_scan();
             let _permit = permit;
             let report = idx.fast_sync(scope, &ignore_prefixes);
             tracing::warn!(

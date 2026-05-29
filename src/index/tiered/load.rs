@@ -135,6 +135,8 @@ impl TieredIndex {
                 std::time::Duration::from_secs(1),
             )),
             clock_reconciliation_count: AtomicU64::new(0),
+            ioprio_idle_set: AtomicBool::new(false),
+            ioprio_set_failed: AtomicBool::new(false),
             stable_snapshot_enabled: AtomicBool::new(true),
             mount_policy_counters,
             stats: Arc::new(crate::stats::StatsCollector::new()),

@@ -213,6 +213,8 @@ pub struct TieredIndex {
     pub(self) quarantine_verified_roots: AtomicU64,
     pub(self) clock_skew: Mutex<crate::clock::ClockSkewDetector>,
     pub(self) clock_reconciliation_count: AtomicU64,
+    pub(self) ioprio_idle_set: AtomicBool,
+    pub(self) ioprio_set_failed: AtomicBool,
     pub(self) stable_snapshot_enabled: AtomicBool,
     pub(self) mount_policy_counters: Arc<SharedMountPolicyCounters>,
     pub(self) stats: Arc<StatsCollector>,
@@ -338,6 +340,24 @@ impl TieredIndex {
         self.clock_skew.lock().mark_reconciled();
     }
 
+    pub(crate) fn record_idle_io_priority_result(&self, result: std::io::Result<()>) {
+        match result {
+            Ok(()) => {
+                self.ioprio_idle_set.store(true, Ordering::Relaxed);
+            }
+            Err(err) => {
+                self.ioprio_set_failed.store(true, Ordering::Relaxed);
+                tracing::debug!("idle ioprio best-effort setup failed: {}", err);
+            }
+        }
+    }
+
+    pub(crate) fn set_current_thread_idle_io_priority_for_scan(&self) {
+        self.record_idle_io_priority_result(
+            crate::io_governor::set_current_thread_idle_io_priority_best_effort(),
+        );
+    }
+
     pub fn record_query_metric(&self, elapsed_us: u64) {
         self.stats.record_query(elapsed_us);
     }
@@ -374,6 +394,16 @@ impl DiagnosticSource for TieredIndex {
         report.clocks.reconciliation_count =
             self.clock_reconciliation_count.load(Ordering::Relaxed);
         report.clocks.reconciliation_window_active = !clock.cutoff_trusted();
+        let ioprio_idle = self.ioprio_idle_set.load(Ordering::Relaxed);
+        let ioprio_failed = self.ioprio_set_failed.load(Ordering::Relaxed);
+        report.io.ioprio_class = if ioprio_idle {
+            "idle".to_string()
+        } else if ioprio_failed {
+            "unavailable".to_string()
+        } else {
+            "unset".to_string()
+        };
+        report.io.ioprio_set_failed = report.io.ioprio_set_failed || ioprio_failed;
 
         let mount = self.mount_policy_counters.snapshot();
         report.watchers.fstype_blocked_count = report
