@@ -113,8 +113,14 @@ fn http_api_manual_scan_and_observability_endpoints_work() {
 
     let late = root.join("manual_scan_api_probe.txt");
     let late_dir = root.join("manual_scan_dir_probe");
+    let dupe_a = root.join("manual_dupe_a.txt");
+    let dupe_b = root.join("manual_dupe_b.txt");
+    let dupe_copy = root.join("manual_dupe_copy.txt");
     std::fs::write(&late, b"manual").unwrap();
     std::fs::create_dir_all(&late_dir).unwrap();
+    std::fs::write(&dupe_a, b"same").unwrap();
+    std::fs::hard_link(&dupe_a, &dupe_b).unwrap();
+    std::fs::write(&dupe_copy, b"same").unwrap();
     assert!(
         !common::fd_rdd_client::search(port, "manual_scan_api_probe", 10)
             .iter()
@@ -142,6 +148,16 @@ fn http_api_manual_scan_and_observability_endpoints_work() {
             .iter()
             .any(|r| r.path == late_dir && r.entry_type == "dir"),
         "HTTP /search should return type=dir for directory results: {dir_results:?}"
+    );
+    let dupe_results = common::fd_rdd_client::search(port, "dupe: manual_dupe", 10);
+    assert!(dupe_results.iter().any(|r| r.path == dupe_a));
+    assert!(dupe_results.iter().any(|r| r.path == dupe_b));
+    assert!(dupe_results.iter().all(|r| r.path != dupe_copy));
+    assert!(
+        dupe_results.iter().all(|r| {
+            r.reason.as_deref() == Some("hardlink_same_file_key") && r.confidence == Some(1.0)
+        }),
+        "HTTP /search should annotate hardlink dupe reason/confidence: {dupe_results:?}"
     );
 
     process.kill();

@@ -668,6 +668,47 @@ fn empty_filter_matches_only_real_empty_directories() {
 }
 
 #[test]
+fn dupe_filter_returns_hardlink_aliases_with_reason() {
+    let root = unique_tmp_dir("query-dupe-hardlink");
+    std::fs::create_dir_all(&root).unwrap();
+    let original = root.join("dupe_original.txt");
+    let alias = root.join("dupe_alias.txt");
+    let copy = root.join("dupe_copy.txt");
+    std::fs::write(&original, b"same").unwrap();
+    std::fs::hard_link(&original, &alias).unwrap();
+    std::fs::write(&copy, b"same").unwrap();
+
+    let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    let l2 = index.l2.load_full();
+    IndexBuilder::new(vec![root.clone()]).full_build(l2.as_ref());
+    index.refresh_base();
+
+    let results = index.query_limit_detailed("dupe: dupe_", 10);
+    let paths = results
+        .iter()
+        .map(|result| result.meta.path.clone())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&original));
+    assert!(paths.contains(&alias));
+    assert!(!paths.contains(&copy));
+    assert!(
+        results.iter().all(|result| {
+            result.reason.as_deref() == Some("hardlink_same_file_key")
+                && result.confidence == Some(1.0)
+        }),
+        "dupe: should annotate reason/confidence: {results:?}"
+    );
+
+    let copy_results = index.query("dupe: dupe_copy");
+    assert!(
+        copy_results.is_empty(),
+        "dupe: must reject same-content regular copies"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn execute_query_sorts_by_modified_time() {
     let root = unique_tmp_dir("query-sort");
     std::fs::create_dir_all(&root).unwrap();

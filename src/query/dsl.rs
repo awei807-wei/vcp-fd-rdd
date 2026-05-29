@@ -54,6 +54,8 @@ pub enum Atom {
     EntryType(FileKind),
     /// empty: true empty directory (verified against the filesystem)
     EmptyDir,
+    /// dupe: hardlink duplicate group filter
+    HardlinkDupe,
     /// content:keyword (全文搜索，占位)
     Content(String),
 }
@@ -86,6 +88,7 @@ pub struct CompiledQuery {
     anchors: Vec<Arc<dyn Matcher>>,
     include: CompiledExpr,
     excludes: Vec<CompiledExpr>,
+    hardlink_dupe: bool,
 }
 
 impl CompiledQuery {
@@ -107,6 +110,10 @@ impl CompiledQuery {
 
     pub fn extract_parent_filter(&self) -> Option<String> {
         Self::find_parent_in_expr(&self.include)
+    }
+
+    pub fn requires_hardlink_dupe(&self) -> bool {
+        self.hardlink_dupe
     }
 
     fn find_parent_in_expr(expr: &CompiledExpr) -> Option<String> {
@@ -247,6 +254,7 @@ fn is_path_initials_query(input: &str) -> bool {
         || input.starts_with("len:")
         || input.starts_with("type:")
         || input.starts_with("empty:")
+        || input.starts_with("dupe:")
         || input.starts_with("case:")
         || input.starts_with("content:");
     if !has_separator || has_glob || has_special_prefix {
@@ -296,6 +304,7 @@ pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
     }
 
     // 编译表达式
+    let hardlink_dupe = expr_contains_hardlink_dupe(&include_expr);
     let mut include = compile_expr(&include_expr, case_sensitive)?;
     let excludes = exclude_exprs
         .iter()
@@ -319,7 +328,16 @@ pub fn compile_query(input: &str) -> Result<CompiledQuery, QueryCompileError> {
         anchors,
         include,
         excludes,
+        hardlink_dupe,
     })
+}
+
+fn expr_contains_hardlink_dupe(expr: &Expr) -> bool {
+    match expr {
+        Expr::Or(v) | Expr::And(v) => v.iter().any(expr_contains_hardlink_dupe),
+        Expr::Atom(Atom::HardlinkDupe) => true,
+        Expr::True | Expr::Atom(_) => false,
+    }
 }
 
 fn compile_expr(expr: &Expr, case_sensitive: bool) -> Result<CompiledExpr, QueryCompileError> {
@@ -395,6 +413,7 @@ fn compile_atom(atom: &Atom, case_sensitive: bool) -> Result<CompiledExpr, Query
         Atom::NameLen(op, n) => Ok(CompiledExpr::Filter(Filter::NameLen(*op, *n))),
         Atom::EntryType(k) => Ok(CompiledExpr::Filter(Filter::EntryType(*k))),
         Atom::EmptyDir => Ok(CompiledExpr::Filter(Filter::EmptyDir)),
+        Atom::HardlinkDupe => Ok(CompiledExpr::True),
         Atom::Content(s) => Ok(CompiledExpr::Filter(Filter::Content(s.clone()))),
     }
 }
@@ -522,6 +541,7 @@ fn best_anchor_for_atom(
         | Atom::NameLen(_, _)
         | Atom::EntryType(_)
         | Atom::EmptyDir
+        | Atom::HardlinkDupe
         | Atom::Content(_) => Ok(None),
     }
 }
@@ -714,6 +734,22 @@ fn parse_atom_expr(word: &str, case_sensitive: &mut bool) -> Result<Expr, QueryC
             Ok(Expr::Atom(Atom::EntryType(kind)))
         }
         Some("empty") => Ok(Expr::Atom(Atom::EmptyDir)),
+        Some("dupe") => {
+            let v = unquote(tail)?;
+            if v.trim().is_empty()
+                || matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "hardlink" | "physical"
+                )
+            {
+                Ok(Expr::Atom(Atom::HardlinkDupe))
+            } else {
+                Ok(Expr::And(vec![
+                    Expr::Atom(Atom::HardlinkDupe),
+                    Expr::Atom(Atom::Text(v)),
+                ]))
+            }
+        }
         Some("content") => {
             let v = unquote(tail)?;
             if v.is_empty() {
@@ -1236,6 +1272,18 @@ mod tests {
         assert!(!q.matches(&file_meta));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dupe_filter_sets_hardlink_dupe_flag() {
+        let q = compile_query("dupe: alias").unwrap();
+        assert!(q.requires_hardlink_dupe());
+        assert!(q.matches(&meta("/work/alias-a.txt", 1, None)));
+        assert!(!q.matches(&meta("/work/original.txt", 1, None)));
+
+        let all = compile_query("dupe:").unwrap();
+        assert!(all.requires_hardlink_dupe());
+        assert!(all.matches(&meta("/work/original.txt", 1, None)));
     }
 
     #[test]

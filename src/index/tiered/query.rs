@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
 use crate::core::{EventRecord, FileKey, FileKind, FileMeta};
 use crate::event::sync::DirtyReason;
@@ -13,6 +17,8 @@ use super::query_plan::QueryPlan;
 use super::{QueryResultFreshness, QueryResultIndexTier, QueryResultMeta, TieredIndex};
 
 const QUERY_GUARD_SLOW_THRESHOLD_US: u64 = 50_000;
+const HARDLINK_DUPE_REASON: &str = "hardlink_same_file_key";
+const HARDLINK_DUPE_CONFIDENCE: f32 = 1.0;
 
 impl TieredIndex {
     /// 查询入口：L1 → L2 → DiskSegments（mmap），不扫真实文件系统
@@ -281,12 +287,26 @@ impl TieredIndex {
             overlay_live_metas.push(meta);
         }
         let mut results: Vec<QueryResultMeta> = Vec::with_capacity(limit.min(128));
+        let hardlink_dupe_keys = if plan.requires_hardlink_dupe() {
+            let keys = hardlink_duplicate_keys(self.collect_live_metas_for_diagnostics());
+            if keys.is_empty() {
+                return Vec::new();
+            }
+            Some(keys)
+        } else {
+            None
+        };
+        let scan_limit = if hardlink_dupe_keys.is_some() {
+            usize::MAX
+        } else {
+            limit
+        };
 
         // Overlay upserts take precedence over the immutable base. This keeps
         // delete+recreate and rename windows correct while base is only
         // materialized at snapshot/rebuild boundaries.
         for meta in &overlay_live_metas {
-            if results.len() >= limit {
+            if results.len() >= scan_limit {
                 break;
             }
             let path_str = meta.path.to_string_lossy();
@@ -309,8 +329,8 @@ impl TieredIndex {
             }
         }
 
-        if results.len() >= limit {
-            return results;
+        if results.len() >= scan_limit {
+            return filter_hardlink_dupe_results(results, hardlink_dupe_keys.as_ref(), limit);
         }
 
         // ParentIndex fast path: if query has a parent filter, get exact candidates from base
@@ -336,8 +356,12 @@ impl TieredIndex {
                     };
                     if let Some(result) = self.validate_cold_result(meta, index_tier) {
                         results.push(result);
-                        if results.len() >= limit {
-                            return results;
+                        if results.len() >= scan_limit {
+                            return filter_hardlink_dupe_results(
+                                results,
+                                hardlink_dupe_keys.as_ref(),
+                                limit,
+                            );
                         }
                     }
                 }
@@ -351,12 +375,12 @@ impl TieredIndex {
             deleted_sources.as_slice(),
             &mut blocked_paths,
             &mut results,
-            limit,
+            scan_limit,
         ) {
-            return results;
+            return filter_hardlink_dupe_results(results, hardlink_dupe_keys.as_ref(), limit);
         }
 
-        results
+        filter_hardlink_dupe_results(results, hardlink_dupe_keys.as_ref(), limit)
     }
 
     fn overlay_meta_for_event(&self, ev: &EventRecord) -> Option<FileMeta> {
@@ -640,6 +664,41 @@ fn has_non_filesystem_file_key(meta: &FileMeta) -> bool {
     // Several regression tests build synthetic in-memory indexes with dev=1
     // and no backing file. Do not convert those fixtures into tombstones.
     meta.file_key.dev <= 1 && meta.file_key.generation == 0
+}
+
+fn hardlink_duplicate_keys(metas: impl IntoIterator<Item = FileMeta>) -> HashSet<FileKey> {
+    let mut counts: HashMap<FileKey, usize> = HashMap::new();
+    for meta in metas {
+        if meta.kind.is_file() {
+            *counts.entry(meta.file_key).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(key, count)| (count >= 2).then_some(key))
+        .collect()
+}
+
+fn filter_hardlink_dupe_results(
+    results: Vec<QueryResultMeta>,
+    hardlink_dupe_keys: Option<&HashSet<FileKey>>,
+    limit: usize,
+) -> Vec<QueryResultMeta> {
+    let Some(keys) = hardlink_dupe_keys else {
+        return results;
+    };
+    results
+        .into_iter()
+        .filter_map(|mut result| {
+            if !keys.contains(&result.meta.file_key) {
+                return None;
+            }
+            result.reason = Some(HARDLINK_DUPE_REASON.to_string());
+            result.confidence = Some(HARDLINK_DUPE_CONFIDENCE);
+            Some(result)
+        })
+        .take(limit)
+        .collect()
 }
 
 fn collect_live_meta(

@@ -22,6 +22,10 @@ pub struct SearchResult {
     pub score: i64,
     #[serde(default)]
     pub highlights: Vec<[usize; 2]>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
 }
 
 fn client() -> reqwest::blocking::Client {

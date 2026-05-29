@@ -52,4 +52,11 @@ impl QueryPlan {
             QueryEvaluator::Legacy(_) => None,
         }
     }
+
+    pub(super) fn requires_hardlink_dupe(&self) -> bool {
+        match &self.evaluator {
+            QueryEvaluator::Compiled(compiled) => compiled.requires_hardlink_dupe(),
+            QueryEvaluator::Legacy(_) => false,
+        }
+    }
 }

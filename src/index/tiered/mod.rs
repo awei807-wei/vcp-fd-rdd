@@ -139,6 +139,8 @@ pub struct QueryResultMeta {
     pub freshness: QueryResultFreshness,
     pub index_tier: QueryResultIndexTier,
     pub validated: bool,
+    pub reason: Option<String>,
+    pub confidence: Option<f32>,
 }
 
 impl QueryResultMeta {
@@ -148,6 +150,8 @@ impl QueryResultMeta {
             freshness: QueryResultFreshness::Fresh,
             index_tier: QueryResultIndexTier::HotMemory,
             validated: false,
+            reason: None,
+            confidence: None,
         }
     }
 
@@ -162,6 +166,8 @@ impl QueryResultMeta {
             freshness,
             index_tier,
             validated,
+            reason: None,
+            confidence: None,
         }
     }
 }

@@ -93,6 +93,10 @@ pub struct SearchResult {
     pub freshness: String,
     pub index_tier: String,
     pub validated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -380,6 +384,8 @@ async fn search_handler(
                 freshness: result.freshness.as_str().to_string(),
                 index_tier: result.index_tier.as_str().to_string(),
                 validated: result.validated,
+                reason: result.reason,
+                confidence: result.confidence,
             }
         })
         .collect();
@@ -666,6 +672,8 @@ mod tests {
             freshness: "stale_checked".to_string(),
             index_tier: "ColdMmap".to_string(),
             validated: true,
+            reason: Some("hardlink_same_file_key".to_string()),
+            confidence: Some(1.0),
         })
         .unwrap();
 
@@ -673,5 +681,7 @@ mod tests {
         assert_eq!(value["freshness"], "stale_checked");
         assert_eq!(value["index_tier"], "ColdMmap");
         assert_eq!(value["validated"], true);
+        assert_eq!(value["reason"], "hardlink_same_file_key");
+        assert_eq!(value["confidence"], 1.0);
     }
 }

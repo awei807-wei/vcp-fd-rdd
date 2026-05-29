@@ -383,6 +383,7 @@ fd-rdd --show-config
 | `depth:` | `depth:<=3` | 路径深度 |
 | `type:` | `type:file` | 文件类型 |
 | `empty:` | `type:dir empty:` | 真实空目录 |
+| `dupe:` | `dupe: hardlink` | hardlink 重复路径 |
 | `doc:` / `pic:` / `video:` | `pic:十一` | 按扩展名集合 |
 | `len:` | `len:>50` | 文件名字节长度 |
 
