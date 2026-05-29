@@ -463,18 +463,23 @@ impl TieredIndex {
 
         // 1) 计算需要对齐的目录集合
         let mut dirs: Vec<PathBuf> = match scope {
-            DirtyScope::All { cutoff_ns } => collect_dirs_changed_since(
-                &self.roots,
-                ignore_prefixes,
-                &self.exclude_dirs,
-                cutoff_ns,
-            ),
+            DirtyScope::All { cutoff_ns } => {
+                let cutoff_ns = self.clock_cutoff_for_dirty(cutoff_ns);
+                collect_dirs_changed_since(
+                    &self.roots,
+                    ignore_prefixes,
+                    &self.exclude_dirs,
+                    cutoff_ns,
+                )
+            }
             DirtyScope::Dirs { dirs, cutoff_ns } => {
                 let root_set: HashSet<_> = self.roots.iter().cloned().collect();
                 let (root_dirs, leaf_dirs): (Vec<_>, Vec<_>) =
                     dirs.into_iter().partition(|d| root_set.contains(d));
 
-                let effective_cutoff_ns = cutoff_ns.saturating_sub(10_000_000_000);
+                let effective_cutoff_ns = self
+                    .clock_cutoff_for_dirty(cutoff_ns)
+                    .saturating_sub(10_000_000_000);
                 let mut out = if !root_dirs.is_empty() {
                     collect_dirs_changed_since(
                         &root_dirs,
@@ -639,6 +644,7 @@ impl TieredIndex {
             self.apply_events(chunk);
         }
 
+        self.mark_clock_reconciled();
         self.stats.record_fast_sync();
         report
     }

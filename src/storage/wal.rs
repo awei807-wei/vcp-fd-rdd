@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::storage::checksum::crc32c_checksum;
+use crate::storage::quarantine::{MountIdentity, RootStateKind, RootStateRecord};
 
 const WAL_MAGIC: u32 = 0x314C_4157; // "WAL1"
-const WAL_VERSION: u32 = 3;
+const WAL_VERSION: u32 = 4;
 
 // Safety guard: WAL records are expected to be small (path + metadata). Treat any huge length as
 // corruption to avoid memory DoS via `vec![0u8; len]`.
@@ -122,6 +123,72 @@ fn decode_path_opt(buf: &[u8], off: &mut usize) -> Option<Option<PathBuf>> {
     Some(Some(decode_path(pbytes)))
 }
 
+fn encode_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let len: u32 = bytes.len().try_into().unwrap_or(u32::MAX);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&bytes[..len as usize]);
+    out
+}
+
+fn decode_bytes<'a>(buf: &'a [u8], off: &mut usize) -> Option<&'a [u8]> {
+    let len = u32::from_le_bytes(buf.get(*off..*off + 4)?.try_into().ok()?) as usize;
+    *off += 4;
+    let bytes = buf.get(*off..*off + len)?;
+    *off += len;
+    Some(bytes)
+}
+
+fn encode_string(value: &str) -> Vec<u8> {
+    encode_bytes(value.as_bytes())
+}
+
+fn decode_string(buf: &[u8], off: &mut usize) -> Option<String> {
+    Some(String::from_utf8_lossy(decode_bytes(buf, off)?).into_owned())
+}
+
+fn encode_string_opt(value: &Option<String>) -> Vec<u8> {
+    match value {
+        Some(value) => {
+            let mut out = vec![1];
+            out.extend_from_slice(&encode_string(value));
+            out
+        }
+        None => vec![0],
+    }
+}
+
+fn decode_string_opt(buf: &[u8], off: &mut usize) -> Option<Option<String>> {
+    let tag = *buf.get(*off)?;
+    *off += 1;
+    match tag {
+        0 => Some(None),
+        1 => Some(Some(decode_string(buf, off)?)),
+        _ => None,
+    }
+}
+
+fn encode_paths(paths: &[PathBuf]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let count: u32 = paths.len().try_into().unwrap_or(u32::MAX);
+    out.extend_from_slice(&count.to_le_bytes());
+    for path in paths.iter().take(count as usize) {
+        let bytes = encode_path(path);
+        out.extend_from_slice(&encode_bytes(&bytes));
+    }
+    out
+}
+
+fn decode_paths(buf: &[u8], off: &mut usize) -> Option<Vec<PathBuf>> {
+    let count = u32::from_le_bytes(buf.get(*off..*off + 4)?.try_into().ok()?) as usize;
+    *off += 4;
+    let mut paths = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        paths.push(decode_path(decode_bytes(buf, off)?));
+    }
+    Some(paths)
+}
+
 fn system_time_to_unix(ts: std::time::SystemTime) -> (u64, u32) {
     use std::time::UNIX_EPOCH;
     match ts.duration_since(UNIX_EPOCH) {
@@ -138,7 +205,9 @@ fn unix_to_system_time(secs: u64, nanos: u32) -> std::time::SystemTime {
 #[derive(Clone, Debug)]
 pub struct WalReplayResult {
     pub events: Vec<EventRecord>,
+    pub root_events: Vec<RootStateRecord>,
     pub events_replayed: usize,
+    pub root_events_replayed: usize,
     pub sealed_used: usize,
     pub truncated_tail_records: usize,
     pub gap_detected: bool,
@@ -277,6 +346,23 @@ impl WalStore {
         Ok(())
     }
 
+    pub fn append_root_events(&self, records: &[RootStateRecord]) -> anyhow::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        for record in records {
+            let payload = encode_root_state_record(record);
+            let len: u32 = payload.len().try_into().unwrap_or(u32::MAX);
+            let crc = wal_checksum(&payload);
+            f.write_all(&len.to_le_bytes())?;
+            f.write_all(&crc.to_le_bytes())?;
+            f.write_all(&payload[..len as usize])?;
+        }
+        f.flush()?;
+        Ok(())
+    }
+
     pub fn set_durability(&self, durability: WalDurability) {
         *self.durability.lock().unwrap_or_else(|e| e.into_inner()) = durability;
         self.mark_synced();
@@ -359,15 +445,18 @@ impl WalStore {
         let gap_detected = sealed_id_gap_detected(&sealed_ids);
 
         let mut events: Vec<EventRecord> = Vec::new();
+        let mut root_events: Vec<RootStateRecord> = Vec::new();
         let mut truncated = 0usize;
         for (_, p) in sealed.iter() {
-            let (mut evs, t) = read_wal_file(p)?;
+            let (mut evs, mut roots, t) = read_wal_file(p)?;
             truncated += t;
             events.append(&mut evs);
+            root_events.append(&mut roots);
         }
-        let (mut cur, t) = read_wal_file(&self.current)?;
+        let (mut cur, mut cur_roots, t) = read_wal_file(&self.current)?;
         truncated += t;
         events.append(&mut cur);
+        root_events.append(&mut cur_roots);
 
         // Deduplicate by (id, timestamp), keeping the last occurrence.
         // This prevents duplicate index entries when WAL contains duplicate
@@ -394,9 +483,12 @@ impl WalStore {
         }
 
         let events_replayed = events.len();
+        let root_events_replayed = root_events.len();
         Ok(WalReplayResult {
             events,
+            root_events,
             events_replayed,
+            root_events_replayed,
             sealed_used: sealed.len(),
             truncated_tail_records: truncated,
             gap_detected,
@@ -416,6 +508,10 @@ impl crate::storage::traits::WriteAheadLog for WalStore {
 
     fn append(&self, events: &[EventRecord]) -> anyhow::Result<()> {
         self.append(events)
+    }
+
+    fn append_root_events(&self, records: &[RootStateRecord]) -> anyhow::Result<()> {
+        self.append_root_events(records)
     }
 
     fn seal(&self) -> anyhow::Result<u64> {
@@ -477,12 +573,17 @@ fn open_or_init(path: &Path) -> anyhow::Result<File> {
 
     let magic = u32::from_le_bytes(hdr[0..4].try_into()?);
     let ver = u32::from_le_bytes(hdr[4..8].try_into()?);
-    if magic == WAL_MAGIC && (ver == 1 || ver == 2) && WAL_VERSION == 3 {
-        // v1/v2 -> v3：非破坏性升级
+    if magic == WAL_MAGIC && (ver == 1 || ver == 2 || ver == 3) && ver != WAL_VERSION {
+        // v1/v2/v3 -> latest：非破坏性升级
         // 关键点：绝不能 truncate，否则会丢事件。
         drop(f);
         let id = now_seal_id();
-        let suffix = if ver == 1 { ".v1" } else { ".v2" };
+        let suffix = match ver {
+            1 => ".v1",
+            2 => ".v2",
+            3 => ".v3",
+            _ => "",
+        };
         let sealed = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -511,8 +612,8 @@ fn open_or_init(path: &Path) -> anyhow::Result<File> {
             .read(true)
             .append(true)
             .open(path)?;
-    } else if magic != WAL_MAGIC || (ver != 1 && ver != 2 && ver != 3) {
-        // 不兼容：truncate 重新开始（保守）。v1/v2/v3 以外视为垃圾文件。
+    } else if magic != WAL_MAGIC || !(1..=WAL_VERSION).contains(&ver) {
+        // 不兼容：truncate 重新开始（保守）。已知版本以外视为垃圾文件。
         let mut nf = OpenOptions::new()
             .create(true)
             .write(true)
@@ -528,7 +629,7 @@ fn open_or_init(path: &Path) -> anyhow::Result<File> {
             .append(true)
             .open(path)?;
     } else if ver != WAL_VERSION {
-        // v2 读 v1 sealed 是允许的；但 current WAL 只写最新版本。
+        // 读 legacy sealed 是允许的；但 current WAL 只写最新版本。
         // 若出现 v2->未来版本等情况，会在上面的分支被 truncate。
     }
 
@@ -580,32 +681,34 @@ fn sealed_id_gap_detected(ids: &[u64]) -> bool {
     ids.windows(2).any(|pair| pair[1] > pair[0] + 1)
 }
 
-fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, usize)> {
+fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, Vec<RootStateRecord>, usize)> {
     if !path.exists() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), Vec::new(), 0));
     }
     let mut f = File::open(path)?;
     let file_len = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
 
     let mut hdr = [0u8; 8];
     if f.read_exact(&mut hdr).is_err() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), Vec::new(), 0));
     }
     let magic = u32::from_le_bytes(hdr[0..4].try_into()?);
     let ver = u32::from_le_bytes(hdr[4..8].try_into()?);
-    if magic != WAL_MAGIC || (ver != 1 && ver != 2 && ver != 3) {
-        return Ok((Vec::new(), 0));
+    if magic != WAL_MAGIC || !(1..=WAL_VERSION).contains(&ver) {
+        return Ok((Vec::new(), Vec::new(), 0));
     }
 
-    if ver == 1 || ver == 2 {
+    if ver < WAL_VERSION {
         tracing::warn!(
-            "Loading legacy WAL v{} from {}; consider upgrading to v3 (CRC32C)",
+            "Loading legacy WAL v{} from {}; current writer is v{}",
             ver,
-            path.display()
+            path.display(),
+            WAL_VERSION
         );
     }
 
     let mut out = Vec::new();
+    let mut root_out = Vec::new();
     let mut truncated_tail = 0usize;
     let mut pos: u64 = 8; // header consumed
     loop {
@@ -644,13 +747,14 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<EventRecord>, usize)> {
             continue;
         }
 
-        // Decode version: v3 uses v2 encoding format
-        let decode_ver = if ver >= 3 { 2 } else { ver };
-        if let Some(ev) = decode_event(decode_ver, &buf) {
-            out.push(ev);
+        if let Some(record) = decode_wal_record(ver, &buf) {
+            match record {
+                DecodedWalRecord::File(ev) => out.push(ev),
+                DecodedWalRecord::Root(root) => root_out.push(root),
+            }
         }
     }
-    Ok((out, truncated_tail))
+    Ok((out, root_out, truncated_tail))
 }
 
 fn encode_event(ev: &EventRecord) -> Vec<u8> {
@@ -723,12 +827,94 @@ fn encode_event_v2(ev: &EventRecord) -> Vec<u8> {
     out
 }
 
+fn encode_root_state_record(record: &RootStateRecord) -> Vec<u8> {
+    let mut out = Vec::new();
+    let kind = match record.kind {
+        RootStateKind::OfflineRoot => 101,
+        RootStateKind::OnlineRoot => 102,
+    };
+    let (secs, nanos) = system_time_to_unix(record.timestamp);
+    out.push(kind);
+    out.extend_from_slice(&secs.to_le_bytes());
+    out.extend_from_slice(&nanos.to_le_bytes());
+    out.extend_from_slice(&record.seq.to_le_bytes());
+    let root_path = encode_path(&record.root_path);
+    out.extend_from_slice(&encode_bytes(&root_path));
+    out.extend_from_slice(&record.identity.mount_id.to_le_bytes());
+    out.extend_from_slice(&encode_string(&record.identity.major_minor));
+    out.extend_from_slice(&encode_string_opt(&record.identity.fs_uuid));
+    out.extend_from_slice(&encode_string(&record.identity.source));
+    out.extend_from_slice(&encode_string(&record.identity.fstype));
+    out.extend_from_slice(&encode_paths(&record.affected_prefixes));
+    out.extend_from_slice(&encode_string_opt(&record.reason));
+    out
+}
+
+enum DecodedWalRecord {
+    File(EventRecord),
+    Root(RootStateRecord),
+}
+
+fn decode_wal_record(ver: u32, buf: &[u8]) -> Option<DecodedWalRecord> {
+    match *buf.first()? {
+        101 | 102 if ver >= 3 => decode_root_state_record(buf).map(DecodedWalRecord::Root),
+        _ => {
+            let decode_ver = if ver >= 3 { 2 } else { ver };
+            decode_event(decode_ver, buf).map(DecodedWalRecord::File)
+        }
+    }
+}
+
 fn decode_event(ver: u32, buf: &[u8]) -> Option<EventRecord> {
     match ver {
         1 => decode_event_v1(buf),
         2 => decode_event_v2(buf),
         _ => None,
     }
+}
+
+fn decode_root_state_record(buf: &[u8]) -> Option<RootStateRecord> {
+    if buf.len() < 1 + 8 + 4 + 8 + 4 {
+        return None;
+    }
+    let mut off = 0usize;
+    let kind = match buf[off] {
+        101 => RootStateKind::OfflineRoot,
+        102 => RootStateKind::OnlineRoot,
+        _ => return None,
+    };
+    off += 1;
+    let secs = u64::from_le_bytes(buf.get(off..off + 8)?.try_into().ok()?);
+    off += 8;
+    let nanos = u32::from_le_bytes(buf.get(off..off + 4)?.try_into().ok()?);
+    off += 4;
+    let seq = u64::from_le_bytes(buf.get(off..off + 8)?.try_into().ok()?);
+    off += 8;
+    let root_path = decode_path(decode_bytes(buf, &mut off)?);
+    let mount_id = u32::from_le_bytes(buf.get(off..off + 4)?.try_into().ok()?);
+    off += 4;
+    let major_minor = decode_string(buf, &mut off)?;
+    let fs_uuid = decode_string_opt(buf, &mut off)?;
+    let source = decode_string(buf, &mut off)?;
+    let fstype = decode_string(buf, &mut off)?;
+    let affected_prefixes = decode_paths(buf, &mut off)?;
+    let reason = decode_string_opt(buf, &mut off)?;
+
+    Some(RootStateRecord {
+        kind,
+        root_path,
+        identity: MountIdentity {
+            mount_id,
+            major_minor,
+            fs_uuid,
+            source,
+            fstype,
+        },
+        affected_prefixes,
+        reason,
+        seq,
+        timestamp: unix_to_system_time(secs, nanos),
+    })
 }
 
 fn decode_event_v1(buf: &[u8]) -> Option<EventRecord> {
@@ -870,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_v1_file_is_sealed_and_replayed_after_upgrade_to_v3() {
+    fn wal_v1_file_is_sealed_and_replayed_after_upgrade_to_latest() {
         let dir = unique_tmp_dir("upgrade");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -904,7 +1090,7 @@ mod tests {
             f.flush().unwrap();
         }
 
-        // 打开时应触发 v1 -> v3 非破坏性升级（rename 为 sealed-*.v1）
+        // 打开时应触发 v1 -> latest 非破坏性升级（rename 为 sealed-*.v1）
         let wal = WalStore::open_in_dir(dir.clone()).unwrap();
 
         let sealed_v1 = std::fs::read_dir(&dir)
@@ -922,5 +1108,46 @@ mod tests {
         // 回放应能读到 v1 sealed 中的事件
         let r = wal.replay_since_seal(0).unwrap();
         assert_eq!(r.events.len(), 1);
+    }
+
+    #[test]
+    fn wal_replays_offline_and_online_root_state_records() {
+        let dir = unique_tmp_dir("root-state");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal = WalStore::open_in_dir(dir.clone()).unwrap();
+        let identity = MountIdentity {
+            mount_id: 7,
+            major_minor: "8:1".to_string(),
+            fs_uuid: Some("uuid-a".to_string()),
+            source: "/dev/sda1".to_string(),
+            fstype: "ext4".to_string(),
+        };
+        let offline = RootStateRecord::offline(
+            1,
+            PathBuf::from("/mnt/offline"),
+            identity.clone(),
+            vec![PathBuf::from("/mnt/offline/project")],
+            Some("probe_timeout".to_string()),
+        );
+        let online = RootStateRecord::online(
+            2,
+            PathBuf::from("/mnt/offline"),
+            identity,
+            vec![PathBuf::from("/mnt/offline/project")],
+        );
+
+        wal.append_root_events(&[offline.clone(), online.clone()])
+            .unwrap();
+        let replay = wal.replay_since_seal(0).unwrap();
+
+        assert_eq!(replay.events_replayed, 0);
+        assert_eq!(replay.root_events_replayed, 2);
+        assert_eq!(replay.root_events[0].kind, RootStateKind::OfflineRoot);
+        assert_eq!(replay.root_events[0].root_path, offline.root_path);
+        assert_eq!(replay.root_events[1].kind, RootStateKind::OnlineRoot);
+        assert_eq!(
+            replay.root_events[1].affected_prefixes,
+            online.affected_prefixes
+        );
     }
 }

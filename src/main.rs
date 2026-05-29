@@ -416,6 +416,7 @@ async fn main() -> anyhow::Result<()> {
                 strict_coverage_failure: watch_state.strict_coverage_failure,
                 strict_fail_on_budget_exceeded: watch_state.strict_fail_on_budget_exceeded,
                 strict_uncovered_dirs: watch_state.strict_uncovered_dirs,
+                diagnostics: fd_rdd::diagnostics::DiagnosticReport::default(),
             }
         })
     };

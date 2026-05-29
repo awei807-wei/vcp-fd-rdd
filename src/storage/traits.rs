@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::core::EventRecord;
 use crate::index::l2_partition::V6Segments;
+use crate::storage::quarantine::RootStateRecord;
 use crate::storage::snapshot::{LoadedSnapshot, LsmLoadedLayers, LsmSegmentLoaded, MmapSnapshotV6};
 use crate::storage::wal::{WalDurability, WalReplayResult};
 
@@ -71,6 +72,11 @@ pub trait WriteAheadLog {
 
     /// Append a batch of events to the current WAL file.
     fn append(&self, events: &[EventRecord]) -> anyhow::Result<()>;
+
+    /// Append root-level offline/online state events to the current WAL file.
+    fn append_root_events(&self, _records: &[RootStateRecord]) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Seal the current WAL (rename to `events.wal.seal-<id>`) and open a
     /// fresh one.  Returns the seal id.

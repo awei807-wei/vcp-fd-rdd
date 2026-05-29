@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 新增 Runtime Boundary State Contract：WAL 支持 `OFFLINE_ROOT` / `ONLINE_ROOT` root 状态记录，quarantine sidecar 使用物理 mount identity 锚定，启动回放后会恢复 quarantine state 并安装 Freeze Gate，阻断离线 root 下 Delete/Modify/Rename 脏写。
+- `/health` 新增强类型 `diagnostics` 字段，按 system/storage/security/clocks/watchers/io 固定板块暴露 WAL、snapshot、quarantine、freeze、HTTP policy、UDS peer policy、scan reject、clock skew 与 mount policy 诊断，同时保留既有 summary 字段兼容旧客户端。
+- 配置支持结构化 `[[roots]]`，兼容旧 `roots = []`；`detected_policy`、`conflict_count`、mount state、freeze gate 等运行时探测状态不会写回 `config.toml`。
+- 补齐 case policy 自动探测基础、mount policy 拒绝原因矩阵、clock skew dirty window 和 root/system daemon 默认禁用未认证 HTTP query/scan 的安全策略测试。
 - 测试补强：新增 daemon API/UDS E2E、真实 watcher create/rename/delete、abrupt kill 与坏 stable snapshot 启动修复组合测试，补齐此前偏模块级的关键真实链路缺口。
 - 仓库清理：将本地运行生成的 `reports/`/`report/` 加入忽略，并停止追踪历史报告产物，避免测试与 daemon 运行污染提交。
 - CI 压测补齐：`stress-large-scale` workflow 显式运行 `large_directory_scan_100k_files` 与 `high_load_event_processing` 两个 ignored 重型测试；80 万文件 hybrid 压测继续由 `stress-hybrid-large-scale` 执行。

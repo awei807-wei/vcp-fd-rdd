@@ -93,6 +93,7 @@ impl TieredIndex {
                     tracing::debug!("L1 hit: {} results", results.len());
                     return Ok(results
                         .into_iter()
+                        .filter(|meta| !self.path_is_frozen(meta.path.as_path()))
                         .take(limit)
                         .map(QueryResultMeta::hot)
                         .collect());
@@ -138,10 +139,16 @@ impl TieredIndex {
         let mut results: Vec<FileMeta> = Vec::with_capacity(base.file_count().saturating_add(256));
 
         for ev in &live_events {
+            if ev.best_path().is_some_and(|path| self.path_is_frozen(path)) {
+                continue;
+            }
             let Some(meta) = self.overlay_meta_for_event(ev) else {
                 continue;
             };
             let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+            if self.path_is_frozen(meta.path.as_path()) {
+                continue;
+            }
             if blocked_paths.contains(path_bytes)
                 || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
             {
@@ -152,6 +159,9 @@ impl TieredIndex {
         }
 
         base.for_each_live_meta(|meta| {
+            if self.path_is_frozen(meta.path.as_path()) {
+                return;
+            }
             collect_live_meta(
                 meta,
                 None,
@@ -229,6 +239,9 @@ impl TieredIndex {
         let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
         let mut overlay_live_metas: Vec<FileMeta> = Vec::with_capacity(live_events.len());
         for ev in &live_events {
+            if ev.best_path().is_some_and(|path| self.path_is_frozen(path)) {
+                continue;
+            }
             let Some(meta) = self.overlay_meta_for_event(ev) else {
                 continue;
             };
@@ -250,6 +263,9 @@ impl TieredIndex {
                 break;
             }
             let path_str = meta.path.to_string_lossy();
+            if self.path_is_frozen(meta.path.as_path()) {
+                continue;
+            }
             let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
             if !matches_anchor {
                 continue;
@@ -275,6 +291,9 @@ impl TieredIndex {
             for hit in base.parent_query_metas(parent_path) {
                 let meta = hit.meta;
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+                if self.path_is_frozen(meta.path.as_path()) {
+                    continue;
+                }
                 let blocked = blocked_paths.contains(path_bytes)
                     || path_deleted_by_any(path_bytes, deleted_sources.as_slice());
                 if blocked {
@@ -346,6 +365,9 @@ impl TieredIndex {
             for hit in layer.query_metas(anchor.as_ref()) {
                 let meta = hit.meta;
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+                if self.path_is_frozen(meta.path.as_path()) {
+                    continue;
+                }
                 let blocked = blocked_paths.contains(path_bytes)
                     || layer_deleted.is_some_and(|paths| paths.contains(path_bytes))
                     || path_deleted_by_any(path_bytes, deleted_sources);
@@ -375,6 +397,9 @@ impl TieredIndex {
     }
 
     fn annotate_query_result(&self, meta: FileMeta) -> Option<QueryResultMeta> {
+        if self.path_is_frozen(meta.path.as_path()) {
+            return None;
+        }
         let path_bytes = meta.path.as_os_str().as_encoded_bytes();
         if self.delta_buffer.lock().is_live(path_bytes) {
             return Some(QueryResultMeta::hot(meta));
@@ -392,6 +417,9 @@ impl TieredIndex {
         meta: FileMeta,
         index_tier: QueryResultIndexTier,
     ) -> Option<QueryResultMeta> {
+        if self.path_is_frozen(meta.path.as_path()) {
+            return None;
+        }
         if meta.mtime.is_none() {
             return Some(QueryResultMeta::cold(
                 meta,

@@ -11,8 +11,8 @@ pub(crate) mod sync;
 #[cfg(test)]
 mod tests;
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,11 +21,13 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::core::AdaptiveScheduler;
+use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::DirtyQueue;
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::stats::{StatsCollector, StatsReport};
+use crate::storage::quarantine::{FreezeGate, QuarantineState, RootStateRecord};
 use crate::storage::recovery_audit::RecoveryAuditReport;
 use crate::storage::traits::WriteAheadLog;
 use crate::storage::wal::WalDurability;
@@ -202,6 +204,10 @@ pub struct TieredIndex {
     pub(self) dirty_queue: Mutex<DirtyQueue>,
     pub(self) dirty_notify: Notify,
     pub(self) recovery_status: Mutex<RecoveryStatus>,
+    pub(self) quarantine_state: Mutex<QuarantineState>,
+    pub(self) freeze_gate: Mutex<FreezeGate>,
+    pub(self) clock_skew: Mutex<crate::clock::ClockSkewDetector>,
+    pub(self) clock_reconciliation_count: AtomicU64,
     pub(self) stable_snapshot_enabled: AtomicBool,
     pub(self) stats: Arc<StatsCollector>,
 }
@@ -242,12 +248,92 @@ impl TieredIndex {
             .unwrap_or_default()
     }
 
+    pub fn install_freeze_gate(&self, gate: FreezeGate) {
+        *self.freeze_gate.lock() = gate;
+    }
+
+    pub fn restore_quarantine_from_wal(&self, records: &[RootStateRecord]) {
+        let state = QuarantineState::from_wal_records(records);
+        let gate = state.freeze_gate();
+        *self.quarantine_state.lock() = state;
+        self.install_freeze_gate(gate);
+    }
+
+    pub fn apply_root_state_record(&self, record: RootStateRecord) {
+        if let Some(wal) = self.wal.lock().clone() {
+            if let Err(e) = wal.append_root_events(std::slice::from_ref(&record)) {
+                tracing::warn!("WAL root-state append failed (continuing): {}", e);
+            }
+        }
+
+        {
+            let mut state = self.quarantine_state.lock();
+            state.apply_wal_record(record.clone());
+            let gate = state.freeze_gate();
+            drop(state);
+            self.install_freeze_gate(gate);
+        }
+
+        if matches!(
+            record.kind,
+            crate::storage::quarantine::RootStateKind::OnlineRoot
+        ) && !record.affected_prefixes.is_empty()
+        {
+            self.enqueue_dirty_dirs(
+                record.affected_prefixes,
+                crate::event::sync::DirtyReason::StartupRepair,
+            );
+        }
+    }
+
+    pub fn path_is_frozen(&self, path: &Path) -> bool {
+        self.freeze_gate.lock().is_path_frozen(path)
+    }
+
+    pub(crate) fn clock_cutoff_for_dirty(&self, cutoff_ns: u64) -> u64 {
+        let trusted = self.clock_skew.lock().cutoff_trusted();
+        crate::clock::cutoff_for_crawl(cutoff_ns, trusted)
+    }
+
+    pub(crate) fn observe_clock_boundary(&self) {
+        let skewed = self
+            .clock_skew
+            .lock()
+            .observe(std::time::SystemTime::now(), std::time::Instant::now());
+        if skewed {
+            self.clock_reconciliation_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn mark_clock_reconciled(&self) {
+        self.clock_skew.lock().mark_reconciled();
+    }
+
     pub fn record_query_metric(&self, elapsed_us: u64) {
         self.stats.record_query(elapsed_us);
     }
 
     pub fn stats_report(&self) -> StatsReport {
         self.stats.report()
+    }
+}
+
+impl DiagnosticSource for TieredIndex {
+    fn collect(&self, report: &mut DiagnosticReport) {
+        let quarantine = self.quarantine_state.lock();
+        let gate = self.freeze_gate.lock();
+        let clock = self.clock_skew.lock();
+
+        report.storage.quarantine_roots = quarantine.active_root_count();
+        report.storage.freeze_gates = gate.frozen_root_count();
+        report.storage.freeze_blocked_events = gate.blocked_events();
+        report.clocks.skew_count = clock.skew_count();
+        report.clocks.last_drift_ms = clock.last_negative_drift().as_millis() as u64;
+        report.clocks.cutoff_trusted = clock.cutoff_trusted();
+        report.clocks.reconciliation_count =
+            self.clock_reconciliation_count.load(Ordering::Relaxed);
+        report.clocks.reconciliation_window_active = !clock.cutoff_trusted();
     }
 }
 

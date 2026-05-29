@@ -189,6 +189,20 @@ v7 快照启动时会挂载为 manifest-only 冷段：常驻内存只保留 segm
 
 DirtyQueue 是冷层补偿的统一入口，会合并来自 inotify 冷层事件、查询 stale hit、路径形态 query miss、周期冷层扫描、启动修复和 overflow recovery 的 dirty scope。队列带 debounce、优先级和重试；局部补扫优先扫描事件所在叶子目录，失败时再逐级扩大范围。
 
+Runtime Boundary State Contract 规定了远程/虚拟文件系统离线时的状态顺序：先加载 snapshot，再回放 WAL，随后恢复 quarantine root state 并安装 Freeze Gate，最后才启动 DeltaBuffer/event pipeline 和旁车校验。WAL 支持 `OFFLINE_ROOT` / `ONLINE_ROOT` 根状态记录；quarantine sidecar 使用 `root_path + mount_id + major:minor + fs_uuid? + source + fstype + affected_prefixes` 作为物理锚点，不使用 PathId/DocId 作为持久主键。Freeze Gate 会阻止离线 root 下的 Delete/Modify/Rename 进入 DeltaBuffer，查询默认隐藏离线 root 结果；设备恢复后写入 `ONLINE_ROOT` 并把 affected prefixes 加入局部对账队列。
+
+`/health` 保留既有 summary 字段，同时新增强类型 `diagnostics`：`system`、`storage`、`security`、`clocks`、`watchers`、`io`。运行时探测状态只出现在 diagnostics/runtime state 中，不写回用户配置。结构化 roots 配置使用对象数组：
+
+```toml
+[[roots]]
+path = "/mnt/samba"
+case_policy = "Auto" # Sensitive | Insensitive | Auto | Unknown
+allow_remote = false
+one_file_system = true
+```
+
+旧格式 `roots = ["/path"]` 仍可读取。`detected_policy`、`conflict_count`、mount state、freeze gate 等运行时字段不会被写入 `config.toml`。
+
 Tiered watcher 还支持 Ephemeral Watch：当同一 dirty scope 在短窗口内反复触发、正式 L0 晋升又不合适或预算受阻时，后台会按独立的 `ephemeral_watch_budget` 创建临时 watcher 租约。临时 watcher 不属于 L0/L1/L2/L3，也不会替代 DirtyQueue；它只覆盖小成本局部根，并会在 idle、TTL、连续无变化补扫、被正式 L0 覆盖或预算驱逐时自动移除。
 
 Tiered watcher 的一致性 profile 用 `tiered_watch.profile` 控制：

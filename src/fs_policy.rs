@@ -156,6 +156,49 @@ impl FsPolicyDecision {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MountPolicyCounters {
+    pub fstype_blocked_count: u64,
+    pub network_fs_ignored_count: u64,
+    pub one_file_system_boundary_count: u64,
+    pub fuse_probe_timeout_count: u64,
+    pub denied_mount_count: u64,
+    pub allowed_override_count: u64,
+}
+
+impl MountPolicyCounters {
+    pub fn record_decision(&mut self, decision: &FsPolicyDecision) {
+        let FsPolicyDecision::Deny { reason } = decision else {
+            return;
+        };
+        self.denied_mount_count = self.denied_mount_count.saturating_add(1);
+        if reason == "one_file_system" {
+            self.one_file_system_boundary_count =
+                self.one_file_system_boundary_count.saturating_add(1);
+        } else if let Some(fstype) = reason.strip_prefix("remote_fstype:") {
+            self.network_fs_ignored_count = self.network_fs_ignored_count.saturating_add(1);
+            if fstype.starts_with("fuse.") {
+                self.fstype_blocked_count = self.fstype_blocked_count.saturating_add(1);
+            }
+        } else if reason.starts_with("deny_fstype:") {
+            self.fstype_blocked_count = self.fstype_blocked_count.saturating_add(1);
+            if let Some(fstype) = reason.strip_prefix("deny_fstype:") {
+                if is_remote_fstype(fstype) {
+                    self.network_fs_ignored_count = self.network_fs_ignored_count.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    pub fn record_fuse_probe_timeout(&mut self) {
+        self.fuse_probe_timeout_count = self.fuse_probe_timeout_count.saturating_add(1);
+    }
+
+    pub fn record_allowed_override(&mut self) {
+        self.allowed_override_count = self.allowed_override_count.saturating_add(1);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FsPolicy {
     table: MountTable,
@@ -354,5 +397,20 @@ mod tests {
             1
         });
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn mount_policy_reason_matrix_counts_rejections() {
+        let policy = FsPolicy::new(MountTable::parse(SAMPLE), FsPolicyConfig::default());
+        let mut counters = MountPolicyCounters::default();
+
+        counters.record_decision(&policy.check_path(Path::new("/home/user/remote/a"), None));
+        counters.record_decision(&policy.check_path(Path::new("/home/user/rclone/a"), None));
+        counters.record_fuse_probe_timeout();
+
+        assert_eq!(counters.denied_mount_count, 2);
+        assert_eq!(counters.network_fs_ignored_count, 2);
+        assert_eq!(counters.fstype_blocked_count, 2);
+        assert_eq!(counters.fuse_probe_timeout_count, 1);
     }
 }

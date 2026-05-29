@@ -144,6 +144,9 @@ pub struct Config {
     pub socket_path: Option<PathBuf>,
     /// Index root directories.
     pub roots: Vec<PathBuf>,
+    /// Structured per-root user intent. Runtime detected state is intentionally not persisted here.
+    #[serde(skip)]
+    pub root_configs: Vec<RootConfig>,
     /// Whether .gitignore / .ignore rules are applied during scan.
     pub ignore_enabled: bool,
     /// Log level (e.g. "info", "debug", "trace").
@@ -186,6 +189,45 @@ pub struct Config {
     pub fs_policy: FsPolicyConfig,
     /// Directory names that are never indexed, regardless of .gitignore rules.
     pub exclude_dirs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub enum RootCasePolicy {
+    Sensitive,
+    Insensitive,
+    #[default]
+    Auto,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RootConfig {
+    pub path: PathBuf,
+    pub case_policy: RootCasePolicy,
+    pub allow_remote: bool,
+    pub one_file_system: bool,
+}
+
+impl Default for RootConfig {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            case_policy: RootCasePolicy::Auto,
+            allow_remote: false,
+            one_file_system: true,
+        }
+    }
+}
+
+impl RootConfig {
+    pub fn from_path(path: PathBuf) -> Self {
+        Self {
+            path,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -401,6 +443,7 @@ impl Default for Config {
         Self {
             socket_path: None,
             roots: Vec::new(),
+            root_configs: Vec::new(),
             ignore_enabled: true,
             log_level: "info".to_string(),
             http_port: 6060,
@@ -446,14 +489,28 @@ impl Config {
             return Ok(Self::default());
         }
         let text = std::fs::read_to_string(path)?;
-        let value: toml::Value = toml::from_str(&text)?;
+        let mut value: toml::Value = toml::from_str(&text)?;
         let has_exclude_dirs = value.get("exclude_dirs").is_some();
-        let mut cfg: Config = toml::from_str(&text)?;
+        let root_configs = extract_root_configs(&mut value)?;
+        let mut cfg: Config = value.try_into()?;
+        cfg.root_configs = root_configs;
         cfg.exclude_dirs = normalize_exclude_dirs(cfg.exclude_dirs);
         if !has_exclude_dirs {
             append_missing_exclude_dirs(path, &text, &cfg.exclude_dirs)?;
         }
         cfg.roots = cfg.roots.into_iter().map(expand_tilde_path).collect();
+        if cfg.root_configs.is_empty() {
+            cfg.root_configs = cfg
+                .roots
+                .iter()
+                .cloned()
+                .map(RootConfig::from_path)
+                .collect();
+        } else {
+            for root in &mut cfg.root_configs {
+                root.path = expand_tilde_path(std::mem::take(&mut root.path));
+            }
+        }
         cfg.tiered_watch.hot_dirs = cfg
             .tiered_watch
             .hot_dirs
@@ -481,10 +538,63 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = toml::to_string_pretty(self)?;
+        let text = self.to_toml_string()?;
         std::fs::write(&path, text)?;
         Ok(())
     }
+
+    pub fn to_toml_string(&self) -> anyhow::Result<String> {
+        let mut value = toml::Value::try_from(self)?;
+        let roots = if self.root_configs.is_empty() {
+            self.roots
+                .iter()
+                .cloned()
+                .map(RootConfig::from_path)
+                .collect::<Vec<_>>()
+        } else {
+            self.root_configs.clone()
+        };
+        value
+            .as_table_mut()
+            .expect("Config serializes as a TOML table")
+            .insert("roots".to_string(), toml::Value::try_from(roots)?);
+        Ok(toml::to_string_pretty(&value)?)
+    }
+}
+
+fn extract_root_configs(value: &mut toml::Value) -> anyhow::Result<Vec<RootConfig>> {
+    let Some(roots_value) = value.get_mut("roots") else {
+        return Ok(Vec::new());
+    };
+
+    let Some(items) = roots_value.as_array() else {
+        anyhow::bail!("config roots must be an array");
+    };
+
+    if items.iter().all(|item| item.as_str().is_some()) {
+        let paths = items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(|path| RootConfig::from_path(PathBuf::from(path)))
+            .collect::<Vec<_>>();
+        return Ok(paths);
+    }
+
+    if items.iter().all(|item| item.as_table().is_some()) {
+        let configs: Vec<RootConfig> = items
+            .iter()
+            .cloned()
+            .map(|item| item.try_into())
+            .collect::<Result<Vec<_>, _>>()?;
+        let legacy_paths = configs
+            .iter()
+            .map(|root| toml::Value::String(root.path.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        *roots_value = toml::Value::Array(legacy_paths);
+        return Ok(configs);
+    }
+
+    anyhow::bail!("config roots must be either [\"/path\"] or [[roots]] objects");
 }
 
 #[derive(Serialize)]
@@ -497,6 +607,21 @@ fn append_missing_exclude_dirs(
     existing_text: &str,
     exclude_dirs: &[String],
 ) -> anyhow::Result<()> {
+    let patch = format!(
+        "# fd-rdd default index-time directory exclusions. Edit this list to customize.\n{}",
+        toml::to_string_pretty(&ExcludeDirsPatch { exclude_dirs })?
+    );
+    if existing_text.contains("[[roots]]") {
+        let mut text = patch;
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push('\n');
+        text.push_str(existing_text);
+        std::fs::write(path, text)?;
+        return Ok(());
+    }
+
     let mut text = existing_text.to_string();
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
@@ -504,10 +629,7 @@ fn append_missing_exclude_dirs(
     if !text.is_empty() {
         text.push('\n');
     }
-    text.push_str(
-        "# fd-rdd default index-time directory exclusions. Edit this list to customize.\n",
-    );
-    text.push_str(&toml::to_string_pretty(&ExcludeDirsPatch { exclude_dirs })?);
+    text.push_str(&patch);
     std::fs::write(path, text)?;
     Ok(())
 }
@@ -735,5 +857,72 @@ l3_scan_policy = "validate-on-query"
         .expect("hyphenated value should remain accepted for CLI-style configs");
 
         assert_eq!(legacy_hyphen.l3_scan_policy, L3ScanPolicy::ValidateOnQuery);
+    }
+
+    #[test]
+    fn load_accepts_structured_roots_and_keeps_runtime_state_out_of_config() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-config-structured-roots-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+exclude_dirs = ["target"]
+
+[[roots]]
+path = "/mnt/samba"
+case_policy = "Auto"
+allow_remote = false
+one_file_system = true
+detected_policy = "Insensitive"
+conflict_count = 14
+"#,
+        )
+        .expect("write config");
+
+        let cfg = Config::load_from_path(&path).expect("structured roots should parse");
+
+        assert_eq!(cfg.roots, vec![PathBuf::from("/mnt/samba")]);
+        assert_eq!(cfg.root_configs.len(), 1);
+        assert_eq!(cfg.root_configs[0].case_policy, RootCasePolicy::Auto);
+        assert!(!cfg.root_configs[0].allow_remote);
+        assert!(cfg.root_configs[0].one_file_system);
+
+        let toml = cfg.to_toml_string().expect("serialize config");
+        assert!(toml.contains("[[roots]]"));
+        assert!(toml.contains("case_policy = \"Auto\""));
+        assert!(!toml.contains("detected_policy"));
+        assert!(!toml.contains("conflict_count"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_accepts_legacy_roots_array() {
+        let root =
+            std::env::temp_dir().join(format!("fd-rdd-config-legacy-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+roots = ["/tmp"]
+exclude_dirs = ["target"]
+"#,
+        )
+        .expect("write config");
+
+        let cfg = Config::load_from_path(&path).expect("legacy roots should parse");
+
+        assert_eq!(cfg.roots, vec![PathBuf::from("/tmp")]);
+        assert_eq!(cfg.root_configs[0].path, PathBuf::from("/tmp"));
+        assert_eq!(cfg.root_configs[0].case_policy, RootCasePolicy::Auto);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

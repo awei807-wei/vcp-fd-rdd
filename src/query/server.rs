@@ -1,7 +1,9 @@
+use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::tiered_watch::TieredWatchDebugDump;
 use crate::index::TieredIndex;
 use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
 use crate::query::{execute_query_with_metadata_result, QueryMode, SortColumn, SortOrder};
+use crate::security::{effective_http_policy, http_policy_label, HttpPolicy, RunningIdentity};
 use crate::stats::{EventPipelineStats, MemoryReport, StatsReport, WatchStateReport};
 use crate::storage::recovery_audit::RecoveryAuditReport;
 use crate::util::maybe_trim_rss;
@@ -14,6 +16,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -67,6 +70,7 @@ pub struct HealthTelemetry {
     pub strict_coverage_failure: bool,
     pub strict_fail_on_budget_exceeded: bool,
     pub strict_uncovered_dirs: Vec<String>,
+    pub diagnostics: DiagnosticReport,
 }
 
 #[derive(Deserialize)]
@@ -154,6 +158,7 @@ pub struct HealthResponse {
     pub strict_coverage_failure: bool,
     pub strict_fail_on_budget_exceeded: bool,
     pub strict_uncovered_dirs: Vec<String>,
+    pub diagnostics: DiagnosticReport,
     pub issues: Vec<String>,
 }
 
@@ -190,6 +195,8 @@ struct QueryServerState {
     stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync>,
     watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
     tiered_watch_debug_provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync>,
+    scan_reject_count: Arc<AtomicU64>,
+    http_policy: HttpPolicy,
 }
 
 pub struct QueryServer {
@@ -199,6 +206,8 @@ pub struct QueryServer {
     stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync>,
     watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
     tiered_watch_debug_provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync>,
+    scan_reject_count: Arc<AtomicU64>,
+    http_policy: HttpPolicy,
 }
 
 impl QueryServer {
@@ -210,6 +219,8 @@ impl QueryServer {
             stats_provider: Arc::new(EventPipelineStats::default),
             watch_state_provider: Arc::new(WatchStateReport::default),
             tiered_watch_debug_provider: Arc::new(|_| TieredWatchDebugDump::default()),
+            scan_reject_count: Arc::new(AtomicU64::new(0)),
+            http_policy: effective_http_policy(None, RunningIdentity::current()),
         }
     }
 
@@ -245,7 +256,16 @@ impl QueryServer {
         self
     }
 
+    pub fn with_http_policy(mut self, policy: HttpPolicy) -> Self {
+        self.http_policy = policy;
+        self
+    }
+
     pub async fn run(self, port: u16) -> anyhow::Result<()> {
+        if self.http_policy == HttpPolicy::Disabled {
+            tracing::warn!("HTTP query server disabled by security policy");
+            return Ok(());
+        }
         let state = QueryServerState {
             index: self.index,
             config: self.config,
@@ -254,6 +274,8 @@ impl QueryServer {
             stats_provider: self.stats_provider,
             watch_state_provider: self.watch_state_provider,
             tiered_watch_debug_provider: self.tiered_watch_debug_provider,
+            scan_reject_count: self.scan_reject_count,
+            http_policy: self.http_policy,
         };
         let app = Router::new()
             .route("/search", get(search_handler))
@@ -440,6 +462,32 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     } else {
         "warning"
     };
+
+    let mut diagnostics = health.diagnostics.clone();
+    state.index.collect(&mut diagnostics);
+    diagnostics.system.version = env!("CARGO_PKG_VERSION").to_string();
+    diagnostics.system.allocator = crate::ALLOCATOR_KIND.to_string();
+    diagnostics.system.uptime_secs = uptime;
+    diagnostics.storage.snapshot_source = health.snapshot_source.clone();
+    diagnostics.storage.wal_events_replayed = health.wal_events_replayed;
+    diagnostics.storage.wal_sealed_used = health.wal_sealed_used;
+    diagnostics.storage.wal_truncated_tail_records = health.wal_truncated_tail_records;
+    diagnostics.storage.wal_gap_detected = health.wal_gap_detected;
+    diagnostics.storage.wal_checkpoint_used = health.wal_checkpoint_used;
+    diagnostics.storage.wal_durability = health.wal_durability.clone();
+    diagnostics.security.http_policy = http_policy_label(state.http_policy).to_string();
+    diagnostics.security.scan_reject_count = state.scan_reject_count.load(Ordering::Relaxed);
+    let identity = RunningIdentity::current();
+    diagnostics.security.multi_user_risk = identity.multi_user_risk();
+    diagnostics.watchers.denied_mount_count = diagnostics
+        .watchers
+        .denied_mount_count
+        .saturating_add(health.watch_failures);
+    diagnostics.watchers.fstype_blocked_count = diagnostics
+        .watchers
+        .fstype_blocked_count
+        .saturating_add(health.event_degraded_roots as u64);
+
     Json(HealthResponse {
         status: "ok",
         index_health,
@@ -489,6 +537,7 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         strict_coverage_failure: health.strict_coverage_failure,
         strict_fail_on_budget_exceeded: health.strict_fail_on_budget_exceeded,
         strict_uncovered_dirs: health.strict_uncovered_dirs,
+        diagnostics,
         issues,
     })
 }
@@ -535,6 +584,7 @@ async fn scan_handler(
     let dirs: Vec<PathBuf> = params.paths.iter().take(10).map(PathBuf::from).collect();
     for dir in &dirs {
         if !crate::security::path_within_roots(dir, &state.index.roots) {
+            state.scan_reject_count.fetch_add(1, Ordering::Relaxed);
             return Err((
                 StatusCode::FORBIDDEN,
                 format!("scan path is outside configured roots: {}", dir.display()),

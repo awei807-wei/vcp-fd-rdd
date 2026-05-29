@@ -114,6 +114,7 @@ impl TieredIndex {
             return;
         }
 
+        self.observe_clock_boundary();
         if let Some(wal) = self.wal.lock().clone() {
             if let Err(e) = wal.append(events) {
                 tracing::warn!("WAL append failed (continuing without durability): {}", e);
@@ -194,6 +195,73 @@ impl TieredIndex {
         })
     }
 
+    fn filter_events_for_freeze(&self, events: &[EventRecord]) -> Vec<EventRecord> {
+        let mut gate = self.freeze_gate.lock();
+        let mut filtered = Vec::with_capacity(events.len());
+        for ev in events {
+            if gate.should_block_event(ev) {
+                gate.note_blocked();
+                tracing::warn!(
+                    "freeze gate blocked {:?} under offline root: {:?}",
+                    ev.event_type,
+                    ev.best_path()
+                );
+                continue;
+            }
+            filtered.push(ev.clone());
+        }
+        filtered
+    }
+
+    fn retain_events_allowed_by_freeze(&self, events: &mut Vec<EventRecord>) {
+        let mut gate = self.freeze_gate.lock();
+        events.retain(|ev| {
+            if gate.should_block_event(ev) {
+                gate.note_blocked();
+                tracing::warn!(
+                    "freeze gate blocked {:?} under offline root: {:?}",
+                    ev.event_type,
+                    ev.best_path()
+                );
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn filter_upserted_for_freeze(
+        &self,
+        events: &[EventRecord],
+        metas: &mut Vec<FileMeta>,
+    ) -> Vec<EventRecord> {
+        if events.len() != metas.len() {
+            let filtered = self.filter_events_for_freeze(events);
+            if filtered.len() != events.len() {
+                metas.clear();
+            }
+            return filtered;
+        }
+
+        let mut gate = self.freeze_gate.lock();
+        let mut filtered_events = Vec::with_capacity(events.len());
+        let mut filtered_metas = Vec::with_capacity(metas.len());
+        for (ev, meta) in events.iter().zip(metas.iter()) {
+            if gate.should_block_event(ev) {
+                gate.note_blocked();
+                tracing::warn!(
+                    "freeze gate blocked upsert under offline root: {:?}",
+                    ev.best_path()
+                );
+                continue;
+            }
+            filtered_events.push(ev.clone());
+            filtered_metas.push(meta.clone());
+        }
+        *metas = filtered_metas;
+        filtered_events
+    }
+
     fn normalize_event_paths(ev: &mut EventRecord) {
         use super::normalize_path;
         if let Some(ref mut p) = ev.path_hint {
@@ -217,16 +285,24 @@ impl TieredIndex {
     }
 
     pub(super) fn apply_events_inner(&self, events: &[EventRecord], log_to_wal: bool) {
-        let Some(batch) = self.begin_apply_batch(events, log_to_wal) else {
+        let events = self.filter_events_for_freeze(events);
+        if events.is_empty() {
+            return;
+        }
+        let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal) else {
             return;
         };
-        batch.l2.apply_events(events);
+        batch.l2.apply_events(events.as_slice());
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
         self.stats.record_events_applied(batch.event_count as u64);
     }
 
     pub(super) fn apply_events_inner_drain(&self, events: &mut Vec<EventRecord>, log_to_wal: bool) {
+        self.retain_events_allowed_by_freeze(events);
+        if events.is_empty() {
+            return;
+        }
         let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal) else {
             return;
         };
@@ -243,7 +319,8 @@ impl TieredIndex {
         metas: &mut Vec<FileMeta>,
         log_to_wal: bool,
     ) {
-        let Some(batch) = self.begin_apply_batch(events, log_to_wal) else {
+        let events = self.filter_upserted_for_freeze(events, metas);
+        let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal) else {
             metas.clear();
             return;
         };

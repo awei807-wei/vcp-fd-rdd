@@ -1,5 +1,6 @@
 pub mod checksum;
 pub mod mmap;
+pub mod quarantine;
 pub mod recovery_audit;
 pub mod serde;
 pub mod snapshot;

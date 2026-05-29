@@ -50,6 +50,15 @@ pub fn effective_http_policy(
     }
 }
 
+pub fn http_policy_label(policy: HttpPolicy) -> &'static str {
+    match policy {
+        HttpPolicy::Disabled => "disabled",
+        HttpPolicy::LocalhostDebug => "localhost-debug",
+        HttpPolicy::Token => "token",
+        HttpPolicy::Unsafe => "unsafe",
+    }
+}
+
 pub fn path_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }

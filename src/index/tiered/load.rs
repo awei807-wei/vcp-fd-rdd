@@ -119,6 +119,12 @@ impl TieredIndex {
             dirty_queue: Mutex::new(crate::event::sync::DirtyQueue::default()),
             dirty_notify: Notify::new(),
             recovery_status: Mutex::new(super::RecoveryStatus::default()),
+            quarantine_state: Mutex::new(crate::storage::quarantine::QuarantineState::default()),
+            freeze_gate: Mutex::new(crate::storage::quarantine::FreezeGate::default()),
+            clock_skew: Mutex::new(crate::clock::ClockSkewDetector::new(
+                std::time::Duration::from_secs(1),
+            )),
+            clock_reconciliation_count: AtomicU64::new(0),
             stable_snapshot_enabled: AtomicBool::new(true),
             stats: Arc::new(crate::stats::StatsCollector::new()),
         }
@@ -434,6 +440,13 @@ impl TieredIndex {
                         r.truncated_tail_records
                     );
                     self.apply_events_inner(&r.events, false);
+                }
+                if !r.root_events.is_empty() {
+                    tracing::info!(
+                        "WAL replay: root_state_events={} active_freeze_gates_restored",
+                        r.root_events_replayed
+                    );
+                    self.restore_quarantine_from_wal(&r.root_events);
                 }
                 summary
             }

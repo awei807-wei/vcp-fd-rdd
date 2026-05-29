@@ -53,6 +53,18 @@ fn http_api_manual_scan_and_observability_endpoints_work() {
     assert_eq!(health["index_health"], "static");
     assert_eq!(health["watch_enabled"], false);
     assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+    assert!(health["diagnostics"].is_object());
+    assert_eq!(
+        health["diagnostics"]["system"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(health["diagnostics"]["storage"]["wal_events_replayed"]
+        .as_u64()
+        .is_some());
+    assert_eq!(
+        health["diagnostics"]["security"]["uds_peer_policy"],
+        "same-user"
+    );
 
     let status = get_json(port, "/status");
     assert_eq!(status["indexed_count"], 1);
@@ -84,6 +96,20 @@ fn http_api_manual_scan_and_observability_endpoints_work() {
         .send()
         .unwrap();
     assert_eq!(empty_scan.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let forbidden_scan = client
+        .post(format!("http://127.0.0.1:{port}/scan"))
+        .json(&json!({ "paths": [state.to_string_lossy()] }))
+        .send()
+        .unwrap();
+    assert_eq!(forbidden_scan.status(), reqwest::StatusCode::FORBIDDEN);
+    let health_after_reject = get_json(port, "/health");
+    assert!(
+        health_after_reject["diagnostics"]["security"]["scan_reject_count"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
 
     let late = root.join("manual_scan_api_probe.txt");
     std::fs::write(&late, b"manual").unwrap();

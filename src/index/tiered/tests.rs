@@ -3,6 +3,7 @@ use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::event::sync::{DirtyReason, DirtyScope};
 use crate::index::tiered::events::event_record_estimated_bytes;
 use crate::stats::EventPipelineStats;
+use crate::storage::quarantine::{FreezeGate, MountIdentity, RootStateRecord};
 use crate::storage::snapshot::SnapshotStore;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +24,87 @@ fn unique_tmp_dir(tag: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("fd-rdd-{}-{}", tag, nanos))
+}
+
+fn test_mount_identity() -> MountIdentity {
+    MountIdentity {
+        mount_id: 7,
+        major_minor: "8:1".to_string(),
+        fs_uuid: Some("uuid-a".to_string()),
+        source: "/dev/sda1".to_string(),
+        fstype: "ext4".to_string(),
+    }
+}
+
+#[test]
+fn freeze_gate_blocks_destructive_events_before_delta_buffer() {
+    let root = unique_tmp_dir("freeze-delta");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.install_freeze_gate(FreezeGate::from_roots(vec![root.clone()]));
+
+    let p = root.join("blocked.txt");
+    let old = root.join("old.txt");
+    let rename = EventRecord {
+        seq: 3,
+        timestamp: std::time::SystemTime::now(),
+        event_type: EventType::Rename {
+            from: FileIdentifier::Path(old.clone()),
+            from_path_hint: Some(old),
+        },
+        id: FileIdentifier::Path(root.join("new.txt")),
+        path_hint: Some(root.join("new.txt")),
+    };
+    idx.apply_events(&[
+        mk_event(1, EventType::Modify, p.clone()),
+        mk_event(2, EventType::Delete, p),
+        rename,
+    ]);
+
+    assert_eq!(idx.delta_buffer.lock().len(), 0);
+    assert_eq!(idx.freeze_gate.lock().blocked_events(), 3);
+}
+
+#[test]
+fn frozen_root_query_results_are_hidden_by_default() {
+    let root = unique_tmp_dir("freeze-query");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("visible_before_freeze.txt");
+    std::fs::write(&path, b"data").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.apply_events(&[mk_event(1, EventType::Create, path)]);
+    assert!(!idx.query("visible_before_freeze").is_empty());
+
+    idx.install_freeze_gate(FreezeGate::from_roots(vec![root]));
+    assert!(idx.query("visible_before_freeze").is_empty());
+}
+
+#[test]
+fn online_root_record_unfreezes_and_queues_prefix_reconciliation() {
+    let root = unique_tmp_dir("freeze-online");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let prefix = root.join("project");
+
+    idx.apply_root_state_record(RootStateRecord::offline(
+        1,
+        root.clone(),
+        test_mount_identity(),
+        vec![prefix.clone()],
+        Some("probe_timeout".to_string()),
+    ));
+    assert!(idx.path_is_frozen(&prefix));
+
+    idx.apply_root_state_record(RootStateRecord::online(
+        2,
+        root,
+        test_mount_identity(),
+        vec![prefix],
+    ));
+
+    assert_eq!(idx.freeze_gate.lock().frozen_root_count(), 0);
+    assert_eq!(idx.dirty_queue_len(), 1);
 }
 
 #[test]

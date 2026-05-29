@@ -12,6 +12,7 @@ pub const ALLOCATOR_KIND: &str = if cfg!(feature = "mimalloc") {
 pub mod clock;
 pub mod config;
 pub mod core;
+pub mod diagnostics;
 pub mod event;
 pub mod fs_policy;
 pub mod index;
