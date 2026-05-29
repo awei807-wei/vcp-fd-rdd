@@ -1,6 +1,7 @@
 use clap::Parser;
 use fd_rdd::config::{
-    default_snapshot_path, default_socket_path, Config, TieredWatchProfile, WatchMode,
+    default_snapshot_path, default_socket_path, Config, RuntimeProfile, TieredWatchProfile,
+    WatchMode,
 };
 use fd_rdd::event::ignore_filter::IgnoreFilter;
 use fd_rdd::event::sync::{DirtyReason, DirtyScope};
@@ -100,6 +101,10 @@ struct Args {
     #[arg(long, value_parser = ["recursive", "tiered", "off"])]
     watch_mode: Option<String>,
 
+    /// 运行时资源配置档：default 或 memory_light。
+    #[arg(long, value_parser = ["default", "memory_light", "memory-light"])]
+    runtime_profile: Option<String>,
+
     /// WAL 持久化模式：flush-only、sync-interval、sync-always。
     #[arg(long, value_parser = ["flush-only", "sync-interval", "sync-always"])]
     wal_durability: Option<String>,
@@ -119,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let cli_watch_mode = parse_watch_mode(args.watch_mode.as_deref())?;
+    let cli_runtime_profile = parse_runtime_profile(args.runtime_profile.as_deref())?;
 
     // 检测首次启动：配置文件不存在视为首次启动
     let config_path = Config::config_path();
@@ -149,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 WatchMode::Recursive
             }),
+            runtime_profile: cli_runtime_profile.unwrap_or_default(),
             ignore_enabled: !args.no_ignore,
             ..Config::default()
         };
@@ -199,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
     let snapshot_interval_secs = args
         .snapshot_interval_secs
         .unwrap_or(cfg.snapshot_interval_secs);
+    let runtime_profile = cli_runtime_profile.unwrap_or(cfg.runtime_profile);
     let wal_durability_mode = args
         .wal_durability
         .as_deref()
@@ -216,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
         wal_sync_interval_ms,
         wal_sync_batch_records,
     )?;
+    tracing::info!("runtime profile: {}", runtime_profile.as_str());
     let report_interval_secs = args.report_interval_secs.unwrap_or(60);
     let event_channel_size = args.event_channel_size.unwrap_or(65_536);
     let debounce_ms = args.debounce_ms.unwrap_or(10);
@@ -708,6 +717,12 @@ fn watch_mode_label(mode: WatchMode) -> &'static str {
     }
 }
 
+fn parse_runtime_profile(value: Option<&str>) -> anyhow::Result<Option<RuntimeProfile>> {
+    value
+        .map(|value| value.parse().map_err(anyhow::Error::msg))
+        .transpose()
+}
+
 fn watch_profile_label(profile: TieredWatchProfile) -> &'static str {
     match profile {
         TieredWatchProfile::Strict => "strict",
@@ -1181,6 +1196,24 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("fd-rdd-main-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn runtime_profile_cli_accepts_memory_light_aliases() {
+        assert_eq!(parse_runtime_profile(None).unwrap(), None);
+        assert_eq!(
+            parse_runtime_profile(Some("default")).unwrap(),
+            Some(RuntimeProfile::Default)
+        );
+        assert_eq!(
+            parse_runtime_profile(Some("memory_light")).unwrap(),
+            Some(RuntimeProfile::MemoryLight)
+        );
+        assert_eq!(
+            parse_runtime_profile(Some("memory-light")).unwrap(),
+            Some(RuntimeProfile::MemoryLight)
+        );
+        assert!(parse_runtime_profile(Some("low")).is_err());
     }
 
     #[test]

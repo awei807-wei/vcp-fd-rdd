@@ -177,6 +177,8 @@ pub struct Config {
     pub startup_repair_budget_ms: u64,
     /// If repair failure ratio exceeds this value, full rebuild may be scheduled.
     pub startup_repair_force_rebuild_ratio: f32,
+    /// Runtime resource profile. `memory_light` lowers hot-memory residency at higher I/O cost.
+    pub runtime_profile: RuntimeProfile,
     /// WAL durability mode: `flush-only`, `sync-interval`, or `sync-always`.
     pub wal_durability: String,
     /// WAL sync interval in milliseconds when `wal_durability = "sync-interval"`.
@@ -296,6 +298,37 @@ pub enum L3ScanPolicy {
     #[serde(alias = "validate-on-query")]
     ValidateOnQuery,
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeProfile {
+    #[default]
+    Default,
+    MemoryLight,
+}
+
+impl RuntimeProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::MemoryLight => "memory_light",
+        }
+    }
+}
+
+impl std::str::FromStr for RuntimeProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "memory_light" | "memory-light" => Ok(Self::MemoryLight),
+            other => Err(format!(
+                "unsupported runtime profile {other:?}; expected default or memory_light"
+            )),
+        }
+    }
 }
 
 impl L3ScanPolicy {
@@ -459,6 +492,7 @@ impl Default for Config {
             startup_repair_max_dirs: 16,
             startup_repair_budget_ms: 10_000,
             startup_repair_force_rebuild_ratio: 0.25,
+            runtime_profile: RuntimeProfile::Default,
             wal_durability: "flush-only".to_string(),
             wal_sync_interval_ms: 1000,
             wal_sync_batch_records: 1024,
@@ -761,6 +795,32 @@ max_watch_dirs = 16
         assert!(toml.contains("ephemeral_watch_ttl_secs"));
         assert!(toml.contains("ephemeral_idle_secs"));
         assert!(toml.contains("ephemeral_max_cost_per_root"));
+    }
+
+    #[test]
+    fn runtime_profile_defaults_and_accepts_memory_light() {
+        let default_cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+"#,
+        )
+        .expect("config should parse without runtime profile");
+
+        assert_eq!(default_cfg.runtime_profile, RuntimeProfile::Default);
+
+        let memory_light: Config = toml::from_str(
+            r#"
+roots = ["~"]
+runtime_profile = "memory_light"
+"#,
+        )
+        .expect("memory_light runtime profile should parse");
+
+        assert_eq!(memory_light.runtime_profile, RuntimeProfile::MemoryLight);
+        assert_eq!(RuntimeProfile::MemoryLight.as_str(), "memory_light");
+
+        let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
+        assert!(toml.contains("runtime_profile"));
     }
 
     #[test]
