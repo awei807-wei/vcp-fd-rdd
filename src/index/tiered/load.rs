@@ -119,7 +119,9 @@ impl TieredIndex {
         let base = ArcSwap::from(Arc::new(base_data));
         let fs_policy_config = l3.fs_policy_config.clone();
         let mount_policy_counters = Arc::new(SharedMountPolicyCounters::default());
-        let l3 = l3.with_mount_policy_counters(mount_policy_counters.clone());
+        let l3 = l3
+            .with_mount_policy_counters(mount_policy_counters.clone())
+            .with_io_governor(io_governor.clone());
 
         Self {
             l1,

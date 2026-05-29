@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - I/O Governor 记录 token bucket 限流等待次数，为后续 scan loop 接入和 `/health.diagnostics.io.token_bucket_limited_count` 提供真实计数来源。
 - `TieredIndex` 持有配置化共享 I/O Governor，并将 backoff/token bucket 计数汇总到 `/health.diagnostics.io`。
 - I/O Governor 保存最近一次 PSI pressure 观测值，并通过 `/health.diagnostics.io.psi_some_avg10` / `psi_full_avg10` 暴露。
+- full build、rebuild 和 `IndexBuilder` 增量补扫会在文件 metadata 读取前消费共享 I/O Governor token，相关操作计数进入 `/health.diagnostics.io`。
 - 补齐 case policy 自动探测基础、mount policy 拒绝原因矩阵、clock skew dirty window 和 root/system daemon 默认禁用未认证 HTTP query/scan 的安全策略测试。
 - 测试补强：新增 daemon API/UDS E2E、真实 watcher create/rename/delete、abrupt kill 与坏 stable snapshot 启动修复组合测试，补齐此前偏模块级的关键真实链路缺口。
 - 仓库清理：将本地运行生成的 `reports/`/`report/` 加入忽略，并停止追踪历史报告产物，避免测试与 daemon 运行污染提交。

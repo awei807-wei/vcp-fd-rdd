@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::fs_policy::{FsPolicy, FsPolicyConfig, SharedMountPolicyCounters};
+use crate::io_governor::IoGovernor;
 use crate::util::path_has_excluded_component;
 
 /// 文件身份：Linux 上用 (dev, ino, generation) 做主键，rename 时 ino 不变，
@@ -153,6 +154,7 @@ pub struct FsScanRDD {
     exclude_dirs: Vec<String>,
     mount_policy_counters: Option<Arc<SharedMountPolicyCounters>>,
     fs_policy_config: FsPolicyConfig,
+    io_governor: Option<Arc<IoGovernor>>,
 }
 
 impl FsScanRDD {
@@ -175,6 +177,7 @@ impl FsScanRDD {
             exclude_dirs: Vec::new(),
             mount_policy_counters: None,
             fs_policy_config: FsPolicyConfig::default(),
+            io_governor: None,
         }
     }
 
@@ -218,6 +221,11 @@ impl FsScanRDD {
         self
     }
 
+    pub fn with_io_governor(mut self, governor: Arc<IoGovernor>) -> Self {
+        self.io_governor = Some(governor);
+        self
+    }
+
     /// 按指定并行度遍历所有文件元数据（用于冷启动/重建的弹性构建）。
     ///
     /// 注意：这是 FsScanRDD 的专用入口，不改变 `BuildRDD` 的 Iterator 抽象，
@@ -244,6 +252,7 @@ impl FsScanRDD {
                 self.exclude_dirs.clone(),
                 self.mount_policy_counters.clone(),
                 self.fs_policy_config.clone(),
+                self.io_governor.clone(),
                 sink.clone(),
             );
         }
@@ -271,6 +280,7 @@ impl BuildRDD<FileMeta> for FsScanRDD {
         let root = part.root.clone();
         let exclude_dirs = self.exclude_dirs.clone();
         let mount_policy_counters = self.mount_policy_counters.clone();
+        let io_governor = self.io_governor.clone();
         builder.filter_entry(move |entry| {
             (exclude_dirs.is_empty() || !path_has_excluded_component(entry.path(), &exclude_dirs))
                 && fs_policy
@@ -300,6 +310,9 @@ impl BuildRDD<FileMeta> for FsScanRDD {
             })
             .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
             .filter_map(move |e| {
+                if let Some(governor) = io_governor.as_ref() {
+                    governor.before_io();
+                }
                 let meta = match e.metadata() {
                     Ok(meta) => meta,
                     Err(err) => {
@@ -331,6 +344,7 @@ fn scan_partition_parallel(
     exclude_dirs: Vec<String>,
     mount_policy_counters: Option<Arc<SharedMountPolicyCounters>>,
     fs_policy_config: FsPolicyConfig,
+    io_governor: Option<Arc<IoGovernor>>,
     sink: Arc<dyn Fn(FileMeta) + Send + Sync>,
 ) {
     use ignore::{WalkBuilder, WalkState};
@@ -368,6 +382,7 @@ fn scan_partition_parallel(
 
     walker.run(|| {
         let sink = sink.clone();
+        let io_governor = io_governor.clone();
         Box::new(move |entry| {
             let e = match entry {
                 Ok(e) => e,
@@ -378,6 +393,9 @@ fn scan_partition_parallel(
             };
             if !e.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                 return WalkState::Continue;
+            }
+            if let Some(governor) = io_governor.as_ref() {
+                governor.before_io();
             }
             let meta = match e.metadata() {
                 Ok(meta) => meta,
@@ -501,6 +519,24 @@ mod tests {
         assert!(!seen
             .iter()
             .any(|p| p.components().any(|c| c.as_os_str() == "node_modules")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_calls_io_governor_before_metadata_reads() {
+        let root = unique_tmp_dir("io-governor");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("one.txt"), b"one").expect("write one");
+        fs::write(root.join("two.txt"), b"two").expect("write two");
+
+        let governor = Arc::new(IoGovernor::new(true, 1_000_000));
+        let rdd = FsScanRDD::from_roots(vec![root.clone()]).with_io_governor(governor.clone());
+        let mut seen = Vec::new();
+        rdd.for_each(|meta| seen.push(meta.path));
+
+        assert_eq!(seen.len(), 2);
+        assert_eq!(governor.operations(), 2);
 
         let _ = fs::remove_dir_all(root);
     }

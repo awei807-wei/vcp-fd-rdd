@@ -1,6 +1,7 @@
 use crate::core::{BuildRDD, ExecutionStrategy, FileMeta, FsScanRDD};
 use crate::fs_policy::{FsPolicyConfig, SharedMountPolicyCounters};
 use crate::index::l2_partition::PersistentIndex;
+use crate::io_governor::IoGovernor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -14,6 +15,7 @@ pub struct IndexBuilder {
     pub exclude_dirs: Vec<String>,
     pub mount_policy_counters: Option<Arc<SharedMountPolicyCounters>>,
     pub fs_policy_config: FsPolicyConfig,
+    pub io_governor: Option<Arc<IoGovernor>>,
 }
 
 impl IndexBuilder {
@@ -63,6 +65,7 @@ impl IndexBuilder {
             exclude_dirs,
             mount_policy_counters: None,
             fs_policy_config: FsPolicyConfig::default(),
+            io_governor: None,
         }
     }
 
@@ -76,6 +79,11 @@ impl IndexBuilder {
         self
     }
 
+    pub fn with_io_governor(mut self, governor: Arc<IoGovernor>) -> Self {
+        self.io_governor = Some(governor);
+        self
+    }
+
     /// 全量构建：扫描所有 roots，流式灌入 PersistentIndex
     pub fn full_build(&self, index: &PersistentIndex) {
         let mut rdd = FsScanRDD::from_roots(self.roots.clone())
@@ -86,6 +94,9 @@ impl IndexBuilder {
             .with_fs_policy_config(self.fs_policy_config.clone());
         if let Some(counters) = self.mount_policy_counters.as_ref() {
             rdd = rdd.with_mount_policy_counters(counters.clone());
+        }
+        if let Some(governor) = self.io_governor.as_ref() {
+            rdd = rdd.with_io_governor(governor.clone());
         }
         let mut count = 0usize;
 
@@ -124,6 +135,9 @@ impl IndexBuilder {
         if let Some(counters) = self.mount_policy_counters.as_ref() {
             rdd = rdd.with_mount_policy_counters(counters.clone());
         }
+        if let Some(governor) = self.io_governor.as_ref() {
+            rdd = rdd.with_io_governor(governor.clone());
+        }
         let count = Arc::new(AtomicUsize::new(0));
         let idx = index.clone();
         let c = count.clone();
@@ -158,6 +172,9 @@ impl IndexBuilder {
             .with_fs_policy_config(self.fs_policy_config.clone());
         if let Some(counters) = self.mount_policy_counters.as_ref() {
             rdd = rdd.with_mount_policy_counters(counters.clone());
+        }
+        if let Some(governor) = self.io_governor.as_ref() {
+            rdd = rdd.with_io_governor(governor.clone());
         }
         let mut count = 0usize;
 
