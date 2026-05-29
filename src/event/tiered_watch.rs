@@ -1364,6 +1364,12 @@ impl TieredWatchRuntime {
             ));
         }
         let watched_dirs_estimated = self.current_watch_cost.load(Ordering::Relaxed) as usize;
+        let logical_watch_cost = l0_watch_cost
+            .saturating_add(l1_watch_cost)
+            .saturating_add(l2_watch_cost)
+            .saturating_add(l3_watch_cost);
+        let kernel_watch_cost = watched_dirs_estimated as u64;
+        let skipped_watch_cost = logical_watch_cost.saturating_sub(kernel_watch_cost);
         let watch_budget_utilization_pct = if self.max_watch_dirs == 0 {
             0
         } else {
@@ -1420,6 +1426,9 @@ impl TieredWatchRuntime {
             cold_mmap_dirs,
             frozen_manifest_dirs,
             notes,
+            logical_watch_cost,
+            kernel_watch_cost,
+            skipped_watch_cost,
             l0_watch_cost,
             l1_watch_cost,
             l2_watch_cost,
@@ -2025,6 +2034,9 @@ mod tests {
     fn report_includes_watch_cost_per_tier() {
         let rt = runtime();
         let report = rt.report();
+        assert_eq!(report.logical_watch_cost, 5);
+        assert_eq!(report.kernel_watch_cost, 2);
+        assert_eq!(report.skipped_watch_cost, 3);
         assert_eq!(report.l0_watch_cost, 2);
         assert_eq!(report.l1_watch_cost, 3);
         assert_eq!(report.l2_watch_cost, 0);

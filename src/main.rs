@@ -881,6 +881,13 @@ fn build_tiered_watch_plan(
             ));
         }
     }
+    let logical_watch_cost = admitted
+        .iter()
+        .chain(scan_roots.iter())
+        .map(|(_, cost)| *cost as u64)
+        .fold(0u64, u64::saturating_add);
+    let kernel_watch_cost = estimated_total as u64;
+    let skipped_watch_cost = logical_watch_cost.saturating_sub(kernel_watch_cost);
 
     let watch_roots = admitted
         .iter()
@@ -914,6 +921,11 @@ fn build_tiered_watch_plan(
             scan_items_per_sec: tiered.scan_items_per_sec,
             scan_ms_per_tick: tiered.scan_ms_per_tick,
             ephemeral_watch_budget: tiered.ephemeral_watch_budget,
+            logical_watch_cost,
+            kernel_watch_cost,
+            skipped_watch_cost,
+            l0_watch_cost: kernel_watch_cost,
+            l1_watch_cost: skipped_watch_cost,
             last_adjustment_unix_secs: now,
             notes,
             ..WatchStateReport::default()
@@ -1320,6 +1332,17 @@ mod tests {
         assert_eq!(plan.state.l0_dirs, 2);
         assert_eq!(plan.state.l1_dirs, 0);
         assert!(plan.state.required_watch_cost > 0);
+        assert_eq!(
+            plan.state.logical_watch_cost,
+            plan.state.required_watch_cost
+        );
+        assert_eq!(
+            plan.state.kernel_watch_cost,
+            plan.state.watched_dirs_estimated as u64
+        );
+        assert_eq!(plan.state.skipped_watch_cost, 0);
+        assert_eq!(plan.state.l0_watch_cost, plan.state.kernel_watch_cost);
+        assert_eq!(plan.state.l1_watch_cost, 0);
         assert_eq!(plan.state.watch_budget_shortfall, 0);
         assert!(plan.state.strict_coverage_ok);
         assert!(!plan.state.strict_coverage_failure);
@@ -1350,6 +1373,23 @@ mod tests {
         assert_eq!(plan.state.l1_dirs, 1);
         assert!(plan.state.required_watch_cost > plan.state.max_watch_dirs as u64);
         assert!(plan.state.watch_budget_shortfall > 0);
+        assert_eq!(
+            plan.state.logical_watch_cost,
+            plan.state.required_watch_cost
+        );
+        assert_eq!(
+            plan.state.kernel_watch_cost,
+            plan.state.watched_dirs_estimated as u64
+        );
+        assert!(plan.state.skipped_watch_cost > 0);
+        assert_eq!(
+            plan.state.logical_watch_cost,
+            plan.state
+                .kernel_watch_cost
+                .saturating_add(plan.state.skipped_watch_cost)
+        );
+        assert_eq!(plan.state.l0_watch_cost, plan.state.kernel_watch_cost);
+        assert_eq!(plan.state.l1_watch_cost, plan.state.skipped_watch_cost);
         assert!(!plan.state.strict_coverage_ok);
         assert!(plan.state.strict_coverage_failure);
         assert_eq!(plan.state.strict_uncovered_dirs.len(), 1);
