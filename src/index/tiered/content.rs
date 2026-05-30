@@ -12,6 +12,12 @@ use crate::util::path_has_excluded_component;
 
 use super::TieredIndex;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ContentReadEligibility {
+    Eligible { size: u64 },
+    Skip { reason: String },
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ContentIndexReport {
     pub indexed_paths: usize,
@@ -132,36 +138,10 @@ impl TieredIndex {
         config: &ContentIndexConfig,
         fs_policy: &Option<FsPolicy>,
     ) -> Option<(PathBuf, String, u64)> {
-        if !meta.kind.is_file()
-            || self.path_is_frozen(meta.path.as_path())
-            || path_has_excluded_component(&meta.path, &self.exclude_dirs)
-            || !content_extension_allowed(&meta.path, config)
-        {
-            return None;
-        }
-        let root = self.roots.iter().find(|root| meta.path.starts_with(root));
-        if fs_policy
-            .as_ref()
-            .map(|policy| {
-                policy
-                    .check_path_counted(
-                        meta.path.as_path(),
-                        root.map(|path| path.as_path()),
-                        self.mount_policy_counters.as_ref(),
-                    )
-                    .is_allowed()
-            })
-            .unwrap_or(true)
-            == false
-        {
-            return None;
-        }
-
-        self.io_governor.before_io();
-        let fs_meta = std::fs::metadata(&meta.path).ok()?;
-        if !fs_meta.is_file() || fs_meta.len() > config.max_file_size {
-            return None;
-        }
+        match self.content_read_eligibility(meta, config, fs_policy, true) {
+            ContentReadEligibility::Eligible { .. } => {}
+            ContentReadEligibility::Skip { .. } => return None,
+        };
 
         self.io_governor.before_io();
         let bytes = std::fs::read(&meta.path).ok()?;
@@ -173,6 +153,68 @@ impl TieredIndex {
             String::from_utf8_lossy(&bytes).to_lowercase(),
             bytes.len() as u64,
         ))
+    }
+
+    pub(super) fn content_read_eligibility(
+        &self,
+        meta: &FileMeta,
+        config: &ContentIndexConfig,
+        fs_policy: &Option<FsPolicy>,
+        require_allowed_extension: bool,
+    ) -> ContentReadEligibility {
+        if !meta.kind.is_file() {
+            return content_read_skip("not_file_entry");
+        }
+        if self.path_is_frozen(meta.path.as_path()) {
+            return content_read_skip("frozen_path");
+        }
+        if path_has_excluded_component(&meta.path, &self.exclude_dirs) {
+            return content_read_skip("excluded_dir");
+        }
+        if require_allowed_extension && !content_extension_allowed(&meta.path, config) {
+            return content_read_skip("extension_not_allowed");
+        }
+
+        let root = self.roots.iter().find(|root| meta.path.starts_with(root));
+        if let Some(policy) = fs_policy.as_ref() {
+            let decision = policy.check_path_counted(
+                meta.path.as_path(),
+                root.map(|path| path.as_path()),
+                self.mount_policy_counters.as_ref(),
+            );
+            if let crate::fs_policy::FsPolicyDecision::Deny { reason } = decision {
+                return ContentReadEligibility::Skip {
+                    reason: format!("mount_policy:{reason}"),
+                };
+            }
+        }
+
+        self.io_governor.before_io();
+        let fs_meta = match std::fs::metadata(&meta.path) {
+            Ok(fs_meta) => fs_meta,
+            Err(err) => {
+                return ContentReadEligibility::Skip {
+                    reason: format!("metadata_error:{}", err.kind()),
+                };
+            }
+        };
+        if !fs_meta.is_file() {
+            return content_read_skip("not_file");
+        }
+        let size = fs_meta.len();
+        if size > config.max_file_size {
+            return ContentReadEligibility::Skip {
+                reason: format!("too_large>{}", config.max_file_size),
+            };
+        }
+
+        ContentReadEligibility::Eligible { size }
+    }
+}
+
+fn content_read_skip(reason: &str) -> ContentReadEligibility {
+    ContentReadEligibility::Skip {
+        reason: reason.to_string(),
     }
 }
 

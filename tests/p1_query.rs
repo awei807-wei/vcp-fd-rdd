@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use fd_rdd::config::ContentIndexConfig;
 use fd_rdd::core::{FileKey, FileKind, FileMeta};
 use fd_rdd::diagnostics::{DiagnosticReport, DiagnosticSource};
 use fd_rdd::index::{IndexBuilder, TieredIndex};
@@ -49,6 +50,19 @@ fn build_index_with_metas(root: &Path, files: &[FileMeta]) -> Arc<TieredIndex> {
         l2.upsert(meta.clone());
     }
     index
+}
+
+fn file_meta_from_path(path: PathBuf) -> FileMeta {
+    let metadata = std::fs::metadata(&path).unwrap();
+    FileMeta {
+        file_key: FileKey::from_path_and_metadata(&path, &metadata).unwrap(),
+        path,
+        size: metadata.len(),
+        mtime: metadata.modified().ok(),
+        ctime: metadata.created().ok(),
+        atime: metadata.accessed().ok(),
+        kind: FileKind::from_metadata(&metadata),
+    }
 }
 
 fn path_depth(path: &Path) -> usize {
@@ -755,6 +769,76 @@ fn dupe_content_filter_returns_same_content_copies_with_reason() {
         hardlink_results.is_empty(),
         "plain dupe: must keep hardlink semantics and not match same-content copies"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dupe_content_filter_skips_excluded_and_oversized_candidates() {
+    let root = unique_tmp_dir("query-dupe-content-policy");
+    let excluded_dir = root.join("node_modules");
+    std::fs::create_dir_all(&excluded_dir).unwrap();
+
+    let allowed_a = root.join("content_policy_allowed_a.txt");
+    let allowed_b = root.join("content_policy_allowed_b.txt");
+    let excluded_a = excluded_dir.join("content_policy_excluded_a.txt");
+    let excluded_b = excluded_dir.join("content_policy_excluded_b.txt");
+    let oversized_a = root.join("content_policy_oversized_a.txt");
+    let oversized_b = root.join("content_policy_oversized_b.txt");
+    std::fs::write(&allowed_a, b"shared-policy").unwrap();
+    std::fs::write(&allowed_b, b"shared-policy").unwrap();
+    std::fs::write(&excluded_a, b"excluded-policy").unwrap();
+    std::fs::write(&excluded_b, b"excluded-policy").unwrap();
+    std::fs::write(&oversized_a, vec![b'x'; 64]).unwrap();
+    std::fs::write(&oversized_b, vec![b'x'; 64]).unwrap();
+
+    let index = Arc::new(TieredIndex::empty_with_options_follow_and_excludes(
+        vec![root.clone()],
+        false,
+        true,
+        false,
+        vec!["node_modules".to_string()],
+    ));
+    index.apply_content_index_config(ContentIndexConfig {
+        enable: false,
+        max_file_size: 32,
+        include_ext: Vec::new(),
+        exclude_ext: Vec::new(),
+    });
+    let l2 = index.l2.load_full();
+    for path in [
+        allowed_a.clone(),
+        allowed_b.clone(),
+        excluded_a.clone(),
+        excluded_b.clone(),
+        oversized_a.clone(),
+        oversized_b.clone(),
+    ] {
+        l2.upsert(file_meta_from_path(path));
+    }
+    index.refresh_base();
+
+    let results = index.query_limit_detailed("dupe:content content_policy", 20);
+    let paths = results
+        .iter()
+        .map(|result| result.meta.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 2, "only allowed duplicate files should match");
+    assert!(paths.contains(&allowed_a));
+    assert!(paths.contains(&allowed_b));
+    assert!(!paths.contains(&excluded_a));
+    assert!(!paths.contains(&excluded_b));
+    assert!(!paths.contains(&oversized_a));
+    assert!(!paths.contains(&oversized_b));
+
+    let mut report = DiagnosticReport::default();
+    index.collect(&mut report);
+    assert_eq!(report.storage.content_hash_confirmed_groups, 1);
+    assert!(
+        report.storage.content_hash_skipped_count >= 4,
+        "excluded and oversized indexed candidates must be diagnosed as skipped"
+    );
+    assert!(!report.storage.content_hash_last_skip_reason.is_empty());
 
     let _ = std::fs::remove_dir_all(&root);
 }

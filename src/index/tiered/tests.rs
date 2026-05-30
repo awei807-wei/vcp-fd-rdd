@@ -1,9 +1,9 @@
 use super::*;
 use crate::config::{ContentIndexConfig, MmapWarmupConfig, RuntimeProfile};
-use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta};
+use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta};
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::{DirtyReason, DirtyScope};
-use crate::fs_policy::{FsPolicyDecision, MountTable};
+use crate::fs_policy::{FsPolicyConfig, FsPolicyDecision, MountTable};
 use crate::index::tiered::events::event_record_estimated_bytes;
 use crate::index::tiered::sync::RebuildAdmission;
 use crate::io_governor::{BackoffPolicy, IoGovernor, IoGovernorConfig, IoPressure};
@@ -34,6 +34,19 @@ fn unique_tmp_dir(tag: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("fd-rdd-{}-{}", tag, nanos))
+}
+
+fn file_meta_from_path(path: PathBuf) -> FileMeta {
+    let metadata = std::fs::metadata(&path).unwrap();
+    FileMeta {
+        file_key: FileKey::from_path_and_metadata(&path, &metadata).unwrap(),
+        path,
+        size: metadata.len(),
+        mtime: metadata.modified().ok(),
+        ctime: metadata.created().ok(),
+        atime: metadata.accessed().ok(),
+        kind: FileKind::from_metadata(&metadata),
+    }
 }
 
 fn unix_secs_for_test() -> u64 {
@@ -1347,6 +1360,57 @@ fn enabled_content_index_supports_content_and_text_filters() -> anyhow::Result<(
     assert_eq!(
         diagnostics.storage.content_indexed_bytes,
         report.indexed_bytes
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn dupe_content_respects_mount_policy_before_hashing() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("query-dupe-content-mount-policy");
+    let denied = root.join("denied");
+    std::fs::create_dir_all(&denied)?;
+
+    let denied_a = denied.join("mount_policy_dupe_a.txt");
+    let denied_b = denied.join("mount_policy_dupe_b.txt");
+    std::fs::write(&denied_a, b"same denied content")?;
+    std::fs::write(&denied_b, b"same denied content")?;
+
+    let l1 = L1Cache::with_capacity(1000);
+    let l2 = Arc::new(PersistentIndex::new_with_roots(vec![root.clone()]));
+    l2.upsert(file_meta_from_path(denied_a.clone()));
+    l2.upsert(file_meta_from_path(denied_b.clone()));
+    let l3 = IndexBuilder::new(vec![root.clone()]).with_fs_policy_config(FsPolicyConfig {
+        deny_mounts: vec![denied.clone()],
+        ..FsPolicyConfig::default()
+    });
+    let idx = TieredIndex::new_with_base_and_io_governor(
+        l1,
+        l2,
+        l3,
+        vec![root.clone()],
+        false,
+        true,
+        false,
+        Vec::new(),
+        None,
+        Arc::new(IoGovernor::disabled()),
+    );
+
+    let results = idx.query_limit_detailed("dupe:content mount_policy_dupe", 10);
+    assert!(
+        results.is_empty(),
+        "dupe:content must not hash files denied by mount policy"
+    );
+
+    let mut diagnostics = DiagnosticReport::default();
+    idx.collect(&mut diagnostics);
+    assert_eq!(diagnostics.watchers.denied_mount_count, 2);
+    assert_eq!(diagnostics.storage.content_hash_skipped_count, 2);
+    assert_eq!(
+        diagnostics.storage.content_hash_last_skip_reason,
+        "mount_policy:deny_mount"
     );
 
     let _ = std::fs::remove_dir_all(&root);

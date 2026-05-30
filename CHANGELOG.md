@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `dupe:content` 补齐查询期内容读取边界：复用内容索引的 frozen/offline、exclude 目录、mount policy 与 `content_index.max_file_size` 准入策略，并把 partial/full hash 慢 I/O 移出 query generation guard，避免内容重复扫描延长 base generation 强引用。
+- `scripts/smoke-search-syntax.sh` 支持无 `--root` 默认自建临时 root，并在 HTTP daemon 不可用时自动启动本仓库 `fd-rdd` 做自包含 smoke；仍可用 `--no-auto-spawn` 保持只联调既有 daemon。
 - 新增 Runtime Boundary State Contract：WAL 支持 `OFFLINE_ROOT` / `ONLINE_ROOT` root 状态记录，quarantine sidecar 使用物理 mount identity 锚定；启动时先恢复 sidecar 并安装 Freeze Gate，再按 WAL 原始记录顺序回放 root state 与文件事件，阻断离线 root 下 Delete/Modify/Rename 脏写。
 - quarantine sidecar verify 接入后台 worker：设备 identity 匹配后先 append `ONLINE_ROOT`，写入成功后才解除 freeze，并将 affected prefixes 入队局部 scan；identity 不匹配或设备仍离线时保持冻结。
 - `/health` 新增强类型 `diagnostics` 字段，按 system/storage/security/clocks/watchers/io 固定板块暴露 WAL、snapshot、quarantine verify、freeze、HTTP policy、UDS peer policy、scan reject、clock skew 与 mount policy 诊断，同时保留既有 summary 字段兼容旧客户端。

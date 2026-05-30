@@ -8,6 +8,7 @@ use std::{
 
 use crate::core::{EventRecord, FileKey, FileKind, FileMeta};
 use crate::event::sync::DirtyReason;
+use crate::fs_policy::FsPolicy;
 use crate::index::base_index::BaseIndexData;
 use crate::index::content_filter::ContentFilter;
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
@@ -17,6 +18,7 @@ use crate::query::matcher::create_matcher;
 use xxhash_rust::xxh3::Xxh3;
 
 use super::arena::{path_deleted_by_any, PathArenaSet};
+use super::content::ContentReadEligibility;
 use super::query_plan::QueryPlan;
 use super::{QueryResultFreshness, QueryResultIndexTier, QueryResultMeta, TieredIndex};
 
@@ -279,46 +281,165 @@ impl TieredIndex {
         limit: usize,
         content_matches: Option<&ContentMatcher<'_>>,
     ) -> Vec<QueryResultMeta> {
-        let _guard = QueryGenerationGuard::new(self);
-        let base = self.base.load_full();
-        let db = self.delta_buffer.lock();
-        let mut del = PathArenaSet::default();
-        for p in db.deleted_paths() {
-            let _ = del.insert(p);
-        }
-        let live_events: Vec<EventRecord> = db.live_records().cloned().collect();
-        drop(db);
-        let overlay_deleted = Arc::new(del);
-        let mut blocked_paths = PathArenaSet::default();
-        let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
-        let mut overlay_live_metas: Vec<FileMeta> = Vec::with_capacity(live_events.len());
-        for ev in &live_events {
-            if ev.best_path().is_some_and(|path| self.path_is_frozen(path)) {
-                continue;
-            }
-            let Some(meta) = self.overlay_meta_for_event(ev) else {
-                continue;
-            };
-            let path_bytes = meta.path.as_os_str().as_encoded_bytes();
-            if blocked_paths.contains(path_bytes)
-                || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
-            {
-                continue;
-            }
-            overlay_live_metas.push(meta);
-        }
-        let mut results: Vec<QueryResultMeta> = Vec::with_capacity(limit.min(128));
-        let hardlink_dupe_keys = if plan.requires_hardlink_dupe() {
-            let keys = hardlink_duplicate_keys(self.collect_live_metas_for_diagnostics());
-            if keys.is_empty() {
-                return Vec::new();
-            }
-            Some(keys)
+        let requires_hardlink_dupe = plan.requires_hardlink_dupe();
+        let requires_content_dupe = plan.requires_content_dupe();
+        let scan_limit = if requires_hardlink_dupe || requires_content_dupe {
+            usize::MAX
         } else {
-            None
+            limit
         };
-        let content_dupe_paths = if plan.requires_content_dupe() {
-            let outcome = content_duplicate_paths(self.collect_live_metas_for_diagnostics(), self);
+        let (results, hardlink_dupe_keys, content_dupe_metas) = {
+            let _guard = QueryGenerationGuard::new(self);
+            let base = self.base.load_full();
+            let db = self.delta_buffer.lock();
+            let mut del = PathArenaSet::default();
+            for p in db.deleted_paths() {
+                let _ = del.insert(p);
+            }
+            let live_events: Vec<EventRecord> = db.live_records().cloned().collect();
+            drop(db);
+            let overlay_deleted = Arc::new(del);
+            let mut blocked_paths = PathArenaSet::default();
+            let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
+            let mut overlay_live_metas: Vec<FileMeta> = Vec::with_capacity(live_events.len());
+            for ev in &live_events {
+                if ev.best_path().is_some_and(|path| self.path_is_frozen(path)) {
+                    continue;
+                }
+                let Some(meta) = self.overlay_meta_for_event(ev) else {
+                    continue;
+                };
+                let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+                if blocked_paths.contains(path_bytes)
+                    || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
+                {
+                    continue;
+                }
+                overlay_live_metas.push(meta);
+            }
+            let mut results: Vec<QueryResultMeta> = Vec::with_capacity(limit.min(128));
+            let dupe_metas = if requires_hardlink_dupe || requires_content_dupe {
+                Some(self.collect_live_metas_for_diagnostics())
+            } else {
+                None
+            };
+            let hardlink_dupe_keys = if requires_hardlink_dupe {
+                let keys = hardlink_duplicate_keys(
+                    dupe_metas
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|metas| metas.iter().cloned()),
+                );
+                if keys.is_empty() {
+                    return Vec::new();
+                }
+                Some(keys)
+            } else {
+                None
+            };
+            let content_dupe_metas = if requires_content_dupe {
+                dupe_metas
+            } else {
+                None
+            };
+
+            'collect_results: {
+                // Overlay upserts take precedence over the immutable base. This keeps
+                // delete+recreate and rename windows correct while base is only
+                // materialized at snapshot/rebuild boundaries.
+                for meta in &overlay_live_metas {
+                    if results.len() >= scan_limit {
+                        break;
+                    }
+                    let path_str = meta.path.to_string_lossy();
+                    if self.path_is_frozen(meta.path.as_path()) {
+                        continue;
+                    }
+                    let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
+                    if !matches_anchor {
+                        continue;
+                    }
+                    let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+                    if blocked_paths.contains(path_bytes)
+                        || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
+                    {
+                        continue;
+                    }
+                    let _ = blocked_paths.insert(path_bytes);
+                    if self.plan_matches(plan, meta, content_matches) {
+                        results.push(QueryResultMeta::hot(meta.clone()));
+                    }
+                }
+
+                if results.len() >= scan_limit {
+                    break 'collect_results;
+                }
+
+                // ParentIndex fast path: if query has a parent filter, get exact candidates from base
+                if let Some(ref parent_path) = plan.parent_filter() {
+                    for hit in base.parent_query_metas(parent_path) {
+                        let meta = hit.meta;
+                        let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+                        if self.path_is_frozen(meta.path.as_path()) {
+                            continue;
+                        }
+                        let blocked = blocked_paths.contains(path_bytes)
+                            || path_deleted_by_any(path_bytes, deleted_sources.as_slice());
+                        if blocked {
+                            self.stats.record_query_stale_hits(1);
+                            continue;
+                        }
+                        let _ = blocked_paths.insert(path_bytes);
+                        if self.plan_matches(plan, &meta, content_matches) {
+                            let index_tier = if hit.manifest_only {
+                                QueryResultIndexTier::FrozenManifestOnly
+                            } else {
+                                QueryResultIndexTier::ColdMmap
+                            };
+                            if let Some(result) = self.validate_cold_result(meta, index_tier) {
+                                results.push(result);
+                                if results.len() >= scan_limit {
+                                    break 'collect_results;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if self.query_layer(
+                    plan,
+                    base.as_ref(),
+                    None,
+                    deleted_sources.as_slice(),
+                    &mut blocked_paths,
+                    &mut results,
+                    scan_limit,
+                    content_matches,
+                ) {
+                    break 'collect_results;
+                }
+
+                if base.file_count() == 0 && !self.rebuild_in_progress() {
+                    let l2 = self.l2.load_full();
+                    if self.query_l2_layer(
+                        plan,
+                        l2.as_ref(),
+                        deleted_sources.as_slice(),
+                        &mut blocked_paths,
+                        &mut results,
+                        scan_limit,
+                        content_matches,
+                    ) {
+                        break 'collect_results;
+                    }
+                }
+            }
+
+            (results, hardlink_dupe_keys, content_dupe_metas)
+        };
+
+        let content_dupe_paths = if let Some(metas) = content_dupe_metas {
+            let outcome = content_duplicate_paths(metas, self);
             self.record_content_dupe_outcome(&outcome);
             if outcome.paths.is_empty() {
                 return Vec::new();
@@ -327,121 +448,6 @@ impl TieredIndex {
         } else {
             None
         };
-        let scan_limit = if hardlink_dupe_keys.is_some() || content_dupe_paths.is_some() {
-            usize::MAX
-        } else {
-            limit
-        };
-
-        // Overlay upserts take precedence over the immutable base. This keeps
-        // delete+recreate and rename windows correct while base is only
-        // materialized at snapshot/rebuild boundaries.
-        for meta in &overlay_live_metas {
-            if results.len() >= scan_limit {
-                break;
-            }
-            let path_str = meta.path.to_string_lossy();
-            if self.path_is_frozen(meta.path.as_path()) {
-                continue;
-            }
-            let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
-            if !matches_anchor {
-                continue;
-            }
-            let path_bytes = meta.path.as_os_str().as_encoded_bytes();
-            if blocked_paths.contains(path_bytes)
-                || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
-            {
-                continue;
-            }
-            let _ = blocked_paths.insert(path_bytes);
-            if self.plan_matches(plan, meta, content_matches) {
-                results.push(QueryResultMeta::hot(meta.clone()));
-            }
-        }
-
-        if results.len() >= scan_limit {
-            return filter_dupe_results(
-                results,
-                hardlink_dupe_keys.as_ref(),
-                content_dupe_paths.as_ref(),
-                limit,
-            );
-        }
-
-        // ParentIndex fast path: if query has a parent filter, get exact candidates from base
-        if let Some(ref parent_path) = plan.parent_filter() {
-            for hit in base.parent_query_metas(parent_path) {
-                let meta = hit.meta;
-                let path_bytes = meta.path.as_os_str().as_encoded_bytes();
-                if self.path_is_frozen(meta.path.as_path()) {
-                    continue;
-                }
-                let blocked = blocked_paths.contains(path_bytes)
-                    || path_deleted_by_any(path_bytes, deleted_sources.as_slice());
-                if blocked {
-                    self.stats.record_query_stale_hits(1);
-                    continue;
-                }
-                let _ = blocked_paths.insert(path_bytes);
-                if self.plan_matches(plan, &meta, content_matches) {
-                    let index_tier = if hit.manifest_only {
-                        QueryResultIndexTier::FrozenManifestOnly
-                    } else {
-                        QueryResultIndexTier::ColdMmap
-                    };
-                    if let Some(result) = self.validate_cold_result(meta, index_tier) {
-                        results.push(result);
-                        if results.len() >= scan_limit {
-                            return filter_dupe_results(
-                                results,
-                                hardlink_dupe_keys.as_ref(),
-                                content_dupe_paths.as_ref(),
-                                limit,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        if self.query_layer(
-            plan,
-            base.as_ref(),
-            None,
-            deleted_sources.as_slice(),
-            &mut blocked_paths,
-            &mut results,
-            scan_limit,
-            content_matches,
-        ) {
-            return filter_dupe_results(
-                results,
-                hardlink_dupe_keys.as_ref(),
-                content_dupe_paths.as_ref(),
-                limit,
-            );
-        }
-
-        if base.file_count() == 0 && !self.rebuild_in_progress() {
-            let l2 = self.l2.load_full();
-            if self.query_l2_layer(
-                plan,
-                l2.as_ref(),
-                deleted_sources.as_slice(),
-                &mut blocked_paths,
-                &mut results,
-                scan_limit,
-                content_matches,
-            ) {
-                return filter_dupe_results(
-                    results,
-                    hardlink_dupe_keys.as_ref(),
-                    content_dupe_paths.as_ref(),
-                    limit,
-                );
-            }
-        }
 
         filter_dupe_results(
             results,
@@ -893,9 +899,13 @@ fn content_duplicate_paths(
     let started = Instant::now();
     let mut outcome = ContentDupeOutcome::default();
     let mut by_size: HashMap<u64, Vec<ContentDupeCandidate>> = HashMap::new();
+    let config = index.content_index_config.lock().clone();
+    let fs_policy = FsPolicy::current_with_config(index.fs_policy_config());
 
     for meta in metas {
-        let Some(candidate) = content_dupe_candidate(meta, index, &mut outcome) else {
+        let Some(candidate) =
+            content_dupe_candidate(meta, index, &config, &fs_policy, &mut outcome)
+        else {
             continue;
         };
         by_size.entry(candidate.size).or_default().push(candidate);
@@ -954,31 +964,18 @@ fn content_duplicate_paths(
 fn content_dupe_candidate(
     meta: FileMeta,
     index: &TieredIndex,
+    config: &crate::config::ContentIndexConfig,
+    fs_policy: &Option<FsPolicy>,
     outcome: &mut ContentDupeOutcome,
 ) -> Option<ContentDupeCandidate> {
-    if !meta.kind.is_file() {
-        return None;
-    }
-    if index.path_is_frozen(meta.path.as_path()) {
-        record_content_skip(outcome, "frozen_path".to_string());
-        return None;
-    }
-    index.io_governor.before_io();
-    let fs_meta = match std::fs::metadata(&meta.path) {
-        Ok(fs_meta) => fs_meta,
-        Err(err) => {
-            record_content_skip(outcome, format!("metadata_error:{}", err.kind()));
+    let size = match index.content_read_eligibility(&meta, config, fs_policy, false) {
+        ContentReadEligibility::Eligible { size } => size,
+        ContentReadEligibility::Skip { reason } => {
+            record_content_skip(outcome, reason);
             return None;
         }
     };
-    if !fs_meta.is_file() {
-        record_content_skip(outcome, "not_file".to_string());
-        return None;
-    }
-    Some(ContentDupeCandidate {
-        meta,
-        size: fs_meta.len(),
-    })
+    Some(ContentDupeCandidate { meta, size })
 }
 
 fn file_partial_hash(path: &Path, index: &TieredIndex) -> Result<u64, String> {

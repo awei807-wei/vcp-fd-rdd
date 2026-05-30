@@ -351,7 +351,7 @@ jq '{
 
 `runtime_profile = "memory_light"` 适合更关注常驻内存上限、可接受更频繁 snapshot/flush 的环境。该模式会降低 DeltaBuffer 触发 flush 的路径数/字节门槛，给周期 flush 增加最大滞留时间，缩短 rebuild 合并冷却，并在 WAL 体积超过阈值时请求 snapshot 边界；强制 flush、退出前 final snapshot、WAL replay 和离线 root 的 Freeze Gate 保护不变。CLI 可用 `--runtime-profile memory_light` 临时覆盖。
 
-内容索引默认关闭，`content:` / `text:` 查询会返回明确的 unsupported 错误，避免默认文件名查询热路径读取文件内容。启用 `[content_index]` 后，后台低优先级 worker 会按 `max_file_size`、`include_ext`、`exclude_ext`、exclude 目录、mount policy 和 I/O governor 维护轻量文本索引；查询只读取该索引，不在热路径打开文件。
+内容索引默认关闭，`content:` / `text:` 查询会返回明确的 unsupported 错误，避免默认文件名查询热路径读取文件内容。启用 `[content_index]` 后，后台低优先级 worker 会按 `max_file_size`、`include_ext`、`exclude_ext`、exclude 目录、mount policy 和 I/O governor 维护轻量文本索引；查询只读取该索引，不在热路径打开文件。`dupe:content` 不依赖内容索引开关，但会复用 frozen/offline、exclude 目录、mount policy 和 `content_index.max_file_size` 准入策略，并在 query generation guard 之外执行 partial/full hash。
 
 可用 `scripts/fs-churn.py` 做默认 profile 与 `memory_light` 的 churn 对照：
 
@@ -400,7 +400,7 @@ fd-rdd --show-config
 | `depth:` | `depth:<=3` | 路径深度 |
 | `type:` | `type:file` | 文件类型 |
 | `empty:` | `type:dir empty:` | 真实空目录 |
-| `dupe:` | `dupe: hardlink` / `dupe:content` | hardlink 重复路径；显式 `dupe:content` 使用 size + partial/full hash 查找同内容副本 |
+| `dupe:` | `dupe: hardlink` / `dupe:content` | hardlink 重复路径；显式 `dupe:content` 使用 size + partial/full hash 查找同内容副本，并跳过 frozen/offline、exclude、mount policy 拒绝和超出 `content_index.max_file_size` 的候选 |
 | `content:` / `text:` | `content:needle` | 内容查询；默认关闭时返回 unsupported，启用 `[content_index]` 后查询已索引文本 |
 | `doc:` / `pic:` / `video:` | `pic:十一` | 按扩展名集合 |
 | `len:` | `len:>50` | 文件名字节长度 |

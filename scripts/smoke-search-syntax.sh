@@ -5,54 +5,161 @@ set -euo pipefail
 
 ROOT=""
 BASE_URL="${FD_RDD_SMOKE_BASE_URL:-http://127.0.0.1:6060}"
+BASE_URL_EXPLICIT=0
+if [[ -n "${FD_RDD_SMOKE_BASE_URL:-}" ]]; then
+  BASE_URL_EXPLICIT=1
+fi
 TIMEOUT_SECS="${FD_RDD_SMOKE_TIMEOUT_SECS:-20}"
+AUTO_SPAWN="${FD_RDD_SMOKE_AUTO_SPAWN:-auto}"
+FD_BIN="${FD_RDD_SMOKE_BIN:-}"
 KEEP=1
+ROOT_CREATED=0
+BASE_DIR=""
+DAEMON_PID=""
+DAEMON_LOG=""
 
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/smoke-search-syntax.sh --root <fd-rdd-root> [--base-url <url>] [--timeout <secs>] [--cleanup]
+  scripts/smoke-search-syntax.sh [--root <fd-rdd-root>] [--base-url <url>] [--timeout <secs>] [--cleanup]
+  scripts/smoke-search-syntax.sh --root <fd-rdd-root> --no-auto-spawn
+
+No --root:
+  使用临时 root 与临时 HTTP 端口，自启动 fd-rdd，结束后清理。
 
 Env:
   FD_RDD_SMOKE_BASE_URL        default: http://127.0.0.1:6060
   FD_RDD_SMOKE_TIMEOUT_SECS    default: 20
+  FD_RDD_SMOKE_AUTO_SPAWN      auto | always | never, default: auto
+  FD_RDD_SMOKE_BIN             fd-rdd binary path; default: target/debug, target/release, then PATH
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --root) ROOT="${2:-}"; shift 2 ;;
-    --base-url) BASE_URL="${2:-}"; shift 2 ;;
+    --base-url) BASE_URL="${2:-}"; BASE_URL_EXPLICIT=1; shift 2 ;;
     --timeout) TIMEOUT_SECS="${2:-}"; shift 2 ;;
+    --auto-spawn) AUTO_SPAWN="always"; shift ;;
+    --no-auto-spawn) AUTO_SPAWN="never"; shift ;;
+    --fd-bin) FD_BIN="${2:-}"; shift 2 ;;
     --cleanup) KEEP=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
   esac
 done
 
-[[ -n "$ROOT" ]] || { echo "Missing --root" >&2; usage; exit 2; }
-[[ -d "$ROOT" ]] || { echo "Root 不是目录：$ROOT" >&2; exit 2; }
-command -v curl >/dev/null || { echo "Missing dependency: curl" >&2; exit 2; }
-command -v jq >/dev/null || { echo "Missing dependency: jq" >&2; exit 2; }
-
-curl -fsS "${BASE_URL%/}/status" >/dev/null || {
-  echo "fd-rdd HTTP 不可用：${BASE_URL%/}/status" >&2
-  echo "请确认 daemon 已启动且端口正确（默认 6060）。" >&2
-  exit 2
-}
-
-RUN_ID="$(date +%Y%m%d%H%M%S)_$$"
-BASE_DIR="${ROOT%/}/fd_rdd_smoke_${RUN_ID}"
-EXCLUDE_DIR="exclude_${RUN_ID}"
-
 cleanup() {
-  if [[ "$KEEP" -eq 0 ]]; then
+  if [[ -n "${DAEMON_PID:-}" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+    kill "$DAEMON_PID" 2>/dev/null || true
+    wait "$DAEMON_PID" 2>/dev/null || true
+  fi
+  if [[ "$ROOT_CREATED" -eq 1 ]]; then
+    rm -rf "$ROOT"
+  elif [[ -n "$BASE_DIR" && "$KEEP" -eq 0 ]]; then
     rm -rf "$BASE_DIR"
-  else
+  elif [[ -n "$BASE_DIR" ]]; then
     echo "保留样例目录：$BASE_DIR"
   fi
 }
 trap cleanup EXIT
+
+if [[ -z "$ROOT" ]]; then
+  ROOT="$(mktemp -d "${TMPDIR:-/tmp}/fd-rdd-smoke-root.XXXXXX")"
+  ROOT_CREATED=1
+  KEEP=0
+  if [[ "$BASE_URL_EXPLICIT" -eq 0 ]]; then
+    BASE_URL="http://127.0.0.1:$((16000 + ($$ % 20000)))"
+  fi
+  if [[ "$AUTO_SPAWN" == "auto" ]]; then
+    AUTO_SPAWN="always"
+  fi
+fi
+[[ -d "$ROOT" ]] || { echo "Root 不是目录：$ROOT" >&2; exit 2; }
+command -v curl >/dev/null || { echo "Missing dependency: curl" >&2; exit 2; }
+command -v jq >/dev/null || { echo "Missing dependency: jq" >&2; exit 2; }
+
+fd_cmd=()
+resolve_fd_cmd() {
+  if [[ -n "$FD_BIN" ]]; then
+    fd_cmd=("$FD_BIN")
+  elif [[ -x "./target/debug/fd-rdd" ]]; then
+    fd_cmd=("./target/debug/fd-rdd")
+  elif [[ -x "./target/release/fd-rdd" ]]; then
+    fd_cmd=("./target/release/fd-rdd")
+  elif command -v fd-rdd >/dev/null; then
+    fd_cmd=("fd-rdd")
+  elif command -v cargo >/dev/null; then
+    fd_cmd=("cargo" "run" "--quiet" "--bin" "fd-rdd" "--")
+  else
+    echo "fd-rdd HTTP 不可用，且未找到可启动的 fd-rdd 二进制。" >&2
+    echo "请先运行 cargo build，或用 --fd-bin /path/to/fd-rdd 指定。" >&2
+    exit 2
+  fi
+}
+
+base_url_port() {
+  local stripped="${BASE_URL#http://}"
+  stripped="${stripped#https://}"
+  stripped="${stripped%%/*}"
+  if [[ "$stripped" == *:* ]]; then
+    echo "${stripped##*:}"
+  else
+    echo "6060"
+  fi
+}
+
+start_daemon() {
+  resolve_fd_cmd
+  local port
+  port="$(base_url_port)"
+  DAEMON_LOG="${ROOT%/}/fd-rdd-smoke-daemon.log"
+  mkdir -p "${ROOT%/}/.fd-rdd-smoke-config" "${ROOT%/}/.fd-rdd-smoke-runtime"
+  XDG_CONFIG_HOME="${ROOT%/}/.fd-rdd-smoke-config" \
+  XDG_RUNTIME_DIR="${ROOT%/}/.fd-rdd-smoke-runtime" \
+    "${fd_cmd[@]}" \
+      --root "$ROOT" \
+      --snapshot-path "${ROOT%/}/fd-rdd-smoke-index.db" \
+      --uds-socket "${ROOT%/}/fd-rdd-smoke.sock" \
+      --http-port "$port" \
+      --no-watch \
+      --snapshot-interval-secs 0 \
+      --report-interval-secs 3600 \
+      >"$DAEMON_LOG" 2>&1 &
+  DAEMON_PID=$!
+
+  local deadline=$((SECONDS + TIMEOUT_SECS))
+  while (( SECONDS < deadline )); do
+    if curl -fsS "${BASE_URL%/}/status" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+      echo "fd-rdd daemon 启动失败，日志：$DAEMON_LOG" >&2
+      tail -80 "$DAEMON_LOG" >&2 || true
+      exit 2
+    fi
+    sleep 0.2
+  done
+  echo "等待 fd-rdd HTTP 启动超时：${BASE_URL%/}/status" >&2
+  echo "daemon 日志：$DAEMON_LOG" >&2
+  tail -80 "$DAEMON_LOG" >&2 || true
+  exit 2
+}
+
+if [[ "$AUTO_SPAWN" == "always" ]]; then
+  start_daemon
+elif ! curl -fsS "${BASE_URL%/}/status" >/dev/null 2>&1; then
+  if [[ "$AUTO_SPAWN" == "never" ]]; then
+    echo "fd-rdd HTTP 不可用：${BASE_URL%/}/status" >&2
+    echo "请确认 daemon 已启动且端口正确（默认 6060）。" >&2
+    exit 2
+  fi
+  start_daemon
+fi
+
+RUN_ID="$(date +%Y%m%d%H%M%S)_$$"
+BASE_DIR="${ROOT%/}/fd_rdd_smoke_${RUN_ID}"
+EXCLUDE_DIR="exclude_${RUN_ID}"
 
 api_search_paths() {
   local q="$1"
@@ -81,6 +188,46 @@ api_scan_json() {
         --data-binary @-
 }
 
+api_scan_paths_json() {
+  jq -nc '$ARGS.positional | {paths: .}' --args "$@" \
+    | curl -fsS -X POST "${BASE_URL%/}/scan" \
+        -H 'Content-Type: application/json' \
+        --data-binary @-
+}
+
+api_scan_tree_json() {
+  local root="$1"
+  local -a batch=()
+  local total_scanned=0
+  local total_elapsed_ms=0
+  local json scanned elapsed
+
+  while IFS= read -r -d '' dir; do
+    batch+=("$dir")
+    if [[ "${#batch[@]}" -ge 10 ]]; then
+      json="$(api_scan_paths_json "${batch[@]}")"
+      scanned="$(printf '%s' "$json" | jq -r '.scanned')"
+      elapsed="$(printf '%s' "$json" | jq -r '.elapsed_ms')"
+      total_scanned=$((total_scanned + scanned))
+      total_elapsed_ms=$((total_elapsed_ms + elapsed))
+      batch=()
+    fi
+  done < <(find "$root" -type d -print0)
+
+  if [[ "${#batch[@]}" -gt 0 ]]; then
+    json="$(api_scan_paths_json "${batch[@]}")"
+    scanned="$(printf '%s' "$json" | jq -r '.scanned')"
+    elapsed="$(printf '%s' "$json" | jq -r '.elapsed_ms')"
+    total_scanned=$((total_scanned + scanned))
+    total_elapsed_ms=$((total_elapsed_ms + elapsed))
+  fi
+
+  jq -nc \
+    --argjson scanned "$total_scanned" \
+    --argjson elapsed_ms "$total_elapsed_ms" \
+    '{scanned:$scanned, elapsed_ms:$elapsed_ms}'
+}
+
 wait_until_indexed() {
   local q="$1"
   local expect="$2"
@@ -94,7 +241,7 @@ wait_until_indexed() {
     sleep 0.2
   done
   echo "等待索引超时（${TIMEOUT_SECS}s）：未命中 $expect" >&2
-  echo "提示：请确认 daemon 的 --root 覆盖了该目录，且未使用 --no-watch。" >&2
+  echo "提示：脚本已尝试 POST /scan，请确认 daemon 的 --root 覆盖了该目录。" >&2
   return 1
 }
 
@@ -181,6 +328,7 @@ printf '中文\n' > "$BASE_DIR/cjk/中文检索_${RUN_ID}.txt"
 # ready marker（避免用 wfn/regex/glob 做等待条件）
 READY="READY_smoke_${RUN_ID}.txt"
 printf 'ready\n' > "$BASE_DIR/${READY}"
+api_scan_tree_json "$BASE_DIR" >/dev/null
 wait_until_indexed "$READY" "$READY"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -206,7 +354,7 @@ assert_json_expr() {
 # Force a full directory refresh before assertions. Waiting for READY alone only
 # proves one file is visible; the rest of the sample tree may still be settling
 # on slower CI runners while the first smart-case query starts.
-json="$(api_scan_json "$BASE_DIR")"
+json="$(api_scan_tree_json "$BASE_DIR")"
 assert_json_expr "$json" ".scanned >= 1" "POST /scan 应至少扫描样本目录"
 wait_until_indexed "vcpsmoke_${RUN_ID}" "VCPsmoke_${RUN_ID}_upper.txt"
 wait_until_indexed "vcpsmoke_${RUN_ID}" "vcpsmoke_${RUN_ID}_lower.txt"
