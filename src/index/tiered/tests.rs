@@ -1805,3 +1805,196 @@ fn dirty_scan_collects_project_marker_roots() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn acceptance_project_marker_scan_makes_new_file_searchable() {
+    let root = unique_tmp_dir("acceptance-project-marker-search");
+    let project = root.join("new-app");
+    let src = project.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        b"[package]\nname = \"acceptance-new-app\"\n",
+    )
+    .unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.enqueue_dirty_dirs(vec![project.clone()], DirtyReason::QueryMiss);
+
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let markers = vec!["Cargo.toml".to_string(), ".git".to_string()];
+    let report = idx.process_dirty_entry_with_project_markers(entry, &[], &markers);
+
+    assert!(!report.failed);
+    assert_eq!(report.outcomes.len(), 1);
+    assert_eq!(
+        report.outcomes[0].outcome.project_roots,
+        vec![project.clone()]
+    );
+
+    let main_rs = src.join("main.rs");
+    std::fs::write(
+        &main_rs,
+        b"fn main() { println!(\"acceptance_main_probe\"); }\n",
+    )
+    .unwrap();
+    idx.enqueue_dirty_dirs(vec![src], DirtyReason::InotifyEvent);
+
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let report = idx.process_dirty_entry_with_project_markers(entry, &[], &markers);
+
+    assert!(!report.failed);
+    assert!(report.changed >= 1);
+    let results = idx.query_limit_detailed("main", 10);
+    assert!(
+        results.iter().any(|result| result.meta.path == main_rs),
+        "new project file should be searchable immediately after dirty scan: {results:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn acceptance_large_excluded_project_tree_does_not_become_marker_candidate() {
+    let root = unique_tmp_dir("acceptance-excluded-marker");
+    let project = root.join("workspace").join("node_modules").join("pkg");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("package.json"), b"{\"name\":\"pkg\"}\n").unwrap();
+
+    let idx = TieredIndex::empty_with_options_follow_and_excludes(
+        vec![root.clone()],
+        false,
+        true,
+        false,
+        vec!["node_modules".to_string()],
+    );
+    idx.enqueue_dirty_dirs(vec![root.join("workspace")], DirtyReason::QueryMiss);
+
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let markers = vec!["package.json".to_string()];
+    let report = idx.process_dirty_entry_with_project_markers(entry, &[], &markers);
+
+    assert!(!report.failed);
+    assert!(
+        report
+            .outcomes
+            .iter()
+            .all(|scan| scan.outcome.project_roots.is_empty()),
+        "excluded node_modules project marker must not become a project candidate: {report:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn periodic_cold_scan_skips_unchanged_directory_manifest() {
+    let root = unique_tmp_dir("manifest-skip");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("stable.txt"), b"stable").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let first = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    assert_eq!(first.scanned, 1);
+    assert_eq!(idx.directory_manifest_report().dirs, 1);
+
+    idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::PeriodicColdScan);
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let manifest_skip_dirs = std::collections::HashSet::from([root.clone()]);
+    let report = idx.process_dirty_entry_with_project_markers_and_manifest_skip_dirs(
+        entry,
+        &[],
+        &[],
+        &manifest_skip_dirs,
+    );
+
+    assert!(!report.failed);
+    assert_eq!(report.dirs_scanned, 1);
+    assert_eq!(report.outcomes.len(), 1);
+    assert!(report.outcomes[0].manifest_skipped);
+    assert_eq!(report.outcomes[0].outcome.scanned, 0);
+    assert_eq!(report.outcomes[0].outcome.changed, 0);
+
+    let manifest = idx.directory_manifest_report();
+    assert_eq!(manifest.skipped_scans, 1);
+    assert_eq!(manifest.changed_scans, 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn periodic_cold_scan_detects_directory_manifest_hash_change() {
+    let root = unique_tmp_dir("manifest-hash-change");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("stable.txt"), b"stable").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let first = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    assert_eq!(first.scanned, 1);
+
+    std::fs::write(root.join("new_child.txt"), b"new").unwrap();
+    idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::PeriodicColdScan);
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let manifest_skip_dirs = std::collections::HashSet::from([root.clone()]);
+    let report = idx.process_dirty_entry_with_project_markers_and_manifest_skip_dirs(
+        entry,
+        &[],
+        &[],
+        &manifest_skip_dirs,
+    );
+
+    assert!(!report.failed);
+    assert_eq!(report.outcomes.len(), 1);
+    assert!(!report.outcomes[0].manifest_skipped);
+    assert_eq!(report.outcomes[0].outcome.scanned, 2);
+    assert!(report.outcomes[0].outcome.changed >= 1);
+
+    let manifest = idx.directory_manifest_report();
+    assert_eq!(manifest.skipped_scans, 0);
+    assert_eq!(manifest.changed_scans, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn periodic_cold_scan_bypasses_manifest_when_clock_cutoff_untrusted() {
+    let root = unique_tmp_dir("manifest-clock-bypass");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("stable.txt"), b"stable").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let first = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    assert_eq!(first.scanned, 1);
+
+    {
+        let mut clock = idx.clock_skew.lock();
+        let base_wall = std::time::SystemTime::now();
+        let base_mono = std::time::Instant::now();
+        assert!(!clock.observe(base_wall, base_mono));
+        assert!(clock.observe(
+            base_wall - std::time::Duration::from_secs(3),
+            base_mono + std::time::Duration::from_secs(3),
+        ));
+        assert!(!clock.cutoff_trusted());
+    }
+
+    idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::PeriodicColdScan);
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let manifest_skip_dirs = std::collections::HashSet::from([root.clone()]);
+    let report = idx.process_dirty_entry_with_project_markers_and_manifest_skip_dirs(
+        entry,
+        &[],
+        &[],
+        &manifest_skip_dirs,
+    );
+
+    assert!(!report.failed);
+    assert_eq!(report.outcomes.len(), 1);
+    assert!(!report.outcomes[0].manifest_skipped);
+    assert_eq!(report.outcomes[0].outcome.scanned, 1);
+
+    let manifest = idx.directory_manifest_report();
+    assert_eq!(manifest.skipped_scans, 0);
+    assert_eq!(manifest.untrusted_clock_bypass, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

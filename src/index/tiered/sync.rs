@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -5,12 +6,14 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta, Task};
 use crate::event::sync::{now_ns, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyScope};
+use crate::fs_policy::FsPolicy;
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
 use crate::index::PathFreshness;
 use crate::io_governor::IoGovernor;
 use crate::util::{maybe_trim_rss, path_has_excluded_component};
 
 use super::{
+    directory_manifest::{DirectoryManifestBuilder, DirectoryManifestSummary},
     pathbuf_from_bytes, DirtyProcessReport, DirtyScanOutcome, ScanOutcome, StartupRepairStats,
     TieredIndex,
 };
@@ -418,6 +421,21 @@ impl TieredIndex {
         ignore_prefixes: &[PathBuf],
         project_markers: &[String],
     ) -> DirtyProcessReport {
+        self.process_dirty_entry_with_project_markers_and_manifest_skip_dirs(
+            entry,
+            ignore_prefixes,
+            project_markers,
+            &HashSet::new(),
+        )
+    }
+
+    pub fn process_dirty_entry_with_project_markers_and_manifest_skip_dirs(
+        &self,
+        entry: DirtyQueueEntry,
+        ignore_prefixes: &[PathBuf],
+        project_markers: &[String],
+        manifest_skip_dirs: &HashSet<PathBuf>,
+    ) -> DirtyProcessReport {
         let mut report = DirtyProcessReport {
             entries_processed: 1,
             ..DirtyProcessReport::default()
@@ -440,10 +458,14 @@ impl TieredIndex {
                     }
                     match std::fs::symlink_metadata(dir) {
                         Ok(meta) if meta.is_dir() => {
-                            let outcome = self.scan_dirs_immediate_outcome_with_project_markers(
-                                std::slice::from_ref(dir),
-                                project_markers,
-                            );
+                            let allow_manifest_skip = entry.reason == DirtyReason::PeriodicColdScan
+                                && manifest_skip_dirs.contains(dir);
+                            let (outcome, manifest_skipped) = self
+                                .scan_dirs_periodic_cold_outcome_with_project_markers(
+                                    std::slice::from_ref(dir),
+                                    project_markers,
+                                    allow_manifest_skip,
+                                );
                             report.dirs_scanned = report.dirs_scanned.saturating_add(1);
                             report.changed = report.changed.saturating_add(outcome.changed);
                             report.elapsed_ms =
@@ -452,6 +474,7 @@ impl TieredIndex {
                                 dir: dir.clone(),
                                 outcome,
                                 reason: entry.reason,
+                                manifest_skipped,
                             });
                         }
                         Ok(_) => {
@@ -838,6 +861,7 @@ impl TieredIndex {
         if !upsert_events.is_empty() {
             self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
         }
+        self.update_directory_manifests_for_dirs(&dirs, project_markers);
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
         project_roots.sort();
@@ -851,6 +875,42 @@ impl TieredIndex {
         }
     }
 
+    fn scan_dirs_periodic_cold_outcome_with_project_markers(
+        &self,
+        dirs: &[PathBuf],
+        project_markers: &[String],
+        allow_manifest_skip: bool,
+    ) -> (ScanOutcome, bool) {
+        let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
+        if allow_manifest_skip && dirs.len() == 1 {
+            let dir = dirs[0];
+            if let Some(summary) = self.directory_manifest_summary(dir, project_markers) {
+                let trusted = self.clock_cutoff_trusted();
+                if self
+                    .directory_manifests
+                    .should_skip(dir.as_path(), &summary, trusted)
+                {
+                    self.directory_manifests.update(
+                        dir.clone(),
+                        summary,
+                        self.event_seq.load(Ordering::Relaxed),
+                    );
+                    return (
+                        ScanOutcome {
+                            elapsed_ms: 0,
+                            ..ScanOutcome::default()
+                        },
+                        true,
+                    );
+                }
+            }
+        }
+
+        let outcome =
+            self.scan_dirs_with_depth_and_project_markers(&dirs, Some(1), 10_000, project_markers);
+        (outcome, false)
+    }
+
     pub fn scan_dirs_immediate_outcome_with_project_markers(
         &self,
         dirs: &[PathBuf],
@@ -858,6 +918,102 @@ impl TieredIndex {
     ) -> ScanOutcome {
         let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
         self.scan_dirs_with_depth_and_project_markers(&dirs, Some(1), 10_000, project_markers)
+    }
+
+    fn directory_manifest_summary(
+        &self,
+        dir: &Path,
+        project_markers: &[String],
+    ) -> Option<DirectoryManifestSummary> {
+        let hidden_markers_enabled = project_markers.iter().any(|marker| marker.starts_with('.'));
+        let mut builder = ignore::WalkBuilder::new(dir);
+        builder
+            .max_depth(Some(1))
+            .hidden(!self.include_hidden && !hidden_markers_enabled)
+            .follow_links(false)
+            .ignore(self.ignore_enabled)
+            .git_ignore(self.ignore_enabled)
+            .git_global(self.ignore_enabled)
+            .git_exclude(self.ignore_enabled);
+        let fs_policy = FsPolicy::current_with_config(self.fs_policy_config());
+        let root = dir.to_path_buf();
+        let exclude_dirs = self.exclude_dirs.clone();
+        let mount_policy_counters = self.mount_policy_counters();
+        let include_hidden = self.include_hidden;
+        let project_markers_filter = project_markers.to_vec();
+        builder.filter_entry(move |entry| {
+            (exclude_dirs.is_empty() || !path_has_excluded_component(entry.path(), &exclude_dirs))
+                && (include_hidden
+                    || !hidden_markers_enabled
+                    || !path_has_hidden_component_after_root(entry.path(), root.as_path())
+                    || project_root_for_marker(entry.path(), &project_markers_filter).is_some())
+                && fs_policy
+                    .as_ref()
+                    .map(|policy| {
+                        policy
+                            .check_path_counted(
+                                entry.path(),
+                                Some(root.as_path()),
+                                mount_policy_counters.as_ref(),
+                            )
+                            .is_allowed()
+                    })
+                    .unwrap_or(true)
+        });
+
+        let mut manifest = DirectoryManifestBuilder::default();
+        for ent in builder.build() {
+            let ent = match ent {
+                Ok(e) => e,
+                Err(err) => {
+                    tracing::debug!(
+                        "directory manifest skipped entry under {}: {}",
+                        dir.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
+            let path = ent.path();
+            if path == dir {
+                continue;
+            }
+            let Some(ft) = ent.file_type() else {
+                continue;
+            };
+            if !ft.is_file() && !ft.is_dir() {
+                continue;
+            }
+            self.io_governor.before_io();
+            let meta = match ent.metadata() {
+                Ok(meta) => meta,
+                Err(err) => {
+                    tracing::debug!(
+                        "directory manifest metadata failed for {}: {}",
+                        path.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
+            manifest.push_child(
+                path,
+                FileKind::from_metadata(&meta),
+                mtime_to_ns(meta.modified().ok()),
+            );
+        }
+
+        Some(manifest.finish())
+    }
+
+    fn update_directory_manifests_for_dirs(&self, dirs: &[&PathBuf], project_markers: &[String]) {
+        let generation = self.event_seq.load(Ordering::Relaxed);
+        for dir in dirs {
+            if let Some(summary) = self.directory_manifest_summary(dir, project_markers) {
+                self.directory_manifests
+                    .update((*dir).clone(), summary, generation);
+            }
+        }
     }
 
     pub fn path_freshness(

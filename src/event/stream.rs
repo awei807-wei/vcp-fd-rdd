@@ -59,6 +59,18 @@ fn mount_policy_allows_dynamic_watch(
         .unwrap_or(true)
 }
 
+fn note_watch_mount_policy_rejected(runtime: &Option<Arc<TieredWatchRuntime>>) {
+    if let Some(runtime) = runtime.as_ref() {
+        runtime.note_watch_mount_policy_rejected();
+    }
+}
+
+fn note_watch_exclude_rejected(runtime: &Option<Arc<TieredWatchRuntime>>) {
+    if let Some(runtime) = runtime.as_ref() {
+        runtime.note_watch_exclude_rejected();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum WatchCommand {
     Add(PathBuf),
@@ -345,6 +357,7 @@ impl EventPipeline {
                                     &configured_roots,
                                     path.as_path(),
                                 ) {
+                                    note_watch_mount_policy_rejected(&tiered_runtime);
                                     if let Some(runtime) = tiered_runtime.as_ref() {
                                         runtime.rollback_promote(path.as_path());
                                     }
@@ -378,6 +391,7 @@ impl EventPipeline {
                                     &configured_roots,
                                     path.as_path(),
                                 ) {
+                                    note_watch_mount_policy_rejected(&tiered_runtime);
                                     if let Some(runtime) = tiered_runtime.as_ref() {
                                         runtime.rollback_ephemeral_add(path.as_path());
                                     }
@@ -481,6 +495,7 @@ impl EventPipeline {
                                     &configured_roots,
                                     promote.as_path(),
                                 ) {
+                                    note_watch_mount_policy_rejected(&tiered_runtime);
                                     if let Some(runtime) = tiered_runtime.as_ref() {
                                         runtime.rollback_replacement(
                                             demote.as_path(),
@@ -590,6 +605,7 @@ impl EventPipeline {
                                     &configured_roots,
                                     add.as_path(),
                                 ) {
+                                    note_watch_mount_policy_rejected(&tiered_runtime);
                                     if let Some(runtime) = tiered_runtime.as_ref() {
                                         runtime.rollback_ephemeral_replace(
                                             remove.as_path(),
@@ -720,11 +736,14 @@ impl EventPipeline {
 
                 // 过滤：全局目录排除和索引自身写入路径，必须在动态 watch / fast path 前执行。
                 raw_events.retain(|ev| {
-                    !should_ignore_event(ev, &ignore_paths)
-                        && !ev
-                            .paths
-                            .iter()
-                            .any(|p| path_has_excluded_component(p, &exclude_dirs))
+                    let excluded = ev
+                        .paths
+                        .iter()
+                        .any(|p| path_has_excluded_component(p, &exclude_dirs));
+                    if excluded {
+                        note_watch_exclude_rejected(&tiered_runtime);
+                    }
+                    !should_ignore_event(ev, &ignore_paths) && !excluded
                 });
                 if let Some(ref gi) = ignore_filter {
                     raw_events.retain(|ev| !ev.paths.iter().any(|p| gi.is_ignored(p)));
@@ -769,8 +788,11 @@ impl EventPipeline {
                         if ignore_paths
                             .iter()
                             .any(|ig| !ig.as_os_str().is_empty() && path.starts_with(ig))
-                            || path_has_excluded_component(path, &exclude_dirs)
                         {
+                            continue;
+                        }
+                        if path_has_excluded_component(path, &exclude_dirs) {
+                            note_watch_exclude_rejected(&tiered_runtime);
                             continue;
                         }
                         if ignore_filter
@@ -791,6 +813,7 @@ impl EventPipeline {
                             &configured_roots,
                             path.as_path(),
                         ) {
+                            note_watch_mount_policy_rejected(&tiered_runtime);
                             tracing::warn!(
                                 "dynamic watcher add denied by mount policy for {:?}",
                                 path
@@ -1251,5 +1274,31 @@ mod tests {
             }
             _ => panic!("expected rename event type"),
         }
+    }
+
+    #[test]
+    fn acceptance_watch_candidate_respects_mount_policy() {
+        let table = crate::fs_policy::MountTable::parse(
+            "42 1 8:1 / /workspace rw,relatime - ext4 /dev/sda1 rw\n",
+        );
+        let policy = crate::fs_policy::FsPolicy::new(
+            table,
+            crate::fs_policy::FsPolicyConfig {
+                deny_mounts: vec![PathBuf::from("/workspace/blocked")],
+                ..crate::fs_policy::FsPolicyConfig::default()
+            },
+        );
+        let counters = crate::fs_policy::SharedMountPolicyCounters::default();
+        let roots = vec![PathBuf::from("/workspace")];
+
+        assert!(!mount_policy_allows_dynamic_watch(
+            Some(&policy),
+            &counters,
+            &roots,
+            Path::new("/workspace/blocked/project"),
+        ));
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.denied_mount_count, 1);
     }
 }

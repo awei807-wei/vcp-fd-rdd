@@ -280,6 +280,11 @@ pub struct TieredWatchRuntime {
     demotions: AtomicU64,
     replacements: AtomicU64,
     promotion_budget_blocked: AtomicU64,
+    watch_mount_policy_rejected: AtomicU64,
+    watch_exclude_rejected: AtomicU64,
+    last_budget_blocked_kernel_watch_cost: AtomicU64,
+    last_budget_blocked_budget_remaining: AtomicU64,
+    last_budget_blocked_reason: RwLock<String>,
     cold_validate_count: AtomicU64,
     dirty_queue_len: AtomicUsize,
     query_stale_hit_count: AtomicU64,
@@ -343,6 +348,11 @@ impl TieredWatchRuntime {
             demotions: AtomicU64::new(0),
             replacements: AtomicU64::new(0),
             promotion_budget_blocked: AtomicU64::new(0),
+            watch_mount_policy_rejected: AtomicU64::new(0),
+            watch_exclude_rejected: AtomicU64::new(0),
+            last_budget_blocked_kernel_watch_cost: AtomicU64::new(0),
+            last_budget_blocked_budget_remaining: AtomicU64::new(0),
+            last_budget_blocked_reason: RwLock::new(String::new()),
             cold_validate_count: AtomicU64::new(0),
             dirty_queue_len: AtomicUsize::new(0),
             query_stale_hit_count: AtomicU64::new(0),
@@ -463,6 +473,7 @@ impl TieredWatchRuntime {
             .iter()
             .any(|name| !name.is_empty() && path_has_component(path.as_path(), name))
         {
+            self.note_watch_exclude_rejected();
             return EphemeralWatchDecision::NotEligible;
         }
         {
@@ -562,6 +573,16 @@ impl TieredWatchRuntime {
 
         self.ephemeral_watch_budget_blocked
             .fetch_add(1, Ordering::Relaxed);
+        let remaining =
+            budget.saturating_sub(self.current_ephemeral_watch_cost.load(Ordering::Relaxed));
+        self.record_last_budget_blocked(
+            format!(
+                "ephemeral budget blocked: kernel_watch_cost={} budget_remaining={}",
+                cost, remaining
+            ),
+            cost,
+            remaining,
+        );
         EphemeralWatchDecision::BudgetBlocked
     }
 
@@ -753,6 +774,28 @@ impl TieredWatchRuntime {
 
     pub fn max_watch_dirs(&self) -> usize {
         self.max_watch_dirs as usize
+    }
+
+    pub fn note_watch_mount_policy_rejected(&self) {
+        self.watch_mount_policy_rejected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_watch_exclude_rejected(&self) {
+        self.watch_exclude_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_last_budget_blocked(
+        &self,
+        reason: String,
+        kernel_watch_cost: u64,
+        budget_remaining: u64,
+    ) {
+        self.last_budget_blocked_kernel_watch_cost
+            .store(kernel_watch_cost, Ordering::Relaxed);
+        self.last_budget_blocked_budget_remaining
+            .store(budget_remaining, Ordering::Relaxed);
+        *self.last_budget_blocked_reason.write() = reason;
     }
 
     pub fn expired_l0(&self, idle_ttl_secs: u64) -> Vec<PathBuf> {
@@ -947,9 +990,13 @@ impl TieredWatchRuntime {
     }
 
     pub fn record_scan(&self, path: &Path, outcome: ScanOutcome) {
+        self.record_scan_inner(path, outcome, false);
+    }
+
+    fn record_scan_inner(&self, path: &Path, outcome: ScanOutcome, manifest_skipped: bool) {
         if let Some(state) = self.state(path) {
             let now = unix_secs();
-            if matches!(state.tier(), WatchTier::L2 | WatchTier::L3) {
+            if !manifest_skipped && matches!(state.tier(), WatchTier::L2 | WatchTier::L3) {
                 self.cold_validate_count.fetch_add(1, Ordering::Relaxed);
             }
             state.last_scan_unix_secs.store(now, Ordering::Relaxed);
@@ -984,6 +1031,15 @@ impl TieredWatchRuntime {
     }
 
     pub fn record_scan_for_path(&self, path: &Path, outcome: ScanOutcome) -> Option<PathBuf> {
+        self.record_scan_for_path_with_manifest_status(path, outcome, false)
+    }
+
+    pub fn record_scan_for_path_with_manifest_status(
+        &self,
+        path: &Path,
+        outcome: ScanOutcome,
+        manifest_skipped: bool,
+    ) -> Option<PathBuf> {
         let target = {
             let dirs = self.dirs.read();
             dirs.iter()
@@ -991,7 +1047,7 @@ impl TieredWatchRuntime {
                 .max_by_key(|(root, _)| root.as_os_str().as_encoded_bytes().len())
                 .map(|(root, _)| root.clone())
         }?;
-        self.record_scan(target.as_path(), outcome);
+        self.record_scan_inner(target.as_path(), outcome, manifest_skipped);
         Some(target)
     }
 
@@ -1102,6 +1158,8 @@ impl TieredWatchRuntime {
                 promote: path.to_path_buf(),
             }
         } else {
+            let current = self.current_watch_cost.load(Ordering::Relaxed);
+            let remaining = self.max_watch_dirs.saturating_sub(current);
             let now = unix_secs();
             state.promotion_pending.store(false, Ordering::Release);
             let blocked_count = state
@@ -1116,6 +1174,14 @@ impl TieredWatchRuntime {
             }
             self.promotion_budget_blocked
                 .fetch_add(1, Ordering::Relaxed);
+            self.record_last_budget_blocked(
+                format!(
+                    "promotion budget blocked: kernel_watch_cost={} budget_remaining={}",
+                    cost, remaining
+                ),
+                cost,
+                remaining,
+            );
             PromotionDecision::BudgetBlocked
         }
     }
@@ -1357,10 +1423,37 @@ impl TieredWatchRuntime {
             ));
         }
         let blocked = self.promotion_budget_blocked.load(Ordering::Relaxed);
+        let watch_mount_policy_rejected = self.watch_mount_policy_rejected.load(Ordering::Relaxed);
+        let watch_exclude_rejected = self.watch_exclude_rejected.load(Ordering::Relaxed);
+        let last_budget_blocked_kernel_watch_cost = self
+            .last_budget_blocked_kernel_watch_cost
+            .load(Ordering::Relaxed);
+        let last_budget_blocked_budget_remaining = self
+            .last_budget_blocked_budget_remaining
+            .load(Ordering::Relaxed);
+        let last_budget_blocked_reason = self.last_budget_blocked_reason.read().clone();
         if blocked > 0 {
             notes.push(format!(
                 "{} promotion attempt(s) were blocked by watch budget",
                 blocked
+            ));
+        }
+        if watch_mount_policy_rejected > 0 {
+            notes.push(format!(
+                "{} watch candidate(s) were rejected by mount policy",
+                watch_mount_policy_rejected
+            ));
+        }
+        if watch_exclude_rejected > 0 {
+            notes.push(format!(
+                "{} watch candidate(s) were rejected by exclude rules",
+                watch_exclude_rejected
+            ));
+        }
+        if !last_budget_blocked_reason.is_empty() {
+            notes.push(format!(
+                "last budget rejection: {}",
+                last_budget_blocked_reason
             ));
         }
         let watched_dirs_estimated = self.current_watch_cost.load(Ordering::Relaxed) as usize;
@@ -1407,6 +1500,11 @@ impl TieredWatchRuntime {
             demotions: self.demotions.load(Ordering::Relaxed),
             l0_replacements: self.replacements.load(Ordering::Relaxed),
             promotion_budget_blocked: blocked,
+            watch_mount_policy_rejected,
+            watch_exclude_rejected,
+            last_budget_blocked_kernel_watch_cost,
+            last_budget_blocked_budget_remaining,
+            last_budget_blocked_reason,
             watch_budget_utilization_pct,
             last_adjustment_unix_secs: self.last_adjustment_unix_secs.load(Ordering::Relaxed),
             next_scan_unix_secs: if next_scan_unix_secs == u64::MAX {
@@ -1446,6 +1544,10 @@ impl TieredWatchRuntime {
             dirty_queue_len: self.dirty_queue_len.load(Ordering::Relaxed),
             cold_validate_count: self.cold_validate_count.load(Ordering::Relaxed),
             query_stale_hit_count: self.query_stale_hit_count.load(Ordering::Relaxed),
+            directory_manifest_dirs: 0,
+            directory_manifest_skipped_scans: 0,
+            directory_manifest_changed_scans: 0,
+            directory_manifest_untrusted_clock_bypass: 0,
         }
     }
 
@@ -1864,6 +1966,104 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_project_marker_candidate_can_promote_or_request_lease() {
+        let promoted_rt = TieredWatchRuntime::new(
+            vec![(PathBuf::from("/tmp/hot"), 1)],
+            Vec::new(),
+            2,
+            5_000,
+            20,
+        );
+        let project = PathBuf::from("/tmp/projects/new-app");
+
+        assert_eq!(
+            promoted_rt.register_project_marker_candidate(project.clone(), 1),
+            PromotionDecision::SendAdd
+        );
+        promoted_rt.confirm_promoted(project.as_path());
+
+        let promoted = promoted_rt.report();
+        assert_eq!(promoted.l0_dirs, 2);
+        assert_eq!(promoted.promotions, 1);
+        let promoted_dump = promoted_rt.debug_dump(Some("/tmp/projects/new-app"));
+        assert_eq!(promoted_dump.dirs[0].watch_tier, "L0");
+        assert!(promoted_dump.dirs[0].high_priority_scan);
+
+        let leased_rt = TieredWatchRuntime::new_with_ephemeral(
+            vec![(PathBuf::from("/tmp/hot"), 2)],
+            Vec::new(),
+            2,
+            5_000,
+            20,
+            2,
+        );
+        leased_rt.record_scan(
+            Path::new("/tmp/hot"),
+            ScanOutcome {
+                scanned: 1,
+                changed: 30,
+                elapsed_ms: 1,
+                project_roots: Vec::new(),
+            },
+        );
+        let blocked_project = PathBuf::from("/tmp/projects/leased-app");
+        assert_eq!(
+            leased_rt.register_project_marker_candidate(blocked_project.clone(), 1),
+            PromotionDecision::BudgetBlocked
+        );
+
+        let lease_cfg = EphemeralWatchConfig {
+            budget: 2,
+            repeat_threshold: 1,
+            max_cost_per_root: 1,
+            ..EphemeralWatchConfig::default()
+        };
+        assert_eq!(
+            leased_rt.note_dirty_scope_at(blocked_project.clone(), 1, &[], &lease_cfg, 100, 1),
+            EphemeralWatchDecision::Add(blocked_project.clone())
+        );
+        leased_rt.confirm_ephemeral_added(blocked_project.as_path());
+
+        let leased = leased_rt.report();
+        assert_eq!(leased.promotion_budget_blocked, 1);
+        assert_eq!(leased.ephemeral_watch_dirs, 1);
+        assert_eq!(leased.ephemeral_watch_created, 1);
+        assert!(leased
+            .notes
+            .iter()
+            .any(|note| note.contains("last budget rejection")));
+    }
+
+    #[test]
+    fn acceptance_project_l0_can_demote_after_idle_ttl() {
+        let rt = TieredWatchRuntime::new(Vec::new(), Vec::new(), 2, 5_000, 20);
+        let project = PathBuf::from("/tmp/projects/idle-app");
+
+        assert_eq!(
+            rt.register_project_marker_candidate(project.clone(), 1),
+            PromotionDecision::SendAdd
+        );
+        rt.confirm_promoted(project.as_path());
+
+        let state = rt
+            .state(project.as_path())
+            .expect("promoted project should be tracked");
+        state
+            .last_event_unix_secs
+            .store(unix_secs().saturating_sub(120), Ordering::Relaxed);
+
+        let expired = rt.expired_l0(60);
+        assert_eq!(expired, vec![project.clone()]);
+        assert!(rt.mark_demotion_pending(project.as_path()));
+        rt.confirm_demoted(project.as_path());
+
+        let report = rt.report();
+        assert_eq!(report.l0_dirs, 0);
+        assert_eq!(report.l1_dirs, 1);
+        assert_eq!(report.demotions, 1);
+    }
+
+    #[test]
     fn dynamic_candidate_stays_l1_when_budget_blocked() {
         let rt = runtime();
         let dynamic = PathBuf::from("/tmp/hot/too-large-child");
@@ -2041,6 +2241,11 @@ mod tests {
         assert_eq!(report.l1_watch_cost, 3);
         assert_eq!(report.l2_watch_cost, 0);
         assert_eq!(report.l3_watch_cost, 0);
+        assert_eq!(report.watch_mount_policy_rejected, 0);
+        assert_eq!(report.watch_exclude_rejected, 0);
+        assert_eq!(report.last_budget_blocked_kernel_watch_cost, 0);
+        assert_eq!(report.last_budget_blocked_budget_remaining, 0);
+        assert!(report.last_budget_blocked_reason.is_empty());
     }
 
     #[test]
@@ -2329,6 +2534,52 @@ mod tests {
         assert_eq!(report.l1_dirs, 1);
         assert_eq!(report.watched_dirs_estimated, 3);
         assert_eq!(report.l0_replacements, 0);
+    }
+
+    #[test]
+    fn acceptance_nested_project_debug_explains_without_ancestor_eviction() {
+        let rt = TieredWatchRuntime::new(
+            vec![(PathBuf::from("/workspace"), 3)],
+            vec![(PathBuf::from("/workspace/project"), 1)],
+            3,
+            5_000,
+            20,
+        );
+        let child = PathBuf::from("/workspace/project");
+
+        let dump = rt.debug_dump(Some("/workspace"));
+        let parent = dump
+            .dirs
+            .iter()
+            .find(|dir| dir.path == "/workspace")
+            .expect("parent root should be present");
+        let nested = dump
+            .dirs
+            .iter()
+            .find(|dir| dir.path == "/workspace/project")
+            .expect("nested project root should be present");
+
+        assert_eq!(parent.nested_relation, "ancestor_of_nested_roots");
+        assert_eq!(nested.nearest_ancestor_root.as_deref(), Some("/workspace"));
+        assert_eq!(nested.l0_covering_root.as_deref(), Some("/workspace"));
+        assert_eq!(nested.nested_relation, "covered_by_l0_ancestor");
+        assert!(nested.budget_isolated_from_ancestor);
+
+        rt.record_scan(
+            child.as_path(),
+            ScanOutcome {
+                scanned: 10,
+                changed: 20,
+                elapsed_ms: 1,
+                project_roots: Vec::new(),
+            },
+        );
+        assert_eq!(
+            rt.try_reserve_promotion(child.as_path()),
+            PromotionDecision::BudgetBlocked,
+            "nested child must not evict its L0 ancestor to satisfy promotion"
+        );
+        assert_eq!(rt.report().l0_replacements, 0);
     }
 
     #[test]
@@ -2645,6 +2896,58 @@ mod tests {
         );
         let report = rt.report();
         assert_eq!(report.promotion_budget_blocked, 1);
+        assert_eq!(report.last_budget_blocked_kernel_watch_cost, 6);
+        assert_eq!(report.last_budget_blocked_budget_remaining, 3);
+        assert!(report
+            .last_budget_blocked_reason
+            .contains("promotion budget blocked"));
+        assert!(report
+            .last_budget_blocked_reason
+            .contains("kernel_watch_cost=6"));
+        assert!(report
+            .last_budget_blocked_reason
+            .contains("budget_remaining=3"));
+        assert!(report.notes.iter().any(|note| {
+            note.contains("last budget rejection")
+                && note.contains("kernel_watch_cost=6")
+                && note.contains("budget_remaining=3")
+        }));
+    }
+
+    #[test]
+    fn watch_reject_counters_distinguish_mount_policy_and_exclude() {
+        let rt = runtime();
+        let cfg = EphemeralWatchConfig {
+            budget: 4,
+            repeat_threshold: 1,
+            max_cost_per_root: 2,
+            ..EphemeralWatchConfig::default()
+        };
+
+        rt.note_watch_mount_policy_rejected();
+        assert_eq!(
+            rt.note_dirty_scope_at(
+                PathBuf::from("/tmp/cold/node_modules/pkg"),
+                1,
+                &["node_modules".to_string()],
+                &cfg,
+                100,
+                1,
+            ),
+            EphemeralWatchDecision::NotEligible
+        );
+
+        let report = rt.report();
+        assert_eq!(report.watch_mount_policy_rejected, 1);
+        assert_eq!(report.watch_exclude_rejected, 1);
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("rejected by mount policy")));
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("rejected by exclude rules")));
     }
 
     #[test]
@@ -2719,6 +3022,40 @@ mod tests {
         let report = rt.report();
         assert_eq!(report.ephemeral_watch_cost, 0);
         assert_eq!(report.ephemeral_watch_dirs, 0);
+        assert_eq!(report.watch_exclude_rejected, 1);
+    }
+
+    #[test]
+    fn ephemeral_budget_blocked_reports_kernel_watch_cost() {
+        let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 2);
+        let cfg = EphemeralWatchConfig {
+            budget: 2,
+            repeat_threshold: 1,
+            max_cost_per_root: 2,
+            ..EphemeralWatchConfig::default()
+        };
+
+        let first = PathBuf::from("/tmp/first");
+        let second = PathBuf::from("/tmp/second");
+        assert_eq!(
+            rt.note_dirty_scope_at(first.clone(), 2, &[], &cfg, 100, 1),
+            EphemeralWatchDecision::Add(first)
+        );
+        assert_eq!(
+            rt.note_dirty_scope_at(second, 2, &[], &cfg, 101, 1),
+            EphemeralWatchDecision::BudgetBlocked
+        );
+
+        let report = rt.report();
+        assert_eq!(report.ephemeral_watch_budget_blocked, 1);
+        assert_eq!(report.last_budget_blocked_kernel_watch_cost, 2);
+        assert_eq!(report.last_budget_blocked_budget_remaining, 0);
+        assert!(report
+            .last_budget_blocked_reason
+            .contains("ephemeral budget blocked"));
+        assert!(report
+            .last_budget_blocked_reason
+            .contains("kernel_watch_cost=2"));
     }
 
     #[test]

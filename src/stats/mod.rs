@@ -209,6 +209,11 @@ pub struct WatchStateReport {
     pub demotions: u64,
     pub l0_replacements: u64,
     pub promotion_budget_blocked: u64,
+    pub watch_mount_policy_rejected: u64,
+    pub watch_exclude_rejected: u64,
+    pub last_budget_blocked_kernel_watch_cost: u64,
+    pub last_budget_blocked_budget_remaining: u64,
+    pub last_budget_blocked_reason: String,
     pub watch_budget_utilization_pct: u8,
     pub last_adjustment_unix_secs: u64,
     pub next_scan_unix_secs: u64,
@@ -242,6 +247,10 @@ pub struct WatchStateReport {
     pub dirty_queue_len: usize,
     pub cold_validate_count: u64,
     pub query_stale_hit_count: u64,
+    pub directory_manifest_dirs: usize,
+    pub directory_manifest_skipped_scans: u64,
+    pub directory_manifest_changed_scans: u64,
+    pub directory_manifest_untrusted_clock_bypass: u64,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]

@@ -227,6 +227,10 @@ strict_fail_on_budget_exceeded = true
 
 `strict` 会要求 `strict_required_hot_dirs` 全部进入 L0 watcher；预算不足时 `/watch-state` 输出 `required_watch_cost`、`watch_budget_shortfall` 和 `strict_uncovered_dirs`，`/health` 在 `strict_fail_on_budget_exceeded = true` 时返回 `index_health = "degraded"`，否则返回 `warning`。`/watch-state` 同时暴露 `logical_watch_cost`、`kernel_watch_cost` 和 `skipped_watch_cost`，分别解释逻辑候选成本、实际 inotify watch 成本和未进入 L0 的扫描/临时 watch 补偿成本。未配置 `max_watch_dirs` 时，tiered watcher 默认预算为 `131072`；未配置 profile 时保持 `balanced` 行为。
 
+`balanced` 会用 `project_markers` 识别用户正在使用的项目根。L1/L2/L3 dirty scan 发现 `Cargo.toml`、`package.json`、`.git` 等 marker 后，会把项目根登记为 candidate、提高 event score，并在预算足够时晋升 L0；预算不足且不能替换更冷 L0 时，会尝试 Ephemeral Watch lease；仍受限时保留 high-priority L1 scan。project marker 不会绕过 `exclude_dirs`、ignore prefix 或 mount policy，大型 `node_modules` / `target` 等排除树不会因为内部 marker 被提升为 watcher 候选。
+
+L2/L3 periodic cold scan 会维护 directory manifest，用 `child_count`、`names_hash`、`child_mtime_hash`、mtime range 和 scan generation 判断目录是否可跳过真实补扫。`/watch-state` 暴露 `directory_manifest_dirs`、`directory_manifest_skipped_scans`、`directory_manifest_changed_scans` 和 `directory_manifest_untrusted_clock_bypass`；clock cutoff 不可信时会绕过 manifest skip，优先执行真实对账。预算拒绝还会记录 `last_budget_blocked_kernel_watch_cost`、`last_budget_blocked_budget_remaining` 和 `last_budget_blocked_reason`，便于判断是 promotion 预算不足还是 ephemeral lease 预算不足。
+
 L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` 会把 L3 上次扫描干净的目录展示为 `ScannedFresh`，未被实时覆盖的 L3 目录按 `EventuallyConsistent` 口径出现在 `/watch-state.eventually_consistent_dirs` 与 metrics diagnostics 中。嵌套项目会在 `/debug/tiered-watch` 中暴露 `nearest_ancestor_root`、`descendant_roots`、`l0_covering_root`、`budget_isolated_from_ancestor` 和 `nested_relation`，用于解释祖先/后代项目之间的覆盖与预算隔离关系。
 
 ## fd-rdd-sim 压测框架
@@ -334,7 +338,10 @@ jq '{
 | `content_index.max_file_size` | `u64` | `1048576` | 内容索引单文件大小上限 |
 | `content_index.include_ext` | `[String]` | `[]` | 内容索引后缀白名单 |
 | `content_index.exclude_ext` | `[String]` | `[]` | 内容索引后缀黑名单 |
+| `tiered_watch.profile` | `String` | `"balanced"` | `strict` / `balanced` / `low_power` |
+| `tiered_watch.max_watch_dirs` | `usize` | `131072` | tiered L0 inotify 递归 watch 预算 |
 | `tiered_watch.project_markers` | `[String]` | 常见项目标记 | balanced watcher 识别项目根的 marker 名称 |
+| `tiered_watch.ephemeral_watch_budget` | `usize` | `256` | 临时 watcher lease 独立预算 |
 | `snapshot_interval_secs` | `u64` | `300` | 快照落盘周期 |
 | `stable_snapshot_enabled` | `bool` | `true` | 稳定快照轮转 |
 | `startup_repair_enabled` | `bool` | `true` | 启动修复扫描 |

@@ -7,6 +7,7 @@ use fd_rdd::event::ignore_filter::IgnoreFilter;
 use fd_rdd::event::sync::{DirtyReason, DirtyScope};
 use fd_rdd::event::tiered_watch::{
     EphemeralWatchConfig, EphemeralWatchDecision, TieredWatchDebugDump, TieredWatchDebugSummary,
+    WatchTier,
 };
 use fd_rdd::event::watcher::check_inotify_limit;
 use fd_rdd::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
@@ -22,6 +23,7 @@ use fd_rdd::storage::snapshot::{
 };
 use fd_rdd::storage::wal::WalDurability;
 use fd_rdd::util::{estimate_notify_recursive_watch_count, normalize_exclude_dirs};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -461,6 +463,11 @@ async fn main() -> anyhow::Result<()> {
             report.cold_validate_count = report
                 .cold_validate_count
                 .saturating_add(stats.cold_validate_count);
+            let manifest = index.directory_manifest_report();
+            report.directory_manifest_dirs = manifest.dirs;
+            report.directory_manifest_skipped_scans = manifest.skipped_scans;
+            report.directory_manifest_changed_scans = manifest.changed_scans;
+            report.directory_manifest_untrusted_clock_bypass = manifest.untrusted_clock_bypass;
             report
         })
     };
@@ -971,17 +978,39 @@ fn spawn_dirty_queue_loop(
             }
 
             let work = batch.clone();
+            let work_manifest_skip_dirs = runtime
+                .as_ref()
+                .map(|runtime| {
+                    let mut skip_dirs = HashSet::new();
+                    for entry in &work {
+                        if entry.reason != DirtyReason::PeriodicColdScan {
+                            continue;
+                        }
+                        for dir in entry.scope.dir_paths() {
+                            if matches!(
+                                runtime.covering_tier(dir.as_path()),
+                                Some(WatchTier::L2 | WatchTier::L3)
+                            ) {
+                                skip_dirs.insert(dir.clone());
+                            }
+                        }
+                    }
+                    skip_dirs
+                })
+                .unwrap_or_default();
             let work_index = index.clone();
             let work_ignore_prefixes = ignore_prefixes.clone();
             let work_project_markers = tiered.project_markers.clone();
             let processed = tokio::task::spawn_blocking(move || {
                 work.into_iter()
                     .map(|entry| {
-                        let report = work_index.process_dirty_entry_with_project_markers(
-                            entry.clone(),
-                            &work_ignore_prefixes,
-                            &work_project_markers,
-                        );
+                        let report = work_index
+                            .process_dirty_entry_with_project_markers_and_manifest_skip_dirs(
+                                entry.clone(),
+                                &work_ignore_prefixes,
+                                &work_project_markers,
+                                &work_manifest_skip_dirs,
+                            );
                         (entry, report)
                     })
                     .collect::<Vec<_>>()
@@ -1021,7 +1050,11 @@ fn spawn_dirty_queue_loop(
                         let changed = scan.outcome.changed;
                         let project_roots = scan.outcome.project_roots.clone();
                         let policy_dir = runtime
-                            .record_scan_for_path(scan.dir.as_path(), scan.outcome.clone())
+                            .record_scan_for_path_with_manifest_status(
+                                scan.dir.as_path(),
+                                scan.outcome.clone(),
+                                scan.manifest_skipped,
+                            )
                             .unwrap_or_else(|| scan.dir.clone());
                         runtime.apply_scan_policy(
                             policy_dir.as_path(),
@@ -1054,6 +1087,13 @@ fn spawn_dirty_queue_loop(
                         }
 
                         for project_root in project_roots {
+                            if fd_rdd::util::path_has_excluded_component(
+                                project_root.as_path(),
+                                &exclude_dirs,
+                            ) {
+                                runtime.note_watch_exclude_rejected();
+                                continue;
+                            }
                             if !project_marker_root_is_eligible(
                                 project_root.as_path(),
                                 index.roots.as_slice(),
@@ -1227,6 +1267,7 @@ async fn maybe_send_ephemeral_watch_command(
         return;
     }
     if fd_rdd::util::path_has_excluded_component(dir.as_path(), exclude_dirs) {
+        runtime.note_watch_exclude_rejected();
         return;
     }
     let cost = estimate_notify_recursive_watch_count(
@@ -1394,6 +1435,84 @@ mod tests {
         assert!(plan.state.strict_coverage_failure);
         assert_eq!(plan.state.strict_uncovered_dirs.len(), 1);
         assert!(plan.state.strict_uncovered_dirs[0].contains("Downloads"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn acceptance_project_marker_eligibility_respects_exclude_and_ignore() {
+        let root = temp_root("marker-eligibility");
+        let project = root.join("workspace").join("new-app");
+        let excluded = root.join("workspace").join("node_modules").join("pkg");
+        let ignored = root.join("workspace").join("ignored").join("pkg");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&excluded).unwrap();
+        std::fs::create_dir_all(&ignored).unwrap();
+
+        let roots = vec![root.join("workspace")];
+        let exclude_dirs = vec!["node_modules".to_string()];
+        let ignore_prefixes = vec![root.join("workspace").join("ignored")];
+
+        assert!(project_marker_root_is_eligible(
+            project.as_path(),
+            &roots,
+            &exclude_dirs,
+            &ignore_prefixes,
+        ));
+        assert!(!project_marker_root_is_eligible(
+            excluded.as_path(),
+            &roots,
+            &exclude_dirs,
+            &ignore_prefixes,
+        ));
+        assert!(!project_marker_root_is_eligible(
+            ignored.as_path(),
+            &roots,
+            &exclude_dirs,
+            &ignore_prefixes,
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn acceptance_low_power_and_strict_profiles_keep_budget_semantics() {
+        let root = temp_root("watch-profile-budget");
+        let active = root.join("Active");
+        let archive = root.join("Archive");
+        std::fs::create_dir_all(active.join("project")).unwrap();
+        std::fs::create_dir_all(archive.join("cold")).unwrap();
+
+        let mut low_power = fd_rdd::config::TieredWatchConfig {
+            profile: TieredWatchProfile::LowPower,
+            max_watch_dirs: 2,
+            ..fd_rdd::config::TieredWatchConfig::default()
+        };
+        low_power.hot_dirs = vec![active.clone(), archive.clone()];
+        let low_power_plan = build_tiered_watch_plan(std::slice::from_ref(&root), &low_power, &[]);
+
+        assert_eq!(low_power_plan.state.watch_profile, "low_power");
+        assert!(low_power_plan.state.watched_dirs_estimated <= low_power_plan.state.max_watch_dirs);
+        assert_eq!(low_power_plan.state.strict_coverage_ok, true);
+        assert_eq!(low_power_plan.state.strict_coverage_failure, false);
+        assert!(low_power_plan.state.l1_dirs >= 1);
+
+        let mut strict = fd_rdd::config::TieredWatchConfig {
+            profile: TieredWatchProfile::Strict,
+            max_watch_dirs: 2,
+            ..fd_rdd::config::TieredWatchConfig::default()
+        };
+        strict.hot_dirs.clear();
+        strict.strict_required_hot_dirs = vec![active.clone(), archive.clone()];
+        strict.strict_fail_on_budget_exceeded = true;
+        let strict_plan = build_tiered_watch_plan(std::slice::from_ref(&root), &strict, &[]);
+
+        assert_eq!(strict_plan.state.watch_profile, "strict");
+        assert!(strict_plan.state.strict_fail_on_budget_exceeded);
+        assert!(!strict_plan.state.strict_coverage_ok);
+        assert!(strict_plan.state.strict_coverage_failure);
+        assert!(!strict_plan.state.strict_uncovered_dirs.is_empty());
+        assert!(strict_plan.state.watched_dirs_estimated <= strict_plan.state.max_watch_dirs);
 
         let _ = std::fs::remove_dir_all(root);
     }

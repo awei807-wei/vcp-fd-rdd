@@ -187,6 +187,7 @@ impl TieredIndex {
             content_hash_skipped_count: AtomicU64::new(0),
             content_hash_last_elapsed_ms: AtomicU64::new(0),
             content_hash_last_skip_reason: Mutex::new(String::new()),
+            directory_manifests: super::directory_manifest::DirectoryManifestStore::default(),
         }
     }
 

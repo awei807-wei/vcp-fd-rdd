@@ -1,5 +1,6 @@
 pub(crate) mod arena;
 mod content;
+mod directory_manifest;
 pub(crate) mod events;
 pub(crate) mod load;
 mod memory;
@@ -37,6 +38,8 @@ use crate::storage::traits::WriteAheadLog;
 use crate::storage::wal::WalDurability;
 
 use self::rebuild::RebuildState;
+pub use directory_manifest::DirectoryManifestReport;
+use directory_manifest::DirectoryManifestStore;
 
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
 
@@ -77,6 +80,7 @@ pub struct DirtyScanOutcome {
     pub dir: PathBuf,
     pub outcome: ScanOutcome,
     pub reason: crate::event::sync::DirtyReason,
+    pub manifest_skipped: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -244,6 +248,7 @@ pub struct TieredIndex {
     pub(self) content_hash_skipped_count: AtomicU64,
     pub(self) content_hash_last_elapsed_ms: AtomicU64,
     pub(self) content_hash_last_skip_reason: Mutex<String>,
+    pub(self) directory_manifests: DirectoryManifestStore,
 }
 
 impl TieredIndex {
@@ -385,6 +390,10 @@ impl TieredIndex {
         self.clock_skew.lock().mark_reconciled();
     }
 
+    pub(crate) fn clock_cutoff_trusted(&self) -> bool {
+        self.clock_skew.lock().cutoff_trusted()
+    }
+
     pub(crate) fn record_idle_io_priority_result(&self, result: std::io::Result<()>) {
         match result {
             Ok(()) => {
@@ -445,6 +454,10 @@ impl TieredIndex {
 
     pub fn fs_policy_config(&self) -> FsPolicyConfig {
         self.fs_policy_config.clone()
+    }
+
+    pub fn directory_manifest_report(&self) -> DirectoryManifestReport {
+        self.directory_manifests.report()
     }
 }
 
