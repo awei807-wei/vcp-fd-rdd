@@ -45,6 +45,13 @@
 - `stress-hybrid-large-scale` workflow 继续显式运行 `p2_large_scale_hybrid` 的 80 万文件混合工作区测试，并保持 `continue-on-error`，避免 GitHub runner 资源波动阻塞普通分支推进。
 - 新增 `p1_api_e2e.rs`、`p1_real_watcher.rs`、`p1_crash_recovery_matrix.rs`，补齐 daemon HTTP/UDS 真实链路、真实 watcher 文件事件、坏快照/非干净退出后的启动修复组合。
 
+## v7.0.0 测试相关变更
+
+- 全量 `cargo test -q` 覆盖 runtime boundary、mmap v7 cold segment、WAL/root state、query DSL、content index、tiered watcher 和 sim parity 等回归。
+- `scripts/smoke-search-syntax.sh` 支持自建临时 root、临时 HTTP 端口和自启动 daemon；在 `--no-watch` 下会递归分批调用 `/scan`，完整覆盖 HTTP search DSL smoke 矩阵。
+- `dupe:content` 新增 exclude/oversized/mount policy 回归，确认内容重复扫描复用 frozen/offline、exclude 目录、mount policy 与 `content_index.max_file_size` 准入，并把 partial/full hash 慢 I/O 放在 query generation guard 外。
+- `memory_light` 的 RSS/P95、idle RSS 和默认 profile 对照仍需在非沙箱 daemon 或真实数据集环境采集；本地测试不伪造性能数值。
+
 ## v0.6.0 更新（零拷贝序列化 P1 + Compaction 降维 P2）
 
 ### P1 — 零拷贝序列化

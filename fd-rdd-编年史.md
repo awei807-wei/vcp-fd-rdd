@@ -304,7 +304,22 @@ v0.5.8 积累的 P0 问题促成了这一轮大重构：
 - **策略验证**：`fd-rdd-sim` 覆盖策略搜索、固定 seed 回归、runtime/sim parity 与 TOML patch 回填，把 watcher 策略从经验参数推进到可复现实验。
 - **对外接口**：HTTP `/search` + UDS 流式协议 + `/scan` + `/health` + `/metrics` + `/memory` + `/watch-state` + `/debug/tiered-watch` + `/trim`；`size` 字段、`size:` 与 `sort=size` 已从公开查询契约中移除。
 
-## 19. 仍待推进的方向
+## 19. 2026-05-30：v7.0.0 —— Runtime Boundary、冷启动内存与查询体验合并发布
+
+这一版把 2026-05 下旬连续推进的 runtime boundary、memory light、watcher balanced、query experience 和 review closure 合并成新的主版本。版本号跳到 v7.0.0，是因为公开查询契约、snapshot header、运行时配置与诊断面都已经越过 0.6.x 的增量修补范围。
+
+- **Runtime Boundary State Contract**：WAL 记录 `OFFLINE_ROOT` / `ONLINE_ROOT`，quarantine sidecar 使用物理 mount identity 锚定；启动时先恢复 sidecar 与 Freeze Gate，再按 WAL 顺序回放 root state 和文件事件，阻断离线 root 下的脏删除/修改/重命名。
+- **诊断面收口**：`/health.diagnostics` 固定 system/storage/security/clocks/watchers/io 板块，汇总 WAL、snapshot、quarantine、freeze、HTTP/UDS policy、scan reject、clock skew、mount policy、I/O governor 与 mmap warmup 状态。
+- **memory_light profile**：新增 `runtime_profile = "memory_light"` 与 CLI 覆盖，降低 overlay/周期 flush 门槛，缩短 rebuild 合并冷却，并在 WAL 体积过大时请求 snapshot 边界；真实 RSS/P95 对照仍保留为外部 daemon / 真实数据集验收项。
+- **查询体验二阶段**：目录 entry、`type:file` / `type:dir`、`empty:`、hardlink `dupe:`、`dupe:content`、默认关闭的 `content:` / `text:` 内容索引查询和 HTTP result type/reason/confidence 形成完整 DSL 面。
+- **`dupe:content` 边界补齐**：内容重复扫描复用 frozen/offline、exclude 目录、mount policy 与 `content_index.max_file_size` 准入；partial/full hash 慢 I/O 移出 query generation guard，避免延长旧 base generation 存活。
+- **Watcher balanced evolution**：project marker、ephemeral watch、directory manifest、nested project debug 解释、strict/low_power/balanced profile 和 watch cost 诊断形成统一控制面；fanotify 保留为未来 opt-in 实验方向，不进入默认热路径。
+- **Smoke 与测试闭环**：`scripts/smoke-search-syntax.sh` 可自建临时 root、临时 HTTP 端口并自启动 daemon；在 `--no-watch` 下递归分批 `/scan`，让统一 query DSL smoke 不再依赖预置 daemon。
+- **发行元数据同步**：Cargo、README、CHANGELOG、AUR `PKGBUILD` / `.SRCINFO` 更新到 7.0.0 系列。
+
+小结：v7.0.0 的重点不是单个功能，而是把“可恢复边界、可解释内存、可验证查询、可观测 watcher 策略”合并成一个发布基线。
+
+## 20. 仍待推进的方向
 
 - **冷层过滤继续精细化**：manifest-only cold segment 已能 mmap 直读，但仍可继续评估更强的段级过滤/统计，减少无效触页和全段回退。
 - **WAL 语义工业化**：fsync 策略、序列号去重、gap verify、与 watcher/DirtyQueue 边界的精确定义仍可继续收紧。

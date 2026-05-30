@@ -1,9 +1,9 @@
 # Maintainer: shiyi
 pkgname=fd-rdd-git
 _pkgname=vcp-fd-rdd
-pkgver=0.6.1
-pkgrel=3
-pkgdesc="Event-driven elastic file indexer with RDD lineage and glob support"
+pkgver=7.0.0
+pkgrel=1
+pkgdesc="Event-driven elastic file indexer with mmap snapshots, tiered watcher, and HTTP search"
 arch=('x86_64')
 options=(!lto)
 url="https://github.com/awei807-wei/vcp-fd-rdd"
@@ -17,7 +17,7 @@ sha256sums=('SKIP')
 
 pkgver() {
     cd "$_pkgname"
-    printf "0.2.0.r%s.%s" "$(git rev-list --count HEAD 2>/dev/null || echo 0)" "$(git rev-parse --short HEAD 2>/dev/null || echo init)"
+    printf "7.0.0.r%s.%s" "$(git rev-list --count HEAD 2>/dev/null || echo 0)" "$(git rev-parse --short HEAD 2>/dev/null || echo init)"
 }
 
 prepare() {

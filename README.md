@@ -19,7 +19,7 @@
 - **长期稳定**：compaction 做物理回收；heap high-water 主动 trim；内存报告可量化 RSS 组成
 - **Tiered Watcher**：预算受控的热点目录监听，避免 inotify 耗尽系统 watch 配额
 
-当前版本 **v0.6.16** · [更新日志](CHANGELOG.md) · [编年史](fd-rdd-编年史.md)
+当前版本 **v7.0.0** · [更新日志](CHANGELOG.md) · [编年史](fd-rdd-编年史.md)
 
 </details>
 
@@ -37,7 +37,7 @@
 - **Stable long-running**: compaction reclaims storage; proactive heap trim; attributed memory reports
 - **Tiered Watcher**: budget-constrained hot-directory watching to avoid exhausting inotify limits
 
-Current version **v0.6.16** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-编年史.md)
+Current version **v7.0.0** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-编年史.md)
 
 </details>
 
@@ -55,7 +55,7 @@ Current version **v0.6.16** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-�
 - **長期安定**: compaction による物理的回収、ヒープ高水位の積極的トリム、RSS 構成の可視化
 - **Tiered Watcher**: 予算制約付きのホットディレクトリ監視、inotify 枯渇の防止
 
-現在のバージョン **v0.6.16** · [変更履歴](CHANGELOG.md) · [年代記](fd-rdd-编年史.md)
+現在のバージョン **v7.0.0** · [変更履歴](CHANGELOG.md) · [年代記](fd-rdd-编年史.md)
 
 </details>
 
