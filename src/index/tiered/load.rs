@@ -169,8 +169,13 @@ impl TieredIndex {
                 std::time::Duration::from_secs(1),
             )),
             clock_reconciliation_count: AtomicU64::new(0),
+            root_case_policies: Mutex::new(Vec::new()),
             ioprio_idle_set: AtomicBool::new(false),
             ioprio_set_failed: AtomicBool::new(false),
+            mmap_warmup_enabled: AtomicBool::new(false),
+            mmap_warmup_pages: AtomicU64::new(0),
+            mmap_warmup_elapsed_ms: AtomicU64::new(0),
+            mmap_warmup_cancel_reason: Mutex::new("disabled".to_string()),
             stable_snapshot_enabled: AtomicBool::new(true),
             mount_policy_counters,
             io_governor,
@@ -546,6 +551,7 @@ impl TieredIndex {
                             e
                         );
                     }
+                    idx.set_root_case_policy_diagnostics(runtime_state.root_case_policies.clone());
                     let checkpoint =
                         choose_checkpoint(SnapshotCheckpointSource::from_label(source), &audit);
                     let replay = idx.replay_wal_if_any(checkpoint);
@@ -586,6 +592,7 @@ impl TieredIndex {
                 e
             );
         }
+        idx.set_root_case_policy_diagnostics(runtime_state.root_case_policies.clone());
         let replay = idx.replay_wal_if_any(0);
         idx.set_startup_recovery_report(startup_report("empty", &runtime_state, &audit, replay));
         Ok(idx)

@@ -1,18 +1,19 @@
 use super::*;
-use crate::config::{ContentIndexConfig, RuntimeProfile};
-use crate::core::{EventRecord, EventType, FileIdentifier};
+use crate::config::{ContentIndexConfig, MmapWarmupConfig, RuntimeProfile};
+use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta};
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::{DirtyReason, DirtyScope};
 use crate::fs_policy::{FsPolicyDecision, MountTable};
 use crate::index::tiered::events::event_record_estimated_bytes;
 use crate::index::tiered::sync::RebuildAdmission;
-use crate::io_governor::{BackoffPolicy, IoGovernor, IoPressure};
+use crate::io_governor::{BackoffPolicy, IoGovernor, IoGovernorConfig, IoPressure};
 use crate::stats::EventPipelineStats;
 use crate::storage::quarantine::{
     FreezeGate, MountIdentity, QuarantineRoot, QuarantineRootState, QuarantineSidecar,
     RootStateKind, RootStateRecord,
 };
-use crate::storage::snapshot::{quarantine_sidecar_path_for, SnapshotStore};
+use crate::storage::snapshot::{quarantine_sidecar_path_for, stable_v7_path_for, SnapshotStore};
+use crate::storage::snapshot_v7::write_v7_snapshot_atomic;
 use crate::storage::traits::WalFactory;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -174,9 +175,124 @@ fn tiered_diagnostics_include_io_governor_counters() {
     assert_eq!(report.io.psi_some_avg10, Some(20.0));
     assert_eq!(report.io.psi_full_avg10, Some(1.5));
     assert_eq!(report.io.backoff_count, 1);
+    assert_eq!(report.io.current_backoff_ms, 1);
+    assert_eq!(report.io.token_bucket_consume_count, 0);
     assert_eq!(report.io.token_bucket_limited_count, 0);
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn tiered_diagnostics_include_root_case_policy_state() {
+    let root = unique_tmp_dir("case-policy-diag");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let l2 = idx.l2.load_full();
+    l2.upsert(FileMeta {
+        file_key: FileKey {
+            dev: 1,
+            ino: 10,
+            generation: 0,
+        },
+        path: root.join("Straße.txt"),
+        size: 1,
+        mtime: None,
+        ctime: None,
+        atime: None,
+        kind: Default::default(),
+    });
+    l2.upsert(FileMeta {
+        file_key: FileKey {
+            dev: 1,
+            ino: 11,
+            generation: 0,
+        },
+        path: root.join("STRASSE.txt"),
+        size: 1,
+        mtime: None,
+        ctime: None,
+        atime: None,
+        kind: Default::default(),
+    });
+    idx.refresh_base();
+
+    let roots = idx.refresh_root_case_policy_diagnostics();
+    assert_eq!(roots.len(), 1);
+    assert!(roots[0].conflict_count >= 1);
+
+    let mut report = DiagnosticReport::default();
+    idx.collect(&mut report);
+    assert_eq!(report.storage.case_policy_roots, roots);
+    assert!(report.storage.case_policy_conflict_count >= 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn mmap_warmup_default_disabled_and_reports_enabled_cold_snapshot() {
+    let root = unique_tmp_dir("mmap-warmup");
+    let state = unique_tmp_dir("mmap-warmup-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let l2 = PersistentIndex::new_with_roots(vec![root.clone()]);
+    l2.upsert(FileMeta {
+        file_key: FileKey {
+            dev: 1,
+            ino: 20,
+            generation: 0,
+        },
+        path: root.join("needle.txt"),
+        size: 1,
+        mtime: None,
+        ctime: None,
+        atime: None,
+        kind: Default::default(),
+    });
+    let store = SnapshotStore::new(state.join("index.db"));
+    let stable_path = stable_v7_path_for(store.path());
+    std::fs::create_dir_all(stable_path.parent().unwrap()).unwrap();
+    write_v7_snapshot_atomic(&stable_path, &l2.to_base_index_data()).unwrap();
+
+    let idx = TieredIndex::load_or_empty_with_options_follow_excludes_fs_policy_and_io_governor(
+        &store,
+        vec![root.clone()],
+        false,
+        true,
+        false,
+        Vec::new(),
+        crate::fs_policy::FsPolicyConfig::default(),
+        IoGovernorConfig {
+            enabled: true,
+            stat_rate_per_sec: 1_000_000,
+            ..IoGovernorConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut report = DiagnosticReport::default();
+    idx.collect(&mut report);
+    assert!(!report.storage.mmap_warmup_enabled);
+    assert_eq!(report.storage.mmap_warmup_pages, 0);
+    assert_eq!(report.storage.mmap_warmup_cancel_reason, "disabled");
+
+    idx.apply_mmap_warmup_config(MmapWarmupConfig {
+        enable: true,
+        max_bytes: 4096,
+    });
+    let mut report = DiagnosticReport::default();
+    idx.collect(&mut report);
+    assert!(report.storage.mmap_warmup_enabled);
+    assert!(report.storage.mmap_warmup_pages >= 1);
+    assert!(matches!(
+        report.storage.mmap_warmup_cancel_reason.as_str(),
+        "" | "max_bytes"
+    ));
+    assert!(report.io.token_bucket_consume_count >= 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
 }
 
 #[test]

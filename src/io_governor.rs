@@ -265,6 +265,10 @@ impl IoGovernor {
         self.backoff_count.load(Ordering::Relaxed)
     }
 
+    pub fn current_backoff_ms(&self) -> u64 {
+        self.backoff.lock().unwrap().current_delay.as_millis() as u64
+    }
+
     pub fn last_pressure(&self) -> Option<IoPressure> {
         *self.last_pressure.lock().unwrap()
     }

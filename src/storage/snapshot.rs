@@ -57,6 +57,8 @@ pub struct RecoveryRuntimeState {
     pub last_wal_seal_id: u64,
     pub last_startup_source: String,
     pub last_recovery_mode: String,
+    #[serde(default)]
+    pub root_case_policies: Vec<crate::diagnostics::RootCasePolicyDiagnostics>,
 }
 
 impl Default for RecoveryRuntimeState {
@@ -67,6 +69,7 @@ impl Default for RecoveryRuntimeState {
             last_wal_seal_id: 0,
             last_startup_source: "unknown".to_string(),
             last_recovery_mode: "unknown".to_string(),
+            root_case_policies: Vec::new(),
         }
     }
 }

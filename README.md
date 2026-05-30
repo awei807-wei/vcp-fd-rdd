@@ -185,13 +185,13 @@ fd-rdd-query --limit 2000 "*.rs"
 
 HTTP `/search` 返回每条结果的 `path`、`type`（`file` / `dir`）、`score`、`highlights`，以及冷层校验语义：`freshness`（如 `fresh` / `stale_checked` / `changed`）、`index_tier`（如 `HotMemory` / `ColdMmap`）和 `validated`。响应不再包含 `size` 字段。当冷层/base 命中已删除时，查询会写入 tombstone 并屏蔽旧结果；当文件 mtime 或身份变化时，会把命中父目录加入 DirtyQueue，由后台补偿调度做局部补扫。
 
-v7 快照启动时会挂载为 manifest-only 冷段：常驻内存只保留 segment manifest、路径 Bloom-style filter、mtime 范围和 dirty/freshness 状态；metadata/postings 不再 hydration 到 `BaseIndexData`，查询、metadata lookup 和 parent candidates 会直接从 mmap 段按需读取并返回 `index_tier = "FrozenManifestOnly"`。新写 v7 快照会持久化完整路径 trigram posting 与 `[0,0,0]` sentinel，使 mmap 查询可安全用 posting 判空；旧 basename-only 段或缺少 sentinel 的段会回退全段精确过滤，避免目录组件命中漏查。`/memory` 会拆出 `hot_memory_entries`、`manifest_only_entries`、`cold_segment_count`、`cold_manifest_bytes`、`cold_filter_bytes` 和 `cold_mmap_bytes`，用于证明冷层是降低索引驻留而不只是降低扫描频率。
+v7 快照启动时会挂载为 manifest-only 冷段：常驻内存只保留 segment manifest、路径 Bloom-style filter、mtime 范围和 dirty/freshness 状态；metadata/postings 不再 hydration 到 `BaseIndexData`，查询、metadata lookup 和 parent candidates 会直接从 mmap 段按需读取并返回 `index_tier = "FrozenManifestOnly"`。新写 v7 快照会持久化完整路径 trigram posting 与 `[0,0,0]` sentinel，使 mmap 查询可安全用 posting 判空；旧 basename-only 段或缺少 sentinel 的段会回退全段精确过滤，避免目录组件命中漏查。`/memory` 会拆出 `hot_memory_entries`、`manifest_only_entries`、`cold_segment_count`、`cold_manifest_bytes`、`cold_filter_bytes` 和 `cold_mmap_bytes`，Linux 上还会暴露 `process_faults.minflt/majflt`，用于证明冷层是降低索引驻留而不只是降低扫描频率。默认关闭的 `[mmap_warmup]` 可在启动后对 cold v7 mmap 执行 best-effort `MADV_WILLNEED`；该路径会先消费 I/O Governor token，并在 `/health.diagnostics.storage` 暴露 `mmap_warmup_enabled`、`mmap_warmup_pages`、`mmap_warmup_elapsed_ms` 和 `mmap_warmup_cancel_reason`。
 
 DirtyQueue 是冷层补偿的统一入口，会合并来自 inotify 冷层事件、查询 stale hit、路径形态 query miss、周期冷层扫描、启动修复和 overflow recovery 的 dirty scope。队列带 debounce、优先级和重试；局部补扫优先扫描事件所在叶子目录，失败时再逐级扩大范围。
 
 Runtime Boundary State Contract 规定了远程/虚拟文件系统离线时的状态顺序：先加载 snapshot 并 attach WAL，再从 quarantine sidecar 恢复 root state 并安装 Freeze Gate，随后按 WAL 原始记录顺序回放 root state 与文件事件，最后才启动 DeltaBuffer/event pipeline 和旁车校验。WAL 支持 `OFFLINE_ROOT` / `ONLINE_ROOT` 根状态记录；quarantine sidecar 使用 `root_path + mount_id + major:minor + fs_uuid? + source + fstype + affected_prefixes` 作为物理锚点，不使用 PathId/DocId 作为持久主键。Freeze Gate 会阻止离线 root 下的 Delete/Modify/Rename 进入 DeltaBuffer，查询默认隐藏离线 root 结果；设备恢复后先写入 `ONLINE_ROOT`，再解除 freeze 并把 affected prefixes 加入局部对账队列。
 
-`/health` 保留既有 summary 字段，同时新增强类型 `diagnostics`：`system`、`storage`、`security`、`clocks`、`watchers`、`io`。`diagnostics.storage` 暴露 `quarantine_verify_pending`、`quarantine_verified_roots`、`freeze_gates`、`freeze_blocked_events`、`hardlink_group_count`、`hardlink_max_group_size`、`content_index_enabled`、`content_indexed_paths`、`content_indexed_bytes` 和 `content_index_last_elapsed_ms`；hardlink 统计来自当前可见 path/docid 的临时物理分组视图，不改变搜索主键。`diagnostics.watchers` 会汇总 full build、rebuild、fast-sync、immediate scan、dynamic watch 和 ephemeral watch 入口的 mount policy 拒绝原因，包括 `denied_mount_count`、`fstype_blocked_count`、`network_fs_ignored_count`、`one_file_system_boundary_count`、`fuse_probe_timeout_count` 和 `allowed_override_count`。FUSE/SSHFS 可疑 mount 会先进入后台 probe timeout cache；扫描线程只消费缓存状态，pending/timeout/failed 时保守拒绝，不在扫描线程直接执行可能挂起的 `readdir`。运行时探测状态只出现在 diagnostics/runtime state 中，不写回用户配置。结构化 roots 配置使用对象数组：
+`/health` 保留既有 summary 字段，同时新增强类型 `diagnostics`：`system`、`storage`、`security`、`clocks`、`watchers`、`io`。`diagnostics.storage` 暴露 `quarantine_verify_pending`、`quarantine_verified_roots`、`freeze_gates`、`freeze_blocked_events`、case policy 的 `case_policy_roots` / `case_policy_conflict_count`、hardlink 统计、content index 统计和 mmap warmup 统计；hardlink 统计来自当前可见 path/docid 的临时物理分组视图，不改变搜索主键。`diagnostics.watchers` 会汇总 full build、rebuild、fast-sync、immediate scan、dynamic watch 和 ephemeral watch 入口的 mount policy 拒绝原因，包括 `denied_mount_count`、`fstype_blocked_count`、`network_fs_ignored_count`、`one_file_system_boundary_count`、`fuse_probe_timeout_count` 和 `allowed_override_count`。`diagnostics.io` 暴露 `ioprio_class`、`ioprio_set_failed`、PSI avg10、backoff、当前 backoff、token consume 和 token limited 计数。FUSE/SSHFS 可疑 mount 会先进入后台 probe timeout cache；扫描线程只消费缓存状态，pending/timeout/failed 时保守拒绝，不在扫描线程直接执行可能挂起的 `readdir`。运行时探测状态只出现在 diagnostics/runtime state 中，不写回用户配置。结构化 roots 配置使用对象数组：
 
 ```toml
 [[roots]]
@@ -334,6 +334,8 @@ jq '{
 | `watch_enabled` | `bool` | `true` | 启用文件监听 |
 | `watch_mode` | `String` | `"recursive"` | `recursive` / `tiered` / `off` |
 | `runtime_profile` | `String` | `"default"` | `default` / `memory_light` |
+| `mmap_warmup.enable` | `bool` | `false` | cold v7 mmap 预热开关，默认关闭 |
+| `mmap_warmup.max_bytes` | `u64` | `67108864` | 单次 best-effort 预热字节上限，0 表示不限制 |
 | `content_index.enable` | `bool` | `false` | 内容索引开关，默认关闭 |
 | `content_index.max_file_size` | `u64` | `1048576` | 内容索引单文件大小上限 |
 | `content_index.include_ext` | `[String]` | `[]` | 内容索引后缀白名单 |

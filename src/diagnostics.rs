@@ -47,6 +47,18 @@ pub struct StorageDiagnostics {
     pub content_hash_skipped_count: usize,
     pub content_hash_last_skip_reason: String,
     pub content_hash_last_elapsed_ms: u64,
+    pub case_policy_roots: Vec<RootCasePolicyDiagnostics>,
+    pub mmap_warmup_enabled: bool,
+    pub mmap_warmup_pages: u64,
+    pub mmap_warmup_elapsed_ms: u64,
+    pub mmap_warmup_cancel_reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RootCasePolicyDiagnostics {
+    pub root_path: String,
+    pub detected_policy: String,
+    pub conflict_count: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -108,6 +120,8 @@ pub struct IoDiagnostics {
     pub psi_some_avg10: Option<f32>,
     pub psi_full_avg10: Option<f32>,
     pub backoff_count: u64,
+    pub current_backoff_ms: u64,
+    pub token_bucket_consume_count: u64,
     pub token_bucket_limited_count: u64,
 }
 

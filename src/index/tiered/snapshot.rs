@@ -95,6 +95,7 @@ impl TieredIndex {
                     last_wal_seal_id: wal_seal_id,
                     last_startup_source: self.recovery_status().report.snapshot_source,
                     last_recovery_mode: "snapshot".to_string(),
+                    root_case_policies: self.root_case_policy_diagnostics(),
                 };
                 if let Err(e) = write_recovery_runtime_state(store.path(), &state) {
                     tracing::warn!("recovery runtime state write failed: {}", e);

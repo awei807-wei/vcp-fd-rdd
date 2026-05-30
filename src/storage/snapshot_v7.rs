@@ -1,6 +1,6 @@
 use memmap2::Mmap;
 #[cfg(unix)]
-use memmap2::UncheckedAdvice;
+use memmap2::{Advice, UncheckedAdvice};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::{FileKey, FileMeta};
-use crate::index::base_index::{BaseIndexData, FileEntryIndex, TrigramIndex};
+use crate::index::base_index::{BaseIndexData, FileEntryIndex, MmapWarmupReport, TrigramIndex};
 use crate::index::file_entry_v2::FileEntry;
 use crate::index::parent_index::ParentIndex;
 use crate::index::path_table_v2::{PathTableBuilder, PathTableV2};
@@ -805,6 +805,51 @@ impl V7Snapshot {
                     .unchecked_advise(UncheckedAdvice::DontNeed)
             } {
                 tracing::debug!("v7 mmap MADV_DONTNEED failed: {}", e);
+            }
+        }
+    }
+
+    pub fn warmup(&self, max_bytes: u64) -> MmapWarmupReport {
+        let start = std::time::Instant::now();
+        let requested_len = if max_bytes == 0 {
+            self.mapped_len()
+        } else {
+            self.mapped_len().min(max_bytes as usize)
+        };
+
+        if requested_len == 0 {
+            return MmapWarmupReport {
+                pages: 0,
+                elapsed_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                cancel_reason: "empty".to_string(),
+            };
+        }
+
+        #[cfg(unix)]
+        {
+            let cancel_reason =
+                match self
+                    .mmap
+                    .as_ref()
+                    .advise_range(Advice::WillNeed, 0, requested_len)
+                {
+                    Ok(()) if requested_len < self.mapped_len() => "max_bytes".to_string(),
+                    Ok(()) => String::new(),
+                    Err(err) => format!("madvise_error:{}", err.kind()),
+                };
+            return MmapWarmupReport {
+                pages: ((requested_len as u64).saturating_add(4095)) / 4096,
+                elapsed_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                cancel_reason,
+            };
+        }
+
+        #[cfg(not(unix))]
+        {
+            MmapWarmupReport {
+                pages: 0,
+                elapsed_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                cancel_reason: "unsupported".to_string(),
             }
         }
     }
@@ -1639,6 +1684,31 @@ mod tests {
 
         assert_eq!(decoded.entries_by_key.len(), 1);
         assert!(decoded.tombstones.contains(42));
+    }
+
+    #[test]
+    fn v7_segment_offsets_are_aligned_and_warmup_reports_pages() {
+        let path = tmp_v7_path("alignment-warmup");
+        let (data, _) = sample_query_data();
+
+        write_v7_snapshot_atomic(&path, &data).unwrap();
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+        assert!(
+            loaded
+                .segments
+                .iter()
+                .all(|(_, range)| range.start % 8 == 0),
+            "all v7 mmap segment offsets must remain 8-byte aligned"
+        );
+
+        let report = loaded.warmup(4096);
+        assert!(report.pages >= 1);
+        assert!(matches!(
+            report.cancel_reason.as_str(),
+            "" | "max_bytes" | "unsupported"
+        ));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -82,6 +82,7 @@ async fn audit_marks_bad_stable_and_loads_good_prev() {
         last_wal_seal_id: 9,
         last_startup_source: "stable".to_string(),
         last_recovery_mode: "clean-shutdown".to_string(),
+        root_case_policies: Vec::new(),
     };
     write_recovery_runtime_state(&snap_path, &runtime).unwrap();
 
@@ -221,6 +222,7 @@ async fn load_uses_runtime_checkpoint_to_skip_old_sealed_wal() {
             last_wal_seal_id: checkpoint,
             last_startup_source: "stable".to_string(),
             last_recovery_mode: "snapshot".to_string(),
+            root_case_policies: Vec::new(),
         },
     )
     .unwrap();
@@ -262,6 +264,7 @@ async fn delete_wal_replay_hides_stable_snapshot_path() {
             last_wal_seal_id: 0,
             last_startup_source: "stable".to_string(),
             last_recovery_mode: "snapshot".to_string(),
+            root_case_policies: Vec::new(),
         },
     )
     .unwrap();
@@ -295,6 +298,7 @@ async fn startup_repair_delete_alignment_removes_missing_stable_path() {
             last_wal_seal_id: 0,
             last_startup_source: "stable".to_string(),
             last_recovery_mode: "running".to_string(),
+            root_case_policies: Vec::new(),
         },
     )
     .unwrap();
@@ -334,6 +338,7 @@ async fn startup_repair_reconciles_renamed_subtree_after_crash() {
             last_wal_seal_id: 0,
             last_startup_source: "stable".to_string(),
             last_recovery_mode: "running".to_string(),
+            root_case_policies: Vec::new(),
         },
     )
     .unwrap();

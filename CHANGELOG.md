@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mount policy 诊断收口到共享计数器：full build、rebuild、fast-sync、immediate scan、dynamic watch 和 ephemeral watch 入口统一记录拒绝原因，watcher 动态注册前会先执行 mount policy，拒绝时回滚 tiered/ephemeral reservation 并跳过 `watch()` 与后续深扫；FUSE/SSHFS 可疑 mount 通过后台 probe timeout cache 避免扫描线程直接执行可能挂起的 `readdir`。
 - 配置支持结构化 `[[roots]]`，兼容旧 `roots = []`；`detected_policy`、`conflict_count`、mount state、freeze gate 等运行时探测状态不会写回 `config.toml`。
 - case policy 探测先尝试平台 `pathconf(_PC_CASE_SENSITIVE)` 能力；`EINVAL`/unsupported 时回落到受控临时对象探测，只读、缺失或无权限 root 保持 `Unknown`，Unicode fold 回归继续覆盖 `ß -> ss` 的 byte-window trigram。
+- case policy 自动探测结果进入 runtime state 与 `/health.diagnostics.storage.case_policy_roots` / `case_policy_conflict_count`，仍不写回 `config.toml`；恢复加载会先复用上次 runtime state，再在启动路径刷新当前 root 诊断。
 - fast-sync 在使用 dirty mtime cutoff 前观察 wall/monotonic clock boundary；当 cutoff 被标记为不可信时转为全量 crawl，并在对账完成后恢复 trusted 状态，避免 wall-clock 回拨后漏掉离线新增文件。
 - 后台 full build、rebuild 和 fast-sync 会记录 idle `ioprio_set` best-effort 结果，并通过 `/health.diagnostics.io` 暴露 `ioprio_class` 与 `ioprio_set_failed`，容器或权限受限环境失败时不影响扫描。
 - I/O Governor 记录 token bucket 限流等待次数，为后续 scan loop 接入和 `/health.diagnostics.io.token_bucket_limited_count` 提供真实计数来源。
@@ -21,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - full build、rebuild 和 `IndexBuilder` 增量补扫会在文件 metadata 读取前消费共享 I/O Governor token，相关操作计数进入 `/health.diagnostics.io`。
 - fast-sync、dirty queue 即时扫描和启动修复扫描会在目录/metadata 检查前消费共享 I/O Governor token。
 - I/O Governor 会按固定操作间隔低频采样 Linux PSI，并使用配置阈值触发 backoff，避免每次 I/O 都读取 `/proc/pressure/io`。
+- 新增默认关闭的 `[mmap_warmup]` 配置：启动挂载 cold v7 mmap 后可执行 best-effort `MADV_WILLNEED`，并通过 `/health.diagnostics.storage` 暴露预热页数、耗时和取消原因。
 - `/memory` 与 metrics JSONL 暴露当前 base/L2 generation 的 Arc strong refs，便于观察查询或后台任务是否延长旧代存活。
 - `/memory` 与 metrics JSONL 暴露 dirty queue pending scopes、dirs 和估算字节，便于解释待局部对账/补扫的内存来源。
 - `/metrics` 与 metrics JSONL 暴露 exact/fuzzy 查询计数、短查询 no-trigram hint 计数，以及 fuzzy fallback 全量候选扫描的 candidates/elapsed 统计。

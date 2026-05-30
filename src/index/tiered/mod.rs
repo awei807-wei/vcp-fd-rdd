@@ -23,9 +23,9 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use crate::config::{ContentIndexConfig, RuntimeProfileSettings};
+use crate::config::{ContentIndexConfig, MmapWarmupConfig, RuntimeProfileSettings};
 use crate::core::AdaptiveScheduler;
-use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
+use crate::diagnostics::{DiagnosticReport, DiagnosticSource, RootCasePolicyDiagnostics};
 use crate::event::sync::DirtyQueue;
 use crate::fs_policy::{FsPolicyConfig, SharedMountPolicyCounters};
 use crate::index::l1_cache::L1Cache;
@@ -230,8 +230,13 @@ pub struct TieredIndex {
     pub(self) quarantine_verified_roots: AtomicU64,
     pub(self) clock_skew: Mutex<crate::clock::ClockSkewDetector>,
     pub(self) clock_reconciliation_count: AtomicU64,
+    pub(self) root_case_policies: Mutex<Vec<RootCasePolicyDiagnostics>>,
     pub(self) ioprio_idle_set: AtomicBool,
     pub(self) ioprio_set_failed: AtomicBool,
+    pub(self) mmap_warmup_enabled: AtomicBool,
+    pub(self) mmap_warmup_pages: AtomicU64,
+    pub(self) mmap_warmup_elapsed_ms: AtomicU64,
+    pub(self) mmap_warmup_cancel_reason: Mutex<String>,
     pub(self) stable_snapshot_enabled: AtomicBool,
     pub(self) mount_policy_counters: Arc<SharedMountPolicyCounters>,
     pub(self) io_governor: Arc<crate::io_governor::IoGovernor>,
@@ -376,13 +381,22 @@ impl TieredIndex {
     }
 
     pub(crate) fn observe_clock_boundary(&self) {
-        let skewed = self
-            .clock_skew
-            .lock()
-            .observe(std::time::SystemTime::now(), std::time::Instant::now());
+        self.observe_clock_boundary_at(std::time::SystemTime::now(), std::time::Instant::now());
+    }
+
+    pub(crate) fn observe_clock_boundary_at(
+        &self,
+        wall: std::time::SystemTime,
+        mono: std::time::Instant,
+    ) {
+        let skewed = self.clock_skew.lock().observe(wall, mono);
         if skewed {
             self.clock_reconciliation_count
                 .fetch_add(1, Ordering::Relaxed);
+            self.enqueue_dirty(
+                crate::event::sync::DirtyScope::All { cutoff_ns: 0 },
+                crate::event::sync::DirtyReason::StartupRepair,
+            );
         }
     }
 
@@ -459,6 +473,72 @@ impl TieredIndex {
     pub fn directory_manifest_report(&self) -> DirectoryManifestReport {
         self.directory_manifests.report()
     }
+
+    pub fn set_root_case_policy_diagnostics(&self, roots: Vec<RootCasePolicyDiagnostics>) {
+        *self.root_case_policies.lock() = roots;
+    }
+
+    pub fn root_case_policy_diagnostics(&self) -> Vec<RootCasePolicyDiagnostics> {
+        self.root_case_policies.lock().clone()
+    }
+
+    pub fn refresh_root_case_policy_diagnostics(&self) -> Vec<RootCasePolicyDiagnostics> {
+        use crate::index::case_policy::{
+            detect_root_case_policy, folded_conflict_count, CasePolicy,
+        };
+
+        let metas = self.collect_live_metas_for_diagnostics();
+        let mut roots = Vec::with_capacity(self.roots.len());
+        for root in &self.roots {
+            let detected = detect_root_case_policy(root, None);
+            let conflict_count =
+                folded_conflict_count(metas.iter().filter(|meta| meta.path.starts_with(root)).map(
+                    |meta| {
+                        meta.path
+                            .strip_prefix(root)
+                            .unwrap_or(meta.path.as_path())
+                            .as_os_str()
+                            .as_encoded_bytes()
+                    },
+                ));
+            let detected_policy = match detected.detected_policy {
+                CasePolicy::Sensitive => "Sensitive",
+                CasePolicy::Insensitive => "Insensitive",
+                CasePolicy::Auto => "Auto",
+                CasePolicy::Unknown => "Unknown",
+            }
+            .to_string();
+            roots.push(RootCasePolicyDiagnostics {
+                root_path: root.display().to_string(),
+                detected_policy,
+                conflict_count: detected.conflict_count.saturating_add(conflict_count),
+            });
+        }
+        self.set_root_case_policy_diagnostics(roots.clone());
+        roots
+    }
+
+    pub fn apply_mmap_warmup_config(&self, config: MmapWarmupConfig) {
+        self.mmap_warmup_enabled
+            .store(config.enable, Ordering::Relaxed);
+        if config.enable {
+            self.warmup_current_mmap_segments(config.max_bytes);
+        } else {
+            self.mmap_warmup_pages.store(0, Ordering::Relaxed);
+            self.mmap_warmup_elapsed_ms.store(0, Ordering::Relaxed);
+            *self.mmap_warmup_cancel_reason.lock() = "disabled".to_string();
+        }
+    }
+
+    pub(crate) fn warmup_current_mmap_segments(&self, max_bytes: u64) {
+        self.io_governor.before_io();
+        let report = self.base.load_full().warmup_cold_segments(max_bytes);
+        self.mmap_warmup_pages
+            .store(report.pages, Ordering::Relaxed);
+        self.mmap_warmup_elapsed_ms
+            .store(report.elapsed_ms, Ordering::Relaxed);
+        *self.mmap_warmup_cancel_reason.lock() = report.cancel_reason;
+    }
 }
 
 impl DiagnosticSource for TieredIndex {
@@ -513,6 +593,17 @@ impl DiagnosticSource for TieredIndex {
             self.content_hash_last_elapsed_ms.load(Ordering::Relaxed);
         report.storage.content_hash_last_skip_reason =
             self.content_hash_last_skip_reason.lock().clone();
+        report.storage.case_policy_roots = self.root_case_policy_diagnostics();
+        report.storage.case_policy_conflict_count = report
+            .storage
+            .case_policy_roots
+            .iter()
+            .map(|root| root.conflict_count)
+            .sum();
+        report.storage.mmap_warmup_enabled = self.mmap_warmup_enabled.load(Ordering::Relaxed);
+        report.storage.mmap_warmup_pages = self.mmap_warmup_pages.load(Ordering::Relaxed);
+        report.storage.mmap_warmup_elapsed_ms = self.mmap_warmup_elapsed_ms.load(Ordering::Relaxed);
+        report.storage.mmap_warmup_cancel_reason = self.mmap_warmup_cancel_reason.lock().clone();
 
         report.clocks.skew_count = clock_skew_count;
         report.clocks.last_drift_ms = clock_last_drift_ms;
@@ -538,6 +629,14 @@ impl DiagnosticSource for TieredIndex {
             .io
             .backoff_count
             .saturating_add(self.io_governor.backoff_count());
+        report.io.current_backoff_ms = report
+            .io
+            .current_backoff_ms
+            .max(self.io_governor.current_backoff_ms());
+        report.io.token_bucket_consume_count = report
+            .io
+            .token_bucket_consume_count
+            .saturating_add(self.io_governor.operations());
         report.io.token_bucket_limited_count = report
             .io
             .token_bucket_limited_count

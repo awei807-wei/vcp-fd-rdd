@@ -17,6 +17,13 @@ use crate::util::pathbuf_from_encoded_vec;
 
 const COLD_NAME_FILTER_WORDS: usize = 256;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MmapWarmupReport {
+    pub pages: u64,
+    pub elapsed_ms: u64,
+    pub cancel_reason: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColdSegmentManifest {
     pub segment_id: u64,
@@ -248,6 +255,10 @@ impl ColdSegment {
     fn filter_bytes(&self) -> u64 {
         self.filter.allocated_bytes()
     }
+
+    fn warmup_mmap(&self, max_bytes: u64) -> MmapWarmupReport {
+        self.snapshot.warmup(max_bytes)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -342,6 +353,38 @@ impl ColdSegmentStore {
             .iter()
             .map(|segment| segment.manifest.mmap_bytes)
             .sum()
+    }
+
+    fn warmup_mmap(&self, max_bytes: u64) -> MmapWarmupReport {
+        let start = std::time::Instant::now();
+        let mut pages = 0u64;
+        let mut warmed_bytes = 0u64;
+        let mut cancel_reason = String::new();
+
+        for segment in &self.segments {
+            if max_bytes > 0 && warmed_bytes >= max_bytes {
+                cancel_reason = "max_bytes".to_string();
+                break;
+            }
+            let remaining = if max_bytes == 0 {
+                0
+            } else {
+                max_bytes.saturating_sub(warmed_bytes)
+            };
+            let report = segment.warmup_mmap(remaining);
+            pages = pages.saturating_add(report.pages);
+            warmed_bytes = warmed_bytes.saturating_add(report.pages.saturating_mul(4096));
+            if !report.cancel_reason.is_empty() && report.cancel_reason != "unsupported" {
+                cancel_reason = report.cancel_reason;
+                break;
+            }
+        }
+
+        MmapWarmupReport {
+            pages,
+            elapsed_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            cancel_reason,
+        }
     }
 }
 
@@ -666,6 +709,10 @@ impl BaseIndexData {
 
     pub fn has_manifest_only_segments(&self) -> bool {
         !self.cold_segments.is_empty()
+    }
+
+    pub fn warmup_cold_segments(&self, max_bytes: u64) -> MmapWarmupReport {
+        self.cold_segments.warmup_mmap(max_bytes)
     }
 
     pub fn parent_query_metas(&self, parent_path: &str) -> Vec<BaseQueryMatch> {

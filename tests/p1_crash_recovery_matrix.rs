@@ -78,6 +78,7 @@ fn corrupt_stable_snapshot_with_clean_runtime_state_still_repairs_from_root() {
             last_wal_seal_id: 0,
             last_startup_source: "stable".to_string(),
             last_recovery_mode: "clean-shutdown".to_string(),
+            root_case_policies: Vec::new(),
         },
     )
     .unwrap();

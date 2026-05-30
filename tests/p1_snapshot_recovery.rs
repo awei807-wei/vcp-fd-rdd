@@ -151,6 +151,11 @@ fn runtime_state_roundtrips_atomically() {
         last_wal_seal_id: 7,
         last_startup_source: "stable".to_string(),
         last_recovery_mode: "clean-shutdown".to_string(),
+        root_case_policies: vec![fd_rdd::diagnostics::RootCasePolicyDiagnostics {
+            root_path: root.display().to_string(),
+            detected_policy: "Sensitive".to_string(),
+            conflict_count: 2,
+        }],
     };
     write_recovery_runtime_state(&snap_path, &expected).unwrap();
 
@@ -160,6 +165,7 @@ fn runtime_state_roundtrips_atomically() {
     assert_eq!(loaded.last_wal_seal_id, 7);
     assert_eq!(loaded.last_startup_source, "stable");
     assert_eq!(loaded.last_recovery_mode, "clean-shutdown");
+    assert_eq!(loaded.root_case_policies, expected.root_case_policies);
 
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -187,6 +187,8 @@ pub struct Config {
     pub wal_sync_batch_records: usize,
     /// Background scan I/O governor.
     pub io_governor: IoGovernorConfig,
+    /// Optional mmap warmup for cold v7 snapshots. Disabled by default.
+    pub mmap_warmup: MmapWarmupConfig,
     /// Optional lightweight content index. Disabled by default to keep filename queries unaffected.
     pub content_index: ContentIndexConfig,
     /// Filesystem boundary policy for mount traversal.
@@ -245,6 +247,24 @@ pub struct ContentIndexConfig {
     pub include_ext: Vec<String>,
     /// Extension deny-list applied after include_ext.
     pub exclude_ext: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MmapWarmupConfig {
+    /// Enable best-effort MADV_WILLNEED for cold v7 mmap snapshots.
+    pub enable: bool,
+    /// Maximum mmap bytes to warm in one pass. 0 means no limit.
+    pub max_bytes: u64,
+}
+
+impl Default for MmapWarmupConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            max_bytes: 64 * 1024 * 1024,
+        }
+    }
 }
 
 impl Default for ContentIndexConfig {
@@ -586,6 +606,7 @@ impl Default for Config {
             wal_sync_interval_ms: 1000,
             wal_sync_batch_records: 1024,
             io_governor: IoGovernorConfig::default(),
+            mmap_warmup: MmapWarmupConfig::default(),
             content_index: ContentIndexConfig::default(),
             fs_policy: FsPolicyConfig::default(),
             exclude_dirs: default_exclude_dirs(),

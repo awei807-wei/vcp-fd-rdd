@@ -73,6 +73,7 @@ async fn startup_repair_dirty_only_skips_after_clean_shutdown() {
             last_wal_seal_id: 0,
             last_startup_source: "stable".to_string(),
             last_recovery_mode: "clean-shutdown".to_string(),
+            root_case_policies: Vec::new(),
         },
     )
     .unwrap();
@@ -106,6 +107,7 @@ async fn startup_repair_dirty_only_runs_after_unclean_shutdown() {
             last_wal_seal_id: 0,
             last_startup_source: "stable".to_string(),
             last_recovery_mode: "running".to_string(),
+            root_case_policies: Vec::new(),
         },
     )
     .unwrap();

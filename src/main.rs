@@ -19,7 +19,8 @@ use fd_rdd::stats::{
     MetricsRuntimeSnapshot, MetricsSnapshot, WatchStateReport,
 };
 use fd_rdd::storage::snapshot::{
-    quarantine_sidecar_path_for, write_recovery_runtime_state, RecoveryRuntimeState, SnapshotStore,
+    quarantine_sidecar_path_for, read_recovery_runtime_state, write_recovery_runtime_state,
+    RecoveryRuntimeState, SnapshotStore,
 };
 use fd_rdd::storage::wal::WalDurability;
 use fd_rdd::util::{estimate_notify_recursive_watch_count, normalize_exclude_dirs};
@@ -253,6 +254,8 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     index.apply_runtime_profile_settings(runtime_profile.settings());
     index.apply_content_index_config(cfg.content_index.clone());
+    let root_case_policies = index.refresh_root_case_policy_diagnostics();
+    index.apply_mmap_warmup_config(cfg.mmap_warmup.clone());
     let _ = index.attach_wal(store.as_ref());
     index.set_wal_durability(wal_durability);
     index.set_stable_snapshot_enabled(cfg.stable_snapshot_enabled);
@@ -278,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
         false,
         &index.recovery_status().report.snapshot_source,
         "running",
+        root_case_policies,
     );
     index.spawn_quarantine_verify_worker(quarantine_sidecar_path_for(store.path()));
 
@@ -618,6 +622,7 @@ async fn main() -> anyhow::Result<()> {
         true,
         &index.recovery_status().report.snapshot_source,
         "clean-shutdown",
+        index.root_case_policy_diagnostics(),
     );
     info!("Goodbye.");
 
@@ -629,15 +634,16 @@ fn mark_runtime_state(
     clean_shutdown: bool,
     startup_source: &str,
     recovery_mode: &str,
+    root_case_policies: Vec<fd_rdd::diagnostics::RootCasePolicyDiagnostics>,
 ) {
-    let previous =
-        fd_rdd::storage::snapshot::read_recovery_runtime_state(snapshot_path).unwrap_or_default();
+    let previous = read_recovery_runtime_state(snapshot_path).unwrap_or_default();
     let state = RecoveryRuntimeState {
         last_clean_shutdown: clean_shutdown,
         last_snapshot_unix_secs: unix_secs(),
         last_wal_seal_id: previous.last_wal_seal_id,
         last_startup_source: startup_source.to_string(),
         last_recovery_mode: recovery_mode.to_string(),
+        root_case_policies,
     };
     if let Err(e) = write_recovery_runtime_state(snapshot_path, &state) {
         tracing::warn!("failed to write recovery runtime state: {}", e);
