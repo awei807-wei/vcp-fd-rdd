@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DeltaBuffer::clear()` 在 flush/snapshot 后会释放过大的 HashMap capacity，降低一次大批增量对账后的 allocator 高水位常驻。
 - strict tiered watcher 新增 `tiered_watch.l0_max_cost_per_root` 单根 L0 成本上限，默认 `8192`；超大 required hot dir 会进入 L1/scan 补偿并暴露为 strict coverage failure，不再在启动时整棵注册数万 inotify watch。
 - manifest-only v7 冷段挂载不再遍历全部 live path 构建路径 Bloom-style filter，改为只扫描 entries/tombstones 统计 live count 与 mtime range；`/memory.base.cold_filter_bytes` 在该模式下为 `0`，降低重启时路径 case-fold/trigram 临时分配和 mimalloc 高水位。
+- 优化 v7 cold mmap 查询路径：无 trigram hint、legacy fallback 或 `MatchAll` 触发全段扫描时，raw/decoded path table 解析会复用调用方 scratch buffer，只有真正命中的 `FileMeta` 才复制 path，降低启动后首次短查询/full-scan 查询把 80 万级冷段路径反复分配到堆上造成的 RSS 高水位。
 - 回归测试补齐恢复证据与内存观测边界：覆盖 clean shutdown skip、unclean shutdown soft repair、bad manifest、missing segment、WAL gap、bad current WAL、当前 WAL 版本兼容、`/memory` 默认 light 与显式 full，以及轻量内存快照缓存复用/失效。
+- 新增 v7 cold mmap `MatchAll` full-scan 回归测试，确认路径缓冲区复用后仍只返回 live entry，并保持 tombstone 过滤与 metadata 结果正确。
 
 ## [7.0.0] - 2026-05-30
 

@@ -238,15 +238,22 @@ impl PathTableV2 {
             [e.suffix_offset as usize..(e.suffix_offset as usize + e.suffix_len as usize)]
     }
 
-    /// Resolve a sorted position to the full path bytes.
-    fn resolve_sorted(&self, sorted_pos: usize) -> Vec<u8> {
+    /// Resolve a sorted position to the full path bytes into a caller-owned buffer.
+    fn resolve_sorted_into(&self, sorted_pos: usize, out: &mut Vec<u8>) {
         let anchor_pos = (sorted_pos / ANCHOR_INTERVAL) * ANCHOR_INTERVAL;
-        let mut path = self.get_suffix(anchor_pos).to_vec();
+        out.clear();
+        out.extend_from_slice(self.get_suffix(anchor_pos));
         for k in (anchor_pos + 1)..=sorted_pos {
             let e = &self.slots[k];
-            path.truncate(e.shared_len as usize);
-            path.extend_from_slice(self.get_suffix(k));
+            out.truncate(e.shared_len as usize);
+            out.extend_from_slice(self.get_suffix(k));
         }
+    }
+
+    /// Resolve a sorted position to the full path bytes.
+    fn resolve_sorted(&self, sorted_pos: usize) -> Vec<u8> {
+        let mut path = Vec::new();
+        self.resolve_sorted_into(sorted_pos, &mut path);
         path
     }
 
@@ -254,6 +261,13 @@ impl PathTableV2 {
     pub fn resolve(&self, idx: PathIdx) -> Option<Vec<u8>> {
         let sorted_pos = *self.idx_to_sorted.get(idx as usize)? as usize;
         Some(self.resolve_sorted(sorted_pos))
+    }
+
+    /// Resolve a `PathIdx` into a caller-owned buffer.
+    pub fn resolve_into(&self, idx: PathIdx, out: &mut Vec<u8>) -> Option<()> {
+        let sorted_pos = *self.idx_to_sorted.get(idx as usize)? as usize;
+        self.resolve_sorted_into(sorted_pos, out);
+        Some(())
     }
 
     /// Find the parent directory index for the entry at original index.

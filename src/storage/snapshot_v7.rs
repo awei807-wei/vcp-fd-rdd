@@ -463,10 +463,10 @@ enum V7PathResolver<'a> {
 }
 
 impl V7PathResolver<'_> {
-    fn resolve(&self, idx: u32) -> Option<Vec<u8>> {
+    fn resolve_into(&self, idx: u32, out: &mut Vec<u8>) -> Option<()> {
         match self {
-            Self::Raw { bytes, layout } => resolve_raw_path(bytes, *layout, idx),
-            Self::Decoded(table) => table.resolve(idx),
+            Self::Raw { bytes, layout } => resolve_raw_path_into(bytes, *layout, idx, out),
+            Self::Decoded(table) => table.resolve_into(idx, out),
         }
     }
 
@@ -478,22 +478,28 @@ impl V7PathResolver<'_> {
     }
 }
 
-fn resolve_raw_path(bytes: &[u8], layout: RawPathTableLayout, idx: u32) -> Option<Vec<u8>> {
+fn resolve_raw_path_into(
+    bytes: &[u8],
+    layout: RawPathTableLayout,
+    idx: u32,
+    out: &mut Vec<u8>,
+) -> Option<()> {
     let sorted_pos = layout.sorted_pos_for_idx(bytes, idx)?;
     let anchor_pos = (sorted_pos / RAW_PATH_TABLE_ANCHOR_INTERVAL) * RAW_PATH_TABLE_ANCHOR_INTERVAL;
     let anchor = layout.slot(bytes, anchor_pos)?;
-    let mut path = layout.suffix(bytes, anchor)?.to_vec();
+    out.clear();
+    out.extend_from_slice(layout.suffix(bytes, anchor)?);
 
     for pos in (anchor_pos + 1)..=sorted_pos {
         let slot = layout.slot(bytes, pos)?;
-        if slot.shared_len > path.len() {
+        if slot.shared_len > out.len() {
             return None;
         }
-        path.truncate(slot.shared_len);
-        path.extend_from_slice(layout.suffix(bytes, slot)?);
+        out.truncate(slot.shared_len);
+        out.extend_from_slice(layout.suffix(bytes, slot)?);
     }
 
-    Some(path)
+    Some(())
 }
 
 fn lookup_raw_path(bytes: &[u8], layout: RawPathTableLayout, target: &[u8]) -> Option<u32> {
@@ -915,6 +921,7 @@ impl V7Snapshot {
         let mut out = Vec::new();
 
         if let Some(candidates) = self.trigram_candidates(matcher)? {
+            let mut path_bytes = Vec::new();
             for docid in candidates.iter() {
                 if tombstones.contains(docid) {
                     continue;
@@ -922,9 +929,12 @@ impl V7Snapshot {
                 let Some(entry) = file_entry_at(entries, self.version, docid) else {
                     continue;
                 };
-                let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
+                if resolver
+                    .resolve_into(entry.path_index(), &mut path_bytes)
+                    .is_none()
+                {
                     continue;
-                };
+                }
                 let path_str = std::str::from_utf8(&path_bytes)
                     .map(std::borrow::Cow::Borrowed)
                     .unwrap_or_else(|_| String::from_utf8_lossy(&path_bytes));
@@ -936,6 +946,7 @@ impl V7Snapshot {
         }
 
         let count = entry_count_from_segment(entries, self.version).unwrap_or(0);
+        let mut path_bytes = Vec::new();
         for docid in 0..count {
             let docid = docid as u32;
             if tombstones.contains(docid) {
@@ -944,9 +955,12 @@ impl V7Snapshot {
             let Some(entry) = file_entry_at(entries, self.version, docid) else {
                 continue;
             };
-            let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
+            if resolver
+                .resolve_into(entry.path_index(), &mut path_bytes)
+                .is_none()
+            {
                 continue;
-            };
+            }
             let path_str = std::str::from_utf8(&path_bytes)
                 .map(std::borrow::Cow::Borrowed)
                 .unwrap_or_else(|_| String::from_utf8_lossy(&path_bytes));
@@ -967,6 +981,7 @@ impl V7Snapshot {
         let mut out = Vec::new();
 
         if let Some(candidates) = self.trigram_candidates(matcher)? {
+            let mut path_bytes = Vec::new();
             for docid in candidates.iter() {
                 if tombstones.contains(docid) {
                     continue;
@@ -974,9 +989,12 @@ impl V7Snapshot {
                 let Some(entry) = file_entry_at(entries, self.version, docid) else {
                     continue;
                 };
-                let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
+                if resolver
+                    .resolve_into(entry.path_index(), &mut path_bytes)
+                    .is_none()
+                {
                     continue;
-                };
+                }
                 let matched = {
                     let path_str = std::str::from_utf8(&path_bytes)
                         .map(std::borrow::Cow::Borrowed)
@@ -984,13 +1002,14 @@ impl V7Snapshot {
                     matcher.matches(&path_str)
                 };
                 if matched {
-                    out.push(entry_to_meta(entry, path_bytes));
+                    out.push(entry_to_meta(entry, path_bytes.clone()));
                 }
             }
             return Ok(out);
         }
 
         let count = entry_count_from_segment(entries, self.version).unwrap_or(0);
+        let mut path_bytes = Vec::new();
         for docid in 0..count {
             let docid = docid as u32;
             if tombstones.contains(docid) {
@@ -999,9 +1018,12 @@ impl V7Snapshot {
             let Some(entry) = file_entry_at(entries, self.version, docid) else {
                 continue;
             };
-            let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
+            if resolver
+                .resolve_into(entry.path_index(), &mut path_bytes)
+                .is_none()
+            {
                 continue;
-            };
+            }
             let matched = {
                 let path_str = std::str::from_utf8(&path_bytes)
                     .map(std::borrow::Cow::Borrowed)
@@ -1009,7 +1031,7 @@ impl V7Snapshot {
                 matcher.matches(&path_str)
             };
             if matched {
-                out.push(entry_to_meta(entry, path_bytes));
+                out.push(entry_to_meta(entry, path_bytes.clone()));
             }
         }
 
@@ -1023,6 +1045,7 @@ impl V7Snapshot {
         let resolver = self.path_resolver()?;
         let tombstones = self.tombstones()?;
         let count = entry_count_from_segment(entries, self.version).unwrap_or(0);
+        let mut path_bytes = Vec::new();
 
         for docid in 0..count {
             let docid = docid as u32;
@@ -1035,9 +1058,12 @@ impl V7Snapshot {
             if entry.file_key() != key {
                 continue;
             }
-            let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
+            if resolver
+                .resolve_into(entry.path_index(), &mut path_bytes)
+                .is_none()
+            {
                 continue;
-            };
+            }
             return Ok(Some(entry_to_meta(entry, path_bytes)));
         }
 
@@ -1054,6 +1080,7 @@ impl V7Snapshot {
         };
         let tombstones = self.tombstones()?;
         let count = entry_count_from_segment(entries, self.version).unwrap_or(0);
+        let mut path_bytes = Vec::new();
 
         for docid in 0..count {
             let docid = docid as u32;
@@ -1063,9 +1090,12 @@ impl V7Snapshot {
             let Some(entry) = file_entry_at(entries, self.version, docid) else {
                 continue;
             };
-            let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
+            if resolver
+                .resolve_into(entry.path_index(), &mut path_bytes)
+                .is_none()
+            {
                 continue;
-            };
+            }
             f(&entry, &path_bytes);
         }
 
@@ -1157,6 +1187,7 @@ impl V7Snapshot {
         };
         let tombstones = self.tombstones()?;
         let mut out = Vec::with_capacity(docids.len() as usize);
+        let mut path_bytes = Vec::new();
         for docid in docids.iter() {
             if tombstones.contains(docid) {
                 continue;
@@ -1164,10 +1195,13 @@ impl V7Snapshot {
             let Some(entry) = file_entry_at(entries, self.version, docid) else {
                 continue;
             };
-            let Some(path_bytes) = resolver.resolve(entry.path_index()) else {
+            if resolver
+                .resolve_into(entry.path_index(), &mut path_bytes)
+                .is_none()
+            {
                 continue;
-            };
-            out.push(entry_to_meta(entry, path_bytes));
+            }
+            out.push(entry_to_meta(entry, path_bytes.clone()));
         }
         Ok(out)
     }
@@ -1621,7 +1655,7 @@ fn file_modified_unix_ns(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::core::{FileKey, FileKind};
-    use crate::query::ExactMatcher;
+    use crate::query::{ExactMatcher, MatchAllMatcher};
     use std::path::PathBuf;
 
     fn tmp_v7_path(tag: &str) -> PathBuf {
@@ -1849,6 +1883,23 @@ mod tests {
         let missing = ExactMatcher::new("skip", false);
         assert!(loaded.query_keys(&missing).unwrap().is_empty());
         assert!(loaded.query_metas(&missing).unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v7_query_full_scan_reuses_path_buffer_for_match_all() {
+        let path = tmp_v7_path("match-all-full-scan");
+        let (data, key) = sample_query_data();
+        write_v7_snapshot_atomic(&path, &data).unwrap();
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+
+        let matcher = MatchAllMatcher;
+        assert_eq!(loaded.query_keys(&matcher).unwrap(), vec![key]);
+        let metas = loaded.query_metas(&matcher).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].file_key, key);
+        assert_eq!(metas[0].path, PathBuf::from("/tmp/cold/needle.txt"));
 
         let _ = std::fs::remove_file(path);
     }
