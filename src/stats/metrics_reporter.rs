@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
 
-use crate::stats::{EventPipelineStats, MemoryReport, StatsReport, WatchStateReport};
+use crate::index::tiered::RecoveryReasonCount;
+use crate::stats::{
+    EventPipelineStats, MemoryReport, MemorySampleDepth, StatsReport, WatchStateReport,
+};
 
 /// 定期采集统一诊断指标并输出到按小时划分的 JSON Lines 文件。
 pub struct MetricsReporter {
@@ -69,6 +72,10 @@ pub struct MetricsRuntimeSnapshot {
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct MetricsMemorySnapshot {
+    pub sample_depth: MemorySampleDepth,
+    pub cache_hit: bool,
+    pub cached_full_age_ms: u64,
+    pub full_sample_elapsed_ms: u64,
     pub process_rss_bytes: u64,
     pub process_swap_bytes: u64,
     pub process_rss_plus_swap_bytes: u64,
@@ -105,6 +112,7 @@ pub struct MetricsHealthSnapshot {
     pub tiered_degraded: bool,
     pub tiered_unwatched_dirs: usize,
     pub max_watch_dirs: usize,
+    pub l0_max_cost_per_root: usize,
     pub system_max_user_watches: usize,
     pub required_watch_cost: u64,
     pub watch_budget_shortfall: u64,
@@ -125,10 +133,18 @@ pub struct MetricsHealthSnapshot {
     pub wal_durability: String,
     pub recovery_requires_repair: bool,
     pub recovery_requires_rebuild: bool,
+    pub recovery_soft_repair_needed: bool,
+    pub recovery_hard_rebuild_needed: bool,
+    pub recovery_soft_reasons: Vec<String>,
+    pub recovery_hard_reasons: Vec<String>,
+    pub recovery_reason_counts: Vec<RecoveryReasonCount>,
     pub startup_repair_ran: bool,
     pub startup_repair_escalated: bool,
     pub startup_repair_scanned: usize,
     pub startup_repair_changed: usize,
+    pub startup_repair_budget_ms: u64,
+    pub startup_repair_budget_exhausted: bool,
+    pub startup_repair_escalation_reason: String,
     pub last_clean_shutdown: bool,
 }
 
@@ -199,6 +215,10 @@ impl MetricsRuntimeSnapshot {
 impl MetricsMemorySnapshot {
     pub fn from_report(report: &MemoryReport) -> Self {
         Self {
+            sample_depth: report.sample_depth,
+            cache_hit: report.cache_hit,
+            cached_full_age_ms: report.cached_full_age_ms,
+            full_sample_elapsed_ms: report.full_sample_elapsed_ms,
             process_rss_bytes: report.process_rss_bytes,
             process_swap_bytes: report.process_swap_bytes,
             process_rss_plus_swap_bytes: report
@@ -288,9 +308,10 @@ impl MetricsDiagnostics {
         }
         if health.strict_coverage_failure {
             issues.push(format!(
-                "strict_coverage_incomplete: required_watch_cost={} max_watch_dirs={} shortfall={} uncovered={:?}",
+                "strict_coverage_incomplete: required_watch_cost={} max_watch_dirs={} l0_max_cost_per_root={} shortfall={} uncovered={:?}",
                 health.required_watch_cost,
                 health.max_watch_dirs,
+                health.l0_max_cost_per_root,
                 health.watch_budget_shortfall,
                 health.strict_uncovered_dirs
             ));

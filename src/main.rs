@@ -19,8 +19,8 @@ use fd_rdd::stats::{
     MetricsRuntimeSnapshot, MetricsSnapshot, WatchStateReport,
 };
 use fd_rdd::storage::snapshot::{
-    quarantine_sidecar_path_for, read_recovery_runtime_state, write_recovery_runtime_state,
-    RecoveryRuntimeState, SnapshotStore,
+    quarantine_sidecar_path_for, read_recovery_runtime_state, stable_prev_v7_path_for,
+    stable_v7_path_for, write_recovery_runtime_state, RecoveryRuntimeState, SnapshotStore,
 };
 use fd_rdd::storage::wal::WalDurability;
 use fd_rdd::util::{estimate_notify_recursive_watch_count, normalize_exclude_dirs};
@@ -237,7 +237,6 @@ async fn main() -> anyhow::Result<()> {
 
     // 2) 快照存储
     let snapshot_path = args.snapshot_path.unwrap_or_else(default_snapshot_path);
-    let startup_reconcile_cutoff_ns = modified_unix_ns(&snapshot_path.with_extension("v7"));
     let store = Arc::new(SnapshotStore::new(snapshot_path));
 
     // 3) 从快照加载或空索引启动
@@ -300,6 +299,10 @@ async fn main() -> anyhow::Result<()> {
     let mut startup_ignore_paths = args.ignore_paths.clone();
     startup_ignore_paths.push(store.path().to_path_buf());
     startup_ignore_paths.push(store.derived_lsm_dir_path());
+    let startup_reconcile_cutoff_ns = startup_reconcile_cutoff_ns_for_source(
+        store.path(),
+        &index.recovery_status().report.snapshot_source,
+    );
     if watch_enabled && index.file_count() > 0 && startup_reconcile_cutoff_ns > 0 {
         index.enqueue_dirty(
             DirtyScope::All {
@@ -315,14 +318,17 @@ async fn main() -> anyhow::Result<()> {
         &exclude_dirs,
     );
     let tiered_runtime = if effective_watch_mode == WatchMode::Tiered {
-        Some(Arc::new(TieredWatchRuntime::new_with_ephemeral(
-            watch_plan.l0_roots.clone(),
-            watch_plan.l1_roots.clone(),
-            cfg.tiered_watch.max_watch_dirs.max(1),
-            cfg.tiered_watch.scan_items_per_sec,
-            cfg.tiered_watch.scan_ms_per_tick,
-            cfg.tiered_watch.ephemeral_watch_budget,
-        )))
+        Some(Arc::new(
+            TieredWatchRuntime::new_with_l0_max_cost_and_ephemeral(
+                watch_plan.l0_roots.clone(),
+                watch_plan.l1_roots.clone(),
+                cfg.tiered_watch.max_watch_dirs.max(1),
+                effective_l0_max_cost_per_root(&cfg.tiered_watch),
+                cfg.tiered_watch.scan_items_per_sec,
+                cfg.tiered_watch.scan_ms_per_tick,
+                cfg.tiered_watch.ephemeral_watch_budget,
+            ),
+        ))
     } else {
         None
     };
@@ -419,17 +425,26 @@ async fn main() -> anyhow::Result<()> {
                 wal_sync_batch_records: index.wal_durability().sync_batch_records(),
                 recovery_requires_repair: recovery.report.requires_repair,
                 recovery_requires_rebuild: recovery.report.requires_rebuild,
+                recovery_soft_repair_needed: recovery.report.soft_repair_needed,
+                recovery_hard_rebuild_needed: recovery.report.hard_rebuild_needed,
                 recovery_reasons: recovery.report.reasons,
+                recovery_soft_reasons: recovery.report.soft_reasons,
+                recovery_hard_reasons: recovery.report.hard_reasons,
+                recovery_reason_counts: recovery.report.repair_reason_counts,
                 recovery_audit: recovery.report.audit,
                 startup_repair_ran: recovery.repair.ran,
                 startup_repair_escalated: recovery.repair.escalated,
                 startup_repair_scanned: recovery.repair.scanned,
                 startup_repair_changed: recovery.repair.changed,
+                startup_repair_budget_ms: recovery.repair.budget_ms,
+                startup_repair_budget_exhausted: recovery.repair.budget_exhausted,
+                startup_repair_escalation_reason: recovery.repair.escalation_reason,
                 last_clean_shutdown: recovery.report.previous_clean_shutdown,
                 l1_dirs: watch_state.l1_dirs,
                 l2_dirs: watch_state.l2_dirs,
                 l3_dirs: watch_state.l3_dirs,
                 max_watch_dirs: watch_state.max_watch_dirs,
+                l0_max_cost_per_root: watch_state.l0_max_cost_per_root,
                 watch_budget_utilization_pct: watch_state.watch_budget_utilization_pct,
                 promotion_budget_blocked: watch_state.promotion_budget_blocked,
                 watch_profile: watch_state.watch_profile,
@@ -558,7 +573,7 @@ async fn main() -> anyhow::Result<()> {
                 let pipeline = stats_provider();
                 let runtime =
                     MetricsRuntimeSnapshot::from_reports(index.stats_report(), pipeline.clone());
-                let memory_report = index.memory_report(pipeline);
+                let memory_report = index.memory_report_light(pipeline);
                 let memory = MetricsMemorySnapshot::from_report(&memory_report);
                 let health = health_provider();
                 let health = MetricsHealthSnapshot {
@@ -571,6 +586,7 @@ async fn main() -> anyhow::Result<()> {
                     tiered_degraded: health.tiered_degraded,
                     tiered_unwatched_dirs: health.tiered_unwatched_dirs,
                     max_watch_dirs: health.max_watch_dirs,
+                    l0_max_cost_per_root: health.l0_max_cost_per_root,
                     system_max_user_watches: health.system_max_user_watches,
                     required_watch_cost: health.required_watch_cost,
                     watch_budget_shortfall: health.watch_budget_shortfall,
@@ -591,10 +607,18 @@ async fn main() -> anyhow::Result<()> {
                     wal_durability: health.wal_durability,
                     recovery_requires_repair: health.recovery_requires_repair,
                     recovery_requires_rebuild: health.recovery_requires_rebuild,
+                    recovery_soft_repair_needed: health.recovery_soft_repair_needed,
+                    recovery_hard_rebuild_needed: health.recovery_hard_rebuild_needed,
+                    recovery_soft_reasons: health.recovery_soft_reasons,
+                    recovery_hard_reasons: health.recovery_hard_reasons,
+                    recovery_reason_counts: health.recovery_reason_counts,
                     startup_repair_ran: health.startup_repair_ran,
                     startup_repair_escalated: health.startup_repair_escalated,
                     startup_repair_scanned: health.startup_repair_scanned,
                     startup_repair_changed: health.startup_repair_changed,
+                    startup_repair_budget_ms: health.startup_repair_budget_ms,
+                    startup_repair_budget_exhausted: health.startup_repair_budget_exhausted,
+                    startup_repair_escalation_reason: health.startup_repair_escalation_reason,
                     last_clean_shutdown: health.last_clean_shutdown,
                 };
                 MetricsSnapshot::new(watch, runtime, memory, health)
@@ -652,6 +676,7 @@ fn mark_runtime_state(
 
 fn apply_watch_plan_static_fields(report: &mut WatchStateReport, plan: &WatchStateReport) {
     report.watch_profile = plan.watch_profile.clone();
+    report.l0_max_cost_per_root = plan.l0_max_cost_per_root;
     report.system_max_user_watches = plan.system_max_user_watches;
     report.required_watch_cost = plan.required_watch_cost;
     report.watch_budget_shortfall = plan.watch_budget_shortfall;
@@ -766,6 +791,16 @@ fn modified_unix_ns(path: &std::path::Path) -> u64 {
         .saturating_add(duration.subsec_nanos() as u64)
 }
 
+fn startup_reconcile_cutoff_ns_for_source(snapshot_path: &std::path::Path, source: &str) -> u64 {
+    let path = match source {
+        "stable" => stable_v7_path_for(snapshot_path),
+        "stable-prev" => stable_prev_v7_path_for(snapshot_path),
+        "legacy-v7" => snapshot_path.with_extension("v7"),
+        _ => return 0,
+    };
+    modified_unix_ns(path.as_path())
+}
+
 fn build_watch_plan(
     mode: WatchMode,
     roots: &[PathBuf],
@@ -834,15 +869,19 @@ fn build_tiered_watch_plan(
     let mut rejected = 0usize;
     let mut estimated_total = 0usize;
     let max_watch_dirs = tiered.max_watch_dirs.max(1);
+    let l0_max_cost_per_root = effective_l0_max_cost_per_root(tiered);
+    let estimate_cap = max_watch_dirs.min(l0_max_cost_per_root);
     let system_max_user_watches = check_inotify_limit(0).unwrap_or(0) as usize;
     let mut strict_uncovered_dirs = Vec::new();
     let mut required_watch_cost = 0u64;
 
     let required_set = required.iter().collect::<std::collections::HashSet<_>>();
     for candidate in required.iter() {
-        let estimated = estimate_notify_recursive_watch_count(candidate, max_watch_dirs);
+        let estimated = estimate_notify_recursive_watch_count(candidate, estimate_cap);
         required_watch_cost = required_watch_cost.saturating_add(estimated as u64);
-        if estimated_total.saturating_add(estimated) <= max_watch_dirs {
+        if estimated <= l0_max_cost_per_root
+            && estimated_total.saturating_add(estimated) <= max_watch_dirs
+        {
             estimated_total = estimated_total.saturating_add(estimated);
             admitted.push((candidate.clone(), estimated));
         } else {
@@ -855,8 +894,10 @@ fn build_tiered_watch_plan(
         if required_set.contains(candidate) {
             continue;
         }
-        let estimated = estimate_notify_recursive_watch_count(candidate, max_watch_dirs);
-        if estimated_total.saturating_add(estimated) <= max_watch_dirs {
+        let estimated = estimate_notify_recursive_watch_count(candidate, estimate_cap);
+        if estimated <= l0_max_cost_per_root
+            && estimated_total.saturating_add(estimated) <= max_watch_dirs
+        {
             estimated_total = estimated_total.saturating_add(estimated);
             admitted.push((candidate.clone(), estimated));
         } else {
@@ -873,6 +914,12 @@ fn build_tiered_watch_plan(
         "tiered mode admits only hot directory candidates into L0".to_string(),
         "L1 rejected candidates are scanned by a bounded warm-scan loop".to_string(),
     ];
+    if l0_max_cost_per_root < max_watch_dirs {
+        notes.push(format!(
+            "single L0 root recursive watch cost is capped at {}",
+            l0_max_cost_per_root
+        ));
+    }
     if admitted.is_empty() {
         notes.push("no L0 directories admitted under current budget".to_string());
     }
@@ -920,6 +967,7 @@ fn build_tiered_watch_plan(
             l3_dirs: 0,
             watched_dirs_estimated: estimated_total,
             max_watch_dirs,
+            l0_max_cost_per_root,
             system_max_user_watches,
             required_watch_cost,
             watch_budget_shortfall,
@@ -943,6 +991,15 @@ fn build_tiered_watch_plan(
             notes,
             ..WatchStateReport::default()
         },
+    }
+}
+
+fn effective_l0_max_cost_per_root(tiered: &fd_rdd::config::TieredWatchConfig) -> usize {
+    let max_watch_dirs = tiered.max_watch_dirs.max(1);
+    if tiered.l0_max_cost_per_root == 0 {
+        max_watch_dirs
+    } else {
+        tiered.l0_max_cost_per_root.clamp(1, max_watch_dirs)
     }
 }
 
@@ -1110,7 +1167,7 @@ fn spawn_dirty_queue_loop(
                             }
                             let watch_cost = estimate_notify_recursive_watch_count(
                                 project_root.as_path(),
-                                tiered.max_watch_dirs.max(1),
+                                effective_l0_max_cost_per_root(&tiered).max(1),
                             );
                             let decision = runtime.register_project_marker_candidate(
                                 project_root.clone(),
@@ -1441,6 +1498,45 @@ mod tests {
         assert!(plan.state.strict_coverage_failure);
         assert_eq!(plan.state.strict_uncovered_dirs.len(), 1);
         assert!(plan.state.strict_uncovered_dirs[0].contains("Downloads"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strict_watch_plan_rejects_required_dir_over_l0_per_root_cap_even_when_total_budget_allows() {
+        let root = temp_root("strict-per-root-cap");
+        let documents = root.join("Documents");
+        let desktop = root.join("Desktop");
+        std::fs::create_dir_all(documents.join("a/b/c/d")).unwrap();
+        std::fs::create_dir_all(desktop.join("project")).unwrap();
+
+        let mut cfg = fd_rdd::config::TieredWatchConfig {
+            profile: TieredWatchProfile::Strict,
+            max_watch_dirs: 64,
+            l0_max_cost_per_root: 3,
+            ..fd_rdd::config::TieredWatchConfig::default()
+        };
+        cfg.hot_dirs.clear();
+        cfg.strict_required_hot_dirs = vec![documents.clone(), desktop.clone()];
+
+        let plan = build_tiered_watch_plan(std::slice::from_ref(&root), &cfg, &[]);
+
+        assert_eq!(plan.state.l0_max_cost_per_root, 3);
+        assert_eq!(plan.state.l0_dirs, 1);
+        assert_eq!(plan.state.l1_dirs, 1);
+        assert_eq!(plan.state.watched_dirs_estimated, 2);
+        assert_eq!(plan.state.kernel_watch_cost, 2);
+        assert_eq!(plan.state.skipped_watch_cost, 4);
+        assert_eq!(plan.state.watch_budget_shortfall, 0);
+        assert!(!plan.state.strict_coverage_ok);
+        assert!(plan.state.strict_coverage_failure);
+        assert_eq!(plan.state.strict_uncovered_dirs.len(), 1);
+        assert!(plan.state.strict_uncovered_dirs[0].contains("Documents"));
+        assert_eq!(plan.watch_roots, Some(vec![desktop.clone()]));
+        assert!(plan
+            .l1_roots
+            .iter()
+            .any(|(path, cost)| path == &documents && *cost == 4));
 
         let _ = std::fs::remove_dir_all(root);
     }

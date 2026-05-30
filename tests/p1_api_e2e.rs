@@ -73,6 +73,11 @@ fn http_api_manual_scan_and_observability_endpoints_work() {
     let memory = get_json(port, "/memory");
     assert!(memory["process_rss_bytes"].as_u64().unwrap_or(0) > 0);
     assert!(memory.get("process_swap_bytes").is_some());
+    assert_eq!(memory["sample_depth"], "light");
+
+    let memory_full = get_json(port, "/memory?full=true");
+    assert_eq!(memory_full["sample_depth"], "full");
+    assert_eq!(memory_full["cache_hit"], false);
 
     let watch = get_json(port, "/watch-state");
     assert_eq!(watch["mode"], "off");

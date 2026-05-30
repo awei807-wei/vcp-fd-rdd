@@ -8,8 +8,8 @@ use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::storage::checksum::crc32c_checksum;
 use crate::storage::quarantine::{MountIdentity, RootStateKind, RootStateRecord};
 
-const WAL_MAGIC: u32 = 0x314C_4157; // "WAL1"
-const WAL_VERSION: u32 = 4;
+pub(crate) const WAL_MAGIC: u32 = 0x314C_4157; // "WAL1"
+pub(crate) const WAL_VERSION: u32 = 4;
 
 // Safety guard: WAL records are expected to be small (path + metadata). Treat any huge length as
 // corruption to avoid memory DoS via `vec![0u8; len]`.

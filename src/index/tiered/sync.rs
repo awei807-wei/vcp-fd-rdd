@@ -25,6 +25,12 @@ pub(super) enum RebuildAdmission {
     Coalesced,
 }
 
+#[derive(Debug)]
+struct BudgetedScanOutcome {
+    outcome: ScanOutcome,
+    budget_exhausted: bool,
+}
+
 fn visit_dirs_since(
     roots: &[PathBuf],
     ignore_prefixes: &[PathBuf],
@@ -259,6 +265,7 @@ impl TieredIndex {
                     self.l2.store(Arc::new(PersistentIndex::new_with_roots(
                         self.roots.clone(),
                     )));
+                    self.invalidate_memory_report_cache();
                     if !self.flush_requested.swap(true, Ordering::AcqRel) {
                         self.flush_notify.notify_one();
                     }
@@ -647,12 +654,17 @@ impl TieredIndex {
                 let Some(file_key) = FileKey::from_path_and_metadata(&path, &meta) else {
                     continue;
                 };
+                let mtime = meta.modified().ok();
+                let mtime_ns = mtime_to_ns(mtime);
+                if self.path_freshness(&path, file_key, mtime_ns) == PathFreshness::Unchanged {
+                    continue;
+                }
                 seq = seq.wrapping_add(1);
                 upsert_metas.push(FileMeta {
                     file_key,
                     path: path.clone(),
                     size: meta.len(),
-                    mtime: meta.modified().ok(),
+                    mtime,
                     ctime: meta.created().ok(),
                     atime: meta.accessed().ok(),
                     kind: FileKind::from_metadata(&meta),
@@ -745,12 +757,31 @@ impl TieredIndex {
         max_entries_per_dir: usize,
         project_markers: &[String],
     ) -> ScanOutcome {
+        self.scan_dirs_with_depth_and_project_markers_budgeted(
+            dirs,
+            max_depth,
+            max_entries_per_dir,
+            project_markers,
+            None,
+        )
+        .outcome
+    }
+
+    fn scan_dirs_with_depth_and_project_markers_budgeted(
+        &self,
+        dirs: &[&PathBuf],
+        max_depth: Option<usize>,
+        max_entries_per_dir: usize,
+        project_markers: &[String],
+        budget_ms: Option<u64>,
+    ) -> BudgetedScanOutcome {
         let start = Instant::now();
 
         let mut upsert_events: Vec<EventRecord> = Vec::new();
         let mut upsert_metas: Vec<FileMeta> = Vec::new();
         let mut scanned: usize = 0;
         let mut changed: usize = 0;
+        let mut budget_exhausted = false;
         let mut seq: u64 = 0;
         let io_governor = self.io_governor.as_ref();
 
@@ -798,6 +829,13 @@ impl TieredIndex {
                         .unwrap_or(true)
             });
             for ent in builder.build() {
+                if budget_ms
+                    .filter(|budget| *budget > 0)
+                    .is_some_and(|budget| start.elapsed().as_millis() as u64 >= budget)
+                {
+                    budget_exhausted = true;
+                    break;
+                }
                 let ent = match ent {
                     Ok(e) => e,
                     Err(err) => {
@@ -870,6 +908,9 @@ impl TieredIndex {
                 });
                 scanned += 1;
             }
+            if budget_exhausted {
+                break;
+            }
         }
 
         if !upsert_events.is_empty() {
@@ -881,11 +922,14 @@ impl TieredIndex {
         project_roots.sort();
         project_roots.dedup();
 
-        ScanOutcome {
-            scanned,
-            changed,
-            elapsed_ms,
-            project_roots,
+        BudgetedScanOutcome {
+            outcome: ScanOutcome {
+                scanned,
+                changed,
+                elapsed_ms,
+                project_roots,
+            },
+            budget_exhausted,
         }
     }
 
@@ -1075,7 +1119,7 @@ impl TieredIndex {
         enabled: bool,
         mode: &str,
         max_dirs: usize,
-        _budget_ms: u64,
+        budget_ms: u64,
         force_rebuild_ratio: f32,
     ) -> StartupRepairStats {
         let report = self.recovery_status().report;
@@ -1103,21 +1147,42 @@ impl TieredIndex {
             .cloned()
             .collect::<Vec<_>>();
         let dirs = roots.iter().collect::<Vec<_>>();
-        let outcome = self.scan_dirs_with_depth(&dirs, None, 50_000);
+        let budget = (budget_ms > 0).then_some(budget_ms);
+        let budgeted = self.scan_dirs_with_depth_and_project_markers_budgeted(
+            &dirs,
+            None,
+            50_000,
+            &[],
+            budget,
+        );
+        let outcome = budgeted.outcome;
         let delete_count = self.align_missing_base_paths_for_roots(&roots);
         let changed_ratio = if outcome.scanned == 0 {
             0.0
         } else {
             outcome.changed as f32 / outcome.scanned as f32
         };
+        let changed = outcome.changed.saturating_add(delete_count);
+        let empty_index = self.file_count() == 0 && !report.soft_repair_needed;
+        let force_ratio_exceeded = changed_ratio > force_rebuild_ratio;
+        let (escalated, escalation_reason) = if report.hard_rebuild_needed {
+            (true, "hard_rebuild_evidence")
+        } else if empty_index {
+            (true, "empty_index")
+        } else if force_ratio_exceeded {
+            (true, "force_rebuild_ratio")
+        } else {
+            (false, "")
+        };
         let stats = StartupRepairStats {
             ran: true,
-            escalated: report.requires_rebuild
-                || self.file_count() == 0
-                || changed_ratio > force_rebuild_ratio,
+            escalated,
             scanned: outcome.scanned,
-            changed: outcome.changed.saturating_add(delete_count),
+            changed,
             elapsed_ms: outcome.elapsed_ms,
+            budget_ms,
+            budget_exhausted: budgeted.budget_exhausted,
+            escalation_reason: escalation_reason.to_string(),
         };
         self.set_startup_repair_stats(stats.clone());
         stats

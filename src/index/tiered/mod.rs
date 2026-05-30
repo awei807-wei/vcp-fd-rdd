@@ -17,7 +17,7 @@ mod tests;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -61,9 +61,20 @@ pub struct StartupRecoveryReport {
     pub wal_checkpoint_used: u64,
     pub requires_repair: bool,
     pub requires_rebuild: bool,
+    pub soft_repair_needed: bool,
+    pub hard_rebuild_needed: bool,
     pub previous_clean_shutdown: bool,
     pub reasons: Vec<String>,
+    pub soft_reasons: Vec<String>,
+    pub hard_reasons: Vec<String>,
+    pub repair_reason_counts: Vec<RecoveryReasonCount>,
     pub audit: RecoveryAuditReport,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RecoveryReasonCount {
+    pub reason: String,
+    pub count: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -73,6 +84,9 @@ pub struct StartupRepairStats {
     pub scanned: usize,
     pub changed: usize,
     pub elapsed_ms: u64,
+    pub budget_ms: u64,
+    pub budget_exhausted: bool,
+    pub escalation_reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -254,6 +268,13 @@ pub struct TieredIndex {
     pub(self) content_hash_last_elapsed_ms: AtomicU64,
     pub(self) content_hash_last_skip_reason: Mutex<String>,
     pub(self) directory_manifests: DirectoryManifestStore,
+    pub(self) memory_report_cache: Mutex<MemoryReportCache>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(self) struct MemoryReportCache {
+    pub(self) report: Option<crate::stats::MemoryReport>,
+    pub(self) sampled_at: Option<Instant>,
 }
 
 impl TieredIndex {

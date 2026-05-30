@@ -1072,6 +1072,34 @@ impl V7Snapshot {
         Ok(())
     }
 
+    pub fn live_entry_summary(&self) -> anyhow::Result<(usize, i64, i64)> {
+        let Some(entries) = self.segment(V7SegKind::EntriesByKey) else {
+            return Ok((0, i64::MAX, i64::MIN));
+        };
+        let tombstones = self.tombstones()?;
+        let count = entry_count_from_segment(entries, self.version).unwrap_or(0);
+        let mut live_count = 0usize;
+        let mut min_mtime = i64::MAX;
+        let mut max_mtime = i64::MIN;
+
+        for docid in 0..count {
+            let docid = docid as u32;
+            if tombstones.contains(docid) {
+                continue;
+            }
+            let Some(entry) = file_entry_at(entries, self.version, docid) else {
+                continue;
+            };
+            live_count = live_count.saturating_add(1);
+            if entry.mtime_ns >= 0 {
+                min_mtime = min_mtime.min(entry.mtime_ns);
+                max_mtime = max_mtime.max(entry.mtime_ns);
+            }
+        }
+
+        Ok((live_count, min_mtime, max_mtime))
+    }
+
     pub fn for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) -> anyhow::Result<()> {
         self.for_each_live_entry_path(|entry, path_bytes| {
             f(entry_to_meta(*entry, path_bytes.to_vec()));

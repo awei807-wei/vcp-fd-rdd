@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::{FileKey, FileMeta};
-use crate::index::case_policy::{folded_lookup_bytes_lossy, unicode_case_fold_lookup};
+use crate::index::case_policy::unicode_case_fold_lookup;
 pub use crate::index::file_entry_v2::{FileEntry, FileEntryIndex};
 use crate::index::parent_index::ParentIndex;
 use crate::index::path_table_v2::PathTableV2;
@@ -14,8 +14,6 @@ use crate::query::Matcher;
 use crate::stats::BaseStats;
 use crate::storage::snapshot_v7::V7Snapshot;
 use crate::util::pathbuf_from_encoded_vec;
-
-const COLD_NAME_FILTER_WORDS: usize = 256;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MmapWarmupReport {
@@ -46,72 +44,9 @@ pub struct BaseQueryMatch {
     pub manifest_only: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct ColdNameFilter {
-    bits: Vec<u64>,
-    inserted_trigrams: usize,
-}
-
-impl Default for ColdNameFilter {
-    fn default() -> Self {
-        Self {
-            bits: vec![0; COLD_NAME_FILTER_WORDS],
-            inserted_trigrams: 0,
-        }
-    }
-}
-
-impl ColdNameFilter {
-    fn insert_path_bytes(&mut self, path_bytes: &[u8]) {
-        let folded = folded_lookup_bytes_lossy(path_bytes);
-        let bytes = folded.as_slice();
-        if bytes.len() < 3 {
-            return;
-        }
-        for tri in bytes.windows(3) {
-            self.insert_trigram(tri);
-        }
-    }
-
-    fn insert_trigram(&mut self, tri: &[u8]) {
-        let bit = trigram_filter_bit(tri);
-        self.bits[bit / 64] |= 1u64 << (bit % 64);
-        self.inserted_trigrams = self.inserted_trigrams.saturating_add(1);
-    }
-
-    fn might_match_literal_hint(&self, hint: Option<&[u8]>) -> bool {
-        let Some(hint) = hint else {
-            return true;
-        };
-        let folded = folded_lookup_bytes_lossy(hint);
-        let bytes = folded.as_slice();
-        if bytes.len() < 3 {
-            return true;
-        }
-        bytes.windows(3).all(|tri| {
-            let bit = trigram_filter_bit(tri);
-            (self.bits[bit / 64] & (1u64 << (bit % 64))) != 0
-        })
-    }
-
-    fn allocated_bytes(&self) -> u64 {
-        (std::mem::size_of::<Self>() + self.bits.capacity() * std::mem::size_of::<u64>()) as u64
-    }
-}
-
-fn trigram_filter_bit(tri: &[u8]) -> usize {
-    let mut h = 0x811c9dc5u32;
-    for &b in tri.iter().take(3) {
-        h ^= u32::from(b);
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    (h as usize) % (COLD_NAME_FILTER_WORDS * 64)
-}
-
 #[derive(Clone)]
 pub struct ColdSegment {
     pub manifest: ColdSegmentManifest,
-    filter: ColdNameFilter,
     snapshot: Arc<V7Snapshot>,
 }
 
@@ -119,8 +54,6 @@ impl std::fmt::Debug for ColdSegment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ColdSegment")
             .field("manifest", &self.manifest)
-            .field("filter_bits", &self.filter.bits.len())
-            .field("inserted_trigrams", &self.filter.inserted_trigrams)
             .finish_non_exhaustive()
     }
 }
@@ -133,19 +66,7 @@ impl ColdSegment {
         generation: u64,
         snapshot: Arc<V7Snapshot>,
     ) -> anyhow::Result<Self> {
-        let mut filter = ColdNameFilter::default();
-        let mut entry_count = 0usize;
-        let mut min_mtime = i64::MAX;
-        let mut max_mtime = i64::MIN;
-
-        snapshot.for_each_live_entry_path(|entry, path_bytes| {
-            entry_count = entry_count.saturating_add(1);
-            filter.insert_path_bytes(path_bytes);
-            if entry.mtime_ns >= 0 {
-                min_mtime = min_mtime.min(entry.mtime_ns);
-                max_mtime = max_mtime.max(entry.mtime_ns);
-            }
-        })?;
+        let (entry_count, mut min_mtime, mut max_mtime) = snapshot.live_entry_summary()?;
 
         if min_mtime == i64::MAX {
             min_mtime = -1;
@@ -171,15 +92,11 @@ impl ColdSegment {
                 mtime_max_ns: max_mtime,
                 mmap_bytes: snapshot.mapped_len() as u64,
             },
-            filter,
             snapshot,
         })
     }
 
     fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
-        if !self.filter.might_match_literal_hint(matcher.literal_hint()) {
-            return Vec::new();
-        }
         let result = self.snapshot.query_keys(matcher);
         self.snapshot.advise_dontneed();
         result.unwrap_or_else(|e| {
@@ -193,9 +110,6 @@ impl ColdSegment {
     }
 
     fn query_metas(&self, matcher: &dyn Matcher) -> Vec<FileMeta> {
-        if !self.filter.might_match_literal_hint(matcher.literal_hint()) {
-            return Vec::new();
-        }
         let result = self.snapshot.query_metas(matcher);
         self.snapshot.advise_dontneed();
         result.unwrap_or_else(|e| {
@@ -253,7 +167,7 @@ impl ColdSegment {
     }
 
     fn filter_bytes(&self) -> u64 {
-        self.filter.allocated_bytes()
+        0
     }
 
     fn warmup_mmap(&self, max_bytes: u64) -> MmapWarmupReport {

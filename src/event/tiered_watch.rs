@@ -267,6 +267,7 @@ pub struct TieredWatchRuntime {
     ephemeral: RwLock<HashMap<PathBuf, EphemeralWatchLease>>,
     dirty_observations: RwLock<HashMap<PathBuf, DirtyScopeObservation>>,
     max_watch_dirs: u64,
+    l0_max_cost_per_root: u64,
     current_watch_cost: AtomicU64,
     ephemeral_watch_budget: u64,
     current_ephemeral_watch_cost: AtomicU64,
@@ -299,9 +300,10 @@ impl TieredWatchRuntime {
         scan_items_per_sec: usize,
         scan_ms_per_tick: u64,
     ) -> Self {
-        Self::new_with_ephemeral(
+        Self::new_with_l0_max_cost_and_ephemeral(
             l0_roots,
             l1_roots,
+            max_watch_dirs,
             max_watch_dirs,
             scan_items_per_sec,
             scan_ms_per_tick,
@@ -317,7 +319,33 @@ impl TieredWatchRuntime {
         scan_ms_per_tick: u64,
         ephemeral_watch_budget: usize,
     ) -> Self {
+        Self::new_with_l0_max_cost_and_ephemeral(
+            l0_roots,
+            l1_roots,
+            max_watch_dirs,
+            max_watch_dirs,
+            scan_items_per_sec,
+            scan_ms_per_tick,
+            ephemeral_watch_budget,
+        )
+    }
+
+    pub fn new_with_l0_max_cost_and_ephemeral(
+        l0_roots: Vec<(PathBuf, usize)>,
+        l1_roots: Vec<(PathBuf, usize)>,
+        max_watch_dirs: usize,
+        l0_max_cost_per_root: usize,
+        scan_items_per_sec: usize,
+        scan_ms_per_tick: u64,
+        ephemeral_watch_budget: usize,
+    ) -> Self {
         let now = unix_secs();
+        let max_watch_dirs = max_watch_dirs.max(1);
+        let l0_max_cost_per_root = if l0_max_cost_per_root == 0 {
+            max_watch_dirs
+        } else {
+            l0_max_cost_per_root.clamp(1, max_watch_dirs)
+        };
         let mut current_watch_cost = 0u64;
         let mut dirs = HashMap::new();
 
@@ -335,6 +363,7 @@ impl TieredWatchRuntime {
             ephemeral: RwLock::new(HashMap::new()),
             dirty_observations: RwLock::new(HashMap::new()),
             max_watch_dirs: max_watch_dirs as u64,
+            l0_max_cost_per_root: l0_max_cost_per_root as u64,
             current_watch_cost: AtomicU64::new(current_watch_cost),
             ephemeral_watch_budget: ephemeral_watch_budget as u64,
             current_ephemeral_watch_cost: AtomicU64::new(0),
@@ -776,6 +805,10 @@ impl TieredWatchRuntime {
         self.max_watch_dirs as usize
     }
 
+    pub fn l0_max_cost_per_root(&self) -> usize {
+        self.l0_max_cost_per_root as usize
+    }
+
     pub fn note_watch_mount_policy_rejected(&self) {
         self.watch_mount_policy_rejected
             .fetch_add(1, Ordering::Relaxed);
@@ -1139,6 +1172,31 @@ impl TieredWatchRuntime {
         }
 
         let cost = state.watch_cost.load(Ordering::Relaxed);
+        if self.l0_per_root_guard_active() && cost > self.l0_max_cost_per_root.max(1) {
+            let now = unix_secs();
+            state.promotion_pending.store(false, Ordering::Release);
+            let blocked_count = state
+                .budget_blocked_count
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            state
+                .last_budget_blocked_unix_secs
+                .store(now, Ordering::Relaxed);
+            if blocked_count > 1 {
+                state.high_priority_scan.store(true, Ordering::Relaxed);
+            }
+            self.promotion_budget_blocked
+                .fetch_add(1, Ordering::Relaxed);
+            self.record_last_budget_blocked(
+                format!(
+                    "promotion per-root cost blocked: kernel_watch_cost={} l0_max_cost_per_root={}",
+                    cost, self.l0_max_cost_per_root
+                ),
+                cost,
+                self.l0_max_cost_per_root,
+            );
+            return PromotionDecision::BudgetBlocked;
+        }
         let reserved = self
             .current_watch_cost
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
@@ -1253,6 +1311,9 @@ impl TieredWatchRuntime {
             return false;
         }
         let cost = state.watch_cost.load(Ordering::Relaxed);
+        if self.l0_per_root_guard_active() && cost > self.l0_max_cost_per_root.max(1) {
+            return false;
+        }
         self.current_watch_cost
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
                 if current.saturating_add(cost) <= self.max_watch_dirs {
@@ -1262,6 +1323,10 @@ impl TieredWatchRuntime {
                 }
             })
             .is_ok()
+    }
+
+    fn l0_per_root_guard_active(&self) -> bool {
+        self.l0_max_cost_per_root < self.max_watch_dirs
     }
 
     pub fn cancel_pending_promotion(&self, path: &Path) {
@@ -1483,6 +1548,7 @@ impl TieredWatchRuntime {
             l3_dirs,
             watched_dirs_estimated,
             max_watch_dirs: self.max_watch_dirs as usize,
+            l0_max_cost_per_root: self.l0_max_cost_per_root as usize,
             system_max_user_watches: 0,
             required_watch_cost: 0,
             watch_budget_shortfall: 0,
@@ -2912,6 +2978,40 @@ mod tests {
                 && note.contains("kernel_watch_cost=6")
                 && note.contains("budget_remaining=3")
         }));
+    }
+
+    #[test]
+    fn promotion_blocks_dynamic_candidate_over_l0_per_root_cap() {
+        let rt = TieredWatchRuntime::new_with_l0_max_cost_and_ephemeral(
+            Vec::new(),
+            Vec::new(),
+            10,
+            3,
+            5_000,
+            20,
+            0,
+        );
+        let dynamic = PathBuf::from("/tmp/hot/too-large-child");
+
+        assert_eq!(
+            rt.register_dynamic_candidate(dynamic.clone(), 4),
+            PromotionDecision::BudgetBlocked
+        );
+
+        let report = rt.report();
+        assert_eq!(report.watched_dirs_estimated, 0);
+        assert_eq!(report.l0_dirs, 0);
+        assert_eq!(report.l1_dirs, 1);
+        assert_eq!(report.promotion_budget_blocked, 1);
+        assert_eq!(report.last_budget_blocked_kernel_watch_cost, 4);
+        assert_eq!(report.last_budget_blocked_budget_remaining, 3);
+        assert!(report
+            .last_budget_blocked_reason
+            .contains("promotion per-root cost blocked"));
+        assert!(report
+            .last_budget_blocked_reason
+            .contains("l0_max_cost_per_root=3"));
+        assert!(rt.scan_batch(8).contains(&dynamic));
     }
 
     #[test]

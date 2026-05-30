@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 启动恢复证据分层：`StartupRecoveryReport` 现在区分 `soft_repair_needed` 与 `hard_rebuild_needed`，`unclean_shutdown` / `wal_tail_truncated` 只作为补扫软证据；`bad_manifest`、`missing_segment`、`wal_gap`、`bad_current_wal`、坏 sidecar 等硬证据仍可触发 rebuild 策略。
+- `startup_repair_budget_ms` 接入启动修复深扫，预算耗尽会停止本轮 repair scan 并记录 `startup_repair_budget_exhausted`；`force_rebuild_ratio` 保留为扫描后的次级升级条件，不再由单独异常退出直接放大成重建。
+- `/health` 与 metrics JSONL 新增恢复证据观测字段：soft/hard reasons、reason counts、startup repair budget、budget exhausted 与 escalation reason，便于区分“需要补扫”和“需要重建”。
+- `/memory` 默认返回轻量快照，复用最近完整采样并刷新 RSS、swap、smaps rollup、faults、pipeline、dirty queue、overlay、rebuild 与 query guard 等轻量字段；显式 `/memory?full=true` 才执行完整 Base/L2 统计并刷新缓存。`memory_report_loop` 与 metrics JSONL 复用同一缓存源，并且 RSS trim 只在完整采样检测到高水位时触发。
+- 修复运行态复核发现的 WAL v4 审计误判：`WalStore` 当前写入 v4 WAL，recovery audit 现在复用写入端版本常量接受 v1..=current，不再把正常 `events.wal` 判成 `bad_current_wal` 并触发启动 rebuild。
+- 修复 `/memory` light 缓存过期与 stale smaps 误导：snapshot/rebuild/compat refresh 等 Base/L2 结构切换边界会失效完整采样缓存，cache miss 时轻量报告会重新读取当前 Base/L2 结构统计；cache hit 时也会刷新当前 smaps rollup。Linux 上 `process_rss_bytes` 优先取同一次 smaps rollup 的 `rss_bytes`，smaps 不可读时才回退 statm，避免把当前 statm RSS 和旧 full sample 的 smaps 拆分混入同一响应。
+- 修复启动 fast-sync 对账误写增量层：启动对账 cutoff 现在按实际 `snapshot_source` 选择 `stable.v7`、`stable.prev.v7` 或 legacy `index.v7` 的 mtime，避免使用错误快照时间放大 dirty window。
+- fast-sync 对 dirty 目录中的文件先用 `path_freshness()` 对比 Base/L2 中的 file key 与 mtime，未变化路径不再生成 modify event、写入 L2/overlay/WAL，避免重启后把大量稳定文件重复灌入增量层。
+- `DeltaBuffer::clear()` 在 flush/snapshot 后会释放过大的 HashMap capacity，降低一次大批增量对账后的 allocator 高水位常驻。
+- strict tiered watcher 新增 `tiered_watch.l0_max_cost_per_root` 单根 L0 成本上限，默认 `8192`；超大 required hot dir 会进入 L1/scan 补偿并暴露为 strict coverage failure，不再在启动时整棵注册数万 inotify watch。
+- manifest-only v7 冷段挂载不再遍历全部 live path 构建路径 Bloom-style filter，改为只扫描 entries/tombstones 统计 live count 与 mtime range；`/memory.base.cold_filter_bytes` 在该模式下为 `0`，降低重启时路径 case-fold/trigram 临时分配和 mimalloc 高水位。
+- 回归测试补齐恢复证据与内存观测边界：覆盖 clean shutdown skip、unclean shutdown soft repair、bad manifest、missing segment、WAL gap、bad current WAL、当前 WAL 版本兼容、`/memory` 默认 light 与显式 full，以及轻量内存快照缓存复用/失效。
+
 ## [7.0.0] - 2026-05-30
 
 - `dupe:content` 补齐查询期内容读取边界：复用内容索引的 frozen/offline、exclude 目录、mount policy 与 `content_index.max_file_size` 准入策略，并把 partial/full hash 慢 I/O 移出 query generation guard，避免内容重复扫描延长 base generation 强引用。

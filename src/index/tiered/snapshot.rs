@@ -108,6 +108,7 @@ impl TieredIndex {
             match try_load_v7_cold(&path, self.roots.as_slice()) {
                 Ok(Some(cold_base)) => {
                     self.base.store(Arc::new(cold_base));
+                    self.invalidate_memory_report_cache();
                     tracing::info!("snapshot base remounted cold from {:?}", path);
                 }
                 Ok(None) => {

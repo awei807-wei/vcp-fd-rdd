@@ -7,7 +7,7 @@ use crate::fs_policy::{FsPolicyConfig, FsPolicyDecision, MountTable};
 use crate::index::tiered::events::event_record_estimated_bytes;
 use crate::index::tiered::sync::RebuildAdmission;
 use crate::io_governor::{BackoffPolicy, IoGovernor, IoGovernorConfig, IoPressure};
-use crate::stats::EventPipelineStats;
+use crate::stats::{EventPipelineStats, MemorySampleDepth, SmapsRollupStats};
 use crate::storage::quarantine::{
     FreezeGate, MountIdentity, QuarantineRoot, QuarantineRootState, QuarantineSidecar,
     RootStateKind, RootStateRecord,
@@ -926,6 +926,85 @@ fn memory_report_tracks_dirty_queue_pending_scopes() {
 }
 
 #[test]
+fn memory_report_light_reuses_cached_full_snapshot() {
+    let root = unique_tmp_dir("memory-light-cache");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    let cold_light = idx.memory_report_light(EventPipelineStats::default());
+    assert_eq!(cold_light.sample_depth, MemorySampleDepth::Light);
+    assert!(!cold_light.cache_hit);
+
+    let full = idx.memory_report(EventPipelineStats::default());
+    assert_eq!(full.sample_depth, MemorySampleDepth::Full);
+    assert!(!full.cache_hit);
+
+    let mut stale_full = full.clone();
+    stale_full.process_smaps_rollup = Some(SmapsRollupStats {
+        rss_bytes: 42,
+        pss_bytes: 42,
+        private_clean_bytes: 42,
+        private_dirty_bytes: 42,
+    });
+    {
+        let mut cache = idx.memory_report_cache.lock();
+        cache.report = Some(stale_full);
+        cache.sampled_at = Some(std::time::Instant::now());
+    }
+
+    let dirty_dir = root.join("project");
+    std::fs::create_dir_all(&dirty_dir).unwrap();
+    idx.enqueue_dirty_dirs(vec![dirty_dir], DirtyReason::QueryMiss);
+
+    let light = idx.memory_report_light(EventPipelineStats::default());
+    assert_eq!(light.sample_depth, MemorySampleDepth::Light);
+    assert!(light.cache_hit);
+    assert_eq!(light.base.file_count, full.base.file_count);
+    assert_eq!(light.l2.file_count, full.l2.file_count);
+    assert_eq!(light.dirty_queue.pending_scopes, 1);
+    assert_ne!(
+        light.process_smaps_rollup.as_ref().map(|s| s.rss_bytes),
+        Some(42),
+        "light memory reports must refresh smaps instead of reusing stale full-sample smaps"
+    );
+    if let Some(smaps) = light.process_smaps_rollup.as_ref() {
+        assert_eq!(
+            light.process_rss_bytes, smaps.rss_bytes,
+            "light memory reports should use the same smaps sample for process_rss_bytes"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn memory_report_light_cache_miss_reports_current_generations_after_snapshot() {
+    let root = unique_tmp_dir("memory-light-cache-invalidate");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("flush-me.txt");
+    std::fs::write(&path, b"flush").unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, path)]);
+
+    let full = idx.memory_report(EventPipelineStats::default());
+    assert_eq!(full.sample_depth, MemorySampleDepth::Full);
+    assert_eq!(full.l2.file_count, 1);
+
+    let store = Arc::new(SnapshotStore::new(root.join("index.db")));
+    idx.snapshot_now(store).await.unwrap();
+
+    let light = idx.memory_report_light(EventPipelineStats::default());
+    assert_eq!(light.sample_depth, MemorySampleDepth::Light);
+    assert!(!light.cache_hit);
+    assert_eq!(light.l2.file_count, 0);
+    assert_eq!(light.base.file_count, 1);
+    assert!(light.index_estimated_bytes >= light.base.estimated_bytes);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn memory_report_tracks_query_guard_holds() {
     let root = unique_tmp_dir("query-guard");
     std::fs::create_dir_all(&root).unwrap();
@@ -1057,6 +1136,50 @@ fn fast_sync_reconciles_add_and_delete() {
     }
     assert!(c_found, "c_match should appear after fast_sync");
     assert!(!idx.query("c_match").is_empty());
+}
+
+#[tokio::test]
+async fn fast_sync_skips_unchanged_base_paths() {
+    let root = unique_tmp_dir("fast-sync-unchanged");
+    let state = unique_tmp_dir("fast-sync-unchanged-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let path = root.join("unchanged_base_match.txt");
+    std::fs::write(&path, b"stable").unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, path.clone())]);
+    idx.snapshot_now(Arc::new(SnapshotStore::new(state.join("index.db"))))
+        .await
+        .unwrap();
+    assert_eq!(
+        idx.memory_report(EventPipelineStats::default())
+            .l2
+            .file_count,
+        0
+    );
+
+    let report = idx.fast_sync(
+        DirtyScope::Dirs {
+            cutoff_ns: 0,
+            dirs: vec![root.clone()],
+        },
+        &[],
+    );
+
+    assert!(report.dirs_scanned >= 1);
+    assert_eq!(report.upsert_events, 0);
+    assert_eq!(report.delete_events, 0);
+    assert_eq!(
+        idx.memory_report(EventPipelineStats::default())
+            .l2
+            .file_count,
+        0
+    );
+    assert!(!idx.query("unchanged_base_match").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
 }
 
 #[test]
@@ -1512,6 +1635,7 @@ async fn v7_load_mounts_manifest_only_cold_segment_and_queries_on_demand() -> an
     assert_eq!(after_snapshot_report.hot_memory_entries, 0);
     assert_eq!(after_snapshot_report.manifest_only_entries, 128);
     assert_eq!(after_snapshot_report.cold_segment_count, 1);
+    assert_eq!(after_snapshot_report.cold_filter_bytes, 0);
     assert!(after_snapshot_report.cold_mmap_bytes > 0);
     assert!(
         after_snapshot_report.estimated_bytes < hot_report.estimated_bytes,
@@ -1530,6 +1654,7 @@ async fn v7_load_mounts_manifest_only_cold_segment_and_queries_on_demand() -> an
     assert_eq!(cold_report.hot_memory_entries, 0);
     assert_eq!(cold_report.manifest_only_entries, 128);
     assert_eq!(cold_report.cold_segment_count, 1);
+    assert_eq!(cold_report.cold_filter_bytes, 0);
     assert!(cold_report.cold_mmap_bytes > 0);
     assert!(
         cold_report.estimated_bytes < hot_report.estimated_bytes,
@@ -1547,6 +1672,7 @@ async fn v7_load_mounts_manifest_only_cold_segment_and_queries_on_demand() -> an
     let after_query = loaded.memory_report(EventPipelineStats::default()).base;
     assert_eq!(after_query.hot_memory_entries, 0);
     assert_eq!(after_query.manifest_only_entries, 128);
+    assert_eq!(after_query.cold_filter_bytes, 0);
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())

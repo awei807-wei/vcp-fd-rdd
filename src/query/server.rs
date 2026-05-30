@@ -1,6 +1,7 @@
 use crate::core::FileKind;
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::tiered_watch::TieredWatchDebugDump;
+use crate::index::tiered::RecoveryReasonCount;
 use crate::index::TieredIndex;
 use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
 use crate::query::{execute_query_with_metadata_result, QueryMode, SortColumn, SortOrder};
@@ -50,17 +51,26 @@ pub struct HealthTelemetry {
     pub wal_sync_batch_records: usize,
     pub recovery_requires_repair: bool,
     pub recovery_requires_rebuild: bool,
+    pub recovery_soft_repair_needed: bool,
+    pub recovery_hard_rebuild_needed: bool,
     pub recovery_reasons: Vec<String>,
+    pub recovery_soft_reasons: Vec<String>,
+    pub recovery_hard_reasons: Vec<String>,
+    pub recovery_reason_counts: Vec<RecoveryReasonCount>,
     pub recovery_audit: RecoveryAuditReport,
     pub startup_repair_ran: bool,
     pub startup_repair_escalated: bool,
     pub startup_repair_scanned: usize,
     pub startup_repair_changed: usize,
+    pub startup_repair_budget_ms: u64,
+    pub startup_repair_budget_exhausted: bool,
+    pub startup_repair_escalation_reason: String,
     pub last_clean_shutdown: bool,
     pub l1_dirs: usize,
     pub l2_dirs: usize,
     pub l3_dirs: usize,
     pub max_watch_dirs: usize,
+    pub l0_max_cost_per_root: usize,
     pub watch_budget_utilization_pct: u8,
     pub promotion_budget_blocked: u64,
     pub watch_profile: String,
@@ -144,17 +154,26 @@ pub struct HealthResponse {
     pub wal_sync_batch_records: usize,
     pub recovery_requires_repair: bool,
     pub recovery_requires_rebuild: bool,
+    pub recovery_soft_repair_needed: bool,
+    pub recovery_hard_rebuild_needed: bool,
     pub recovery_reasons: Vec<String>,
+    pub recovery_soft_reasons: Vec<String>,
+    pub recovery_hard_reasons: Vec<String>,
+    pub recovery_reason_counts: Vec<RecoveryReasonCount>,
     pub recovery_audit: RecoveryAuditReport,
     pub startup_repair_ran: bool,
     pub startup_repair_escalated: bool,
     pub startup_repair_scanned: usize,
     pub startup_repair_changed: usize,
+    pub startup_repair_budget_ms: u64,
+    pub startup_repair_budget_exhausted: bool,
+    pub startup_repair_escalation_reason: String,
     pub last_clean_shutdown: bool,
     pub l1_dirs: usize,
     pub l2_dirs: usize,
     pub l3_dirs: usize,
     pub max_watch_dirs: usize,
+    pub l0_max_cost_per_root: usize,
     pub watch_budget_utilization_pct: u8,
     pub promotion_budget_blocked: u64,
     pub watch_profile: String,
@@ -174,6 +193,11 @@ pub struct TrimResponse {
     pub rss_before_bytes: u64,
     pub rss_after_bytes: u64,
     pub reclaimed_bytes: u64,
+}
+
+#[derive(Deserialize, Default)]
+pub struct MemoryParams {
+    pub full: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -420,9 +444,10 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     }
     if health.strict_coverage_failure {
         issues.push(format!(
-            "strict_coverage_incomplete: required_watch_cost={} max_watch_dirs={} shortfall={} uncovered={:?}",
+            "strict_coverage_incomplete: required_watch_cost={} max_watch_dirs={} l0_max_cost_per_root={} shortfall={} uncovered={:?}",
             health.required_watch_cost,
             health.max_watch_dirs,
+            health.l0_max_cost_per_root,
             health.watch_budget_shortfall,
             health.strict_uncovered_dirs
         ));
@@ -533,17 +558,26 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         wal_sync_batch_records: health.wal_sync_batch_records,
         recovery_requires_repair: health.recovery_requires_repair,
         recovery_requires_rebuild: health.recovery_requires_rebuild,
+        recovery_soft_repair_needed: health.recovery_soft_repair_needed,
+        recovery_hard_rebuild_needed: health.recovery_hard_rebuild_needed,
         recovery_reasons: health.recovery_reasons,
+        recovery_soft_reasons: health.recovery_soft_reasons,
+        recovery_hard_reasons: health.recovery_hard_reasons,
+        recovery_reason_counts: health.recovery_reason_counts,
         recovery_audit: health.recovery_audit,
         startup_repair_ran: health.startup_repair_ran,
         startup_repair_escalated: health.startup_repair_escalated,
         startup_repair_scanned: health.startup_repair_scanned,
         startup_repair_changed: health.startup_repair_changed,
+        startup_repair_budget_ms: health.startup_repair_budget_ms,
+        startup_repair_budget_exhausted: health.startup_repair_budget_exhausted,
+        startup_repair_escalation_reason: health.startup_repair_escalation_reason,
         last_clean_shutdown: health.last_clean_shutdown,
         l1_dirs: health.l1_dirs,
         l2_dirs: health.l2_dirs,
         l3_dirs: health.l3_dirs,
         max_watch_dirs: health.max_watch_dirs,
+        l0_max_cost_per_root: health.l0_max_cost_per_root,
         watch_budget_utilization_pct: health.watch_budget_utilization_pct,
         promotion_budget_blocked: health.promotion_budget_blocked,
         watch_profile: health.watch_profile,
@@ -568,8 +602,21 @@ async fn metrics_handler(State(state): State<QueryServerState>) -> impl IntoResp
     Json(report)
 }
 
-async fn memory_handler(State(state): State<QueryServerState>) -> Json<MemoryReport> {
-    Json(state.index.memory_report((state.stats_provider)()))
+async fn memory_handler(
+    Query(params): Query<MemoryParams>,
+    State(state): State<QueryServerState>,
+) -> Json<MemoryReport> {
+    let pipeline = (state.stats_provider)();
+    let full = params
+        .full
+        .as_deref()
+        .is_some_and(|v| matches!(v, "1" | "true" | "yes" | "full"));
+    let report = if full {
+        state.index.memory_report(pipeline)
+    } else {
+        state.index.memory_report_light(pipeline)
+    };
+    Json(report)
 }
 
 async fn watch_state_handler(State(state): State<QueryServerState>) -> Json<WatchStateReport> {

@@ -193,6 +193,7 @@ impl TieredIndex {
             content_hash_last_elapsed_ms: AtomicU64::new(0),
             content_hash_last_skip_reason: Mutex::new(String::new()),
             directory_manifests: super::directory_manifest::DirectoryManifestStore::default(),
+            memory_report_cache: Mutex::new(super::MemoryReportCache::default()),
         }
     }
 
@@ -700,6 +701,11 @@ fn startup_report(
     }
     reasons.sort();
     reasons.dedup();
+    let soft_reasons = recovery_reasons_matching(&reasons, is_soft_repair_reason);
+    let hard_reasons = recovery_reasons_matching(&reasons, is_hard_rebuild_reason);
+    let soft_repair_needed = !soft_reasons.is_empty();
+    let hard_rebuild_needed = !hard_reasons.is_empty() || audit.requires_rebuild;
+    let repair_reason_counts = repair_reason_counts(&reasons);
 
     StartupRecoveryReport {
         snapshot_source: source.to_string(),
@@ -714,8 +720,47 @@ fn startup_report(
             || replay.truncated_tail_records > 0
             || replay.gap_detected,
         requires_rebuild: audit.requires_rebuild,
+        soft_repair_needed,
+        hard_rebuild_needed,
         previous_clean_shutdown: runtime_state.last_clean_shutdown,
         reasons,
+        soft_reasons,
+        hard_reasons,
+        repair_reason_counts,
         audit,
     }
+}
+
+fn recovery_reasons_matching(reasons: &[String], predicate: impl Fn(&str) -> bool) -> Vec<String> {
+    reasons
+        .iter()
+        .filter(|reason| predicate(reason.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn is_soft_repair_reason(reason: &str) -> bool {
+    matches!(reason, "unclean_shutdown" | "wal_tail_truncated")
+}
+
+fn is_hard_rebuild_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "wal_gap"
+            | "bad_current_wal"
+            | "missing_segment"
+            | "bad_segment_sidecar"
+            | "lsm_dir_unreadable"
+    ) || reason.starts_with("bad_manifest:")
+}
+
+fn repair_reason_counts(reasons: &[String]) -> Vec<super::RecoveryReasonCount> {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for reason in reasons {
+        *counts.entry(reason.clone()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(reason, count)| super::RecoveryReasonCount { reason, count })
+        .collect()
 }

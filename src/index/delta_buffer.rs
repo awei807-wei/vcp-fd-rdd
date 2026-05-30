@@ -151,6 +151,9 @@ impl DeltaBuffer {
     /// 清空（flush 后调用）
     pub fn clear(&mut self) {
         self.entries.clear();
+        if self.entries.capacity() > 4096 {
+            self.entries.shrink_to(1024);
+        }
     }
 
     /// 提取需要写入 seg-*.del 的删除路径（Deleted 状态）
@@ -293,6 +296,25 @@ mod tests {
         assert!(db.is_empty());
         assert!(db.apply_events(&[make_event(1, EventType::Create, "/tmp/after_clear")]));
         assert_eq!(db.len(), 1);
+    }
+
+    #[test]
+    fn clear_releases_large_hashmap_capacity() {
+        let mut db = DeltaBuffer::with_capacity(32 * 1024);
+        for i in 0..10_000 {
+            let path = format!("/tmp/clear_capacity_{i}");
+            assert!(db.apply_events(&[make_event(i as u64, EventType::Create, &path)]));
+        }
+        assert!(db.entries.capacity() > 4096);
+
+        db.clear();
+
+        assert!(db.is_empty());
+        assert!(
+            db.entries.capacity() <= 4096,
+            "clear should shrink large overlay capacity, got {}",
+            db.entries.capacity()
+        );
     }
 
     #[test]

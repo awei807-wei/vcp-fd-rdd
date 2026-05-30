@@ -272,6 +272,7 @@ impl TieredIndex {
         self.l2.store(Arc::new(PersistentIndex::new_with_roots(
             self.roots.clone(),
         )));
+        self.invalidate_memory_report_cache();
         new_base
     }
 

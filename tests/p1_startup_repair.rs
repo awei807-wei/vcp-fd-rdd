@@ -116,12 +116,20 @@ async fn startup_repair_dirty_only_runs_after_unclean_shutdown() {
     let index = TieredIndex::load_or_empty(&store, vec![root.clone()])
         .await
         .unwrap();
+    let report = index.recovery_status().report;
+    assert!(report.soft_repair_needed);
+    assert!(!report.hard_rebuild_needed);
+    assert!(report.soft_reasons.iter().any(|r| r == "unclean_shutdown"));
+
     let stats = index.startup_repair_if_needed(true, "dirty-only", 4, 10_000, 1.0);
 
     assert!(index.recovery_status().report.requires_repair);
     assert!(stats.ran);
+    assert!(!stats.escalated);
+    assert_eq!(stats.escalation_reason, "");
     assert!(stats.scanned >= 2);
     assert!(stats.changed >= 1);
+    assert_eq!(stats.budget_ms, 10_000);
 
     let _ = std::fs::remove_dir_all(&root);
 }

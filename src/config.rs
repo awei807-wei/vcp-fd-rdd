@@ -12,6 +12,7 @@ use crate::util::{default_exclude_dirs, normalize_exclude_dirs};
 
 pub const DEFAULT_L3_SCAN_INTERVAL_SECS: u64 = 21_600;
 pub const DEFAULT_TIERED_MAX_WATCH_DIRS: usize = 131_072;
+pub const DEFAULT_TIERED_L0_MAX_COST_PER_ROOT: usize = 8_192;
 
 /// Returns the platform-appropriate default socket path (user-isolated).
 ///
@@ -293,6 +294,8 @@ pub struct TieredWatchConfig {
     pub profile: TieredWatchProfile,
     /// Upper bound for estimated recursive inotify watches admitted into L0.
     pub max_watch_dirs: usize,
+    /// Upper bound for one recursive L0 root. 0 disables the per-root guard.
+    pub l0_max_cost_per_root: usize,
     /// Token budget for L1/L2 scan work. First tiered implementation uses this as diagnostics.
     pub scan_items_per_sec: usize,
     /// Maximum scan wall time per scheduler tick.
@@ -445,6 +448,7 @@ impl Default for TieredWatchConfig {
         Self {
             profile: TieredWatchProfile::Balanced,
             max_watch_dirs: DEFAULT_TIERED_MAX_WATCH_DIRS,
+            l0_max_cost_per_root: DEFAULT_TIERED_L0_MAX_COST_PER_ROOT,
             scan_items_per_sec: 5_000,
             scan_ms_per_tick: 20,
             l0_idle_ttl_secs: 7_200,
@@ -476,6 +480,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
         struct RawTieredWatchConfig {
             profile: TieredWatchProfile,
             max_watch_dirs: Option<usize>,
+            l0_max_cost_per_root: usize,
             scan_items_per_sec: usize,
             scan_ms_per_tick: u64,
             l0_idle_ttl_secs: u64,
@@ -501,6 +506,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
                 Self {
                     profile: defaults.profile,
                     max_watch_dirs: None,
+                    l0_max_cost_per_root: defaults.l0_max_cost_per_root,
                     scan_items_per_sec: defaults.scan_items_per_sec,
                     scan_ms_per_tick: defaults.scan_ms_per_tick,
                     l0_idle_ttl_secs: defaults.l0_idle_ttl_secs,
@@ -528,6 +534,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
         Ok(Self {
             profile: raw.profile,
             max_watch_dirs,
+            l0_max_cost_per_root: raw.l0_max_cost_per_root,
             scan_items_per_sec: raw.scan_items_per_sec,
             scan_ms_per_tick: raw.scan_ms_per_tick,
             l0_idle_ttl_secs: raw.l0_idle_ttl_secs,
@@ -885,6 +892,10 @@ max_watch_dirs = 16
         .expect("config should parse with partial tiered_watch table");
 
         assert_eq!(cfg.tiered_watch.max_watch_dirs, 16);
+        assert_eq!(
+            cfg.tiered_watch.l0_max_cost_per_root,
+            DEFAULT_TIERED_L0_MAX_COST_PER_ROOT
+        );
         assert_eq!(cfg.tiered_watch.ephemeral_watch_budget, 256);
         assert_eq!(cfg.tiered_watch.ephemeral_watch_ttl_secs, 600);
         assert_eq!(cfg.tiered_watch.ephemeral_idle_secs, 120);
@@ -903,6 +914,7 @@ max_watch_dirs = 16
         let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
         assert!(toml.contains("l3_scan_policy"));
         assert!(toml.contains("profile"));
+        assert!(toml.contains("l0_max_cost_per_root"));
         assert!(toml.contains("strict_required_hot_dirs"));
         assert!(toml.contains("strict_fail_on_budget_exceeded"));
         assert!(toml.contains("l3_scan_interval_secs"));
@@ -1031,6 +1043,7 @@ watch_mode = "tiered"
 [tiered_watch]
 profile = "strict"
 max_watch_dirs = 32
+l0_max_cost_per_root = 8
 strict_required_hot_dirs = ["~/Documents"]
 strict_fail_on_budget_exceeded = false
 project_markers = [".git", "WORKSPACE"]
@@ -1040,6 +1053,7 @@ project_markers = [".git", "WORKSPACE"]
 
         assert_eq!(cfg.tiered_watch.profile, TieredWatchProfile::Strict);
         assert_eq!(cfg.tiered_watch.max_watch_dirs, 32);
+        assert_eq!(cfg.tiered_watch.l0_max_cost_per_root, 8);
         assert_eq!(
             cfg.tiered_watch.strict_required_hot_dirs,
             vec![PathBuf::from("~/Documents")]

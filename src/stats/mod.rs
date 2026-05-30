@@ -9,6 +9,14 @@ pub use metrics_reporter::{
 /// 内存占用统计（字节级精确）
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct MemoryReport {
+    /// 采样深度：`full` 会重算 Base/L2 等重型结构；`light` 复用最近完整快照并刷新轻量字段。
+    pub sample_depth: MemorySampleDepth,
+    /// 轻量采样是否命中最近完整快照缓存。
+    pub cache_hit: bool,
+    /// 当前轻量采样复用的完整快照年龄。
+    pub cached_full_age_ms: u64,
+    /// 最近一次完整采样耗时。
+    pub full_sample_elapsed_ms: u64,
     /// L1 热缓存
     pub l1: L1Stats,
     /// 只读 base 索引（v7 snapshot / full build materialized base）
@@ -51,6 +59,14 @@ pub struct MemoryReport {
     pub non_index_private_dirty_bytes: Option<u64>,
     /// 是否疑似“堆高水位常驻”（非索引脏页明显偏高）
     pub heap_high_water_suspected: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySampleDepth {
+    #[default]
+    Light,
+    Full,
 }
 
 /// Service-level observability stats (uptime, snapshot, watcher health).
@@ -192,6 +208,7 @@ pub struct WatchStateReport {
     pub l3_dirs: usize,
     pub watched_dirs_estimated: usize,
     pub max_watch_dirs: usize,
+    pub l0_max_cost_per_root: usize,
     pub system_max_user_watches: usize,
     pub required_watch_cost: u64,
     pub watch_budget_shortfall: u64,
@@ -427,6 +444,16 @@ impl fmt::Display for MemoryReport {
         writeln!(f, "╔══════════════════════════════════════════════════╗")?;
         writeln!(f, "║           fd-rdd Memory Report                  ║")?;
         writeln!(f, "╠══════════════════════════════════════════════════╣")?;
+        writeln!(
+            f,
+            "║ Sample: {:?} cache_hit={} age_ms={:<10} ║",
+            self.sample_depth, self.cache_hit, self.cached_full_age_ms
+        )?;
+        writeln!(
+            f,
+            "║ Full sample elapsed: {:>22} ms ║",
+            self.full_sample_elapsed_ms
+        )?;
         writeln!(
             f,
             "║ Process RSS: {:>35} ║",

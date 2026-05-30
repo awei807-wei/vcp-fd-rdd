@@ -833,7 +833,7 @@ impl EventPipeline {
                             }
                             let watch_cost = estimate_notify_recursive_watch_count(
                                 path,
-                                runtime.max_watch_dirs(),
+                                runtime.l0_max_cost_per_root().max(1),
                             );
                             match runtime.register_dynamic_candidate(path.clone(), watch_cost) {
                                 crate::event::tiered_watch::PromotionDecision::SendAdd => {

@@ -7,6 +7,7 @@ use crate::storage::snapshot::{
     lsm_read_deleted_paths, lsm_read_manifest, parse_lsm_seg_id, stable_prev_v7_path_for,
     stable_v7_path_for, RecoveryRuntimeState,
 };
+use crate::storage::wal::{WAL_MAGIC, WAL_VERSION};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RecoveryAuditReport {
@@ -257,7 +258,7 @@ fn current_wal_header_ok(path: &Path) -> bool {
     }
     let magic = u32::from_le_bytes(header[0..4].try_into().unwrap_or_default());
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap_or_default());
-    magic == 0x314C_4157 && (version == 1 || version == 2 || version == 3)
+    magic == WAL_MAGIC && (1..=WAL_VERSION).contains(&version)
 }
 
 pub(crate) fn parse_wal_seal_id(name: &str) -> Option<u64> {

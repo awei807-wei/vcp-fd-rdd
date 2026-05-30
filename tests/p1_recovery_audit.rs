@@ -13,6 +13,8 @@ use fd_rdd::storage::snapshot::{
 use fd_rdd::storage::snapshot_v7::write_v7_snapshot_atomic;
 use fd_rdd::storage::wal::WalStore;
 
+const WAL_MAGIC: u32 = 0x314C_4157;
+
 fn unique_tmp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -151,7 +153,146 @@ async fn audit_missing_lsm_segment_requires_rebuild() {
     let loaded = TieredIndex::load_or_empty(&store, vec![root.clone()])
         .await
         .unwrap();
-    assert!(loaded.recovery_status().report.requires_rebuild);
+    let recovery = loaded.recovery_status();
+    assert!(recovery.report.requires_rebuild);
+    assert!(recovery.report.hard_rebuild_needed);
+    assert!(recovery
+        .report
+        .hard_reasons
+        .iter()
+        .any(|r| r == "missing_segment"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn audit_bad_manifest_is_hard_rebuild_evidence() {
+    let root = unique_tmp_dir("bad-manifest");
+    std::fs::create_dir_all(&root).unwrap();
+    let snap_path = root.join("index.db");
+    let store = SnapshotStore::new(snap_path.clone());
+
+    std::fs::create_dir_all(store.derived_lsm_dir_path()).unwrap();
+    std::fs::write(store.derived_lsm_dir_path().join("MANIFEST.bin"), b"bad").unwrap();
+
+    let runtime = RecoveryRuntimeState::default();
+    let audit = audit_recovery_ledger(&snap_path, std::slice::from_ref(&root), &runtime);
+    assert!(audit.requires_rebuild);
+    assert!(audit.reasons.iter().any(|r| r.starts_with("bad_manifest:")));
+
+    let loaded = TieredIndex::load_or_empty(&store, vec![root.clone()])
+        .await
+        .unwrap();
+    let recovery = loaded.recovery_status();
+    assert!(recovery.report.hard_rebuild_needed);
+    assert!(recovery
+        .report
+        .hard_reasons
+        .iter()
+        .any(|r| r.starts_with("bad_manifest:")));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn audit_wal_gap_is_hard_rebuild_evidence() {
+    let root = unique_tmp_dir("wal-gap");
+    std::fs::create_dir_all(&root).unwrap();
+    let snap_path = root.join("index.db");
+    let store = SnapshotStore::new(snap_path.clone());
+
+    std::fs::create_dir_all(store.derived_lsm_dir_path()).unwrap();
+    let header = {
+        let mut data = Vec::new();
+        data.extend_from_slice(&WAL_MAGIC.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data
+    };
+    std::fs::write(
+        store
+            .derived_lsm_dir_path()
+            .join("events.wal.seal-0000000000000001"),
+        &header,
+    )
+    .unwrap();
+    std::fs::write(
+        store
+            .derived_lsm_dir_path()
+            .join("events.wal.seal-0000000000000003"),
+        &header,
+    )
+    .unwrap();
+
+    let runtime = RecoveryRuntimeState::default();
+    let audit = audit_recovery_ledger(&snap_path, std::slice::from_ref(&root), &runtime);
+    assert!(audit.wal_gap_detected);
+    assert!(audit.requires_repair);
+    assert!(audit.reasons.iter().any(|r| r == "wal_gap"));
+
+    let loaded = TieredIndex::load_or_empty(&store, vec![root.clone()])
+        .await
+        .unwrap();
+    let recovery = loaded.recovery_status();
+    assert!(recovery.report.hard_rebuild_needed);
+    assert!(recovery.report.hard_reasons.iter().any(|r| r == "wal_gap"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn audit_bad_current_wal_is_hard_rebuild_evidence() {
+    let root = unique_tmp_dir("bad-current-wal");
+    std::fs::create_dir_all(&root).unwrap();
+    let snap_path = root.join("index.db");
+    let store = SnapshotStore::new(snap_path.clone());
+
+    std::fs::create_dir_all(store.derived_lsm_dir_path()).unwrap();
+    std::fs::write(store.derived_lsm_dir_path().join("events.wal"), b"bad").unwrap();
+
+    let runtime = RecoveryRuntimeState::default();
+    let audit = audit_recovery_ledger(&snap_path, std::slice::from_ref(&root), &runtime);
+    assert!(!audit.current_wal_ok);
+    assert!(audit.requires_repair);
+    assert!(audit.reasons.iter().any(|r| r == "bad_current_wal"));
+
+    let loaded = TieredIndex::load_or_empty(&store, vec![root.clone()])
+        .await
+        .unwrap();
+    let recovery = loaded.recovery_status();
+    assert!(recovery.report.hard_rebuild_needed);
+    assert!(recovery
+        .report
+        .hard_reasons
+        .iter()
+        .any(|r| r == "bad_current_wal"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn audit_current_wal_written_by_store_is_not_bad_current_wal() {
+    let root = unique_tmp_dir("current-wal-version");
+    std::fs::create_dir_all(&root).unwrap();
+    let snap_path = root.join("index.db");
+    let store = SnapshotStore::new(snap_path.clone());
+
+    let wal = WalStore::open_in_dir(store.derived_lsm_dir_path()).unwrap();
+    drop(wal);
+
+    let runtime = RecoveryRuntimeState::default();
+    let audit = audit_recovery_ledger(&snap_path, std::slice::from_ref(&root), &runtime);
+    assert!(audit.current_wal_ok);
+    assert!(!audit.reasons.iter().any(|r| r == "bad_current_wal"));
+
+    let loaded = TieredIndex::load_or_empty(&store, vec![root.clone()])
+        .await
+        .unwrap();
+    let recovery = loaded.recovery_status();
+    assert!(!recovery
+        .report
+        .hard_reasons
+        .iter()
+        .any(|r| r == "bad_current_wal"));
 
     let _ = std::fs::remove_dir_all(&root);
 }

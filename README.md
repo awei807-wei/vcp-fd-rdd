@@ -185,7 +185,7 @@ fd-rdd-query --limit 2000 "*.rs"
 
 HTTP `/search` 返回每条结果的 `path`、`type`（`file` / `dir`）、`score`、`highlights`，以及冷层校验语义：`freshness`（如 `fresh` / `stale_checked` / `changed`）、`index_tier`（如 `HotMemory` / `ColdMmap`）和 `validated`。响应不再包含 `size` 字段。当冷层/base 命中已删除时，查询会写入 tombstone 并屏蔽旧结果；当文件 mtime 或身份变化时，会把命中父目录加入 DirtyQueue，由后台补偿调度做局部补扫。
 
-v7 快照启动时会挂载为 manifest-only 冷段：常驻内存只保留 segment manifest、路径 Bloom-style filter、mtime 范围和 dirty/freshness 状态；metadata/postings 不再 hydration 到 `BaseIndexData`，查询、metadata lookup 和 parent candidates 会直接从 mmap 段按需读取并返回 `index_tier = "FrozenManifestOnly"`。新写 v7 快照会持久化完整路径 trigram posting 与 `[0,0,0]` sentinel，使 mmap 查询可安全用 posting 判空；旧 basename-only 段或缺少 sentinel 的段会回退全段精确过滤，避免目录组件命中漏查。`/memory` 会拆出 `hot_memory_entries`、`manifest_only_entries`、`cold_segment_count`、`cold_manifest_bytes`、`cold_filter_bytes` 和 `cold_mmap_bytes`，Linux 上还会暴露 `process_faults.minflt/majflt`，用于证明冷层是降低索引驻留而不只是降低扫描频率。默认关闭的 `[mmap_warmup]` 可在启动后对 cold v7 mmap 执行 best-effort `MADV_WILLNEED`；该路径会先消费 I/O Governor token，并在 `/health.diagnostics.storage` 暴露 `mmap_warmup_enabled`、`mmap_warmup_pages`、`mmap_warmup_elapsed_ms` 和 `mmap_warmup_cancel_reason`。
+v7 快照启动时会挂载为 manifest-only 冷段：常驻内存只保留 segment manifest、mtime 范围和 dirty/freshness 状态；metadata/postings 不再 hydration 到 `BaseIndexData`，查询、metadata lookup 和 parent candidates 会直接从 mmap 段按需读取并返回 `index_tier = "FrozenManifestOnly"`。新写 v7 快照会持久化完整路径 trigram posting 与 `[0,0,0]` sentinel，使 mmap 查询可安全用 posting 判空；旧 basename-only 段或缺少 sentinel 的段会回退全段精确过滤，避免目录组件命中漏查。冷段挂载不再遍历所有路径构建路径 Bloom-style filter，`/memory.base.cold_filter_bytes` 在 manifest-only v7 冷段下保持为 `0`。`/memory` 会拆出 `hot_memory_entries`、`manifest_only_entries`、`cold_segment_count`、`cold_manifest_bytes`、`cold_filter_bytes` 和 `cold_mmap_bytes`，Linux 上还会暴露 `process_faults.minflt/majflt`，用于证明冷层是降低索引驻留而不只是降低扫描频率。默认 `/memory` light 会刷新当前 RSS、swap、smaps rollup 和 fault 计数；Linux 上 `process_rss_bytes` 与 `process_smaps_rollup.rss_bytes` 来自同一次 smaps rollup，smaps 不可读时才回退 statm，避免复用旧完整采样里的进程内存拆分。默认关闭的 `[mmap_warmup]` 可在启动后对 cold v7 mmap 执行 best-effort `MADV_WILLNEED`；该路径会先消费 I/O Governor token，并在 `/health.diagnostics.storage` 暴露 `mmap_warmup_enabled`、`mmap_warmup_pages`、`mmap_warmup_elapsed_ms` 和 `mmap_warmup_cancel_reason`。
 
 DirtyQueue 是冷层补偿的统一入口，会合并来自 inotify 冷层事件、查询 stale hit、路径形态 query miss、周期冷层扫描、启动修复和 overflow recovery 的 dirty scope。队列带 debounce、优先级和重试；局部补扫优先扫描事件所在叶子目录，失败时再逐级扩大范围。
 
@@ -213,6 +213,7 @@ watch_mode = "tiered"
 [tiered_watch]
 profile = "strict" # strict | balanced | low_power
 max_watch_dirs = 131072
+l0_max_cost_per_root = 8192
 project_markers = [".git", "Cargo.toml", "package.json", "go.mod", "pyproject.toml"]
 strict_required_hot_dirs = [
   "~/Documents",
@@ -225,7 +226,7 @@ strict_required_hot_dirs = [
 strict_fail_on_budget_exceeded = true
 ```
 
-`strict` 会要求 `strict_required_hot_dirs` 全部进入 L0 watcher；预算不足时 `/watch-state` 输出 `required_watch_cost`、`watch_budget_shortfall` 和 `strict_uncovered_dirs`，`/health` 在 `strict_fail_on_budget_exceeded = true` 时返回 `index_health = "degraded"`，否则返回 `warning`。`/watch-state` 同时暴露 `logical_watch_cost`、`kernel_watch_cost` 和 `skipped_watch_cost`，分别解释逻辑候选成本、实际 inotify watch 成本和未进入 L0 的扫描/临时 watch 补偿成本。未配置 `max_watch_dirs` 时，tiered watcher 默认预算为 `131072`；未配置 profile 时保持 `balanced` 行为。
+`strict` 会要求 `strict_required_hot_dirs` 尽量进入 L0 watcher；但单个 required root 的真实递归 inotify 成本超过 `l0_max_cost_per_root` 时不会整棵注册 L0，而是进入 L1/scan 补偿，避免 `Documents` / `Downloads` 这类超大目录在启动时一次性注册数万 watch。预算或单根上限不足时 `/watch-state` 输出 `required_watch_cost`、`watch_budget_shortfall`、`l0_max_cost_per_root` 和 `strict_uncovered_dirs`，`/health` 在 `strict_fail_on_budget_exceeded = true` 时返回 `index_health = "degraded"`，否则返回 `warning`。`/watch-state` 同时暴露 `logical_watch_cost`、`kernel_watch_cost` 和 `skipped_watch_cost`，分别解释逻辑候选成本、实际 inotify watch 成本和未进入 L0 的扫描/临时 watch 补偿成本。未配置 `max_watch_dirs` 时，tiered watcher 默认预算为 `131072`；未配置 `l0_max_cost_per_root` 时默认单根上限为 `8192`，设为 `0` 表示按 `max_watch_dirs` 关闭单根保护；未配置 profile 时保持 `balanced` 行为。
 
 `balanced` 会用 `project_markers` 识别用户正在使用的项目根。L1/L2/L3 dirty scan 发现 `Cargo.toml`、`package.json`、`.git` 等 marker 后，会把项目根登记为 candidate、提高 event score，并在预算足够时晋升 L0；预算不足且不能替换更冷 L0 时，会尝试 Ephemeral Watch lease；仍受限时保留 high-priority L1 scan。project marker 不会绕过 `exclude_dirs`、ignore prefix 或 mount policy，大型 `node_modules` / `target` 等排除树不会因为内部 marker 被提升为 watcher 候选。
 
@@ -342,6 +343,7 @@ jq '{
 | `content_index.exclude_ext` | `[String]` | `[]` | 内容索引后缀黑名单 |
 | `tiered_watch.profile` | `String` | `"balanced"` | `strict` / `balanced` / `low_power` |
 | `tiered_watch.max_watch_dirs` | `usize` | `131072` | tiered L0 inotify 递归 watch 预算 |
+| `tiered_watch.l0_max_cost_per_root` | `usize` | `8192` | 单个 L0 根的递归 watch 成本上限，0 表示按总预算关闭单根保护 |
 | `tiered_watch.project_markers` | `[String]` | 常见项目标记 | balanced watcher 识别项目根的 marker 名称 |
 | `tiered_watch.ephemeral_watch_budget` | `usize` | `256` | 临时 watcher lease 独立预算 |
 | `snapshot_interval_secs` | `u64` | `300` | 快照落盘周期 |
