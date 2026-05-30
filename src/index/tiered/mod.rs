@@ -29,7 +29,7 @@ use crate::diagnostics::{DiagnosticReport, DiagnosticSource, RootCasePolicyDiagn
 use crate::event::sync::DirtyQueue;
 use crate::fs_policy::{FsPolicyConfig, SharedMountPolicyCounters};
 use crate::index::l1_cache::L1Cache;
-use crate::index::l2_partition::{physical_dedupe_stats_from_metas, PersistentIndex};
+use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::stats::{StatsCollector, StatsReport};
 use crate::storage::quarantine::{FreezeGate, QuarantineState, RootStateRecord};
@@ -504,24 +504,11 @@ impl TieredIndex {
     }
 
     pub fn refresh_root_case_policy_diagnostics(&self) -> Vec<RootCasePolicyDiagnostics> {
-        use crate::index::case_policy::{
-            detect_root_case_policy, folded_conflict_count, CasePolicy,
-        };
+        use crate::index::case_policy::{detect_root_case_policy, CasePolicy};
 
-        let metas = self.collect_live_metas_for_diagnostics();
         let mut roots = Vec::with_capacity(self.roots.len());
         for root in &self.roots {
             let detected = detect_root_case_policy(root, None);
-            let conflict_count =
-                folded_conflict_count(metas.iter().filter(|meta| meta.path.starts_with(root)).map(
-                    |meta| {
-                        meta.path
-                            .strip_prefix(root)
-                            .unwrap_or(meta.path.as_path())
-                            .as_os_str()
-                            .as_encoded_bytes()
-                    },
-                ));
             let detected_policy = match detected.detected_policy {
                 CasePolicy::Sensitive => "Sensitive",
                 CasePolicy::Insensitive => "Insensitive",
@@ -532,7 +519,7 @@ impl TieredIndex {
             roots.push(RootCasePolicyDiagnostics {
                 root_path: root.display().to_string(),
                 detected_policy,
-                conflict_count: detected.conflict_count.saturating_add(conflict_count),
+                conflict_count: detected.conflict_count,
             });
         }
         self.set_root_case_policy_diagnostics(roots.clone());
@@ -592,10 +579,9 @@ impl DiagnosticSource for TieredIndex {
             self.quarantine_verify_pending.load(Ordering::Relaxed) as usize;
         report.storage.quarantine_verified_roots =
             self.quarantine_verified_roots.load(Ordering::Relaxed);
-        let physical =
-            physical_dedupe_stats_from_metas(self.collect_live_metas_for_diagnostics(), None);
-        report.storage.hardlink_group_count = physical.hardlink_group_count;
-        report.storage.hardlink_max_group_size = physical.max_group_size;
+        let l2_physical = self.l2.load().physical_dedupe_stats();
+        report.storage.hardlink_group_count = l2_physical.hardlink_group_count;
+        report.storage.hardlink_max_group_size = l2_physical.max_group_size;
         report.storage.content_index_enabled = self.content_index_enabled.load(Ordering::Relaxed);
         report.storage.content_indexed_paths =
             self.content_indexed_paths.load(Ordering::Relaxed) as usize;

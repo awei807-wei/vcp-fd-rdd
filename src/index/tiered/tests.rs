@@ -201,44 +201,20 @@ fn tiered_diagnostics_include_root_case_policy_state() {
     std::fs::create_dir_all(&root).unwrap();
 
     let idx = TieredIndex::empty(vec![root.clone()]);
-    let l2 = idx.l2.load_full();
-    l2.upsert(FileMeta {
-        file_key: FileKey {
-            dev: 1,
-            ino: 10,
-            generation: 0,
-        },
-        path: root.join("Straße.txt"),
-        size: 1,
-        mtime: None,
-        ctime: None,
-        atime: None,
-        kind: Default::default(),
-    });
-    l2.upsert(FileMeta {
-        file_key: FileKey {
-            dev: 1,
-            ino: 11,
-            generation: 0,
-        },
-        path: root.join("STRASSE.txt"),
-        size: 1,
-        mtime: None,
-        ctime: None,
-        atime: None,
-        kind: Default::default(),
-    });
-    idx.refresh_base();
 
     let roots = idx.refresh_root_case_policy_diagnostics();
     assert_eq!(roots.len(), 1);
-    assert!(roots[0].conflict_count >= 1);
+    assert_eq!(roots[0].root_path, root.display().to_string());
+    assert!(!roots[0].detected_policy.is_empty());
 
     let mut report = DiagnosticReport::default();
     idx.collect(&mut report);
     assert_eq!(report.storage.case_policy_roots, roots);
-    assert!(report.storage.case_policy_conflict_count >= 1);
-    assert_eq!(report.storage.refresh_base_count, 1);
+    assert_eq!(
+        report.storage.case_policy_conflict_count,
+        roots.iter().map(|root| root.conflict_count).sum::<u64>()
+    );
+    assert_eq!(report.storage.refresh_base_count, 0);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -336,6 +312,42 @@ fn tiered_diagnostics_include_hardlink_physical_stats() {
     assert_eq!(report.storage.hardlink_max_group_size, 3);
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn tiered_diagnostics_skip_manifest_only_cold_hardlink_scan() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("cold-hardlink-diag");
+    let state = unique_tmp_dir("cold-hardlink-diag-state");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&state)?;
+    let original = root.join("original.txt");
+    let alias = root.join("alias.txt");
+    std::fs::write(&original, b"same")?;
+    std::fs::hard_link(&original, &alias)?;
+
+    let store = Arc::new(SnapshotStore::new(state.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, original),
+        mk_event(2, EventType::Create, alias),
+    ]);
+    idx.refresh_base();
+    idx.snapshot_now(store.clone()).await?;
+
+    let loaded = TieredIndex::load_or_empty(&*store, vec![root.clone()]).await?;
+    let cold_report = loaded.memory_report(EventPipelineStats::default()).base;
+    assert_eq!(cold_report.hot_memory_entries, 0);
+    assert_eq!(cold_report.manifest_only_entries, 2);
+    assert_eq!(cold_report.cold_segment_count, 1);
+
+    let mut report = DiagnosticReport::default();
+    loaded.collect(&mut report);
+    assert_eq!(report.storage.hardlink_group_count, 0);
+    assert_eq!(report.storage.hardlink_max_group_size, 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+    Ok(())
 }
 
 #[test]
