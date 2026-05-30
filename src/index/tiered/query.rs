@@ -86,13 +86,6 @@ impl TieredIndex {
             return Ok(Vec::new());
         }
 
-        if self.base.load().file_count() == 0
-            && !self.rebuild_in_progress()
-            && self.l2.load().file_count() > 0
-        {
-            self.refresh_base();
-        }
-
         let plan = match compile_query(keyword) {
             Ok(compiled) => QueryPlan::compiled(compiled),
             Err(e) => {
@@ -430,6 +423,26 @@ impl TieredIndex {
             );
         }
 
+        if base.file_count() == 0 && !self.rebuild_in_progress() {
+            let l2 = self.l2.load_full();
+            if self.query_l2_layer(
+                plan,
+                l2.as_ref(),
+                deleted_sources.as_slice(),
+                &mut blocked_paths,
+                &mut results,
+                scan_limit,
+                content_matches,
+            ) {
+                return filter_dupe_results(
+                    results,
+                    hardlink_dupe_keys.as_ref(),
+                    content_dupe_paths.as_ref(),
+                    limit,
+                );
+            }
+        }
+
         filter_dupe_results(
             results,
             hardlink_dupe_keys.as_ref(),
@@ -502,6 +515,71 @@ impl TieredIndex {
         }
 
         false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_l2_layer(
+        &self,
+        plan: &QueryPlan,
+        layer: &PersistentIndex,
+        deleted_sources: &[Arc<PathArenaSet>],
+        blocked_paths: &mut PathArenaSet,
+        results: &mut Vec<QueryResultMeta>,
+        limit: usize,
+        content_matches: Option<&ContentMatcher<'_>>,
+    ) -> bool {
+        for anchor in plan.anchors() {
+            for meta in layer.query(anchor.as_ref(), limit.saturating_sub(results.len())) {
+                let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+                if self.path_is_frozen(meta.path.as_path()) {
+                    continue;
+                }
+                let blocked = blocked_paths.contains(path_bytes)
+                    || path_deleted_by_any(path_bytes, deleted_sources);
+                if blocked {
+                    self.stats.record_query_stale_hits(1);
+                    continue;
+                }
+
+                let _ = blocked_paths.insert(path_bytes);
+                if self.plan_matches(plan, &meta, content_matches) {
+                    if let Some(result) =
+                        self.validate_l2_warm_result(meta, QueryResultIndexTier::WarmMemory)
+                    {
+                        results.push(result);
+                        if results.len() >= limit {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    fn validate_l2_warm_result(
+        &self,
+        meta: FileMeta,
+        index_tier: QueryResultIndexTier,
+    ) -> Option<QueryResultMeta> {
+        if meta.mtime.is_none() {
+            return Some(QueryResultMeta::cold(
+                meta,
+                QueryResultFreshness::Unknown,
+                index_tier,
+                false,
+            ));
+        }
+        if has_non_filesystem_file_key(&meta) {
+            return Some(QueryResultMeta::cold(
+                meta,
+                QueryResultFreshness::Unknown,
+                index_tier,
+                false,
+            ));
+        }
+        self.validate_cold_result(meta, index_tier)
     }
 
     fn plan_matches(

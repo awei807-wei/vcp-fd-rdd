@@ -1596,34 +1596,6 @@ impl crate::storage::traits::SegmentStore for SnapshotStore {
         self.derived_lsm_dir_path()
     }
 
-    fn load_v6_mmap_if_valid(
-        &self,
-        expected_roots: &[PathBuf],
-    ) -> anyhow::Result<Option<MmapSnapshotV6>> {
-        self.load_v6_mmap_if_valid(expected_roots)
-    }
-
-    fn load_if_valid<'a>(
-        &'a self,
-    ) -> crate::storage::traits::StorageFuture<'a, anyhow::Result<Option<LoadedSnapshot>>> {
-        Box::pin(async move { SnapshotStore::load_if_valid(self).await })
-    }
-
-    fn load_lsm_if_valid(
-        &self,
-        expected_roots: &[PathBuf],
-    ) -> anyhow::Result<Option<LsmLoadedLayers>> {
-        self.load_lsm_if_valid(expected_roots)
-    }
-
-    fn lsm_last_build_ns(&self) -> anyhow::Result<Option<u64>> {
-        self.lsm_last_build_ns()
-    }
-
-    fn lsm_manifest_wal_seal_id(&self) -> anyhow::Result<u64> {
-        self.lsm_manifest_wal_seal_id()
-    }
-
     fn gc_stale_segments(&self) -> anyhow::Result<usize> {
         self.gc_stale_segments()
     }

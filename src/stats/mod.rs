@@ -779,6 +779,7 @@ pub struct StatsReport {
     pub events_dropped: u64,
     pub snapshot_count: u64,
     pub fast_sync_count: u64,
+    pub refresh_base_count: u64,
 }
 
 /// Thread-safe runtime stats collector.
@@ -806,6 +807,7 @@ pub struct StatsCollector {
     events_dropped: std::sync::atomic::AtomicU64,
     snapshot_count: std::sync::atomic::AtomicU64,
     fast_sync_count: std::sync::atomic::AtomicU64,
+    refresh_base_count: std::sync::atomic::AtomicU64,
 }
 
 impl StatsCollector {
@@ -908,6 +910,11 @@ impl StatsCollector {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub fn record_refresh_base(&self) {
+        self.refresh_base_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn report(&self) -> StatsReport {
         let total = self
             .queries_total
@@ -982,6 +989,9 @@ impl StatsCollector {
             fast_sync_count: self
                 .fast_sync_count
                 .load(std::sync::atomic::Ordering::Relaxed),
+            refresh_base_count: self
+                .refresh_base_count
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -1025,6 +1035,7 @@ mod tests {
         stats.record_events_dropped(2);
         stats.record_snapshot();
         stats.record_fast_sync();
+        stats.record_refresh_base();
 
         let report = stats.report();
         assert_eq!(report.queries_total, 2);
@@ -1049,5 +1060,6 @@ mod tests {
         assert_eq!(report.events_dropped, 2);
         assert_eq!(report.snapshot_count, 1);
         assert_eq!(report.fast_sync_count, 1);
+        assert_eq!(report.refresh_base_count, 1);
     }
 }

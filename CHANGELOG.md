@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 修复 manifest-only cold segment 查询路径：冷段 query、metadata lookup 和 parent candidates 改为直接按需读取 v7 mmap 段，避免每次冷查询都 `to_base_index_data()` 全量 hydration。
 - 修复 v7 mmap 冷段 trigram 预过滤的 false negative：旧 basename-only 段或 posting 缺失/空交集时会回退全段精确过滤，目录组件命中不再漏查。
 - 修复 v7 snapshot 写入与 sim optimizer 遗漏：新写 v7 段会持久化完整路径 trigram posting 与 sentinel，使 manifest-only 冷段可直接使用 mmap posting；grid/evolve/optimize 现在会枚举和变异 `interval`、`validate_on_query`、`disabled` 三种 L3 策略模式。
+- 完成 Storage Legacy Cleanup：运行时 `StorageBackend` 不再暴露 legacy v2-v6 snapshot / old LSM read API，这些读取能力保留在 `SnapshotStore` compatibility 边界与兼容测试中；常规 query 和 fast-sync 不再隐式调用 `refresh_base()`，空 base 兼容场景改为只读 L2 warm-memory fallback，并对真实文件系统命中执行 stale 校验和删除补偿。
+- `refresh_base()` 标记为 compatibility/test boundary，新增 `refresh_base_count` 到 `/health.diagnostics.storage`、runtime metrics 和 stats；补齐 query 不物化 base、fast-sync 增删对齐、L1 rename/delete/recreate 失效、旧快照读取兼容、WAL replay、snapshot/rebuild 与 cold mmap 查询回归。
+- rkyv manifest 继续延后：stable v7 手写 manifest schema 仍在演进，当前不引入额外依赖；DocId 仍保持内部身份，不进入对外 API。
 
 ## [0.6.16] - 2026-05-10
 

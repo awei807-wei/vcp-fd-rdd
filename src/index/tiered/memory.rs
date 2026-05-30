@@ -9,8 +9,14 @@ use std::sync::Arc;
 use super::TieredIndex;
 
 impl TieredIndex {
-    /// 手动刷新 base 索引（当 l2 被外部直接修改后需要调用）。
+    /// Compatibility/test boundary: rebuild the read-only base from the mutable
+    /// L2 index after external test helpers or one-off compatibility code mutate
+    /// L2 directly.
+    ///
+    /// Ordinary query, event apply, fast-sync, and watcher paths must not call
+    /// this method; they should read base + overlay/L2 without full materializing.
     pub fn refresh_base(&self) {
+        self.stats.record_refresh_base();
         let l2 = self.l2.load_full();
         let new_base = Arc::new(l2.to_base_index_data());
         self.base.store(new_base);

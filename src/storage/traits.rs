@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::core::EventRecord;
 use crate::index::l2_partition::V6Segments;
 use crate::storage::quarantine::RootStateRecord;
-use crate::storage::snapshot::{LoadedSnapshot, LsmLoadedLayers, LsmSegmentLoaded, MmapSnapshotV6};
+use crate::storage::snapshot::LsmSegmentLoaded;
 use crate::storage::wal::{WalDurability, WalReplayResult};
 
 pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -21,40 +21,18 @@ pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 // SegmentStore – snapshot / LSM segment persistence
 // ---------------------------------------------------------------------------
 
-/// Abstraction over segment-based snapshot storage (legacy bincode + v6 mmap +
-/// LSM directory layout).
+/// Runtime storage boundary used by the tiered index.
 ///
-/// The synchronous subset covers the read path which is the primary
-/// polymorphism point; async write methods remain on the concrete
-/// [`super::SnapshotStore`] for now to avoid an `async_trait` dependency.
+/// Legacy v2-v6 snapshot and old LSM readers intentionally stay on the concrete
+/// [`super::snapshot::SnapshotStore`] compatibility API. They are not part of
+/// this runtime trait so hot startup/query paths cannot accidentally depend on
+/// those formats again.
 pub trait SegmentStore {
     /// Root path of this store (the `index.db` or directory path).
     fn path(&self) -> &Path;
 
     /// Derived LSM directory path (used by watcher event filtering).
     fn derived_lsm_dir_path(&self) -> PathBuf;
-
-    /// Load a v6 mmap snapshot if the on-disk file is valid and roots match.
-    fn load_v6_mmap_if_valid(
-        &self,
-        expected_roots: &[PathBuf],
-    ) -> anyhow::Result<Option<MmapSnapshotV6>>;
-
-    /// Load a legacy snapshot (v2-v5) if present and valid.
-    fn load_if_valid<'a>(&'a self) -> StorageFuture<'a, anyhow::Result<Option<LoadedSnapshot>>>;
-
-    /// Load the full LSM layer stack (base + deltas) if a valid manifest exists.
-    fn load_lsm_if_valid(
-        &self,
-        expected_roots: &[PathBuf],
-    ) -> anyhow::Result<Option<LsmLoadedLayers>>;
-
-    /// Read the `last_build_ns` timestamp from the LSM manifest (cold-start
-    /// offline change detection).
-    fn lsm_last_build_ns(&self) -> anyhow::Result<Option<u64>>;
-
-    /// Read the `wal_seal_id` from the LSM manifest.
-    fn lsm_manifest_wal_seal_id(&self) -> anyhow::Result<u64>;
 
     /// Remove stale segment files no longer referenced by the manifest.
     fn gc_stale_segments(&self) -> anyhow::Result<usize>;
@@ -132,9 +110,9 @@ pub trait WalFactory {
 }
 
 /// Unified storage backend abstraction used by the tiered index.
-pub trait StorageBackend: SegmentStore + SegmentWriter + WalFactory + Send + Sync {}
+pub trait StorageBackend: SegmentStore + WalFactory + Send + Sync {}
 
-impl<T> StorageBackend for T where T: SegmentStore + SegmentWriter + WalFactory + Send + Sync {}
+impl<T> StorageBackend for T where T: SegmentStore + WalFactory + Send + Sync {}
 
 impl<T> SegmentStore for Arc<T>
 where
@@ -146,32 +124,6 @@ where
 
     fn derived_lsm_dir_path(&self) -> PathBuf {
         self.as_ref().derived_lsm_dir_path()
-    }
-
-    fn load_v6_mmap_if_valid(
-        &self,
-        expected_roots: &[PathBuf],
-    ) -> anyhow::Result<Option<MmapSnapshotV6>> {
-        self.as_ref().load_v6_mmap_if_valid(expected_roots)
-    }
-
-    fn load_if_valid<'a>(&'a self) -> StorageFuture<'a, anyhow::Result<Option<LoadedSnapshot>>> {
-        self.as_ref().load_if_valid()
-    }
-
-    fn load_lsm_if_valid(
-        &self,
-        expected_roots: &[PathBuf],
-    ) -> anyhow::Result<Option<LsmLoadedLayers>> {
-        self.as_ref().load_lsm_if_valid(expected_roots)
-    }
-
-    fn lsm_last_build_ns(&self) -> anyhow::Result<Option<u64>> {
-        self.as_ref().lsm_last_build_ns()
-    }
-
-    fn lsm_manifest_wal_seal_id(&self) -> anyhow::Result<u64> {
-        self.as_ref().lsm_manifest_wal_seal_id()
     }
 
     fn gc_stale_segments(&self) -> anyhow::Result<usize> {

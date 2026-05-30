@@ -677,17 +677,31 @@ impl TieredIndex {
             upsert_events.clear();
         }
 
-        if self.base.load().file_count() == 0 && self.l2.load().file_count() > 0 {
-            self.refresh_base();
-        }
-
         let dirty_dirs: HashSet<PathBuf> = dirs.into_iter().collect();
 
         // 3) 删除对齐：只对齐"被标记 dirty 的目录"下的条目（但对文件做轻量存在性检查，避免构建巨大的 names set）。
         let mut delete_events: Vec<EventRecord> = Vec::new();
 
         let base = self.base.load_full();
-        let to_delete = base.delete_alignment_with_parent_index(&dirty_dirs);
+        let to_delete = if base.file_count() > 0 {
+            base.delete_alignment_with_parent_index(&dirty_dirs)
+        } else if !self.rebuild_in_progress() {
+            let mut l2_doc_id = 0u64;
+            let mut candidates = Vec::new();
+            self.l2.load_full().for_each_live_meta(|meta| {
+                if meta
+                    .path
+                    .parent()
+                    .is_some_and(|parent| dirty_dirs.contains(parent))
+                {
+                    candidates.push((l2_doc_id, meta.path));
+                    l2_doc_id = l2_doc_id.saturating_add(1);
+                }
+            });
+            candidates
+        } else {
+            Vec::new()
+        };
         for (_doc_id, path) in to_delete {
             io_governor.before_io();
             match std::fs::symlink_metadata(&path) {

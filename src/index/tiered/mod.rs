@@ -604,6 +604,7 @@ impl DiagnosticSource for TieredIndex {
         report.storage.mmap_warmup_pages = self.mmap_warmup_pages.load(Ordering::Relaxed);
         report.storage.mmap_warmup_elapsed_ms = self.mmap_warmup_elapsed_ms.load(Ordering::Relaxed);
         report.storage.mmap_warmup_cancel_reason = self.mmap_warmup_cancel_reason.lock().clone();
+        report.storage.refresh_base_count = self.stats_report().refresh_base_count;
 
         report.clocks.skew_count = clock_skew_count;
         report.clocks.last_drift_ms = clock_last_drift_ms;

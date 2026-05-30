@@ -52,6 +52,7 @@ pub struct StorageDiagnostics {
     pub mmap_warmup_pages: u64,
     pub mmap_warmup_elapsed_ms: u64,
     pub mmap_warmup_cancel_reason: String,
+    pub refresh_base_count: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

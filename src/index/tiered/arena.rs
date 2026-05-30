@@ -120,5 +120,21 @@ impl PathArenaSet {
 }
 
 pub(super) fn path_deleted_by_any(path_bytes: &[u8], deleted_sets: &[Arc<PathArenaSet>]) -> bool {
-    deleted_sets.iter().any(|paths| paths.contains(path_bytes))
+    deleted_sets
+        .iter()
+        .any(|paths| path_deleted_by_set(path_bytes, paths.as_ref()))
+}
+
+fn path_deleted_by_set(path_bytes: &[u8], deleted: &PathArenaSet) -> bool {
+    if deleted.contains(path_bytes) {
+        return true;
+    }
+
+    for idx in (1..path_bytes.len()).rev() {
+        if matches!(path_bytes[idx], b'/' | b'\\') && deleted.contains(&path_bytes[..idx]) {
+            return true;
+        }
+    }
+
+    false
 }

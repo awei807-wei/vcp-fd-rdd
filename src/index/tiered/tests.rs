@@ -225,6 +225,7 @@ fn tiered_diagnostics_include_root_case_policy_state() {
     idx.collect(&mut report);
     assert_eq!(report.storage.case_policy_roots, roots);
     assert!(report.storage.case_policy_conflict_count >= 1);
+    assert_eq!(report.storage.refresh_base_count, 1);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -827,10 +828,12 @@ fn event_apply_does_not_materialize_base_hot_path() {
         "ordinary event application must not rebuild BaseIndex"
     );
     assert!(!idx.query("first_hot_path").is_empty());
-    assert!(
-        idx.base.load().file_count() > 0,
-        "query may lazily materialize an initially empty test index"
+    assert_eq!(
+        idx.base.load().file_count(),
+        0,
+        "ordinary query must not materialize an initially empty BaseIndex"
     );
+    assert_eq!(idx.stats_report().refresh_base_count, 0);
 
     let second = root.join("second_hot_path.txt");
     std::fs::write(&second, b"second").unwrap();
@@ -842,6 +845,7 @@ fn event_apply_does_not_materialize_base_hot_path() {
         "event application after base exists must still avoid full materialization"
     );
     assert!(!idx.query("second_hot_path").is_empty());
+    assert_eq!(idx.stats_report().refresh_base_count, 0);
 
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -333,4 +333,35 @@ mod tests {
             generation: 0
         }));
     }
+
+    #[test]
+    fn rename_delete_recreate_invalidation_keeps_path_index_current() {
+        let cache = L1Cache::with_capacity(8);
+        cache.insert(meta(10, "alpha.txt"));
+
+        let old_matcher = create_matcher("/tmp/alpha.txt", true);
+        assert_eq!(
+            cache.query(old_matcher.as_ref()).unwrap()[0].file_key.ino,
+            10
+        );
+
+        cache.remove_by_path(Path::new("/tmp/alpha.txt"));
+        cache.insert(meta(10, "beta.txt"));
+
+        assert!(cache.query(old_matcher.as_ref()).is_none());
+        let beta_matcher = create_matcher("/tmp/beta.txt", true);
+        assert_eq!(
+            cache.query(beta_matcher.as_ref()).unwrap()[0].file_key.ino,
+            10
+        );
+
+        cache.remove_by_path(Path::new("/tmp/beta.txt"));
+        assert!(cache.query(beta_matcher.as_ref()).is_none());
+
+        cache.insert(meta(11, "alpha.txt"));
+        assert_eq!(
+            cache.query(old_matcher.as_ref()).unwrap()[0].file_key.ino,
+            11
+        );
+    }
 }
