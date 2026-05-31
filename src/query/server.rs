@@ -49,6 +49,18 @@ pub struct HealthTelemetry {
     pub wal_durability: String,
     pub wal_sync_interval_ms: u64,
     pub wal_sync_batch_records: usize,
+    pub startup_scan_required: bool,
+    pub deferred_repair: bool,
+    pub deferred_dirty_dir_count: usize,
+    pub deferred_unknown_scope: bool,
+    pub wal_tail_dirty_dir_count: usize,
+    pub deferred_repair_queue_len: usize,
+    pub lazy_validation_pending: usize,
+    pub lazy_validation_rate_limited: u64,
+    pub lazy_validation_cache_hits: u64,
+    pub lazy_validation_queue_full: u64,
+    pub lazy_validation_completed: u64,
+    pub lazy_validation_stale_hits: u64,
     pub recovery_requires_repair: bool,
     pub recovery_requires_rebuild: bool,
     pub recovery_soft_repair_needed: bool,
@@ -152,6 +164,18 @@ pub struct HealthResponse {
     pub wal_durability: String,
     pub wal_sync_interval_ms: u64,
     pub wal_sync_batch_records: usize,
+    pub startup_scan_required: bool,
+    pub deferred_repair: bool,
+    pub deferred_dirty_dir_count: usize,
+    pub deferred_unknown_scope: bool,
+    pub wal_tail_dirty_dir_count: usize,
+    pub deferred_repair_queue_len: usize,
+    pub lazy_validation_pending: usize,
+    pub lazy_validation_rate_limited: u64,
+    pub lazy_validation_cache_hits: u64,
+    pub lazy_validation_queue_full: u64,
+    pub lazy_validation_completed: u64,
+    pub lazy_validation_stale_hits: u64,
     pub recovery_requires_repair: bool,
     pub recovery_requires_rebuild: bool,
     pub recovery_soft_repair_needed: bool,
@@ -517,6 +541,18 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     diagnostics.storage.wal_gap_detected = health.wal_gap_detected;
     diagnostics.storage.wal_checkpoint_used = health.wal_checkpoint_used;
     diagnostics.storage.wal_durability = health.wal_durability.clone();
+    diagnostics.storage.startup_scan_required = health.startup_scan_required;
+    diagnostics.storage.deferred_repair = health.deferred_repair;
+    diagnostics.storage.deferred_dirty_dir_count = health.deferred_dirty_dir_count;
+    diagnostics.storage.deferred_unknown_scope = health.deferred_unknown_scope;
+    diagnostics.storage.wal_tail_dirty_dir_count = health.wal_tail_dirty_dir_count;
+    diagnostics.storage.deferred_repair_queue_len = health.deferred_repair_queue_len;
+    diagnostics.storage.lazy_validation_pending = health.lazy_validation_pending;
+    diagnostics.storage.lazy_validation_rate_limited = health.lazy_validation_rate_limited;
+    diagnostics.storage.lazy_validation_cache_hits = health.lazy_validation_cache_hits;
+    diagnostics.storage.lazy_validation_queue_full = health.lazy_validation_queue_full;
+    diagnostics.storage.lazy_validation_completed = health.lazy_validation_completed;
+    diagnostics.storage.lazy_validation_stale_hits = health.lazy_validation_stale_hits;
     diagnostics.security.http_policy = http_policy_label(state.http_policy).to_string();
     diagnostics.security.scan_reject_count = state.scan_reject_count.load(Ordering::Relaxed);
     let identity = RunningIdentity::current();
@@ -556,6 +592,18 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         wal_durability: health.wal_durability,
         wal_sync_interval_ms: health.wal_sync_interval_ms,
         wal_sync_batch_records: health.wal_sync_batch_records,
+        startup_scan_required: health.startup_scan_required,
+        deferred_repair: health.deferred_repair,
+        deferred_dirty_dir_count: health.deferred_dirty_dir_count,
+        deferred_unknown_scope: health.deferred_unknown_scope,
+        wal_tail_dirty_dir_count: health.wal_tail_dirty_dir_count,
+        deferred_repair_queue_len: health.deferred_repair_queue_len,
+        lazy_validation_pending: health.lazy_validation_pending,
+        lazy_validation_rate_limited: health.lazy_validation_rate_limited,
+        lazy_validation_cache_hits: health.lazy_validation_cache_hits,
+        lazy_validation_queue_full: health.lazy_validation_queue_full,
+        lazy_validation_completed: health.lazy_validation_completed,
+        lazy_validation_stale_hits: health.lazy_validation_stale_hits,
         recovery_requires_repair: health.recovery_requires_repair,
         recovery_requires_rebuild: health.recovery_requires_rebuild,
         recovery_soft_repair_needed: health.recovery_soft_repair_needed,

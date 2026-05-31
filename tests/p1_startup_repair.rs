@@ -91,7 +91,7 @@ async fn startup_repair_dirty_only_skips_after_clean_shutdown() {
 }
 
 #[tokio::test]
-async fn startup_repair_dirty_only_runs_after_unclean_shutdown() {
+async fn startup_repair_dirty_only_defers_unclean_shutdown() {
     let root = unique_tmp_dir("dirty-unclean");
     std::fs::create_dir_all(&root).unwrap();
     let snap_path = root.join("index.db");
@@ -119,17 +119,21 @@ async fn startup_repair_dirty_only_runs_after_unclean_shutdown() {
     let report = index.recovery_status().report;
     assert!(report.soft_repair_needed);
     assert!(!report.hard_rebuild_needed);
+    assert!(!report.startup_scan_required);
+    assert!(report.deferred_repair);
+    assert!(report.deferred_unknown_scope);
     assert!(report.soft_reasons.iter().any(|r| r == "unclean_shutdown"));
 
     let stats = index.startup_repair_if_needed(true, "dirty-only", 4, 10_000, 1.0);
 
     assert!(index.recovery_status().report.requires_repair);
-    assert!(stats.ran);
+    assert!(!stats.ran);
     assert!(!stats.escalated);
     assert_eq!(stats.escalation_reason, "");
-    assert!(stats.scanned >= 2);
-    assert!(stats.changed >= 1);
-    assert_eq!(stats.budget_ms, 10_000);
+    assert_eq!(stats.scanned, 0);
+    assert_eq!(stats.changed, 0);
+    index.enqueue_startup_deferred_repair();
+    assert_eq!(index.deferred_repair_queue_len(), 1);
 
     let _ = std::fs::remove_dir_all(&root);
 }

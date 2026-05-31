@@ -253,6 +253,13 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     index.apply_runtime_profile_settings(runtime_profile.settings());
     index.apply_content_index_config(cfg.content_index.clone());
+    index.apply_lazy_validation_config(
+        cfg.lazy_validation_enabled,
+        cfg.lazy_validation_cache_entries,
+        cfg.lazy_validation_ttl_secs,
+        cfg.lazy_validation_stat_per_sec,
+    );
+    index.spawn_lazy_validation_worker();
     let root_case_policies = index.refresh_root_case_policy_diagnostics();
     index.apply_mmap_warmup_config(cfg.mmap_warmup.clone());
     let _ = index.attach_wal(store.as_ref());
@@ -275,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
             repair_stats.escalated
         );
     }
+    index.enqueue_startup_deferred_repair();
     mark_runtime_state(
         store.path(),
         false,
@@ -303,7 +311,11 @@ async fn main() -> anyhow::Result<()> {
         store.path(),
         &index.recovery_status().report.snapshot_source,
     );
-    if watch_enabled && index.file_count() > 0 && startup_reconcile_cutoff_ns > 0 {
+    if watch_enabled
+        && index.file_count() > 0
+        && startup_reconcile_cutoff_ns > 0
+        && index.recovery_status().report.startup_scan_required
+    {
         index.enqueue_dirty(
             DirtyScope::All {
                 cutoff_ns: startup_reconcile_cutoff_ns,
@@ -395,6 +407,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| health_watch_state.as_ref().clone());
             apply_watch_plan_static_fields(&mut watch_state, health_watch_state.as_ref());
             let recovery = index.recovery_status();
+            let lazy_validation = index.lazy_validation_report();
             let event_watcher_degraded = stats.watcher_degraded;
             let event_degraded_roots = stats.degraded_roots;
             let tiered_unwatched_dirs = watch_state
@@ -423,6 +436,18 @@ async fn main() -> anyhow::Result<()> {
                 wal_durability: index.wal_durability().label().to_string(),
                 wal_sync_interval_ms: index.wal_durability().sync_interval_ms(),
                 wal_sync_batch_records: index.wal_durability().sync_batch_records(),
+                startup_scan_required: recovery.report.startup_scan_required,
+                deferred_repair: recovery.report.deferred_repair,
+                deferred_dirty_dir_count: recovery.report.deferred_dirty_dirs.len(),
+                deferred_unknown_scope: recovery.report.deferred_unknown_scope,
+                wal_tail_dirty_dir_count: recovery.report.deferred_dirty_dirs.len(),
+                deferred_repair_queue_len: index.deferred_repair_queue_len(),
+                lazy_validation_pending: lazy_validation.pending,
+                lazy_validation_rate_limited: lazy_validation.rate_limited,
+                lazy_validation_cache_hits: lazy_validation.cache_hits,
+                lazy_validation_queue_full: lazy_validation.queue_full,
+                lazy_validation_completed: lazy_validation.completed,
+                lazy_validation_stale_hits: lazy_validation.stale_hits,
                 recovery_requires_repair: recovery.report.requires_repair,
                 recovery_requires_rebuild: recovery.report.requires_rebuild,
                 recovery_soft_repair_needed: recovery.report.soft_repair_needed,
@@ -605,6 +630,18 @@ async fn main() -> anyhow::Result<()> {
                     wal_gap_detected: health.wal_gap_detected,
                     wal_checkpoint_used: health.wal_checkpoint_used,
                     wal_durability: health.wal_durability,
+                    startup_scan_required: health.startup_scan_required,
+                    deferred_repair: health.deferred_repair,
+                    deferred_dirty_dir_count: health.deferred_dirty_dir_count,
+                    deferred_unknown_scope: health.deferred_unknown_scope,
+                    wal_tail_dirty_dir_count: health.wal_tail_dirty_dir_count,
+                    deferred_repair_queue_len: health.deferred_repair_queue_len,
+                    lazy_validation_pending: health.lazy_validation_pending,
+                    lazy_validation_rate_limited: health.lazy_validation_rate_limited,
+                    lazy_validation_cache_hits: health.lazy_validation_cache_hits,
+                    lazy_validation_queue_full: health.lazy_validation_queue_full,
+                    lazy_validation_completed: health.lazy_validation_completed,
+                    lazy_validation_stale_hits: health.lazy_validation_stale_hits,
                     recovery_requires_repair: health.recovery_requires_repair,
                     recovery_requires_rebuild: health.recovery_requires_rebuild,
                     recovery_soft_repair_needed: health.recovery_soft_repair_needed,

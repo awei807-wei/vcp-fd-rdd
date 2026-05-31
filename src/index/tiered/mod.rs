@@ -2,6 +2,7 @@ pub(crate) mod arena;
 mod content;
 mod directory_manifest;
 pub(crate) mod events;
+mod lazy_validation;
 pub(crate) mod load;
 mod memory;
 mod quarantine;
@@ -59,9 +60,13 @@ pub struct StartupRecoveryReport {
     pub wal_truncated_tail_records: usize,
     pub wal_gap_detected: bool,
     pub wal_checkpoint_used: u64,
+    pub startup_scan_required: bool,
     pub requires_repair: bool,
     pub requires_rebuild: bool,
     pub soft_repair_needed: bool,
+    pub deferred_repair: bool,
+    pub deferred_dirty_dirs: Vec<PathBuf>,
+    pub deferred_unknown_scope: bool,
     pub hard_rebuild_needed: bool,
     pub previous_clean_shutdown: bool,
     pub reasons: Vec<String>,
@@ -268,6 +273,18 @@ pub struct TieredIndex {
     pub(self) content_hash_last_elapsed_ms: AtomicU64,
     pub(self) content_hash_last_skip_reason: Mutex<String>,
     pub(self) directory_manifests: DirectoryManifestStore,
+    pub(self) lazy_validation_enabled: AtomicBool,
+    pub(self) lazy_validation_cache_entries: AtomicU64,
+    pub(self) lazy_validation_ttl_ns: AtomicU64,
+    pub(self) lazy_validation_stat_per_sec: AtomicU64,
+    pub(self) lazy_validation_state: Mutex<lazy_validation::LazyValidationState>,
+    pub(self) lazy_validation_notify: Notify,
+    pub(self) lazy_validation_enqueued: AtomicU64,
+    pub(self) lazy_validation_completed: AtomicU64,
+    pub(self) lazy_validation_stale_hits: AtomicU64,
+    pub(self) lazy_validation_cache_hits: AtomicU64,
+    pub(self) lazy_validation_rate_limited: AtomicU64,
+    pub(self) lazy_validation_queue_full: AtomicU64,
     pub(self) memory_report_cache: Mutex<MemoryReportCache>,
 }
 

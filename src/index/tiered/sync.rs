@@ -395,6 +395,28 @@ impl TieredIndex {
         self.dirty_queue.lock().len()
     }
 
+    pub fn deferred_repair_queue_len(&self) -> usize {
+        self.dirty_queue
+            .lock()
+            .count_by_reason(DirtyReason::StartupRepairDeferred)
+    }
+
+    pub fn enqueue_startup_deferred_repair(&self) {
+        let report = self.recovery_status().report;
+        if !report.deferred_repair {
+            return;
+        }
+        if report.deferred_unknown_scope {
+            self.enqueue_dirty_dirs(self.roots.clone(), DirtyReason::StartupRepairDeferred);
+        }
+        if !report.deferred_dirty_dirs.is_empty() {
+            self.enqueue_dirty_dirs(
+                report.deferred_dirty_dirs,
+                DirtyReason::StartupRepairDeferred,
+            );
+        }
+    }
+
     pub fn dirty_queue_ready_batch(&self, limit: usize) -> Vec<DirtyQueueEntry> {
         self.dirty_queue.lock().pop_ready(now_ns(), limit)
     }
@@ -458,6 +480,14 @@ impl TieredIndex {
                 return report;
             }
             DirtyScope::Dirs { dirs, .. } => {
+                if entry.reason == DirtyReason::StartupRepairDeferred {
+                    let sync = self.fast_sync(entry.scope.clone(), ignore_prefixes);
+                    report.dirs_scanned = sync.dirs_scanned;
+                    report.fast_sync_upserts = sync.upsert_events;
+                    report.fast_sync_deletes = sync.delete_events;
+                    report.changed = sync.upsert_events.saturating_add(sync.delete_events);
+                    return report;
+                }
                 let mut had_failed_dir = false;
                 for dir in dirs {
                     if should_skip_dirty_dir(dir, ignore_prefixes, &self.exclude_dirs) {
@@ -467,11 +497,16 @@ impl TieredIndex {
                         Ok(meta) if meta.is_dir() => {
                             let allow_manifest_skip = entry.reason == DirtyReason::PeriodicColdScan
                                 && manifest_skip_dirs.contains(dir);
+                            let discard_if_event_seq_advances = matches!(
+                                entry.reason,
+                                DirtyReason::PeriodicColdScan | DirtyReason::StartupRepairDeferred
+                            );
                             let (outcome, manifest_skipped) = self
                                 .scan_dirs_periodic_cold_outcome_with_project_markers(
                                     std::slice::from_ref(dir),
                                     project_markers,
                                     allow_manifest_skip,
+                                    discard_if_event_seq_advances,
                                 );
                             report.dirs_scanned = report.dirs_scanned.saturating_add(1);
                             report.changed = report.changed.saturating_add(outcome.changed);
@@ -763,6 +798,7 @@ impl TieredIndex {
             max_entries_per_dir,
             project_markers,
             None,
+            false,
         )
         .outcome
     }
@@ -774,8 +810,10 @@ impl TieredIndex {
         max_entries_per_dir: usize,
         project_markers: &[String],
         budget_ms: Option<u64>,
+        discard_if_event_seq_advances: bool,
     ) -> BudgetedScanOutcome {
         let start = Instant::now();
+        let scan_started_seq = self.event_seq.load(Ordering::Relaxed);
 
         let mut upsert_events: Vec<EventRecord> = Vec::new();
         let mut upsert_metas: Vec<FileMeta> = Vec::new();
@@ -913,10 +951,19 @@ impl TieredIndex {
             }
         }
 
-        if !upsert_events.is_empty() {
-            self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
+        let stale_low_priority_scan = discard_if_event_seq_advances
+            && self.event_seq.load(Ordering::Relaxed) > scan_started_seq;
+        if stale_low_priority_scan {
+            tracing::debug!(
+                "discarded stale low-priority scan result after newer apply seq advanced"
+            );
+            changed = 0;
+        } else {
+            if !upsert_events.is_empty() {
+                self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
+            }
+            self.update_directory_manifests_for_dirs(&dirs, project_markers);
         }
-        self.update_directory_manifests_for_dirs(&dirs, project_markers);
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
         project_roots.sort();
@@ -938,6 +985,7 @@ impl TieredIndex {
         dirs: &[PathBuf],
         project_markers: &[String],
         allow_manifest_skip: bool,
+        discard_if_event_seq_advances: bool,
     ) -> (ScanOutcome, bool) {
         let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
         if allow_manifest_skip && dirs.len() == 1 {
@@ -964,8 +1012,16 @@ impl TieredIndex {
             }
         }
 
-        let outcome =
-            self.scan_dirs_with_depth_and_project_markers(&dirs, Some(1), 10_000, project_markers);
+        let outcome = self
+            .scan_dirs_with_depth_and_project_markers_budgeted(
+                &dirs,
+                Some(1),
+                10_000,
+                project_markers,
+                None,
+                discard_if_event_seq_advances,
+            )
+            .outcome;
         (outcome, false)
     }
 
@@ -1127,10 +1183,10 @@ impl TieredIndex {
             && match mode {
                 "never" => false,
                 "always" => true,
-                "dirty-only" => report.requires_repair,
+                "dirty-only" => report.startup_scan_required,
                 other => {
                     tracing::warn!("unknown startup_repair_mode={}, using dirty-only", other);
-                    report.requires_repair
+                    report.startup_scan_required
                 }
             };
 
@@ -1154,6 +1210,7 @@ impl TieredIndex {
             50_000,
             &[],
             budget,
+            false,
         );
         let outcome = budgeted.outcome;
         let delete_count = self.align_missing_base_paths_for_roots(&roots);

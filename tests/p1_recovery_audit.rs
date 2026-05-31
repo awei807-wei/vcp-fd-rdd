@@ -448,8 +448,13 @@ async fn startup_repair_delete_alignment_removes_missing_stable_path() {
         .await
         .unwrap();
     let stats = loaded.startup_repair_if_needed(true, "dirty-only", 4, 10_000, 1.0);
-    assert!(stats.ran);
-    assert!(stats.changed >= 1);
+    assert!(!stats.ran);
+    assert!(loaded.recovery_status().report.deferred_repair);
+    loaded.enqueue_startup_deferred_repair();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let dirty_entry = loaded.dirty_queue_ready_batch(1).pop().unwrap();
+    let report = loaded.process_dirty_entry(dirty_entry, &[]);
+    assert!(report.changed >= 1);
     assert!(loaded.query("missing-after-crash").is_empty());
 
     let _ = std::fs::remove_dir_all(&root);
@@ -488,7 +493,13 @@ async fn startup_repair_reconciles_renamed_subtree_after_crash() {
         .await
         .unwrap();
     let stats = loaded.startup_repair_if_needed(true, "dirty-only", 8, 10_000, 1.0);
-    assert!(stats.ran);
+    assert!(!stats.ran);
+    assert!(loaded.recovery_status().report.deferred_repair);
+    loaded.enqueue_startup_deferred_repair();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let dirty_entry = loaded.dirty_queue_ready_batch(1).pop().unwrap();
+    let report = loaded.process_dirty_entry(dirty_entry, &[]);
+    assert!(report.changed >= 1);
 
     let results = loaded.query("bundle_1");
     assert!(

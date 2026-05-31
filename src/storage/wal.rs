@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ pub(crate) const WAL_VERSION: u32 = 4;
 // Safety guard: WAL records are expected to be small (path + metadata). Treat any huge length as
 // corruption to avoid memory DoS via `vec![0u8; len]`.
 const MAX_WAL_RECORD_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+const WAL_DAMAGE_FALLBACK_DIRS: usize = 64;
 
 fn now_seal_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -211,8 +213,37 @@ pub struct WalReplayResult {
     pub root_events_replayed: usize,
     pub sealed_used: usize,
     pub truncated_tail_records: usize,
+    pub damage: WalReplayDamage,
     pub gap_detected: bool,
     pub checkpoint_used: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WalReplayDamage {
+    pub dirty_dirs: Vec<PathBuf>,
+    pub unknown_scope: bool,
+    pub truncated_tail_records: usize,
+}
+
+impl WalReplayDamage {
+    fn merge(&mut self, other: WalReplayDamage) {
+        self.truncated_tail_records = self
+            .truncated_tail_records
+            .saturating_add(other.truncated_tail_records);
+        self.unknown_scope |= other.unknown_scope;
+        self.dirty_dirs.extend(other.dirty_dirs);
+        normalize_dirty_dirs(&mut self.dirty_dirs);
+    }
+
+    fn record_damage(&mut self, dirty_dirs: Vec<PathBuf>) {
+        self.truncated_tail_records = self.truncated_tail_records.saturating_add(1);
+        if dirty_dirs.is_empty() {
+            self.unknown_scope = true;
+        } else {
+            self.dirty_dirs.extend(dirty_dirs);
+            normalize_dirty_dirs(&mut self.dirty_dirs);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -452,14 +483,14 @@ impl WalStore {
         let gap_detected = sealed_id_gap_detected(&sealed_ids);
 
         let mut records: Vec<WalReplayRecord> = Vec::new();
-        let mut truncated = 0usize;
+        let mut damage = WalReplayDamage::default();
         for (_, p) in sealed.iter() {
-            let (mut recs, t) = read_wal_file(p)?;
-            truncated += t;
+            let (mut recs, d) = read_wal_file(p)?;
+            damage.merge(d);
             records.append(&mut recs);
         }
-        let (mut cur_records, t) = read_wal_file(&self.current)?;
-        truncated += t;
+        let (mut cur_records, d) = read_wal_file(&self.current)?;
+        damage.merge(d);
         records.append(&mut cur_records);
 
         // Deduplicate by (id, timestamp), keeping the last occurrence.
@@ -513,7 +544,8 @@ impl WalStore {
             events_replayed,
             root_events_replayed,
             sealed_used: sealed.len(),
-            truncated_tail_records: truncated,
+            truncated_tail_records: damage.truncated_tail_records,
+            damage,
             gap_detected,
             checkpoint_used: checkpoint_seal_id,
         })
@@ -704,21 +736,21 @@ fn sealed_id_gap_detected(ids: &[u64]) -> bool {
     ids.windows(2).any(|pair| pair[1] > pair[0] + 1)
 }
 
-fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<WalReplayRecord>, usize)> {
+fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<WalReplayRecord>, WalReplayDamage)> {
     if !path.exists() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), WalReplayDamage::default()));
     }
     let mut f = File::open(path)?;
     let file_len = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
 
     let mut hdr = [0u8; 8];
     if f.read_exact(&mut hdr).is_err() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), WalReplayDamage::default()));
     }
     let magic = u32::from_le_bytes(hdr[0..4].try_into()?);
     let ver = u32::from_le_bytes(hdr[4..8].try_into()?);
     if magic != WAL_MAGIC || !(1..=WAL_VERSION).contains(&ver) {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), WalReplayDamage::default()));
     }
 
     if ver < WAL_VERSION {
@@ -731,13 +763,14 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<WalReplayRecord>, usize)> {
     }
 
     let mut out = Vec::new();
-    let mut truncated_tail = 0usize;
+    let mut damage = WalReplayDamage::default();
+    let mut recent_dirty_dirs = VecDeque::new();
     let mut pos: u64 = 8; // header consumed
     loop {
         let mut lb = [0u8; 8];
         if f.read_exact(&mut lb).is_err() {
             if pos < file_len {
-                truncated_tail += 1;
+                damage.record_damage(recent_dirty_dirs_vec(&recent_dirty_dirs));
             }
             break;
         }
@@ -745,13 +778,13 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<WalReplayRecord>, usize)> {
         let len = u32::from_le_bytes(lb[0..4].try_into()?) as usize;
         let crc = u32::from_le_bytes(lb[4..8].try_into()?);
         if len > MAX_WAL_RECORD_BYTES || pos.saturating_add(len as u64) > file_len {
-            truncated_tail += 1;
+            damage.record_damage(recent_dirty_dirs_vec(&recent_dirty_dirs));
             break;
         }
         let mut buf = vec![0u8; len];
         if f.read_exact(&mut buf).is_err() {
-            // Truncated payload: real IO error, stop reading
-            truncated_tail += 1;
+            // Truncated payload: real IO error, stop reading at the valid prefix boundary.
+            damage.record_damage(recent_dirty_dirs_vec(&recent_dirty_dirs));
             break;
         }
         pos = pos.saturating_add(len as u64);
@@ -764,16 +797,73 @@ fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<WalReplayRecord>, usize)> {
         };
 
         if !crc_ok {
-            // CRC mismatch: skip this record and continue to the next one
-            truncated_tail += 1;
-            continue;
+            let dirty_dirs = decode_wal_record(ver, &buf)
+                .map(|record| wal_record_dirty_dirs(&record))
+                .filter(|dirs| !dirs.is_empty())
+                .unwrap_or_else(|| recent_dirty_dirs_vec(&recent_dirty_dirs));
+            damage.record_damage(dirty_dirs);
+            break;
         }
 
         if let Some(record) = decode_wal_record(ver, &buf) {
+            remember_recent_dirty_dirs(&mut recent_dirty_dirs, &wal_record_dirty_dirs(&record));
             out.push(record);
         }
     }
-    Ok((out, truncated_tail))
+    Ok((out, damage))
+}
+
+fn remember_recent_dirty_dirs(recent: &mut VecDeque<PathBuf>, dirs: &[PathBuf]) {
+    for dir in dirs {
+        if recent.iter().any(|existing| existing == dir) {
+            continue;
+        }
+        recent.push_back(dir.clone());
+        while recent.len() > WAL_DAMAGE_FALLBACK_DIRS {
+            recent.pop_front();
+        }
+    }
+}
+
+fn recent_dirty_dirs_vec(recent: &VecDeque<PathBuf>) -> Vec<PathBuf> {
+    recent.iter().cloned().collect()
+}
+
+fn wal_record_dirty_dirs(record: &WalReplayRecord) -> Vec<PathBuf> {
+    let mut dirs = match record {
+        WalReplayRecord::File(event) => event_dirty_dirs(event),
+        WalReplayRecord::Root(root) => root.affected_prefixes.clone(),
+    };
+    normalize_dirty_dirs(&mut dirs);
+    dirs
+}
+
+fn event_dirty_dirs(event: &EventRecord) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(path) = event.best_path() {
+        if let Some(parent) = path.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    if let EventType::Rename {
+        from,
+        from_path_hint,
+    } = &event.event_type
+    {
+        if let Some(path) = from_path_hint.as_deref().or_else(|| from.as_path()) {
+            if let Some(parent) = path.parent() {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    }
+    normalize_dirty_dirs(&mut dirs);
+    dirs
+}
+
+fn normalize_dirty_dirs(dirs: &mut Vec<PathBuf>) {
+    dirs.retain(|dir| !dir.as_os_str().is_empty());
+    dirs.sort();
+    dirs.dedup();
 }
 
 fn encode_event(ev: &EventRecord) -> Vec<u8> {

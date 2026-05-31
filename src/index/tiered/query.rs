@@ -634,6 +634,16 @@ impl TieredIndex {
             ));
         }
 
+        if self.lazy_validation_is_enabled() {
+            self.try_enqueue_lazy_validation(meta.clone());
+            return Some(QueryResultMeta::cold(
+                meta,
+                QueryResultFreshness::Unknown,
+                index_tier,
+                false,
+            ));
+        }
+
         self.stats.record_cold_validate(1);
 
         let fs_meta = match std::fs::metadata(&meta.path) {

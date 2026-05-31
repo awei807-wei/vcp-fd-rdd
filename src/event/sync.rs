@@ -73,6 +73,7 @@ pub enum DirtyReason {
     QueryMiss,
     PeriodicColdScan,
     StartupRepair,
+    StartupRepairDeferred,
     OverflowRecovery,
 }
 
@@ -82,7 +83,7 @@ impl DirtyReason {
             Self::OverflowRecovery => DirtyPriority::Critical,
             Self::QueryHitStale | Self::StartupRepair => DirtyPriority::High,
             Self::InotifyEvent | Self::QueryMiss => DirtyPriority::Normal,
-            Self::PeriodicColdScan => DirtyPriority::Low,
+            Self::PeriodicColdScan | Self::StartupRepairDeferred => DirtyPriority::Low,
         }
     }
 }
@@ -157,6 +158,13 @@ impl DirtyQueue {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn count_by_reason(&self, reason: DirtyReason) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.reason == reason)
+            .count()
     }
 
     pub fn is_empty(&self) -> bool {

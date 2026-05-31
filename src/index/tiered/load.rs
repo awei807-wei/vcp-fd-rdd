@@ -15,7 +15,7 @@ use crate::storage::snapshot::{
     stable_v7_path_for,
 };
 use crate::storage::traits::StorageBackend;
-use crate::storage::wal::WalReplayRecord;
+use crate::storage::wal::{WalReplayDamage, WalReplayRecord};
 use crate::util::maybe_trim_rss;
 
 use super::{StartupRecoveryReport, TieredIndex, REBUILD_COOLDOWN};
@@ -193,6 +193,20 @@ impl TieredIndex {
             content_hash_last_elapsed_ms: AtomicU64::new(0),
             content_hash_last_skip_reason: Mutex::new(String::new()),
             directory_manifests: super::directory_manifest::DirectoryManifestStore::default(),
+            lazy_validation_enabled: AtomicBool::new(false),
+            lazy_validation_cache_entries: AtomicU64::new(4096),
+            lazy_validation_ttl_ns: AtomicU64::new(10_000_000_000),
+            lazy_validation_stat_per_sec: AtomicU64::new(50),
+            lazy_validation_state: Mutex::new(
+                super::lazy_validation::LazyValidationState::default(),
+            ),
+            lazy_validation_notify: Notify::new(),
+            lazy_validation_enqueued: AtomicU64::new(0),
+            lazy_validation_completed: AtomicU64::new(0),
+            lazy_validation_stale_hits: AtomicU64::new(0),
+            lazy_validation_cache_hits: AtomicU64::new(0),
+            lazy_validation_rate_limited: AtomicU64::new(0),
+            lazy_validation_queue_full: AtomicU64::new(0),
             memory_report_cache: Mutex::new(super::MemoryReportCache::default()),
         }
     }
@@ -619,6 +633,7 @@ impl TieredIndex {
                     events_replayed: r.events_replayed,
                     sealed_used: r.sealed_used,
                     truncated_tail_records: r.truncated_tail_records,
+                    damage: r.damage.clone(),
                     gap_detected: r.gap_detected,
                     checkpoint_used: r.checkpoint_used,
                 };
@@ -655,6 +670,11 @@ impl TieredIndex {
                     events_replayed: 0,
                     sealed_used: 0,
                     truncated_tail_records: 1,
+                    damage: WalReplayDamage {
+                        truncated_tail_records: 1,
+                        unknown_scope: true,
+                        dirty_dirs: Vec::new(),
+                    },
                     gap_detected: false,
                     checkpoint_used: checkpoint_seal_id,
                 }
@@ -663,11 +683,12 @@ impl TieredIndex {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct WalReplaySummary {
     events_replayed: usize,
     sealed_used: usize,
     truncated_tail_records: usize,
+    damage: WalReplayDamage,
     gap_detected: bool,
     checkpoint_used: u64,
 }
@@ -705,6 +726,15 @@ fn startup_report(
     let hard_reasons = recovery_reasons_matching(&reasons, is_hard_rebuild_reason);
     let soft_repair_needed = !soft_reasons.is_empty();
     let hard_rebuild_needed = !hard_reasons.is_empty() || audit.requires_rebuild;
+    let startup_scan_required =
+        source == "empty" || hard_rebuild_needed || replay.gap_detected || !hard_reasons.is_empty();
+    let deferred_dirty_dirs = replay.damage.dirty_dirs.clone();
+    let deferred_unknown_scope = !startup_scan_required
+        && (replay.damage.unknown_scope
+            || (!runtime_state.last_clean_shutdown && deferred_dirty_dirs.is_empty()));
+    let deferred_repair = soft_repair_needed
+        && !startup_scan_required
+        && (deferred_unknown_scope || !deferred_dirty_dirs.is_empty());
     let repair_reason_counts = repair_reason_counts(&reasons);
 
     StartupRecoveryReport {
@@ -714,6 +744,7 @@ fn startup_report(
         wal_truncated_tail_records: replay.truncated_tail_records,
         wal_gap_detected: audit.wal_gap_detected || replay.gap_detected,
         wal_checkpoint_used: replay.checkpoint_used,
+        startup_scan_required,
         requires_repair: source == "empty"
             || audit.requires_repair
             || !runtime_state.last_clean_shutdown
@@ -721,6 +752,9 @@ fn startup_report(
             || replay.gap_detected,
         requires_rebuild: audit.requires_rebuild,
         soft_repair_needed,
+        deferred_repair,
+        deferred_dirty_dirs,
+        deferred_unknown_scope,
         hard_rebuild_needed,
         previous_clean_shutdown: runtime_state.last_clean_shutdown,
         reasons,

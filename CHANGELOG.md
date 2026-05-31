@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 启动 soft evidence 不再驱动前台 repair scan：`StartupRecoveryReport` 新增 `startup_scan_required`、`deferred_repair`、`deferred_dirty_dirs`、`deferred_unknown_scope`，`startup_repair_if_needed("dirty-only")` 只在 hard evidence、WAL gap 或空索引等需要前台扫描的场景运行；`unclean_shutdown` 与 WAL tail damage 会转入低优先级 `StartupRepairDeferred` 队列。
+- WAL replay 改为 valid prefix 语义：遇到首个坏 frame、CRC mismatch、超大 len 或半写 payload 后停止读取 suffix，并返回 `WalReplayDamage`；能 best-effort 解析路径时脏化父目录，无法定位时回退最近 valid WAL 事件目录或标记 unknown scope。
+- 新增 lazy validation 后台校验路径：配置项 `lazy_validation_enabled`、`lazy_validation_cache_entries`、`lazy_validation_ttl_secs`、`lazy_validation_stat_per_sec` 控制查询命中 cold segment 后只做非阻塞入队；后台 worker 限流执行 `stat`，发现 stale 后通过统一 apply 路径写 overlay 并推入 deferred repair。
+- `DirtyReason::StartupRepairDeferred` 作为低优先级 dirty queue reason 接入后台补偿；deferred repair 可观测队列长度、WAL dirty dir 数、unknown scope 与 lazy validation pending/cache/rate-limit/stale 计数，并进入 `/health`、diagnostics 与 metrics JSONL。
+- Recovery audit 对 v7 snapshot 改为浅审计，只检查 header/trailer/segment bounds；完整 segment/global CRC 仅在正式 `load_v7_from_path()` 执行，避免 audit + load 在启动期重复全量校验。
+- 低优先级 deferred/periodic scan 在合并扫描结果前记录并检查 `event_seq`，若扫描期间已有更新事件进入统一 apply 路径，则丢弃该轮扫描结果，避免旧后台扫描覆盖新 watcher/lazy validation 事件。
 - 启动恢复证据分层：`StartupRecoveryReport` 现在区分 `soft_repair_needed` 与 `hard_rebuild_needed`，`unclean_shutdown` / `wal_tail_truncated` 只作为补扫软证据；`bad_manifest`、`missing_segment`、`wal_gap`、`bad_current_wal`、坏 sidecar 等硬证据仍可触发 rebuild 策略。
 - `startup_repair_budget_ms` 接入启动修复深扫，预算耗尽会停止本轮 repair scan 并记录 `startup_repair_budget_exhausted`；`force_rebuild_ratio` 保留为扫描后的次级升级条件，不再由单独异常退出直接放大成重建。
 - `/health` 与 metrics JSONL 新增恢复证据观测字段：soft/hard reasons、reason counts、startup repair budget、budget exhausted 与 escalation reason，便于区分“需要补扫”和“需要重建”。

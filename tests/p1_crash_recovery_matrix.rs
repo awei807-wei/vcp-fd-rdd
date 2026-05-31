@@ -49,7 +49,9 @@ fn abrupt_kill_restart_recovers_visible_incremental_file() {
     );
     let health = common::fd_rdd_client::health_json(port).unwrap();
     assert_eq!(health["last_clean_shutdown"], false);
-    assert_eq!(health["startup_repair_ran"], true);
+    assert_eq!(health["startup_repair_ran"], false);
+    assert_eq!(health["startup_scan_required"], false);
+    assert_eq!(health["deferred_repair"], true);
     restart.kill();
 
     let _ = std::fs::remove_dir_all(&root);

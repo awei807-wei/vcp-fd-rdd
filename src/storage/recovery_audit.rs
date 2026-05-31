@@ -114,11 +114,8 @@ pub fn choose_checkpoint(source: SnapshotCheckpointSource, audit: &RecoveryAudit
 }
 
 fn snapshot_loadable(path: &Path, expected_roots: &[PathBuf]) -> bool {
-    match crate::storage::snapshot_v7::try_load_v7_cold(path, expected_roots) {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(_) => false,
-    }
+    let _ = expected_roots;
+    crate::storage::snapshot_v7::shallow_validate_v7(path).unwrap_or(false)
 }
 
 fn lsm_dir_path(snapshot_path: &Path) -> PathBuf {

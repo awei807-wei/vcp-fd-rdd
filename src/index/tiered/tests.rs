@@ -2062,6 +2062,49 @@ fn cold_query_changed_result_enqueues_parent_rescan() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn lazy_validation_query_enqueues_without_sync_stat_and_worker_repairs() {
+    let root = unique_tmp_dir("lazy-validation-changed");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let path = root.join("lazy_cold_hit.txt");
+    std::fs::write(&path, b"old").unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, path.clone())]);
+    idx.refresh_base();
+    idx.apply_lazy_validation_config(true, 128, 10, 1_000);
+
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    std::fs::write(&path, b"new-content").unwrap();
+
+    let results = idx.query_limit_detailed("lazy_cold_hit", 10);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].freshness, QueryResultFreshness::Unknown);
+    assert!(!results[0].validated);
+    assert_eq!(idx.stats_report().cold_validate_count, 0);
+    assert_eq!(idx.lazy_validation_report().pending, 1);
+
+    idx.spawn_lazy_validation_worker();
+    for _ in 0..50 {
+        if idx.lazy_validation_report().completed >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(idx.lazy_validation_report().completed, 1);
+    assert_eq!(idx.stats_report().cold_validate_count, 1);
+    assert_eq!(idx.stats_report().query_stale_hit_count, 1);
+    assert_eq!(idx.deferred_repair_queue_len(), 1);
+
+    let hot_results = idx.query_limit_detailed("lazy_cold_hit", 10);
+    assert_eq!(hot_results.len(), 1);
+    assert_eq!(hot_results[0].freshness, QueryResultFreshness::Fresh);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn query_miss_path_enqueues_dirty_parent() {
     let root = unique_tmp_dir("query-miss-dirty");

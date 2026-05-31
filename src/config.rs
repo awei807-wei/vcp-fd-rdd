@@ -178,6 +178,14 @@ pub struct Config {
     pub startup_repair_budget_ms: u64,
     /// If repair failure ratio exceeds this value, full rebuild may be scheduled.
     pub startup_repair_force_rebuild_ratio: f32,
+    /// Validate cold query hits asynchronously instead of running stat on the query thread.
+    pub lazy_validation_enabled: bool,
+    /// LRU-style cache capacity for lazy validation enqueue dedupe.
+    pub lazy_validation_cache_entries: usize,
+    /// Lazy validation cache TTL in seconds.
+    pub lazy_validation_ttl_secs: u64,
+    /// Global stat rate limit for lazy validation worker.
+    pub lazy_validation_stat_per_sec: u64,
     /// Runtime resource profile. `memory_light` lowers hot-memory residency at higher I/O cost.
     pub runtime_profile: RuntimeProfile,
     /// WAL durability mode: `flush-only`, `sync-interval`, or `sync-always`.
@@ -608,6 +616,10 @@ impl Default for Config {
             startup_repair_max_dirs: 16,
             startup_repair_budget_ms: 10_000,
             startup_repair_force_rebuild_ratio: 0.25,
+            lazy_validation_enabled: true,
+            lazy_validation_cache_entries: 4096,
+            lazy_validation_ttl_secs: 10,
+            lazy_validation_stat_per_sec: 50,
             runtime_profile: RuntimeProfile::Default,
             wal_durability: "flush-only".to_string(),
             wal_sync_interval_ms: 1000,

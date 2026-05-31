@@ -1345,6 +1345,53 @@ pub fn load_v7_from_path(path: &Path) -> anyhow::Result<Option<V7Snapshot>> {
     }))
 }
 
+/// Lightweight v7 audit used during recovery routing.
+///
+/// This intentionally validates only structural metadata. Full segment/global
+/// CRC validation remains in `load_v7_from_path()` so audit + load do not both
+/// sweep every segment during startup.
+pub fn shallow_validate_v7(path: &Path) -> anyhow::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len() as usize;
+    if file_len < V7_HEADER_SIZE + V7_TRAILER_FIXED_SIZE {
+        return Ok(false);
+    }
+
+    let mmap = unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file)? };
+    let bytes = mmap.as_ref();
+    let header_buf: [u8; V7_HEADER_SIZE] = bytes[0..V7_HEADER_SIZE].try_into()?;
+    let (_version, num_segments, header_crc) = match decode_header(&header_buf) {
+        Some(header) => header,
+        None => return Ok(false),
+    };
+    if compute_header_crc(&header_buf) != header_crc {
+        return Ok(false);
+    }
+
+    let Some((trailer, trailer_start)) = V7Trailer::decode_from_file_end(bytes) else {
+        return Ok(false);
+    };
+    if trailer.num_segments != num_segments {
+        return Ok(false);
+    }
+
+    for i in 0..num_segments as usize {
+        let off = trailer.segment_offsets[i] as usize;
+        let len = trailer.segment_lens[i] as usize;
+        let Some(end) = off.checked_add(len) else {
+            return Ok(false);
+        };
+        if off < V7_HEADER_SIZE || end > trailer_start {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // v7 写入：base + delta → 排序 → 归并 → atomic write v7 单文件
 // ─────────────────────────────────────────────────────────────────────────────
