@@ -1778,6 +1778,57 @@ async fn stable_prev_used_when_stable_is_suspiciously_smaller() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn tiny_stable_without_large_prev_requires_rebuild_after_root_probe() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("tiny-stable-root-probe");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    for i in 0..10_150u64 {
+        std::fs::write(content_root.join(format!("actual_{i:05}.txt")), b"x")?;
+    }
+
+    let store = SnapshotStore::new(state_root.join("index.db"));
+    std::fs::create_dir_all(stable_v7_path_for(store.path()).parent().unwrap())?;
+
+    let small =
+        crate::index::l2_partition::PersistentIndex::new_with_roots(vec![content_root.clone()]);
+    for i in 0..100u64 {
+        small.upsert_path_alias(FileMeta {
+            file_key: FileKey {
+                dev: 88,
+                ino: i + 1,
+                generation: 0,
+            },
+            path: content_root.join(format!("small_{i:03}.txt")),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+            kind: FileKind::File,
+        });
+    }
+    let small_base = small.to_base_index_data();
+    write_v7_snapshot_atomic(&stable_prev_v7_path_for(store.path()), &small_base)?;
+    write_v7_snapshot_atomic(&stable_v7_path_for(store.path()), &small_base)?;
+
+    let loaded = TieredIndex::load_or_empty(&store, vec![content_root.clone()]).await?;
+    let report = loaded.recovery_status().report;
+    assert_eq!(report.snapshot_source, "stable");
+    assert!(report.requires_rebuild);
+    assert!(report.hard_rebuild_needed);
+    assert!(report.startup_scan_required);
+    assert!(report
+        .reasons
+        .iter()
+        .any(|reason| reason == "snapshot_too_small_for_roots"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn snapshot_materialization_does_not_prune_cold_children_for_parent_delete(
 ) -> anyhow::Result<()> {
     let root = unique_tmp_dir("cold-parent-delete");

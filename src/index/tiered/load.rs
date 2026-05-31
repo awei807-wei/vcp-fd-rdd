@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::fs_policy::FsPolicyConfig;
+use crate::core::FileKey;
+use crate::fs_policy::{FsPolicy, FsPolicyConfig};
 use crate::index::base_index::BaseIndexData;
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
@@ -16,7 +17,7 @@ use crate::storage::snapshot::{
 };
 use crate::storage::traits::StorageBackend;
 use crate::storage::wal::{WalReplayDamage, WalReplayRecord};
-use crate::util::maybe_trim_rss;
+use crate::util::{maybe_trim_rss, path_has_excluded_component};
 
 use super::{StartupRecoveryReport, TieredIndex, REBUILD_COOLDOWN};
 
@@ -516,7 +517,7 @@ impl TieredIndex {
             follow_symlinks,
             exclude_dirs.clone(),
         )
-        .with_fs_policy_config(fs_policy_config);
+        .with_fs_policy_config(fs_policy_config.clone());
         let io_governor = Arc::new(IoGovernor::from_config(&io_governor_config));
 
         let runtime_state = read_recovery_runtime_state(store.path()).unwrap_or_else(|e| {
@@ -606,6 +607,27 @@ impl TieredIndex {
                 v7_data.file_count(),
                 v7_data.cold_segments.len()
             );
+            let mut startup_audit = audit.clone();
+            if snapshot_too_small_for_roots(
+                v7_data.file_count(),
+                roots.as_slice(),
+                include_hidden,
+                ignore_enabled,
+                follow_symlinks,
+                exclude_dirs.as_slice(),
+                &fs_policy_config,
+            ) {
+                tracing::warn!(
+                    "{} snapshot has only {} entries but root probe exceeded the rebuild threshold",
+                    source,
+                    v7_data.file_count()
+                );
+                startup_audit.requires_repair = true;
+                startup_audit.requires_rebuild = true;
+                startup_audit
+                    .reasons
+                    .push("snapshot_too_small_for_roots".to_string());
+            }
             let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
             let idx = Self::new_with_base_and_io_governor(
                 l1,
@@ -630,9 +652,14 @@ impl TieredIndex {
             }
             idx.set_root_case_policy_diagnostics(runtime_state.root_case_policies.clone());
             let checkpoint =
-                choose_checkpoint(SnapshotCheckpointSource::from_label(source), &audit);
+                choose_checkpoint(SnapshotCheckpointSource::from_label(source), &startup_audit);
             let replay = idx.replay_wal_if_any(checkpoint);
-            idx.set_startup_recovery_report(startup_report(source, &runtime_state, &audit, replay));
+            idx.set_startup_recovery_report(startup_report(
+                source,
+                &runtime_state,
+                &startup_audit,
+                replay,
+            ));
             maybe_trim_rss();
             return Ok(idx);
         }
@@ -734,6 +761,76 @@ impl TieredIndex {
             }
         }
     }
+}
+
+fn snapshot_too_small_for_roots(
+    snapshot_count: usize,
+    roots: &[PathBuf],
+    include_hidden: bool,
+    ignore_enabled: bool,
+    follow_symlinks: bool,
+    exclude_dirs: &[String],
+    fs_policy_config: &FsPolicyConfig,
+) -> bool {
+    const MAX_BASE_COUNT_FOR_ROOT_PROBE: usize = 10_000;
+    if snapshot_count == 0 || snapshot_count >= MAX_BASE_COUNT_FOR_ROOT_PROBE {
+        return false;
+    }
+
+    let allowed_gap = (snapshot_count / 10).max(10_000);
+    let probe_limit = snapshot_count.saturating_add(allowed_gap).saturating_add(1);
+    let fs_policy = FsPolicy::current_with_config(fs_policy_config.clone());
+    let mut observed = 0usize;
+
+    for root in roots {
+        let mut builder = ignore::WalkBuilder::new(root);
+        builder
+            .hidden(!include_hidden)
+            .follow_links(follow_symlinks)
+            .ignore(ignore_enabled)
+            .git_ignore(ignore_enabled)
+            .git_global(ignore_enabled)
+            .git_exclude(ignore_enabled);
+
+        let filter_root = root.clone();
+        let exclude_dirs = exclude_dirs.to_vec();
+        let fs_policy = fs_policy.clone();
+        builder.filter_entry(move |entry| {
+            (exclude_dirs.is_empty() || !path_has_excluded_component(entry.path(), &exclude_dirs))
+                && fs_policy
+                    .as_ref()
+                    .map(|policy| {
+                        policy
+                            .check_path(entry.path(), Some(filter_root.as_path()))
+                            .is_allowed()
+                    })
+                    .unwrap_or(true)
+        });
+
+        for entry in builder.build().filter_map(Result::ok) {
+            let Some(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() && !file_type.is_dir() {
+                continue;
+            }
+            if file_type.is_dir() && entry.path() == root.as_path() {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if FileKey::from_path_and_metadata(entry.path(), &meta).is_none() {
+                continue;
+            }
+            observed = observed.saturating_add(1);
+            if observed >= probe_limit {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 fn snapshot_suspiciously_smaller(current: usize, previous: usize) -> bool {
