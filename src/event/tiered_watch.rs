@@ -433,6 +433,7 @@ pub struct TieredWatchRuntime {
     fast_scan_generated_events: AtomicU64,
     fast_scan_pending_changed_dirs: AtomicUsize,
     fast_scan_budget_degraded: AtomicBool,
+    fast_scan_bootstrap_next_unix_ms: AtomicU64,
     fast_scan_parent_fence_retries: AtomicU64,
     fast_scan_epoch_conflicts: AtomicU64,
     last_adjustment_unix_secs: AtomicU64,
@@ -547,6 +548,7 @@ impl TieredWatchRuntime {
             fast_scan_generated_events: AtomicU64::new(0),
             fast_scan_pending_changed_dirs: AtomicUsize::new(0),
             fast_scan_budget_degraded: AtomicBool::new(false),
+            fast_scan_bootstrap_next_unix_ms: AtomicU64::new(0),
             fast_scan_parent_fence_retries: AtomicU64::new(0),
             fast_scan_epoch_conflicts: AtomicU64::new(0),
             last_adjustment_unix_secs: AtomicU64::new(now),
@@ -602,6 +604,97 @@ impl TieredWatchRuntime {
             network_mode: network_fast_scan_mode_from_u8(
                 self.fast_scan_network_mode.load(Ordering::Relaxed),
             ),
+        }
+    }
+
+    pub fn should_bootstrap_fast_scan_dirs(&self, candidate_limit: usize) -> bool {
+        self.should_bootstrap_fast_scan_dirs_at(candidate_limit, unix_millis())
+    }
+
+    pub fn should_bootstrap_fast_scan_dirs_at(&self, candidate_limit: usize, now_ms: u64) -> bool {
+        if !self.fast_scan_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let next_allowed = self
+            .fast_scan_bootstrap_next_unix_ms
+            .load(Ordering::Relaxed);
+        if next_allowed > now_ms {
+            return false;
+        }
+
+        let mut l0_dirs = 0usize;
+        let mut has_non_l0_dir = false;
+        {
+            let dirs = self.dirs.read();
+            for state in dirs.values() {
+                if state.tier() == WatchTier::L0 {
+                    l0_dirs = l0_dirs.saturating_add(1);
+                } else {
+                    has_non_l0_dir = true;
+                }
+            }
+        }
+        if !has_non_l0_dir {
+            return false;
+        }
+
+        let known_dirs = self.fast_scan_state.read().sentinels.len();
+        known_dirs.saturating_add(l0_dirs) < candidate_limit.max(1)
+    }
+
+    pub fn fast_scan_l0_roots(&self) -> Vec<PathBuf> {
+        let dirs = self.dirs.read();
+        dirs.iter()
+            .filter_map(|(path, state)| {
+                if state.tier() == WatchTier::L0 {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn fast_scan_bootstrap_excluded_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.fast_scan_l0_roots();
+        roots.extend(self.fast_scan_state.read().sentinels.keys().cloned());
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    pub fn record_fast_scan_bootstrap_result(
+        &self,
+        candidate_count: usize,
+        inserted: usize,
+        candidate_limit: usize,
+        exhausted_retry_ms: u64,
+    ) {
+        self.record_fast_scan_bootstrap_result_at(
+            candidate_count,
+            inserted,
+            candidate_limit,
+            exhausted_retry_ms,
+            unix_millis(),
+        );
+    }
+
+    pub fn record_fast_scan_bootstrap_result_at(
+        &self,
+        candidate_count: usize,
+        inserted: usize,
+        candidate_limit: usize,
+        exhausted_retry_ms: u64,
+        now_ms: u64,
+    ) {
+        if inserted == 0 || candidate_count < candidate_limit.max(1) {
+            self.fast_scan_bootstrap_next_unix_ms.store(
+                now_ms.saturating_add(exhausted_retry_ms.max(1_000)),
+                Ordering::Relaxed,
+            );
+        } else {
+            self.fast_scan_bootstrap_next_unix_ms
+                .store(0, Ordering::Relaxed);
         }
     }
 
@@ -2586,6 +2679,48 @@ mod tests {
         assert!(report.fast_scan_local_strict_ok);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fast_scan_bootstrap_counts_l0_roots_against_candidate_limit() {
+        let root = temp_root("fast-scan-bootstrap-limit");
+        let hot = root.join("hot");
+        let warm = root.join("warm");
+        std::fs::create_dir_all(&hot).unwrap();
+        std::fs::create_dir_all(&warm).unwrap();
+        let table = mount_table_for(root.as_path(), "ext4");
+        let rt = TieredWatchRuntime::new(
+            vec![(hot.clone(), 1)],
+            vec![(warm.clone(), 1)],
+            16,
+            5_000,
+            20,
+        );
+
+        assert!(rt.should_bootstrap_fast_scan_dirs(2));
+        assert_eq!(rt.bootstrap_fast_scan_dirs(vec![warm], &table, 8), 1);
+        assert!(!rt.should_bootstrap_fast_scan_dirs(2));
+        assert_eq!(rt.fast_scan_l0_roots(), vec![hot.clone()]);
+        let excluded = rt.fast_scan_bootstrap_excluded_roots();
+        assert_eq!(excluded.len(), 2);
+        assert!(excluded.contains(&hot));
+
+        let l0_only = TieredWatchRuntime::new(vec![(hot.clone(), 1)], Vec::new(), 16, 5_000, 20);
+        assert!(!l0_only.should_bootstrap_fast_scan_dirs(2_048));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fast_scan_bootstrap_exhaustion_adds_retry_cooldown() {
+        let warm = PathBuf::from("/tmp/warm");
+        let rt = TieredWatchRuntime::new(Vec::new(), vec![(warm, 1)], 16, 5_000, 20);
+
+        assert!(rt.should_bootstrap_fast_scan_dirs_at(2_048, 10_000));
+        rt.record_fast_scan_bootstrap_result_at(0, 0, 2_048, 60_000, 10_000);
+
+        assert!(!rt.should_bootstrap_fast_scan_dirs_at(2_048, 69_999));
+        assert!(rt.should_bootstrap_fast_scan_dirs_at(2_048, 70_000));
     }
 
     #[test]

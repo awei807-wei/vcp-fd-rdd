@@ -141,6 +141,29 @@ impl ColdSegment {
         }
     }
 
+    fn for_each_live_meta_until(&self, mut f: impl FnMut(FileMeta) -> bool) -> bool {
+        let mut completed = true;
+        let result = self.snapshot.for_each_live_meta_until(|meta| {
+            let keep_going = f(meta);
+            if !keep_going {
+                completed = false;
+            }
+            keep_going
+        });
+        self.snapshot.advise_dontneed();
+        match result {
+            Ok(()) => completed,
+            Err(e) => {
+                tracing::warn!(
+                    "cold segment mmap metadata scan failed for {}: {}",
+                    self.manifest.segment_path.display(),
+                    e
+                );
+                true
+            }
+        }
+    }
+
     fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
         let result = self.snapshot.parent_candidates(parent_path);
         self.snapshot.advise_dontneed();
@@ -229,6 +252,15 @@ impl ColdSegmentStore {
         for segment in &self.segments {
             segment.for_each_live_meta(&mut f);
         }
+    }
+
+    fn for_each_live_meta_until(&self, mut f: impl FnMut(FileMeta) -> bool) -> bool {
+        for segment in &self.segments {
+            if !segment.for_each_live_meta_until(&mut f) {
+                return false;
+            }
+        }
+        true
     }
 
     fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
@@ -442,6 +474,13 @@ impl BaseIndexData {
         self.cold_segments.for_each_live_meta(f);
     }
 
+    pub fn for_each_live_meta_until(&self, mut f: impl FnMut(FileMeta) -> bool) -> bool {
+        if !self.resident_for_each_live_meta_until(&mut f) {
+            return false;
+        }
+        self.cold_segments.for_each_live_meta_until(f)
+    }
+
     fn resident_for_each_live_meta(&self, mut f: impl FnMut(FileMeta)) {
         for (docid, entry) in self.entries_by_key.iter().enumerate() {
             if self.tombstones.contains(docid as u32) {
@@ -452,6 +491,21 @@ impl BaseIndexData {
             };
             f(entry_to_meta(entry, &path_bytes));
         }
+    }
+
+    fn resident_for_each_live_meta_until(&self, mut f: impl FnMut(FileMeta) -> bool) -> bool {
+        for (docid, entry) in self.entries_by_key.iter().enumerate() {
+            if self.tombstones.contains(docid as u32) {
+                continue;
+            }
+            let Some(path_bytes) = self.path_table.resolve(entry.path_index()) else {
+                continue;
+            };
+            if !f(entry_to_meta(entry, &path_bytes)) {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
@@ -861,7 +915,9 @@ impl Default for BaseIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::FileKey;
+    use crate::core::{FileKey, FileKind, FileMeta};
+    use crate::index::l2_partition::PersistentIndex;
+    use crate::storage::snapshot_v7::{load_v7_from_path, write_v7_snapshot_atomic};
 
     #[test]
     fn base_index_empty_snapshot() {
@@ -893,5 +949,51 @@ mod tests {
 
         let snap = idx.snapshot();
         assert_eq!(snap.entries_by_key.len(), 1);
+    }
+
+    #[test]
+    fn cold_base_live_meta_until_stops_before_full_materialization() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fd-rdd-cold-until-root-{nanos}"));
+        let state = std::env::temp_dir().join(format!("fd-rdd-cold-until-state-{nanos}"));
+        std::fs::create_dir_all(&state).unwrap();
+
+        let l2 = PersistentIndex::new_with_roots(vec![root.clone()]);
+        for idx in 0..256u64 {
+            l2.upsert_path_alias(FileMeta {
+                file_key: FileKey {
+                    dev: 1,
+                    ino: idx + 1,
+                    generation: 0,
+                },
+                path: root
+                    .join(format!("dir-{idx:03}"))
+                    .join(format!("file-{idx:03}.txt")),
+                size: 0,
+                mtime: None,
+                ctime: None,
+                atime: None,
+                kind: FileKind::File,
+            });
+        }
+
+        let segment_path = state.join("segment.v7");
+        write_v7_snapshot_atomic(&segment_path, &l2.to_base_index_data()).unwrap();
+        let snapshot = Arc::new(load_v7_from_path(&segment_path).unwrap().unwrap());
+        let cold = BaseIndexData::from_cold_v7_snapshot(segment_path, root, 1, snapshot).unwrap();
+
+        let mut visited = 0usize;
+        let completed = cold.for_each_live_meta_until(|_| {
+            visited += 1;
+            visited < 7
+        });
+
+        assert!(!completed);
+        assert_eq!(visited, 7);
+
+        let _ = std::fs::remove_dir_all(state);
     }
 }

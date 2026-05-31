@@ -2513,6 +2513,40 @@ fn fast_scan_changed_dir_reuses_dirty_apply_and_finds_deep_known_dir_create() {
 }
 
 #[test]
+fn fast_scan_known_dir_collection_excludes_l0_covered_roots() {
+    let root = unique_tmp_dir("fast-scan-exclude-l0");
+    let hot_deep = root.join("hot").join("app").join("src");
+    let cold_deep = root.join("cold").join("app").join("src");
+    std::fs::create_dir_all(&hot_deep).unwrap();
+    std::fs::create_dir_all(&cold_deep).unwrap();
+    let hot_file = hot_deep.join("hot_probe.rs");
+    let cold_file = cold_deep.join("cold_probe.rs");
+    std::fs::write(&hot_file, b"fn hot_probe() {}\n").unwrap();
+    std::fs::write(&cold_file, b"fn cold_probe() {}\n").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, hot_file),
+        mk_event(2, EventType::Create, cold_file),
+    ]);
+
+    let excluded = vec![root.join("hot")];
+    let known_dirs = idx.collect_fast_scan_known_dirs_excluding(128, &excluded);
+    assert!(
+        known_dirs.iter().any(|dir| dir == &cold_deep),
+        "cold deep directory should remain eligible for fast scan: {known_dirs:?}"
+    );
+    assert!(
+        !known_dirs
+            .iter()
+            .any(|dir| dir.starts_with(excluded[0].as_path())),
+        "L0-covered hot directory should not be bootstrapped into fast scan: {known_dirs:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn acceptance_large_excluded_project_tree_does_not_become_marker_candidate() {
     let root = unique_tmp_dir("acceptance-excluded-marker");
     let project = root.join("workspace").join("node_modules").join("pkg");

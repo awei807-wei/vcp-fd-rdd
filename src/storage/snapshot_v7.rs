@@ -1136,6 +1136,49 @@ impl V7Snapshot {
         })
     }
 
+    pub fn for_each_live_meta_until(
+        &self,
+        mut f: impl FnMut(FileMeta) -> bool,
+    ) -> anyhow::Result<()> {
+        self.for_each_live_entry_path_until(|entry, path_bytes| {
+            f(entry_to_meta(*entry, path_bytes.to_vec()))
+        })
+    }
+
+    pub fn for_each_live_entry_path_until(
+        &self,
+        mut f: impl FnMut(&FileEntry, &[u8]) -> bool,
+    ) -> anyhow::Result<()> {
+        let resolver = self.path_resolver()?;
+        let Some(entries) = self.segment(V7SegKind::EntriesByKey) else {
+            return Ok(());
+        };
+        let tombstones = self.tombstones()?;
+        let count = entry_count_from_segment(entries, self.version).unwrap_or(0);
+        let mut path_bytes = Vec::new();
+
+        for docid in 0..count {
+            let docid = docid as u32;
+            if tombstones.contains(docid) {
+                continue;
+            }
+            let Some(entry) = file_entry_at(entries, self.version, docid) else {
+                continue;
+            };
+            if resolver
+                .resolve_into(entry.path_index(), &mut path_bytes)
+                .is_none()
+            {
+                continue;
+            }
+            if !f(&entry, &path_bytes) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn parent_candidates(&self, parent_path: &str) -> anyhow::Result<Vec<FileKey>> {
         let Some(entries) = self.segment(V7SegKind::EntriesByKey) else {
             return Ok(Vec::new());

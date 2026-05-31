@@ -160,10 +160,18 @@ impl TieredIndex {
     }
 
     pub fn collect_fast_scan_known_dirs(&self, limit: usize) -> Vec<PathBuf> {
+        self.collect_fast_scan_known_dirs_excluding(limit, &[])
+    }
+
+    pub fn collect_fast_scan_known_dirs_excluding(
+        &self,
+        limit: usize,
+        excluded_roots: &[PathBuf],
+    ) -> Vec<PathBuf> {
         let limit = limit.max(1);
         let mut dirs = HashSet::new();
         for root in &self.roots {
-            if root.is_dir() {
+            if !path_is_under_any_root(root.as_path(), excluded_roots) && root.is_dir() {
                 dirs.insert(root.clone());
             }
             if dirs.len() >= limit {
@@ -171,28 +179,53 @@ impl TieredIndex {
             }
         }
 
-        for meta in self.collect_live_metas_for_diagnostics() {
-            let mut current = if meta.kind.is_directory() {
-                Some(meta.path.as_path())
-            } else {
-                meta.path.parent()
-            };
-            while let Some(dir) = current {
-                if self
-                    .roots
-                    .iter()
-                    .any(|root| dir == root.as_path() || dir.starts_with(root.as_path()))
-                {
-                    dirs.insert(dir.to_path_buf());
-                }
-                if dirs.len() >= limit {
-                    return sorted_limited_dirs(dirs, limit);
-                }
-                if self.roots.iter().any(|root| dir == root.as_path()) {
-                    break;
-                }
-                current = dir.parent();
+        let live_events = {
+            let db = self.delta_buffer.lock();
+            db.live_records().cloned().collect::<Vec<_>>()
+        };
+        for ev in &live_events {
+            if ev.best_path().is_some_and(|path| self.path_is_frozen(path)) {
+                continue;
             }
+            let Some(meta) = self.overlay_meta_for_event(ev) else {
+                continue;
+            };
+            if self.path_is_frozen(meta.path.as_path()) {
+                continue;
+            }
+            collect_parent_dirs_for_fast_scan(&meta, &self.roots, excluded_roots, &mut dirs, limit);
+            if dirs.len() >= limit {
+                return sorted_limited_dirs(dirs, limit);
+            }
+        }
+
+        let base = self.base.load_full();
+        base.for_each_live_meta_until(|meta| {
+            if !self.path_is_frozen(meta.path.as_path()) {
+                collect_parent_dirs_for_fast_scan(
+                    &meta,
+                    &self.roots,
+                    excluded_roots,
+                    &mut dirs,
+                    limit,
+                );
+            }
+            dirs.len() < limit
+        });
+
+        if dirs.len() < limit && base.file_count() == 0 {
+            self.l2.load_full().for_each_live_meta(|meta| {
+                if dirs.len() >= limit || self.path_is_frozen(meta.path.as_path()) {
+                    return;
+                }
+                collect_parent_dirs_for_fast_scan(
+                    &meta,
+                    &self.roots,
+                    excluded_roots,
+                    &mut dirs,
+                    limit,
+                );
+            });
         }
 
         sorted_limited_dirs(dirs, limit)
@@ -1081,6 +1114,41 @@ fn sorted_limited_dirs(dirs: HashSet<PathBuf>, limit: usize) -> Vec<PathBuf> {
     dirs.sort();
     dirs.truncate(limit);
     dirs
+}
+
+fn collect_parent_dirs_for_fast_scan(
+    meta: &FileMeta,
+    roots: &[PathBuf],
+    excluded_roots: &[PathBuf],
+    dirs: &mut HashSet<PathBuf>,
+    limit: usize,
+) {
+    let mut current = if meta.kind.is_directory() {
+        Some(meta.path.as_path())
+    } else {
+        meta.path.parent()
+    };
+    while let Some(dir) = current {
+        let under_index_root = roots
+            .iter()
+            .any(|root| dir == root.as_path() || dir.starts_with(root.as_path()));
+        if under_index_root && !path_is_under_any_root(dir, excluded_roots) {
+            dirs.insert(dir.to_path_buf());
+        }
+        if dirs.len() >= limit {
+            return;
+        }
+        if roots.iter().any(|root| dir == root.as_path()) {
+            break;
+        }
+        current = dir.parent();
+    }
+}
+
+fn path_is_under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|root| path == root.as_path() || path.starts_with(root.as_path()))
 }
 
 fn validate_snapshot_materialization(

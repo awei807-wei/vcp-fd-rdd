@@ -1356,8 +1356,20 @@ fn spawn_tiered_fast_scan_loop(
             tokio::time::sleep(tick).await;
 
             let mount_table = MountTable::current().unwrap_or_default();
-            let known_dirs = index.collect_fast_scan_known_dirs(bootstrap_limit);
-            runtime.bootstrap_fast_scan_dirs(known_dirs, &mount_table, bootstrap_limit);
+            if runtime.should_bootstrap_fast_scan_dirs(bootstrap_limit) {
+                let excluded_roots = runtime.fast_scan_bootstrap_excluded_roots();
+                let known_dirs =
+                    index.collect_fast_scan_known_dirs_excluding(bootstrap_limit, &excluded_roots);
+                let candidate_count = known_dirs.len();
+                let inserted =
+                    runtime.bootstrap_fast_scan_dirs(known_dirs, &mount_table, bootstrap_limit);
+                runtime.record_fast_scan_bootstrap_result(
+                    candidate_count,
+                    inserted,
+                    bootstrap_limit,
+                    fast_scan_bootstrap_retry_ms(&tiered),
+                );
+            }
 
             let result = runtime.fast_scan_tick(&mount_table, runtime.fast_scan_tick_config());
             if result.changed_dirs.is_empty() {
@@ -1366,6 +1378,13 @@ fn spawn_tiered_fast_scan_loop(
             index.enqueue_dirty_dirs(result.changed_dirs, DirtyReason::FastScanChangedDir);
         }
     });
+}
+
+fn fast_scan_bootstrap_retry_ms(tiered: &fd_rdd::config::TieredWatchConfig) -> u64 {
+    tiered
+        .l1_l2_fast_scan_target_secs
+        .max(60)
+        .saturating_mul(1_000)
 }
 
 async fn send_promotion_command(
