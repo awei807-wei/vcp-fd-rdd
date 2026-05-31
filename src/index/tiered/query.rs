@@ -159,6 +159,45 @@ impl TieredIndex {
         self.collect_live_metas_for_diagnostics()
     }
 
+    pub fn collect_fast_scan_known_dirs(&self, limit: usize) -> Vec<PathBuf> {
+        let limit = limit.max(1);
+        let mut dirs = HashSet::new();
+        for root in &self.roots {
+            if root.is_dir() {
+                dirs.insert(root.clone());
+            }
+            if dirs.len() >= limit {
+                return sorted_limited_dirs(dirs, limit);
+            }
+        }
+
+        for meta in self.collect_live_metas_for_diagnostics() {
+            let mut current = if meta.kind.is_directory() {
+                Some(meta.path.as_path())
+            } else {
+                meta.path.parent()
+            };
+            while let Some(dir) = current {
+                if self
+                    .roots
+                    .iter()
+                    .any(|root| dir == root.as_path() || dir.starts_with(root.as_path()))
+                {
+                    dirs.insert(dir.to_path_buf());
+                }
+                if dirs.len() >= limit {
+                    return sorted_limited_dirs(dirs, limit);
+                }
+                if self.roots.iter().any(|root| dir == root.as_path()) {
+                    break;
+                }
+                current = dir.parent();
+            }
+        }
+
+        sorted_limited_dirs(dirs, limit)
+    }
+
     pub(crate) fn collect_live_metas_for_diagnostics(&self) -> Vec<FileMeta> {
         let base = self.base.load_full();
         let db = self.delta_buffer.lock();
@@ -1027,6 +1066,13 @@ fn file_full_hash(path: &Path, index: &TieredIndex) -> Result<u64, String> {
 fn record_content_skip(outcome: &mut ContentDupeOutcome, reason: String) {
     outcome.skipped_count += 1;
     outcome.last_skip_reason = reason;
+}
+
+fn sorted_limited_dirs(dirs: HashSet<PathBuf>, limit: usize) -> Vec<PathBuf> {
+    let mut dirs = dirs.into_iter().collect::<Vec<_>>();
+    dirs.sort();
+    dirs.truncate(limit);
+    dirs
 }
 
 fn collect_live_meta(

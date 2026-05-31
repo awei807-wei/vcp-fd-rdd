@@ -1,11 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::config::L3ScanPolicy;
+use crate::config::{L3ScanPolicy, NetworkFastScanMode, TieredWatchConfig};
+use crate::fs_policy::{is_remote_fstype, MountTable};
 use crate::index::tiered::ScanOutcome;
 use crate::stats::WatchStateReport;
 
@@ -111,6 +112,135 @@ struct DirState {
     budget_blocked_count: AtomicU32,
     last_budget_blocked_unix_secs: AtomicU64,
     high_priority_scan: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FastScanMountClass {
+    LocalTrusted,
+    NetworkUntrusted,
+    FuseUntrusted,
+    Unknown,
+}
+
+impl FastScanMountClass {
+    fn strict_sla_allowed(self) -> bool {
+        matches!(self, Self::LocalTrusted)
+    }
+}
+
+pub fn classify_fast_scan_fstype(fstype: &str) -> FastScanMountClass {
+    let fstype = fstype.trim();
+    if matches!(fstype, "ext4" | "xfs" | "btrfs" | "tmpfs" | "f2fs") {
+        FastScanMountClass::LocalTrusted
+    } else if matches!(fstype, "nfs" | "nfs4" | "cifs" | "smb3") {
+        FastScanMountClass::NetworkUntrusted
+    } else if matches!(fstype, "fuse" | "fuseblk" | "sshfs" | "rclone")
+        || fstype.starts_with("fuse.")
+    {
+        FastScanMountClass::FuseUntrusted
+    } else if is_remote_fstype(fstype) {
+        FastScanMountClass::NetworkUntrusted
+    } else {
+        FastScanMountClass::Unknown
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DirSentinelSignature {
+    dev: u64,
+    ino: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+    nlink: u64,
+}
+
+#[cfg(unix)]
+fn dir_sentinel_signature(meta: &std::fs::Metadata) -> DirSentinelSignature {
+    use std::os::unix::fs::MetadataExt;
+
+    DirSentinelSignature {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        mtime_ns: i128::from(meta.mtime())
+            .saturating_mul(1_000_000_000)
+            .saturating_add(i128::from(meta.mtime_nsec())),
+        ctime_ns: i128::from(meta.ctime())
+            .saturating_mul(1_000_000_000)
+            .saturating_add(i128::from(meta.ctime_nsec())),
+        nlink: meta.nlink(),
+    }
+}
+
+#[cfg(not(unix))]
+fn dir_sentinel_signature(meta: &std::fs::Metadata) -> DirSentinelSignature {
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().min(i128::MAX as u128) as i128)
+        .unwrap_or(0);
+    DirSentinelSignature {
+        mtime_ns,
+        ctime_ns: mtime_ns,
+        nlink: 0,
+        ..DirSentinelSignature::default()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DirSentinel {
+    mount_id: u32,
+    fstype: String,
+    class: FastScanMountClass,
+    signature: DirSentinelSignature,
+    trust_clock: bool,
+    trust_nlink: bool,
+    strict_sla_allowed: bool,
+    last_checked_unix_ms: u64,
+    last_changed_unix_ms: u64,
+    coverage_lag_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct FastScanState {
+    sentinels: HashMap<PathBuf, DirSentinel>,
+    changed_dir_queue: VecDeque<PathBuf>,
+    last_degraded_reason: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FastScanTickConfig {
+    pub enabled: bool,
+    pub target_secs: u64,
+    pub tick_ms: u64,
+    pub local_stat_budget_per_tick: usize,
+    pub network_stat_budget_per_tick: usize,
+    pub local_readdir_budget_per_tick: usize,
+    pub network_readdir_budget_per_tick: usize,
+    pub network_mode: NetworkFastScanMode,
+}
+
+impl Default for FastScanTickConfig {
+    fn default() -> Self {
+        let defaults = TieredWatchConfig::default();
+        Self {
+            enabled: defaults.l1_l2_fast_scan_enabled,
+            target_secs: defaults.l1_l2_fast_scan_target_secs,
+            tick_ms: defaults.l1_l2_fast_scan_tick_ms,
+            local_stat_budget_per_tick: defaults.l1_l2_fast_scan_stat_budget_per_tick,
+            network_stat_budget_per_tick: defaults.network_fast_scan_stat_budget_per_tick,
+            local_readdir_budget_per_tick: defaults.l1_l2_fast_scan_readdir_budget_per_tick,
+            network_readdir_budget_per_tick: defaults.network_fast_scan_readdir_budget_per_tick,
+            network_mode: defaults.network_fast_scan_mode,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FastScanTickResult {
+    pub checked_dirs: usize,
+    pub changed_dirs: Vec<PathBuf>,
+    pub budget_degraded: bool,
 }
 
 impl DirState {
@@ -289,6 +419,22 @@ pub struct TieredWatchRuntime {
     cold_validate_count: AtomicU64,
     dirty_queue_len: AtomicUsize,
     query_stale_hit_count: AtomicU64,
+    fast_scan_enabled: AtomicBool,
+    fast_scan_target_secs: AtomicU64,
+    fast_scan_tick_ms: AtomicU64,
+    fast_scan_local_stat_budget_per_tick: AtomicUsize,
+    fast_scan_network_stat_budget_per_tick: AtomicUsize,
+    fast_scan_local_readdir_budget_per_tick: AtomicUsize,
+    fast_scan_network_readdir_budget_per_tick: AtomicUsize,
+    fast_scan_network_mode: AtomicU8,
+    fast_scan_state: RwLock<FastScanState>,
+    fast_scan_checked_dirs: AtomicU64,
+    fast_scan_changed_dirs: AtomicU64,
+    fast_scan_generated_events: AtomicU64,
+    fast_scan_pending_changed_dirs: AtomicUsize,
+    fast_scan_budget_degraded: AtomicBool,
+    fast_scan_parent_fence_retries: AtomicU64,
+    fast_scan_epoch_conflicts: AtomicU64,
     last_adjustment_unix_secs: AtomicU64,
 }
 
@@ -385,8 +531,277 @@ impl TieredWatchRuntime {
             cold_validate_count: AtomicU64::new(0),
             dirty_queue_len: AtomicUsize::new(0),
             query_stale_hit_count: AtomicU64::new(0),
+            fast_scan_enabled: AtomicBool::new(true),
+            fast_scan_target_secs: AtomicU64::new(5),
+            fast_scan_tick_ms: AtomicU64::new(1_000),
+            fast_scan_local_stat_budget_per_tick: AtomicUsize::new(5_000),
+            fast_scan_network_stat_budget_per_tick: AtomicUsize::new(128),
+            fast_scan_local_readdir_budget_per_tick: AtomicUsize::new(512),
+            fast_scan_network_readdir_budget_per_tick: AtomicUsize::new(16),
+            fast_scan_network_mode: AtomicU8::new(network_fast_scan_mode_to_u8(
+                NetworkFastScanMode::BestEffort,
+            )),
+            fast_scan_state: RwLock::new(FastScanState::default()),
+            fast_scan_checked_dirs: AtomicU64::new(0),
+            fast_scan_changed_dirs: AtomicU64::new(0),
+            fast_scan_generated_events: AtomicU64::new(0),
+            fast_scan_pending_changed_dirs: AtomicUsize::new(0),
+            fast_scan_budget_degraded: AtomicBool::new(false),
+            fast_scan_parent_fence_retries: AtomicU64::new(0),
+            fast_scan_epoch_conflicts: AtomicU64::new(0),
             last_adjustment_unix_secs: AtomicU64::new(now),
         }
+    }
+
+    pub fn apply_fast_scan_config(&self, config: &TieredWatchConfig) {
+        self.fast_scan_enabled
+            .store(config.l1_l2_fast_scan_enabled, Ordering::Relaxed);
+        self.fast_scan_target_secs
+            .store(config.l1_l2_fast_scan_target_secs.max(1), Ordering::Relaxed);
+        self.fast_scan_tick_ms
+            .store(config.l1_l2_fast_scan_tick_ms.max(100), Ordering::Relaxed);
+        self.fast_scan_local_stat_budget_per_tick.store(
+            config.l1_l2_fast_scan_stat_budget_per_tick.max(1),
+            Ordering::Relaxed,
+        );
+        self.fast_scan_network_stat_budget_per_tick.store(
+            config.network_fast_scan_stat_budget_per_tick,
+            Ordering::Relaxed,
+        );
+        self.fast_scan_local_readdir_budget_per_tick.store(
+            config.l1_l2_fast_scan_readdir_budget_per_tick.max(1),
+            Ordering::Relaxed,
+        );
+        self.fast_scan_network_readdir_budget_per_tick.store(
+            config.network_fast_scan_readdir_budget_per_tick,
+            Ordering::Relaxed,
+        );
+        self.fast_scan_network_mode.store(
+            network_fast_scan_mode_to_u8(config.network_fast_scan_mode),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn fast_scan_tick_config(&self) -> FastScanTickConfig {
+        FastScanTickConfig {
+            enabled: self.fast_scan_enabled.load(Ordering::Relaxed),
+            target_secs: self.fast_scan_target_secs.load(Ordering::Relaxed),
+            tick_ms: self.fast_scan_tick_ms.load(Ordering::Relaxed),
+            local_stat_budget_per_tick: self
+                .fast_scan_local_stat_budget_per_tick
+                .load(Ordering::Relaxed),
+            network_stat_budget_per_tick: self
+                .fast_scan_network_stat_budget_per_tick
+                .load(Ordering::Relaxed),
+            local_readdir_budget_per_tick: self
+                .fast_scan_local_readdir_budget_per_tick
+                .load(Ordering::Relaxed),
+            network_readdir_budget_per_tick: self
+                .fast_scan_network_readdir_budget_per_tick
+                .load(Ordering::Relaxed),
+            network_mode: network_fast_scan_mode_from_u8(
+                self.fast_scan_network_mode.load(Ordering::Relaxed),
+            ),
+        }
+    }
+
+    pub fn bootstrap_fast_scan_dirs(
+        &self,
+        dirs: impl IntoIterator<Item = PathBuf>,
+        mount_table: &MountTable,
+        limit: usize,
+    ) -> usize {
+        if !self.fast_scan_enabled.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let mut inserted = 0usize;
+        let now_ms = unix_millis();
+        let mut state = self.fast_scan_state.write();
+        for path in dirs.into_iter().take(limit.max(1)) {
+            if state.sentinels.contains_key(path.as_path()) {
+                continue;
+            }
+            if matches!(self.covering_tier(path.as_path()), Some(WatchTier::L0)) {
+                continue;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            let (mount_id, fstype, class) = fast_scan_mount_info(path.as_path(), mount_table);
+            let strict_sla_allowed = class.strict_sla_allowed();
+            state.sentinels.insert(
+                path.clone(),
+                DirSentinel {
+                    mount_id,
+                    fstype,
+                    class,
+                    signature: dir_sentinel_signature(&meta),
+                    trust_clock: strict_sla_allowed,
+                    trust_nlink: strict_sla_allowed,
+                    strict_sla_allowed,
+                    last_checked_unix_ms: 0,
+                    last_changed_unix_ms: now_ms,
+                    coverage_lag_ms: 0,
+                },
+            );
+            inserted = inserted.saturating_add(1);
+        }
+        inserted
+    }
+
+    pub fn fast_scan_tick(
+        &self,
+        mount_table: &MountTable,
+        config: FastScanTickConfig,
+    ) -> FastScanTickResult {
+        if !config.enabled {
+            return FastScanTickResult::default();
+        }
+
+        let now_ms = unix_millis();
+        let target_ms = config.target_secs.saturating_mul(1_000);
+        let tick_ms = config.tick_ms.max(1);
+        let mut local_budget = config.local_stat_budget_per_tick.max(1);
+        let mut untrusted_budget = if config.network_mode == NetworkFastScanMode::Disabled {
+            0
+        } else {
+            config.network_stat_budget_per_tick
+        };
+        let mut checked_dirs = 0usize;
+
+        let mut state = self.fast_scan_state.write();
+        let local_known = state
+            .sentinels
+            .values()
+            .filter(|sentinel| sentinel.strict_sla_allowed)
+            .count();
+        let required_local_per_tick = required_fast_scan_budget(local_known, target_ms, tick_ms);
+        let budget_degraded =
+            local_known > 0 && config.local_stat_budget_per_tick < required_local_per_tick;
+        self.fast_scan_budget_degraded
+            .store(budget_degraded, Ordering::Relaxed);
+        if budget_degraded {
+            state.last_degraded_reason = format!(
+                "local fast scan budget {} below required {} dirs/tick",
+                config.local_stat_budget_per_tick, required_local_per_tick
+            );
+        }
+
+        let mut candidates = state
+            .sentinels
+            .iter_mut()
+            .filter_map(|(path, sentinel)| {
+                sentinel.coverage_lag_ms = now_ms.saturating_sub(sentinel.last_checked_unix_ms);
+                let enabled_for_mount = sentinel.strict_sla_allowed
+                    || config.network_mode != NetworkFastScanMode::Disabled;
+                if !enabled_for_mount || sentinel.coverage_lag_ms < target_ms {
+                    return None;
+                }
+                Some((
+                    sentinel.strict_sla_allowed,
+                    sentinel.last_checked_unix_ms,
+                    path.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(strict, last_checked, path)| {
+            (std::cmp::Reverse(*strict), *last_checked, path.clone())
+        });
+
+        for (strict_sla_allowed, _, path) in candidates {
+            if strict_sla_allowed {
+                if local_budget == 0 {
+                    continue;
+                }
+                local_budget -= 1;
+            } else {
+                if untrusted_budget == 0 {
+                    continue;
+                }
+                untrusted_budget -= 1;
+            }
+
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(_) => {
+                    state.sentinels.remove(path.as_path());
+                    continue;
+                }
+            };
+            if !meta.is_dir() {
+                state.sentinels.remove(path.as_path());
+                continue;
+            };
+            let Some(sentinel) = state.sentinels.get_mut(path.as_path()) else {
+                continue;
+            };
+
+            let (mount_id, fstype, class) = fast_scan_mount_info(path.as_path(), mount_table);
+            let signature = dir_sentinel_signature(&meta);
+            let strict_poll = !sentinel.strict_sla_allowed
+                && config.network_mode == NetworkFastScanMode::StrictPoll;
+            let changed = strict_poll || signature != sentinel.signature;
+            sentinel.mount_id = mount_id;
+            sentinel.fstype = fstype;
+            sentinel.class = class;
+            sentinel.strict_sla_allowed = class.strict_sla_allowed();
+            sentinel.trust_clock = sentinel.strict_sla_allowed;
+            sentinel.trust_nlink = sentinel.strict_sla_allowed;
+            sentinel.signature = signature;
+            sentinel.last_checked_unix_ms = now_ms;
+            sentinel.coverage_lag_ms = 0;
+            checked_dirs = checked_dirs.saturating_add(1);
+            if changed {
+                sentinel.last_changed_unix_ms = now_ms;
+            }
+
+            if changed && !state.changed_dir_queue.iter().any(|queued| queued == &path) {
+                state.changed_dir_queue.push_back(path);
+            }
+        }
+
+        let changed_budget = config
+            .local_readdir_budget_per_tick
+            .saturating_add(config.network_readdir_budget_per_tick)
+            .max(1);
+        let mut changed_dirs = Vec::new();
+        while changed_dirs.len() < changed_budget {
+            let Some(path) = state.changed_dir_queue.pop_front() else {
+                break;
+            };
+            changed_dirs.push(path);
+        }
+        let pending = state.changed_dir_queue.len();
+        self.fast_scan_pending_changed_dirs
+            .store(pending, Ordering::Relaxed);
+        self.fast_scan_checked_dirs
+            .fetch_add(checked_dirs as u64, Ordering::Relaxed);
+        self.fast_scan_changed_dirs
+            .fetch_add(changed_dirs.len() as u64, Ordering::Relaxed);
+        if pending > 0 {
+            self.fast_scan_budget_degraded
+                .store(true, Ordering::Relaxed);
+            state.last_degraded_reason = format!("changed-dir queue pending={pending}");
+        }
+
+        FastScanTickResult {
+            checked_dirs,
+            changed_dirs,
+            budget_degraded: self.fast_scan_budget_degraded.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn record_fast_scan_generated_events(&self, count: usize) {
+        self.fast_scan_generated_events
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_fast_scan_parent_fence_retry(&self) {
+        self.fast_scan_parent_fence_retries
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_event_paths<'a>(
@@ -1468,6 +1883,58 @@ impl TieredWatchRuntime {
         let ephemeral_watch_cost = self.current_ephemeral_watch_cost.load(Ordering::Relaxed);
         drop(ephemeral);
 
+        let fast_scan_enabled = self.fast_scan_enabled.load(Ordering::Relaxed);
+        let fast_scan_target_secs = self.fast_scan_target_secs.load(Ordering::Relaxed);
+        let fast_scan_tick_ms = self.fast_scan_tick_ms.load(Ordering::Relaxed);
+        let fast_scan_target_ms = fast_scan_target_secs.saturating_mul(1_000);
+        let fast_scan_network_mode =
+            network_fast_scan_mode_from_u8(self.fast_scan_network_mode.load(Ordering::Relaxed));
+        let fast_scan_now_ms = unix_millis();
+        let fast_state = self.fast_scan_state.read();
+        let fast_scan_known_dirs = fast_state.sentinels.len();
+        let fast_scan_local_trusted_dirs = fast_state
+            .sentinels
+            .values()
+            .filter(|sentinel| sentinel.strict_sla_allowed)
+            .count();
+        let fast_scan_untrusted_dirs =
+            fast_scan_known_dirs.saturating_sub(fast_scan_local_trusted_dirs);
+        let fast_scan_pending_changed_dirs = fast_state.changed_dir_queue.len();
+        let mut fast_lags = Vec::with_capacity(fast_scan_known_dirs);
+        let mut last_overdue_dir = String::new();
+        let mut max_lag = 0u64;
+        for (path, sentinel) in fast_state.sentinels.iter() {
+            let lag = if sentinel.last_checked_unix_ms == 0 {
+                fast_scan_target_ms
+            } else {
+                fast_scan_now_ms.saturating_sub(sentinel.last_checked_unix_ms)
+            };
+            if lag > max_lag {
+                max_lag = lag;
+                last_overdue_dir = path.to_string_lossy().to_string();
+            }
+            fast_lags.push(lag);
+        }
+        fast_lags.sort_unstable();
+        let fast_scan_coverage_lag_p50_ms = percentile_ms(&fast_lags, 50);
+        let fast_scan_coverage_lag_p95_ms = percentile_ms(&fast_lags, 95);
+        let fast_scan_coverage_lag_p99_ms = percentile_ms(&fast_lags, 99);
+        let fast_scan_last_degraded_reason = fast_state.last_degraded_reason.clone();
+        drop(fast_state);
+
+        let fast_scan_budget_degraded = self.fast_scan_budget_degraded.load(Ordering::Relaxed);
+        let fast_scan_local_strict_ok = !fast_scan_enabled
+            || fast_scan_local_trusted_dirs == 0
+            || (!fast_scan_budget_degraded && fast_scan_coverage_lag_p99_ms <= fast_scan_target_ms);
+        let fast_scan_sla_ok = fast_scan_local_strict_ok && fast_scan_untrusted_dirs == 0;
+        let fast_scan_mode = fast_scan_mode_label(
+            fast_scan_enabled,
+            fast_scan_local_trusted_dirs,
+            fast_scan_untrusted_dirs,
+            fast_scan_network_mode,
+        )
+        .to_string();
+
         let mut notes = vec![
             "tiered runtime controls L0/L1/L2/L3 hotness scheduling".to_string(),
             "cold L0 directories can be replaced when a hotter candidate needs budget".to_string(),
@@ -1519,6 +1986,22 @@ impl TieredWatchRuntime {
             notes.push(format!(
                 "last budget rejection: {}",
                 last_budget_blocked_reason
+            ));
+        }
+        if fast_scan_enabled {
+            notes.push(format!(
+                "fast scan mode={} known_dirs={} local_trusted={} untrusted={} target_secs={}",
+                fast_scan_mode,
+                fast_scan_known_dirs,
+                fast_scan_local_trusted_dirs,
+                fast_scan_untrusted_dirs,
+                fast_scan_target_secs
+            ));
+        }
+        if fast_scan_budget_degraded && !fast_scan_last_degraded_reason.is_empty() {
+            notes.push(format!(
+                "fast scan degraded: {}",
+                fast_scan_last_degraded_reason
             ));
         }
         let watched_dirs_estimated = self.current_watch_cost.load(Ordering::Relaxed) as usize;
@@ -1614,6 +2097,29 @@ impl TieredWatchRuntime {
             directory_manifest_skipped_scans: 0,
             directory_manifest_changed_scans: 0,
             directory_manifest_untrusted_clock_bypass: 0,
+            fast_scan_enabled,
+            fast_scan_mode,
+            fast_scan_sla_ok,
+            fast_scan_local_strict_ok,
+            fast_scan_target_secs,
+            fast_scan_tick_ms,
+            fast_scan_known_dirs,
+            fast_scan_local_trusted_dirs,
+            fast_scan_untrusted_dirs,
+            fast_scan_pending_changed_dirs,
+            fast_scan_checked_dirs: self.fast_scan_checked_dirs.load(Ordering::Relaxed),
+            fast_scan_changed_dirs: self.fast_scan_changed_dirs.load(Ordering::Relaxed),
+            fast_scan_generated_events: self.fast_scan_generated_events.load(Ordering::Relaxed),
+            fast_scan_coverage_lag_p50_ms,
+            fast_scan_coverage_lag_p95_ms,
+            fast_scan_coverage_lag_p99_ms,
+            fast_scan_budget_degraded,
+            fast_scan_last_overdue_dir: last_overdue_dir,
+            fast_scan_last_degraded_reason,
+            fast_scan_parent_fence_retries: self
+                .fast_scan_parent_fence_retries
+                .load(Ordering::Relaxed),
+            fast_scan_epoch_conflicts: self.fast_scan_epoch_conflicts.load(Ordering::Relaxed),
         }
     }
 
@@ -1859,6 +2365,81 @@ fn next_l3_scan_unix_secs(now: u64, policy: L3ScanPolicy, interval_secs: u64) ->
     }
 }
 
+fn network_fast_scan_mode_to_u8(mode: NetworkFastScanMode) -> u8 {
+    match mode {
+        NetworkFastScanMode::BestEffort => 0,
+        NetworkFastScanMode::StrictPoll => 1,
+        NetworkFastScanMode::Disabled => 2,
+    }
+}
+
+fn network_fast_scan_mode_from_u8(value: u8) -> NetworkFastScanMode {
+    match value {
+        1 => NetworkFastScanMode::StrictPoll,
+        2 => NetworkFastScanMode::Disabled,
+        _ => NetworkFastScanMode::BestEffort,
+    }
+}
+
+fn network_fast_scan_mode_label(mode: NetworkFastScanMode) -> &'static str {
+    match mode {
+        NetworkFastScanMode::BestEffort => "best_effort",
+        NetworkFastScanMode::StrictPoll => "strict_poll",
+        NetworkFastScanMode::Disabled => "disabled",
+    }
+}
+
+fn fast_scan_mode_label(
+    enabled: bool,
+    local_trusted_dirs: usize,
+    untrusted_dirs: usize,
+    network_mode: NetworkFastScanMode,
+) -> &'static str {
+    if !enabled {
+        "disabled"
+    } else if local_trusted_dirs > 0 && untrusted_dirs > 0 {
+        "mixed"
+    } else if local_trusted_dirs > 0 {
+        "local_strict"
+    } else if untrusted_dirs > 0 {
+        network_fast_scan_mode_label(network_mode)
+    } else {
+        "idle"
+    }
+}
+
+fn required_fast_scan_budget(known_dirs: usize, target_ms: u64, tick_ms: u64) -> usize {
+    if known_dirs == 0 {
+        return 0;
+    }
+    let target_ms = target_ms.max(1);
+    let numerator = (known_dirs as u128).saturating_mul(u128::from(tick_ms.max(1)));
+    numerator.div_ceil(u128::from(target_ms)).max(1) as usize
+}
+
+fn percentile_ms(values: &[u64], percentile: usize) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let pct = percentile.min(100);
+    let idx = ((values.len().saturating_sub(1)) * pct).div_ceil(100);
+    values[idx]
+}
+
+fn fast_scan_mount_info(
+    path: &Path,
+    mount_table: &MountTable,
+) -> (u32, String, FastScanMountClass) {
+    let Some(mount) = mount_table.best_match(path) else {
+        return (0, "unknown".to_string(), FastScanMountClass::Unknown);
+    };
+    (
+        mount.mount_id,
+        mount.fstype.clone(),
+        classify_fast_scan_fstype(&mount.fstype),
+    )
+}
+
 fn choose_ephemeral_victim(
     leases: &HashMap<PathBuf, EphemeralWatchLease>,
     candidate: &Path,
@@ -1903,6 +2484,13 @@ fn unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1915,6 +2503,143 @@ mod tests {
             5_000,
             20,
         )
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "fd-rdd-tiered-watch-{tag}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn mount_table_for(path: &Path, fstype: &str) -> crate::fs_policy::MountTable {
+        crate::fs_policy::MountTable::parse(&format!(
+            "1 0 0:1 / {} rw - {} source rw\n",
+            path.display(),
+            fstype
+        ))
+    }
+
+    #[test]
+    fn fast_scan_mount_classification_is_conservative() {
+        assert_eq!(
+            classify_fast_scan_fstype("ext4"),
+            FastScanMountClass::LocalTrusted
+        );
+        assert_eq!(
+            classify_fast_scan_fstype("nfs4"),
+            FastScanMountClass::NetworkUntrusted
+        );
+        assert_eq!(
+            classify_fast_scan_fstype("fuse.sshfs"),
+            FastScanMountClass::FuseUntrusted
+        );
+        assert_eq!(
+            classify_fast_scan_fstype("sshfs"),
+            FastScanMountClass::FuseUntrusted
+        );
+        assert_eq!(
+            classify_fast_scan_fstype("rclone"),
+            FastScanMountClass::FuseUntrusted
+        );
+        assert_eq!(
+            classify_fast_scan_fstype("mysteryfs"),
+            FastScanMountClass::Unknown
+        );
+    }
+
+    #[test]
+    fn fast_scan_sentinel_detects_local_directory_entry_change() {
+        let root = temp_root("fast-scan-change");
+        std::fs::create_dir_all(&root).unwrap();
+        let table = mount_table_for(root.as_path(), "ext4");
+        let rt = TieredWatchRuntime::new(Vec::new(), vec![(root.clone(), 1)], 16, 5_000, 20);
+        assert_eq!(
+            rt.bootstrap_fast_scan_dirs(vec![root.clone()], &table, 8),
+            1
+        );
+
+        let cfg = FastScanTickConfig {
+            target_secs: 0,
+            local_stat_budget_per_tick: 2_000,
+            local_readdir_budget_per_tick: 8,
+            ..FastScanTickConfig::default()
+        };
+        let initial = rt.fast_scan_tick(&table, cfg);
+        assert_eq!(initial.checked_dirs, 1);
+        assert!(initial.changed_dirs.is_empty());
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(root.join("created.txt"), b"new").unwrap();
+
+        let changed = rt.fast_scan_tick(&table, cfg);
+        assert_eq!(changed.checked_dirs, 1);
+        assert_eq!(changed.changed_dirs, vec![root.clone()]);
+        let report = rt.report();
+        assert_eq!(report.fast_scan_known_dirs, 1);
+        assert_eq!(report.fast_scan_local_trusted_dirs, 1);
+        assert_eq!(report.fast_scan_changed_dirs, 1);
+        assert!(report.fast_scan_local_strict_ok);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fast_scan_reports_budget_degraded_for_local_sla_shortfall() {
+        let root = temp_root("fast-scan-budget");
+        let first = root.join("a");
+        let second = root.join("b");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let table = mount_table_for(root.as_path(), "ext4");
+        let rt = TieredWatchRuntime::new(Vec::new(), vec![(root.clone(), 1)], 16, 5_000, 20);
+        assert_eq!(
+            rt.bootstrap_fast_scan_dirs(vec![first, second], &table, 8),
+            2
+        );
+
+        let tick = rt.fast_scan_tick(
+            &table,
+            FastScanTickConfig {
+                target_secs: 1,
+                tick_ms: 1_000,
+                local_stat_budget_per_tick: 1,
+                ..FastScanTickConfig::default()
+            },
+        );
+
+        assert!(tick.budget_degraded);
+        let report = rt.report();
+        assert!(report.fast_scan_budget_degraded);
+        assert!(!report.fast_scan_local_strict_ok);
+        assert!(report
+            .fast_scan_last_degraded_reason
+            .contains("below required"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fast_scan_does_not_report_strict_sla_for_untrusted_mounts() {
+        let root = temp_root("fast-scan-nfs");
+        std::fs::create_dir_all(&root).unwrap();
+        let table = mount_table_for(root.as_path(), "nfs4");
+        let rt = TieredWatchRuntime::new(Vec::new(), vec![(root.clone(), 1)], 16, 5_000, 20);
+        assert_eq!(
+            rt.bootstrap_fast_scan_dirs(vec![root.clone()], &table, 8),
+            1
+        );
+
+        let report = rt.report();
+        assert_eq!(report.fast_scan_untrusted_dirs, 1);
+        assert!(!report.fast_scan_sla_ok);
+        assert_eq!(report.fast_scan_mode, "best_effort");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

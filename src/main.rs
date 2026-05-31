@@ -11,6 +11,7 @@ use fd_rdd::event::tiered_watch::{
 };
 use fd_rdd::event::watcher::check_inotify_limit;
 use fd_rdd::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
+use fd_rdd::fs_policy::MountTable;
 use fd_rdd::index::TieredIndex;
 use fd_rdd::query::SocketServer;
 use fd_rdd::query::{HealthTelemetry, QueryServer};
@@ -344,6 +345,9 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    if let Some(runtime) = tiered_runtime.as_ref() {
+        runtime.apply_fast_scan_config(&cfg.tiered_watch);
+    }
     let watch_state = Arc::new(watch_plan.state.clone());
 
     // 5) 启动事件管道（bounded + debounce）
@@ -390,6 +394,11 @@ async fn main() -> anyhow::Result<()> {
                 watch_command_tx,
                 cfg.tiered_watch.clone(),
             );
+        }
+        if cfg.tiered_watch.l1_l2_fast_scan_enabled {
+            if let Some(runtime) = tiered_runtime.clone() {
+                spawn_tiered_fast_scan_loop(index.clone(), runtime, cfg.tiered_watch.clone());
+            }
         }
     }
 
@@ -480,6 +489,15 @@ async fn main() -> anyhow::Result<()> {
                 strict_coverage_failure: watch_state.strict_coverage_failure,
                 strict_fail_on_budget_exceeded: watch_state.strict_fail_on_budget_exceeded,
                 strict_uncovered_dirs: watch_state.strict_uncovered_dirs,
+                fast_scan_enabled: watch_state.fast_scan_enabled,
+                fast_scan_sla_ok: watch_state.fast_scan_sla_ok,
+                fast_scan_local_strict_ok: watch_state.fast_scan_local_strict_ok,
+                fast_scan_known_dirs: watch_state.fast_scan_known_dirs,
+                fast_scan_local_trusted_dirs: watch_state.fast_scan_local_trusted_dirs,
+                fast_scan_untrusted_dirs: watch_state.fast_scan_untrusted_dirs,
+                fast_scan_coverage_lag_p95_ms: watch_state.fast_scan_coverage_lag_p95_ms,
+                fast_scan_budget_degraded: watch_state.fast_scan_budget_degraded,
+                fast_scan_last_degraded_reason: watch_state.fast_scan_last_degraded_reason,
                 diagnostics: fd_rdd::diagnostics::DiagnosticReport::default(),
             }
         })
@@ -619,6 +637,15 @@ async fn main() -> anyhow::Result<()> {
                     strict_coverage_failure: health.strict_coverage_failure,
                     strict_fail_on_budget_exceeded: health.strict_fail_on_budget_exceeded,
                     strict_uncovered_dirs: health.strict_uncovered_dirs,
+                    fast_scan_enabled: health.fast_scan_enabled,
+                    fast_scan_sla_ok: health.fast_scan_sla_ok,
+                    fast_scan_local_strict_ok: health.fast_scan_local_strict_ok,
+                    fast_scan_known_dirs: health.fast_scan_known_dirs,
+                    fast_scan_local_trusted_dirs: health.fast_scan_local_trusted_dirs,
+                    fast_scan_untrusted_dirs: health.fast_scan_untrusted_dirs,
+                    fast_scan_coverage_lag_p95_ms: health.fast_scan_coverage_lag_p95_ms,
+                    fast_scan_budget_degraded: health.fast_scan_budget_degraded,
+                    fast_scan_last_degraded_reason: health.fast_scan_last_degraded_reason,
                     watch_failures: health.watch_failures,
                     overflow_drops: health.overflow_drops,
                     rescan_signals: health.rescan_signals,
@@ -1146,6 +1173,9 @@ fn spawn_dirty_queue_loop(
                 }
 
                 if let Some(runtime) = runtime.as_ref() {
+                    if entry.reason == DirtyReason::FastScanChangedDir {
+                        runtime.record_fast_scan_generated_events(report.changed);
+                    }
                     for scan in report.outcomes {
                         let changed = scan.outcome.changed;
                         let project_roots = scan.outcome.project_roots.clone();
@@ -1309,6 +1339,31 @@ fn spawn_tiered_scan_loop(
                 continue;
             }
             index.enqueue_dirty_dirs(batch, DirtyReason::PeriodicColdScan);
+        }
+    });
+}
+
+fn spawn_tiered_fast_scan_loop(
+    index: Arc<TieredIndex>,
+    runtime: Arc<TieredWatchRuntime>,
+    tiered: fd_rdd::config::TieredWatchConfig,
+) {
+    tokio::spawn(async move {
+        let tick = Duration::from_millis(tiered.l1_l2_fast_scan_tick_ms.max(100));
+        let bootstrap_limit = tiered.l1_l2_fast_scan_bootstrap_budget_per_tick.max(1);
+
+        loop {
+            tokio::time::sleep(tick).await;
+
+            let mount_table = MountTable::current().unwrap_or_default();
+            let known_dirs = index.collect_fast_scan_known_dirs(bootstrap_limit);
+            runtime.bootstrap_fast_scan_dirs(known_dirs, &mount_table, bootstrap_limit);
+
+            let result = runtime.fast_scan_tick(&mount_table, runtime.fast_scan_tick_config());
+            if result.changed_dirs.is_empty() {
+                continue;
+            }
+            index.enqueue_dirty_dirs(result.changed_dirs, DirtyReason::FastScanChangedDir);
         }
     });
 }

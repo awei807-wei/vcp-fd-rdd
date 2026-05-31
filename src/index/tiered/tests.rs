@@ -3,6 +3,7 @@ use crate::config::{ContentIndexConfig, MmapWarmupConfig, RuntimeProfile};
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta};
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::{DirtyReason, DirtyScope};
+use crate::event::tiered_watch::{FastScanTickConfig, TieredWatchRuntime};
 use crate::fs_policy::{FsPolicyConfig, FsPolicyDecision, MountTable};
 use crate::index::tiered::events::event_record_estimated_bytes;
 use crate::index::tiered::sync::RebuildAdmission;
@@ -2215,6 +2216,64 @@ fn acceptance_project_marker_scan_makes_new_file_searchable() {
         results.iter().any(|result| result.meta.path == main_rs),
         "new project file should be searchable immediately after dirty scan: {results:?}"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fast_scan_changed_dir_reuses_dirty_apply_and_finds_deep_known_dir_create() {
+    let root = unique_tmp_dir("fast-scan-dirty-apply");
+    let deep = root.join("projects").join("app").join("src");
+    std::fs::create_dir_all(&deep).unwrap();
+    let existing = deep.join("existing.rs");
+    std::fs::write(&existing, b"fn existing_probe() {}\n").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, existing.clone())]);
+
+    let known_dirs = idx.collect_fast_scan_known_dirs(128);
+    assert!(
+        known_dirs.iter().any(|dir| dir == &deep),
+        "deep known directory should be registered for fast scan: {known_dirs:?}"
+    );
+
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(root.clone(), 1)], 16, 5_000, 20);
+    let mount_table = MountTable::parse(&format!(
+        "1 0 0:1 / {} rw - ext4 source rw\n",
+        root.display()
+    ));
+    assert!(rt.bootstrap_fast_scan_dirs(known_dirs, &mount_table, 128) >= 1);
+
+    let cfg = FastScanTickConfig {
+        target_secs: 0,
+        local_stat_budget_per_tick: 128,
+        local_readdir_budget_per_tick: 128,
+        ..FastScanTickConfig::default()
+    };
+    let _ = rt.fast_scan_tick(&mount_table, cfg);
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let created = deep.join("fast_created.rs");
+    std::fs::write(&created, b"fn fast_created_probe() {}\n").unwrap();
+
+    let tick = rt.fast_scan_tick(&mount_table, cfg);
+    assert!(
+        tick.changed_dirs.iter().any(|dir| dir == &deep),
+        "fast scan should emit the changed deep directory: {tick:?}"
+    );
+
+    idx.enqueue_dirty_dirs(tick.changed_dirs, DirtyReason::FastScanChangedDir);
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let report = idx.process_dirty_entry(entry, &[]);
+
+    rt.record_fast_scan_generated_events(report.changed);
+    assert!(!report.failed);
+    assert!(report.changed >= 1);
+    assert!(idx
+        .query_limit_detailed("fast_created", 10)
+        .iter()
+        .any(|result| result.meta.path == created));
+    assert!(rt.report().fast_scan_generated_events >= 1);
 
     let _ = std::fs::remove_dir_all(&root);
 }

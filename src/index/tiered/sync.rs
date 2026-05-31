@@ -488,6 +488,27 @@ impl TieredIndex {
                     report.changed = sync.upsert_events.saturating_add(sync.delete_events);
                     return report;
                 }
+                if entry.reason == DirtyReason::FastScanChangedDir {
+                    let sync = self.fast_sync(entry.scope.clone(), ignore_prefixes);
+                    report.dirs_scanned = sync.dirs_scanned;
+                    report.fast_sync_upserts = sync.upsert_events;
+                    report.fast_sync_deletes = sync.delete_events;
+                    report.changed = sync.upsert_events.saturating_add(sync.delete_events);
+                    for dir in entry.scope.dir_paths() {
+                        report.outcomes.push(DirtyScanOutcome {
+                            dir: dir.clone(),
+                            outcome: ScanOutcome {
+                                scanned: sync.dirs_scanned,
+                                changed: report.changed,
+                                elapsed_ms: 0,
+                                project_roots: Vec::new(),
+                            },
+                            reason: entry.reason,
+                            manifest_skipped: false,
+                        });
+                    }
+                    return report;
+                }
                 let mut had_failed_dir = false;
                 for dir in dirs {
                     if should_skip_dirty_dir(dir, ignore_prefixes, &self.exclude_dirs) {
@@ -499,7 +520,9 @@ impl TieredIndex {
                                 && manifest_skip_dirs.contains(dir);
                             let discard_if_event_seq_advances = matches!(
                                 entry.reason,
-                                DirtyReason::PeriodicColdScan | DirtyReason::StartupRepairDeferred
+                                DirtyReason::PeriodicColdScan
+                                    | DirtyReason::StartupRepairDeferred
+                                    | DirtyReason::FastScanChangedDir
                             );
                             let (outcome, manifest_skipped) = self
                                 .scan_dirs_periodic_cold_outcome_with_project_markers(

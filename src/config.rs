@@ -318,6 +318,24 @@ pub struct TieredWatchConfig {
     pub l3_scan_policy: L3ScanPolicy,
     /// Low-frequency L3 verification interval used when l3_scan_policy = "interval".
     pub l3_scan_interval_secs: u64,
+    /// Enable the L1/L2 fast scan lane for known directories outside L0.
+    pub l1_l2_fast_scan_enabled: bool,
+    /// Target coverage window for local trusted L1/L2 directories.
+    pub l1_l2_fast_scan_target_secs: u64,
+    /// Fast scan scheduler tick interval.
+    pub l1_l2_fast_scan_tick_ms: u64,
+    /// Local trusted directory sentinel checks allowed per tick.
+    pub l1_l2_fast_scan_stat_budget_per_tick: usize,
+    /// Local trusted changed-dir readdir work allowed per tick.
+    pub l1_l2_fast_scan_readdir_budget_per_tick: usize,
+    /// Known-directory bootstrap registrations allowed per tick.
+    pub l1_l2_fast_scan_bootstrap_budget_per_tick: usize,
+    /// Network/FUSE fast scan mode. Default best-effort never reports strict SLA success.
+    pub network_fast_scan_mode: NetworkFastScanMode,
+    /// Network/FUSE sentinel checks allowed per tick.
+    pub network_fast_scan_stat_budget_per_tick: usize,
+    /// Network/FUSE strict_poll changed-dir readdir work allowed per tick.
+    pub network_fast_scan_readdir_budget_per_tick: usize,
     /// Empty L1 scans before demotion to L2.
     pub l1_empty_scans_to_l2: u32,
     /// Empty L2 scans before demotion to L3.
@@ -356,6 +374,15 @@ pub enum L3ScanPolicy {
     Interval,
     #[serde(alias = "validate-on-query")]
     ValidateOnQuery,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkFastScanMode {
+    #[default]
+    BestEffort,
+    StrictPoll,
     Disabled,
 }
 
@@ -464,6 +491,15 @@ impl Default for TieredWatchConfig {
             l2_scan_interval_secs: 300,
             l3_scan_policy: L3ScanPolicy::Interval,
             l3_scan_interval_secs: DEFAULT_L3_SCAN_INTERVAL_SECS,
+            l1_l2_fast_scan_enabled: true,
+            l1_l2_fast_scan_target_secs: 5,
+            l1_l2_fast_scan_tick_ms: 1_000,
+            l1_l2_fast_scan_stat_budget_per_tick: 5_000,
+            l1_l2_fast_scan_readdir_budget_per_tick: 512,
+            l1_l2_fast_scan_bootstrap_budget_per_tick: 2_048,
+            network_fast_scan_mode: NetworkFastScanMode::BestEffort,
+            network_fast_scan_stat_budget_per_tick: 128,
+            network_fast_scan_readdir_budget_per_tick: 16,
             l1_empty_scans_to_l2: 5,
             l2_empty_scans_to_l3: 3,
             ephemeral_watch_budget: 256,
@@ -496,6 +532,15 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             l2_scan_interval_secs: u64,
             l3_scan_policy: L3ScanPolicy,
             l3_scan_interval_secs: u64,
+            l1_l2_fast_scan_enabled: bool,
+            l1_l2_fast_scan_target_secs: u64,
+            l1_l2_fast_scan_tick_ms: u64,
+            l1_l2_fast_scan_stat_budget_per_tick: usize,
+            l1_l2_fast_scan_readdir_budget_per_tick: usize,
+            l1_l2_fast_scan_bootstrap_budget_per_tick: usize,
+            network_fast_scan_mode: NetworkFastScanMode,
+            network_fast_scan_stat_budget_per_tick: usize,
+            network_fast_scan_readdir_budget_per_tick: usize,
             l1_empty_scans_to_l2: u32,
             l2_empty_scans_to_l3: u32,
             ephemeral_watch_budget: usize,
@@ -522,6 +567,20 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
                     l2_scan_interval_secs: defaults.l2_scan_interval_secs,
                     l3_scan_policy: defaults.l3_scan_policy,
                     l3_scan_interval_secs: defaults.l3_scan_interval_secs,
+                    l1_l2_fast_scan_enabled: defaults.l1_l2_fast_scan_enabled,
+                    l1_l2_fast_scan_target_secs: defaults.l1_l2_fast_scan_target_secs,
+                    l1_l2_fast_scan_tick_ms: defaults.l1_l2_fast_scan_tick_ms,
+                    l1_l2_fast_scan_stat_budget_per_tick: defaults
+                        .l1_l2_fast_scan_stat_budget_per_tick,
+                    l1_l2_fast_scan_readdir_budget_per_tick: defaults
+                        .l1_l2_fast_scan_readdir_budget_per_tick,
+                    l1_l2_fast_scan_bootstrap_budget_per_tick: defaults
+                        .l1_l2_fast_scan_bootstrap_budget_per_tick,
+                    network_fast_scan_mode: defaults.network_fast_scan_mode,
+                    network_fast_scan_stat_budget_per_tick: defaults
+                        .network_fast_scan_stat_budget_per_tick,
+                    network_fast_scan_readdir_budget_per_tick: defaults
+                        .network_fast_scan_readdir_budget_per_tick,
                     l1_empty_scans_to_l2: defaults.l1_empty_scans_to_l2,
                     l2_empty_scans_to_l3: defaults.l2_empty_scans_to_l3,
                     ephemeral_watch_budget: defaults.ephemeral_watch_budget,
@@ -550,6 +609,17 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             l2_scan_interval_secs: raw.l2_scan_interval_secs,
             l3_scan_policy: raw.l3_scan_policy,
             l3_scan_interval_secs: raw.l3_scan_interval_secs,
+            l1_l2_fast_scan_enabled: raw.l1_l2_fast_scan_enabled,
+            l1_l2_fast_scan_target_secs: raw.l1_l2_fast_scan_target_secs,
+            l1_l2_fast_scan_tick_ms: raw.l1_l2_fast_scan_tick_ms,
+            l1_l2_fast_scan_stat_budget_per_tick: raw.l1_l2_fast_scan_stat_budget_per_tick,
+            l1_l2_fast_scan_readdir_budget_per_tick: raw.l1_l2_fast_scan_readdir_budget_per_tick,
+            l1_l2_fast_scan_bootstrap_budget_per_tick: raw
+                .l1_l2_fast_scan_bootstrap_budget_per_tick,
+            network_fast_scan_mode: raw.network_fast_scan_mode,
+            network_fast_scan_stat_budget_per_tick: raw.network_fast_scan_stat_budget_per_tick,
+            network_fast_scan_readdir_budget_per_tick: raw
+                .network_fast_scan_readdir_budget_per_tick,
             l1_empty_scans_to_l2: raw.l1_empty_scans_to_l2,
             l2_empty_scans_to_l3: raw.l2_empty_scans_to_l3,
             ephemeral_watch_budget: raw.ephemeral_watch_budget,
@@ -912,6 +982,13 @@ max_watch_dirs = 16
         assert_eq!(cfg.tiered_watch.ephemeral_watch_ttl_secs, 600);
         assert_eq!(cfg.tiered_watch.ephemeral_idle_secs, 120);
         assert_eq!(cfg.tiered_watch.ephemeral_max_cost_per_root, 64);
+        assert!(cfg.tiered_watch.l1_l2_fast_scan_enabled);
+        assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_target_secs, 5);
+        assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_tick_ms, 1_000);
+        assert_eq!(
+            cfg.tiered_watch.network_fast_scan_mode,
+            NetworkFastScanMode::BestEffort
+        );
         assert!(cfg
             .tiered_watch
             .project_markers
@@ -934,7 +1011,51 @@ max_watch_dirs = 16
         assert!(toml.contains("ephemeral_watch_ttl_secs"));
         assert!(toml.contains("ephemeral_idle_secs"));
         assert!(toml.contains("ephemeral_max_cost_per_root"));
+        assert!(toml.contains("l1_l2_fast_scan_enabled"));
+        assert!(toml.contains("l1_l2_fast_scan_target_secs"));
+        assert!(toml.contains("network_fast_scan_mode"));
         assert!(toml.contains("project_markers"));
+    }
+
+    #[test]
+    fn tiered_watch_fast_scan_overrides_parse() {
+        let cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+watch_mode = "tiered"
+
+[tiered_watch]
+l1_l2_fast_scan_enabled = false
+l1_l2_fast_scan_target_secs = 7
+l1_l2_fast_scan_tick_ms = 250
+l1_l2_fast_scan_stat_budget_per_tick = 111
+l1_l2_fast_scan_readdir_budget_per_tick = 22
+l1_l2_fast_scan_bootstrap_budget_per_tick = 333
+network_fast_scan_mode = "strict_poll"
+network_fast_scan_stat_budget_per_tick = 44
+network_fast_scan_readdir_budget_per_tick = 5
+"#,
+        )
+        .expect("fast scan config should parse");
+
+        assert!(!cfg.tiered_watch.l1_l2_fast_scan_enabled);
+        assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_target_secs, 7);
+        assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_tick_ms, 250);
+        assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_stat_budget_per_tick, 111);
+        assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_readdir_budget_per_tick, 22);
+        assert_eq!(
+            cfg.tiered_watch.l1_l2_fast_scan_bootstrap_budget_per_tick,
+            333
+        );
+        assert_eq!(
+            cfg.tiered_watch.network_fast_scan_mode,
+            NetworkFastScanMode::StrictPoll
+        );
+        assert_eq!(cfg.tiered_watch.network_fast_scan_stat_budget_per_tick, 44);
+        assert_eq!(
+            cfg.tiered_watch.network_fast_scan_readdir_budget_per_tick,
+            5
+        );
     }
 
     #[test]

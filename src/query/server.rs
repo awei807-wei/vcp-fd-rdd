@@ -93,6 +93,15 @@ pub struct HealthTelemetry {
     pub strict_coverage_failure: bool,
     pub strict_fail_on_budget_exceeded: bool,
     pub strict_uncovered_dirs: Vec<String>,
+    pub fast_scan_enabled: bool,
+    pub fast_scan_sla_ok: bool,
+    pub fast_scan_local_strict_ok: bool,
+    pub fast_scan_known_dirs: usize,
+    pub fast_scan_local_trusted_dirs: usize,
+    pub fast_scan_untrusted_dirs: usize,
+    pub fast_scan_coverage_lag_p95_ms: u64,
+    pub fast_scan_budget_degraded: bool,
+    pub fast_scan_last_degraded_reason: String,
     pub diagnostics: DiagnosticReport,
 }
 
@@ -208,6 +217,15 @@ pub struct HealthResponse {
     pub strict_coverage_failure: bool,
     pub strict_fail_on_budget_exceeded: bool,
     pub strict_uncovered_dirs: Vec<String>,
+    pub fast_scan_enabled: bool,
+    pub fast_scan_sla_ok: bool,
+    pub fast_scan_local_strict_ok: bool,
+    pub fast_scan_known_dirs: usize,
+    pub fast_scan_local_trusted_dirs: usize,
+    pub fast_scan_untrusted_dirs: usize,
+    pub fast_scan_coverage_lag_p95_ms: u64,
+    pub fast_scan_budget_degraded: bool,
+    pub fast_scan_last_degraded_reason: String,
     pub diagnostics: DiagnosticReport,
     pub issues: Vec<String>,
 }
@@ -514,6 +532,24 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     if health.startup_repair_escalated {
         issues.push("startup_repair: escalated to rebuild policy".to_string());
     }
+    if health.fast_scan_enabled && !health.fast_scan_local_strict_ok {
+        issues.push(format!(
+            "fast_scan: local strict coverage lag p95={}ms",
+            health.fast_scan_coverage_lag_p95_ms
+        ));
+    }
+    if health.fast_scan_enabled && health.fast_scan_budget_degraded {
+        issues.push(format!(
+            "fast_scan: degraded {}",
+            health.fast_scan_last_degraded_reason
+        ));
+    }
+    if health.fast_scan_enabled && health.fast_scan_untrusted_dirs > 0 {
+        issues.push(format!(
+            "fast_scan: {} network/fuse/unknown dirs are best-effort",
+            health.fast_scan_untrusted_dirs
+        ));
+    }
     if health.last_snapshot_time == 0 {
         issues.push("snapshot_not_written_yet".to_string());
     }
@@ -521,6 +557,8 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         "static"
     } else if health.event_watcher_degraded
         || (health.strict_coverage_failure && health.strict_fail_on_budget_exceeded)
+        || (health.fast_scan_enabled && !health.fast_scan_local_strict_ok)
+        || (health.fast_scan_enabled && health.fast_scan_budget_degraded)
     {
         "degraded"
     } else if issues.is_empty() {
@@ -565,6 +603,16 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         .watchers
         .fstype_blocked_count
         .saturating_add(health.event_degraded_roots as u64);
+    diagnostics.watchers.fast_scan_enabled = health.fast_scan_enabled;
+    diagnostics.watchers.fast_scan_sla_ok = health.fast_scan_sla_ok;
+    diagnostics.watchers.fast_scan_local_strict_ok = health.fast_scan_local_strict_ok;
+    diagnostics.watchers.fast_scan_known_dirs = health.fast_scan_known_dirs;
+    diagnostics.watchers.fast_scan_local_trusted_dirs = health.fast_scan_local_trusted_dirs;
+    diagnostics.watchers.fast_scan_untrusted_dirs = health.fast_scan_untrusted_dirs;
+    diagnostics.watchers.fast_scan_coverage_lag_p95_ms = health.fast_scan_coverage_lag_p95_ms;
+    diagnostics.watchers.fast_scan_budget_degraded = health.fast_scan_budget_degraded;
+    diagnostics.watchers.fast_scan_last_degraded_reason =
+        health.fast_scan_last_degraded_reason.clone();
 
     Json(HealthResponse {
         status: "ok",
@@ -636,6 +684,15 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         strict_coverage_failure: health.strict_coverage_failure,
         strict_fail_on_budget_exceeded: health.strict_fail_on_budget_exceeded,
         strict_uncovered_dirs: health.strict_uncovered_dirs,
+        fast_scan_enabled: health.fast_scan_enabled,
+        fast_scan_sla_ok: health.fast_scan_sla_ok,
+        fast_scan_local_strict_ok: health.fast_scan_local_strict_ok,
+        fast_scan_known_dirs: health.fast_scan_known_dirs,
+        fast_scan_local_trusted_dirs: health.fast_scan_local_trusted_dirs,
+        fast_scan_untrusted_dirs: health.fast_scan_untrusted_dirs,
+        fast_scan_coverage_lag_p95_ms: health.fast_scan_coverage_lag_p95_ms,
+        fast_scan_budget_degraded: health.fast_scan_budget_degraded,
+        fast_scan_last_degraded_reason: health.fast_scan_last_degraded_reason,
         diagnostics,
         issues,
     })

@@ -232,94 +232,17 @@ strict_fail_on_budget_exceeded = true
 
 L2/L3 periodic cold scan 会维护 directory manifest，用 `child_count`、`names_hash`、`child_mtime_hash`、mtime range 和 scan generation 判断目录是否可跳过真实补扫。`/watch-state` 暴露 `directory_manifest_dirs`、`directory_manifest_skipped_scans`、`directory_manifest_changed_scans` 和 `directory_manifest_untrusted_clock_bypass`；clock cutoff 不可信时会绕过 manifest skip，优先执行真实对账。预算拒绝还会记录 `last_budget_blocked_kernel_watch_cost`、`last_budget_blocked_budget_remaining` 和 `last_budget_blocked_reason`，便于判断是 promotion 预算不足还是 ephemeral lease 预算不足。
 
+L1/L2 fast scan lane 默认启用，用目录 sentinel 对本地可信文件系统上的已知 L1/L2 目录提供 5 秒覆盖目标。它读取 `/proc/self/mountinfo` 分类 mount：`ext4`、`xfs`、`btrfs`、`tmpfs`、`f2fs` 进入 `local_strict`；`nfs`、`nfs4`、`cifs`、`smb3`、`fuse.*`、`sshfs`、`rclone` 和未知文件系统按 untrusted 处理，默认只报告 best-effort，不承诺 strict SLA。sentinel 发现目录项变化后会以 `FastScanChangedDir` 加入 DirtyQueue，并复用统一 depth=1 scan/apply 路径更新索引。
+
+`/watch-state` 暴露 fast scan 的 `fast_scan_enabled`、`fast_scan_mode`、`fast_scan_sla_ok`、`fast_scan_local_strict_ok`、known/local/untrusted dir 数量、pending changed-dir queue、checked/changed/generated counters、coverage lag p50/p95/p99、budget degraded 和最后 degraded reason。`/health` 会区分本地 strict 覆盖失败、预算降级和网络/FUSE best-effort，不把 untrusted 路径伪装成 strict 5 秒 SLA。
+
+网络/FUSE 路径默认只做 best-effort 观测。强 5 秒网络路径 SLA 建议由远端节点上的 RemoteAgent 负责本地采集后同步事件；当前 runtime 不实现 RemoteAgent，也不会用 `statx(FORCE_SYNC)` 伪造网络 strict SLA。
+
 L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` 会把 L3 上次扫描干净的目录展示为 `ScannedFresh`，未被实时覆盖的 L3 目录按 `EventuallyConsistent` 口径出现在 `/watch-state.eventually_consistent_dirs` 与 metrics diagnostics 中。嵌套项目会在 `/debug/tiered-watch` 中暴露 `nearest_ancestor_root`、`descendant_roots`、`l0_covering_root`、`budget_isolated_from_ancestor` 和 `nested_relation`，用于解释祖先/后代项目之间的覆盖与预算隔离关系。
 
 ## fd-rdd-sim 压测框架
 
-`fd-rdd-sim` 是 tiered watcher 参数的 synthetic 竞技场，用来在不触碰真实文件系统 watcher 的情况下持续试错，收敛出 L0/L1/L2/L3 分层策略参数。它会生成热点聚集、突发写入、长眠目录、对抗性 workload，以及 `home-desktop` 这类 `$HOME` 桌面使用画像，让候选策略反复竞争，并输出 SLA、发现延迟、watch/scan 成本、收敛轨迹和可回填到 `tiered_watch` 的推荐配置。
-
-```bash
-# 持续试错，跨 developer/burst/dormant/adversarial/home-desktop workload 收敛推荐参数
-cargo run --bin fd-rdd-sim -- optimize \
-  --dirs 3000 \
-  --events 30000 \
-  --generations 60 \
-  --population 64 \
-  --patience 10 \
-  --checkpoint reports/optimized-tiered-watch.checkpoint.json \
-  --output reports/optimized-tiered-watch.json
-
-# 单策略基线诊断，不代表最优
-cargo run --bin fd-rdd-sim -- single --profile developer --dirs 1000 --events 10000
-
-# 模拟日常 HOME 桌面工作负载：Downloads burst、文档/桌面高价值、小变更媒体和冷 NAS
-cargo run --bin fd-rdd-sim -- single --profile home-desktop --dirs 1200 --events 12000
-
-# 参数网格搜索 baseline
-cargo run --bin fd-rdd-sim -- grid --profile burst --top-n 5
-
-# CI 级策略回归：固定 seed small workloads + 阈值检查 + JSON/Markdown 报告
-cargo run --bin fd-rdd-sim -- regression \
-  --output reports/sim-regression.json \
-  --markdown-output reports/sim-regression.md
-
-# 遗传搜索单 workload baseline
-cargo run --bin fd-rdd-sim -- evolve --generations 16 --population 32
-
-# 对抗鲁棒性测试并保存 JSON 报告
-cargo run --bin fd-rdd-sim -- adversarial --output reports/adversarial.json
-
-# 从一个或多个报告生成可审阅的保守 config.toml 片段
-cargo run --bin fd-rdd-sim -- emit-config \
-  --input reports/optimized-tiered-watch.json \
-  --input reports/adversarial.json \
-  --output reports/optimized-tiered-watch.toml
-
-# 预览推荐参数合并到完整 config.toml 后的结果，不写入用户配置
-cargo run --bin fd-rdd-sim -- apply \
-  --input reports/optimized-tiered-watch.json \
-  --config ~/.config/fd-rdd/config.toml \
-  --dry-run
-```
-
-可通过 `--policy policies/tiered-default.toml` 读取策略基线；CLI 里显式传入的预算、TTL、扫描周期和 `--l3-scan-policy interval|validate_on_query|disabled` 参数会作为本次运行的覆盖值。`grid`、`evolve` 和 `optimize` 会主动搜索三种 L3 策略模式，推荐结果不会被初始 seed 锁死在 `interval`。`optimize` 报告中的 `convergence.phase` / `current_generation` / `current_generation_trials` 显示当前进度，`convergence.trace` 记录每代试错轨迹，`recommendation` 字段给出推荐的 `watch_mode = "tiered"`、`max_watch_dirs`、L1/L2/L3 扫描策略和 TTL。
-
-`home-desktop` profile 将 `$HOME` 拆成 synthetic 热根：`Downloads` 高频新增和 burst，`Documents/Desktop` 小规模高价值，`Pictures/Videos` 低变更但 scan cost 大，`Code` 可能活跃但不保证初始热，`Archive/NAS` 大、冷且有偶发冷查询压力；`.cache`、`node_modules`、构建目录等默认排除项在 workload 中表现为近零 scan work 且不产生事件。
-
-`regression` 子命令内置 5 个小规模 golden workload：`developer-small`、`burst-small`、`dormant-small`、`adversarial-small`、`home-desktop-small`。每个 case 固定 seed，并检查 `p95_discovery_delay_secs`、`promotion_budget_blocked`、`watch_cost_peak`、`scanned_files`、`final_l0_dirs`、`final_l3_dirs` 阈值；任何阈值失败都会在写出 JSON/Markdown 后以非零退出码结束，CI 会上传 `reports/ci/sim-regression.*` 便于比较策略变更前后差异。
-
-`metrics` 除 SLA、发现延迟、watch/scan 成本外，也输出策略控制面指标：`promotions`、`demotions`、`replacements`、`promotion_budget_blocked` 以及最终 `final_l0_dirs` / `final_l1_dirs` / `final_l2_dirs` / `final_l3_dirs` 分布，用于和真实 runtime `/watch-state` 做趋势对照；字段映射维护在 `helloagents/wiki/runtime-sim-report-mapping.md`。P1 parity 回归已覆盖热 L0 保留、BudgetBlocked 高优先级扫描、祖先 L0 不被子候选驱逐、watch budget 不超限，以及 developer/burst/dormant/adversarial/home-desktop 固定 seed workload 的层级与事件计数稳定性；失败时会输出 runtime/sim 关键指标差异。`emit-config` 只生成当前 runtime 支持的 TOML patch，不写入用户配置文件；多个 `--input` 会按更低 watcher/scan 预算、更低 L0 TTL、更长冷层扫描周期和更快空扫降级生成保守汇总，输出会注释说明 `weights`、`per_round_max_dirs`、`per_round_max_files`、`per_round_max_ms` 等 sim-only 参数已忽略；`apply --dry-run` 只打印合并后的完整配置用于审阅。
-
-长时间运行可用 `Ctrl-C` 中断；checkpoint 会在每代结束后原子写入。继续迭代时把同一个文件传给 `--resume` 和 `--checkpoint`：
-
-```bash
-cargo run --release --bin fd-rdd-sim -- optimize \
-  --policy policies/tiered-default.toml \
-  --dirs 3000 \
-  --events 30000 \
-  --duration-secs 7200 \
-  --seed 42 \
-  --generations 120 \
-  --population 96 \
-  --patience 20 \
-  --top-n 20 \
-  --resume reports/optimized-tiered-watch.checkpoint.json \
-  --checkpoint reports/optimized-tiered-watch.checkpoint.json \
-  --output reports/optimized-tiered-watch.json
-```
-
-运行中查看进度：
-
-```bash
-jq '{
-  phase: .convergence.phase,
-  generation: .convergence.current_generation,
-  generation_trials: .convergence.current_generation_trials,
-  total_trials: .convergence.trials,
-  latest_finished_generation: .convergence.generations_completed,
-  best_score: .convergence.best_score
-}' reports/optimized-tiered-watch.checkpoint.json
-```
+`fd-rdd-sim` 是 tiered watcher 参数的 synthetic 竞技场，用来在不触碰真实文件系统 watcher 的情况下持续试错，收敛 L0/L1/L2/L3 分层策略参数。CLI、profile、regression、checkpoint 和 runtime 映射说明已迁移到 `src/sim/README.md`；根 README 只保留入口说明。
 
 ## 配置 / Configuration
 
@@ -346,6 +269,15 @@ jq '{
 | `tiered_watch.l0_max_cost_per_root` | `usize` | `8192` | 单个 L0 根的递归 watch 成本上限，0 表示按总预算关闭单根保护 |
 | `tiered_watch.project_markers` | `[String]` | 常见项目标记 | balanced watcher 识别项目根的 marker 名称 |
 | `tiered_watch.ephemeral_watch_budget` | `usize` | `256` | 临时 watcher lease 独立预算 |
+| `tiered_watch.l1_l2_fast_scan_enabled` | `bool` | `true` | 启用 L1/L2 已知目录 fast scan lane |
+| `tiered_watch.l1_l2_fast_scan_target_secs` | `u64` | `5` | 本地可信 L1/L2 目录 strict 覆盖目标 |
+| `tiered_watch.l1_l2_fast_scan_tick_ms` | `u64` | `1000` | fast scan 调度 tick |
+| `tiered_watch.l1_l2_fast_scan_stat_budget_per_tick` | `usize` | `5000` | 每 tick 本地可信 sentinel stat 预算 |
+| `tiered_watch.l1_l2_fast_scan_readdir_budget_per_tick` | `usize` | `512` | 每 tick 本地可信 changed-dir readdir 预算 |
+| `tiered_watch.l1_l2_fast_scan_bootstrap_budget_per_tick` | `usize` | `2048` | 每 tick 已知目录 sentinel 注册预算 |
+| `tiered_watch.network_fast_scan_mode` | `String` | `"best_effort"` | 网络/FUSE fast scan 模式：`best_effort` / `strict_poll` / `disabled` |
+| `tiered_watch.network_fast_scan_stat_budget_per_tick` | `usize` | `128` | 每 tick 网络/FUSE sentinel stat 预算 |
+| `tiered_watch.network_fast_scan_readdir_budget_per_tick` | `usize` | `16` | 每 tick 网络/FUSE strict_poll changed-dir readdir 预算 |
 | `snapshot_interval_secs` | `u64` | `300` | 快照落盘周期 |
 | `stable_snapshot_enabled` | `bool` | `true` | 稳定快照轮转 |
 | `startup_repair_enabled` | `bool` | `true` | 启动修复扫描 |

@@ -124,6 +124,15 @@ pub struct WatcherDiagnostics {
     pub one_file_system_boundary_count: u64,
     pub denied_mount_count: u64,
     pub allowed_override_count: u64,
+    pub fast_scan_enabled: bool,
+    pub fast_scan_sla_ok: bool,
+    pub fast_scan_local_strict_ok: bool,
+    pub fast_scan_known_dirs: usize,
+    pub fast_scan_local_trusted_dirs: usize,
+    pub fast_scan_untrusted_dirs: usize,
+    pub fast_scan_coverage_lag_p95_ms: u64,
+    pub fast_scan_budget_degraded: bool,
+    pub fast_scan_last_degraded_reason: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

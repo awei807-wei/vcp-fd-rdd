@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- L1/L2 tiered watcher 新增 fast scan lane：默认启用本地可信文件系统 5 秒覆盖目标，按 `/proc/self/mountinfo` 将 ext4/xfs/btrfs/tmpfs/f2fs 归为 `local_strict`，网络/FUSE/未知文件系统默认 `best_effort`，不会报告 strict SLA 成功。
+- 新增 fast scan 配置项：`tiered_watch.l1_l2_fast_scan_enabled`、target/tick/stat/readdir/bootstrap 预算，以及 `network_fast_scan_mode`、network stat/readdir 预算；配置解析、默认值、README 和 diagnostics 已同步。
+- fast scan sentinel 发现已知 L1/L2 目录变化后以 `DirtyReason::FastScanChangedDir` 进入 DirtyQueue，并复用现有 `fast_sync` depth=1 scan/apply 路径更新索引，避免扫描器直接写索引。
+- `/watch-state`、`/health`、diagnostics 与 metrics JSONL 暴露 fast scan enabled/mode/SLA、known/local/untrusted dir 数、pending queue、checked/changed/generated counters、coverage lag p50/p95/p99、budget degraded 和 degraded reason；health 区分本地 strict 失败、预算降级与网络/FUSE best-effort。
+- 根 README 中 `fd-rdd-sim` 长手册迁移到 `src/sim/README.md`，根 README 只保留入口说明；runtime/sim 字段映射明确 fast scan 为 runtime-only，当前 sim 不强行建模该成本。
+- 新增 fast scan 回归测试，覆盖 mount 分类、预算不足降级、本地 sentinel 目录项变化、untrusted mount 不报告 strict SLA，以及深层已知目录通过 `FastScanChangedDir` 复用 dirty apply 后可被搜索。
 - 启动 soft evidence 不再驱动前台 repair scan：`StartupRecoveryReport` 新增 `startup_scan_required`、`deferred_repair`、`deferred_dirty_dirs`、`deferred_unknown_scope`，`startup_repair_if_needed("dirty-only")` 只在 hard evidence、WAL gap 或空索引等需要前台扫描的场景运行；`unclean_shutdown` 与 WAL tail damage 会转入低优先级 `StartupRepairDeferred` 队列。
 - WAL replay 改为 valid prefix 语义：遇到首个坏 frame、CRC mismatch、超大 len 或半写 payload 后停止读取 suffix，并返回 `WalReplayDamage`；能 best-effort 解析路径时脏化父目录，无法定位时回退最近 valid WAL 事件目录或标记 unknown scope。
 - 新增 lazy validation 后台校验路径：配置项 `lazy_validation_enabled`、`lazy_validation_cache_entries`、`lazy_validation_ttl_secs`、`lazy_validation_stat_per_sec` 控制查询命中 cold segment 后只做非阻塞入队；后台 worker 限流执行 `stat`，发现 stale 后通过统一 apply 路径写 overlay 并推入 deferred repair。

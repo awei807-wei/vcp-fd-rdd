@@ -120,6 +120,15 @@ pub struct MetricsHealthSnapshot {
     pub strict_coverage_failure: bool,
     pub strict_fail_on_budget_exceeded: bool,
     pub strict_uncovered_dirs: Vec<String>,
+    pub fast_scan_enabled: bool,
+    pub fast_scan_sla_ok: bool,
+    pub fast_scan_local_strict_ok: bool,
+    pub fast_scan_known_dirs: usize,
+    pub fast_scan_local_trusted_dirs: usize,
+    pub fast_scan_untrusted_dirs: usize,
+    pub fast_scan_coverage_lag_p95_ms: u64,
+    pub fast_scan_budget_degraded: bool,
+    pub fast_scan_last_degraded_reason: String,
     pub watch_failures: u64,
     pub overflow_drops: u64,
     pub rescan_signals: u64,
@@ -328,6 +337,26 @@ impl MetricsDiagnostics {
                 health.strict_uncovered_dirs
             ));
         }
+        if health.fast_scan_enabled && !health.fast_scan_local_strict_ok {
+            issues.push(format!(
+                "fast_scan_local_strict_failed: lag_p95_ms={} known_dirs={} local_trusted_dirs={}",
+                health.fast_scan_coverage_lag_p95_ms,
+                health.fast_scan_known_dirs,
+                health.fast_scan_local_trusted_dirs
+            ));
+        }
+        if health.fast_scan_enabled && health.fast_scan_budget_degraded {
+            issues.push(format!(
+                "fast_scan_budget_degraded: {}",
+                health.fast_scan_last_degraded_reason
+            ));
+        }
+        if health.fast_scan_enabled && health.fast_scan_untrusted_dirs > 0 {
+            issues.push(format!(
+                "fast_scan_untrusted_dirs: {} best-effort directories",
+                health.fast_scan_untrusted_dirs
+            ));
+        }
         if watch.eventually_consistent_dirs > 0 {
             issues.push(format!(
                 "l3_consistency: eventually_consistent_dirs={} scanned_fresh_dirs={}",
@@ -361,6 +390,8 @@ impl MetricsDiagnostics {
         let status = if event_loss_suspected
             || health.event_watcher_degraded
             || (health.strict_coverage_failure && health.strict_fail_on_budget_exceeded)
+            || (health.fast_scan_enabled && !health.fast_scan_local_strict_ok)
+            || (health.fast_scan_enabled && health.fast_scan_budget_degraded)
             || watch.dirty_queue_len > 0
             || watch.query_stale_hit_count > 0
         {

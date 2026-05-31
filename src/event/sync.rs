@@ -72,6 +72,7 @@ pub enum DirtyReason {
     QueryHitStale,
     QueryMiss,
     PeriodicColdScan,
+    FastScanChangedDir,
     StartupRepair,
     StartupRepairDeferred,
     OverflowRecovery,
@@ -82,7 +83,9 @@ impl DirtyReason {
         match self {
             Self::OverflowRecovery => DirtyPriority::Critical,
             Self::QueryHitStale | Self::StartupRepair => DirtyPriority::High,
-            Self::InotifyEvent | Self::QueryMiss => DirtyPriority::Normal,
+            Self::InotifyEvent | Self::QueryMiss | Self::FastScanChangedDir => {
+                DirtyPriority::Normal
+            }
             Self::PeriodicColdScan | Self::StartupRepairDeferred => DirtyPriority::Low,
         }
     }
