@@ -79,7 +79,7 @@ impl TieredIndex {
         table: &MountTable,
         mut sidecar: QuarantineSidecar,
     ) {
-        let verified = verified_roots(&sidecar, &table);
+        let verified = verified_roots(&sidecar, table);
         let mut completed = 0u64;
         for root in verified {
             let seq = self.event_seq.fetch_add(1, Ordering::Relaxed) + 1;

@@ -1687,8 +1687,8 @@ mod tests {
 
         assert_eq!(low_power_plan.state.watch_profile, "low_power");
         assert!(low_power_plan.state.watched_dirs_estimated <= low_power_plan.state.max_watch_dirs);
-        assert_eq!(low_power_plan.state.strict_coverage_ok, true);
-        assert_eq!(low_power_plan.state.strict_coverage_failure, false);
+        assert!(low_power_plan.state.strict_coverage_ok);
+        assert!(!low_power_plan.state.strict_coverage_failure);
         assert!(low_power_plan.state.l1_dirs >= 1);
 
         let mut strict = fd_rdd::config::TieredWatchConfig {

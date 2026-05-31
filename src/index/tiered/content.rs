@@ -125,7 +125,8 @@ impl TieredIndex {
         for term in normalized_terms {
             let paths = docs
                 .iter()
-                .filter_map(|(path, text)| text.contains(&term).then(|| path.clone()))
+                .filter(|(_, text)| text.contains(&term))
+                .map(|(path, _)| path.clone())
                 .collect::<HashSet<_>>();
             matches_by_term.insert(term, paths);
         }

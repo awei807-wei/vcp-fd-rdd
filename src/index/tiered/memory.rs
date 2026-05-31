@@ -286,7 +286,7 @@ impl TieredIndex {
             let stats = pipeline_stats_fn();
             tick_count = tick_count.wrapping_add(1);
             let should_refresh_full =
-                !self.memory_report_cache_ready() || tick_count % full_sample_every == 0;
+                !self.memory_report_cache_ready() || tick_count.is_multiple_of(full_sample_every);
             let report = if should_refresh_full {
                 self.memory_report(stats)
             } else {

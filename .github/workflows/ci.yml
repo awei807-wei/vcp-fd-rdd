@@ -316,3 +316,17 @@ jobs:
 
       - name: cargo test --test p1_visibility_latency
         run: cargo test --locked --test p1_visibility_latency -- --test-threads=1
+
+  fast-scan-sla:
+    name: L1/L2 fast scan SLA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test p1_fast_scan_sla
+        run: cargo test --locked --test p1_fast_scan_sla -- --test-threads=1 --nocapture

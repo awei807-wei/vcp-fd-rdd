@@ -985,7 +985,7 @@ impl TieredIndex {
             if !upsert_events.is_empty() {
                 self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
             }
-            self.update_directory_manifests_for_dirs(&dirs, project_markers);
+            self.update_directory_manifests_for_dirs(dirs, project_markers);
         }
 
         let elapsed_ms = start.elapsed().as_millis() as u64;

@@ -843,11 +843,11 @@ impl V7Snapshot {
                     Ok(()) => String::new(),
                     Err(err) => format!("madvise_error:{}", err.kind()),
                 };
-            return MmapWarmupReport {
+            MmapWarmupReport {
                 pages: ((requested_len as u64).saturating_add(4095)) / 4096,
                 elapsed_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 cancel_reason,
-            };
+            }
         }
 
         #[cfg(not(unix))]

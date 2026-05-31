@@ -229,10 +229,10 @@ mod tests {
 
         let mut tris = Vec::new();
         for_each_folded_trigram("Straße".as_bytes(), |tri| tris.push(tri));
-        assert!(tris.contains(&*b"str"));
-        assert!(tris.contains(&*b"ras"));
-        assert!(tris.contains(&*b"ass"));
-        assert!(tris.contains(&*b"sse"));
+        assert!(tris.contains(b"str"));
+        assert!(tris.contains(b"ras"));
+        assert!(tris.contains(b"ass"));
+        assert!(tris.contains(b"sse"));
     }
 
     #[test]
@@ -328,7 +328,15 @@ mod tests {
         let mut perms = fs::metadata(&root)
             .expect("stat readonly temp probe root")
             .permissions();
-        perms.set_readonly(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o700);
+        }
+        #[cfg(not(unix))]
+        {
+            perms.set_readonly(false);
+        }
         fs::set_permissions(&root, perms).expect("restore temp probe root permissions");
         fs::remove_dir(&root).expect("remove temp probe root");
 

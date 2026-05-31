@@ -370,6 +370,7 @@ impl BuildRDD<FileMeta> for FsScanRDD {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_partition_parallel(
     part: &Partition,
     parallelism: usize,

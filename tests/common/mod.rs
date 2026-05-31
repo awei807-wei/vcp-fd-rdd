@@ -44,6 +44,20 @@ impl FdRddProcess {
     ///
     /// Extra CLI arguments can be passed via `extra_args`.
     pub fn spawn(root: &Path, port: u16, snapshot_path: &Path, extra_args: &[&str]) -> Self {
+        Self::spawn_with_env(root, port, snapshot_path, extra_args, &[])
+    }
+
+    /// Spawn `fd-rdd` with extra environment overrides.
+    ///
+    /// This is useful for integration tests that must isolate `XDG_CONFIG_HOME`
+    /// from the developer or CI machine running the test.
+    pub fn spawn_with_env(
+        root: &Path,
+        port: u16,
+        snapshot_path: &Path,
+        extra_args: &[&str],
+        envs: &[(&str, &Path)],
+    ) -> Self {
         let exe = fd_rdd_exe_path();
         let work_dir = unique_tmp_dir("daemon-cwd");
         std::fs::create_dir_all(&work_dir).expect("create daemon work dir");
@@ -58,6 +72,9 @@ impl FdRddProcess {
             .current_dir(&work_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
 
         let mut child = cmd
             .spawn()

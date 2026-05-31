@@ -289,9 +289,9 @@ pub struct TieredIndex {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(self) struct MemoryReportCache {
-    pub(self) report: Option<crate::stats::MemoryReport>,
-    pub(self) sampled_at: Option<Instant>,
+struct MemoryReportCache {
+    report: Option<crate::stats::MemoryReport>,
+    sampled_at: Option<Instant>,
 }
 
 impl TieredIndex {

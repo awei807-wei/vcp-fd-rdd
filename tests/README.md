@@ -20,6 +20,7 @@
 - `p1_streaming_export.rs` — 流式导出字节一致性
 - `p1_compaction_fast.rs` — fast/legacy compaction 等价性
 - `p1_visibility_latency.rs` — 文件可见性延迟
+- `p1_fast_scan_sla.rs` — L1/L2 fast scan create/delete/rename SLA
 - `p1_api_e2e.rs` — HTTP API 与 `fd-rdd-query` 真实 daemon 端到端
 - `p1_real_watcher.rs` — 真实 watcher create/rename/delete 端到端
 - `p1_crash_recovery_matrix.rs` — abrupt kill、坏快照与启动修复组合恢复
@@ -48,6 +49,7 @@
 ## v7.0.0 测试相关变更
 
 - 全量 `cargo test -q` 覆盖 runtime boundary、mmap v7 cold segment、WAL/root state、query DSL、content index、tiered watcher 和 sim parity 等回归。
+- 新增 `p1_fast_scan_sla.rs`，启动真实 tiered daemon 并隔离 `XDG_CONFIG_HOME`，强制构造 L1/L2 非 L0 目录，验证 create、delete、rename 在 fast scan SLA 窗口内更新搜索结果；CI 新增 `L1/L2 fast scan SLA` 专项 job。
 - `scripts/smoke-search-syntax.sh` 支持自建临时 root、临时 HTTP 端口和自启动 daemon；在 `--no-watch` 下会递归分批调用 `/scan`，完整覆盖 HTTP search DSL smoke 矩阵。
 - `dupe:content` 新增 exclude/oversized/mount policy 回归，确认内容重复扫描复用 frozen/offline、exclude 目录、mount policy 与 `content_index.max_file_size` 准入，并把 partial/full hash 慢 I/O 放在 query generation guard 外。
 - `memory_light` 的 RSS/P95、idle RSS 和默认 profile 对照仍需在非沙箱 daemon 或真实数据集环境采集；本地测试不伪造性能数值。
