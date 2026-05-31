@@ -21,7 +21,7 @@ impl TieredIndex {
     {
         let idx = self.clone();
         let store_for_sync = store.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let delta = idx.l2.load_full();
             let delta_dirty = delta.is_dirty();
 
@@ -37,7 +37,7 @@ impl TieredIndex {
                 tracing::debug!("No delta/overlay changes, skipping flush");
                 idx.flush_requested.store(false, Ordering::Release);
                 idx.reset_pending_flush_batch();
-                return None;
+                return Ok(None);
             }
 
             // WAL：在 snapshot 边界 seal，确保新事件进入新 WAL。
@@ -55,17 +55,17 @@ impl TieredIndex {
             // Snapshot is the materialization boundary: ordinary event batches
             // update the delta path only, so the full visible BaseIndex is
             // rebuilt on this cold path and then written as v7.
-            let base = idx.materialize_snapshot_base();
+            let base = idx.materialize_snapshot_base()?;
             let v7_path = store_for_sync.path().with_extension("v7");
 
             // delta_buffer has been cleared by materialize_snapshot_base after
             // its content was folded into base.
             idx.flush_requested.store(false, Ordering::Release);
 
-            Some((base, v7_path, wal_seal_id))
+            Ok(Some((base, v7_path, wal_seal_id)))
         })
         .await
-        .map_err(|e| anyhow::anyhow!("snapshot sync phase panicked: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("snapshot sync phase panicked: {}", e))??;
 
         let (base, v7_path, wal_seal_id) = match result {
             Some(v) => v,

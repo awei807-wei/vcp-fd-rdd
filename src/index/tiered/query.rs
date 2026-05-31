@@ -263,16 +263,17 @@ impl TieredIndex {
         results
     }
 
-    pub(crate) fn materialize_snapshot_base(&self) -> Arc<BaseIndexData> {
+    pub(crate) fn materialize_snapshot_base(&self) -> anyhow::Result<Arc<BaseIndexData>> {
         let mut db = self.delta_buffer.lock();
         let mut del = PathArenaSet::default();
         for p in db.deleted_paths() {
             let _ = del.insert(p);
         }
+        let deleted_paths = db.deleted_paths().count();
         let live_events: Vec<EventRecord> = db.live_records().cloned().collect();
-        db.clear();
 
         let base = self.base.load_full();
+        let base_count_before = base.file_count();
         let overlay_deleted = Arc::new(del);
         let mut blocked_paths = PathArenaSet::default();
         let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
@@ -307,12 +308,19 @@ impl TieredIndex {
             compact.upsert_path_alias(meta);
         }
         let new_base = Arc::new(compact.to_base_index_data());
+        validate_snapshot_materialization(
+            base_count_before,
+            deleted_paths,
+            live_events.len(),
+            new_base.file_count(),
+        )?;
+        db.clear();
         self.base.store(new_base.clone());
         self.l2.store(Arc::new(PersistentIndex::new_with_roots(
             self.roots.clone(),
         )));
         self.invalidate_memory_report_cache();
-        new_base
+        Ok(new_base)
     }
 
     fn execute_query_plan(
@@ -1073,6 +1081,35 @@ fn sorted_limited_dirs(dirs: HashSet<PathBuf>, limit: usize) -> Vec<PathBuf> {
     dirs.sort();
     dirs.truncate(limit);
     dirs
+}
+
+fn validate_snapshot_materialization(
+    base_count_before: usize,
+    deleted_paths: usize,
+    upserted_paths: usize,
+    candidate_count: usize,
+) -> anyhow::Result<()> {
+    if base_count_before < 10_000 || candidate_count >= base_count_before {
+        return Ok(());
+    }
+
+    let allowed_loss = (base_count_before / 10)
+        .max(10_000)
+        .max(deleted_paths.saturating_mul(1024));
+    let min_expected = base_count_before.saturating_sub(allowed_loss);
+    if candidate_count < min_expected {
+        anyhow::bail!(
+            "snapshot materialization guard refused to shrink base from {} to {} entries \
+             (deleted_paths={}, upserted_paths={}, min_expected={})",
+            base_count_before,
+            candidate_count,
+            deleted_paths,
+            upserted_paths,
+            min_expected
+        );
+    }
+
+    Ok(())
 }
 
 fn collect_live_meta(

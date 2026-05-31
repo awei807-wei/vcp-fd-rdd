@@ -13,7 +13,9 @@ use crate::storage::quarantine::{
     FreezeGate, MountIdentity, QuarantineRoot, QuarantineRootState, QuarantineSidecar,
     RootStateKind, RootStateRecord,
 };
-use crate::storage::snapshot::{quarantine_sidecar_path_for, stable_v7_path_for, SnapshotStore};
+use crate::storage::snapshot::{
+    quarantine_sidecar_path_for, stable_prev_v7_path_for, stable_v7_path_for, SnapshotStore,
+};
 use crate::storage::snapshot_v7::write_v7_snapshot_atomic;
 use crate::storage::traits::WalFactory;
 use std::path::PathBuf;
@@ -1686,6 +1688,134 @@ async fn v7_load_mounts_manifest_only_cold_segment_and_queries_on_demand() -> an
     assert_eq!(after_query.hot_memory_entries, 0);
     assert_eq!(after_query.manifest_only_entries, 128);
     assert_eq!(after_query.cold_filter_bytes, 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stable_prev_used_when_stable_is_suspiciously_smaller() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("stable-prev-smaller");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = SnapshotStore::new(state_root.join("index.db"));
+    std::fs::create_dir_all(stable_v7_path_for(store.path()).parent().unwrap())?;
+
+    let large =
+        crate::index::l2_partition::PersistentIndex::new_with_roots(vec![content_root.clone()]);
+    for i in 0..12_000u64 {
+        let path = content_root.join(format!("bulk_{i:05}.txt"));
+        large.upsert_path_alias(FileMeta {
+            file_key: FileKey {
+                dev: 77,
+                ino: i + 1,
+                generation: 0,
+            },
+            path,
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+            kind: FileKind::File,
+        });
+    }
+    let chronicle = content_root.join("fd-rdd-编年史.md");
+    large.upsert_path_alias(FileMeta {
+        file_key: FileKey {
+            dev: 77,
+            ino: 20_001,
+            generation: 0,
+        },
+        path: chronicle.clone(),
+        size: 1,
+        mtime: None,
+        ctime: None,
+        atime: None,
+        kind: FileKind::File,
+    });
+    write_v7_snapshot_atomic(
+        &stable_prev_v7_path_for(store.path()),
+        &large.to_base_index_data(),
+    )?;
+
+    let small =
+        crate::index::l2_partition::PersistentIndex::new_with_roots(vec![content_root.clone()]);
+    for i in 0..100u64 {
+        small.upsert_path_alias(FileMeta {
+            file_key: FileKey {
+                dev: 88,
+                ino: i + 1,
+                generation: 0,
+            },
+            path: content_root.join(format!("small_{i:03}.txt")),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+            kind: FileKind::File,
+        });
+    }
+    write_v7_snapshot_atomic(
+        &stable_v7_path_for(store.path()),
+        &small.to_base_index_data(),
+    )?;
+
+    let loaded = TieredIndex::load_or_empty(&store, vec![content_root.clone()]).await?;
+    assert_eq!(
+        loaded.recovery_status().report.snapshot_source,
+        "stable-prev"
+    );
+    assert!(loaded.file_count() >= 12_001);
+    let results = loaded.query_limit_detailed("编年史", 10);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].meta.path, chronicle);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_materialization_does_not_prune_cold_children_for_parent_delete(
+) -> anyhow::Result<()> {
+    let root = unique_tmp_dir("cold-parent-delete");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let parent = content_root.join("Downloads");
+    std::fs::create_dir_all(&parent)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    let chronicle = parent.join("fd-rdd-编年史.md");
+    std::fs::write(&chronicle, b"chronicle")?;
+    idx.apply_events(&[mk_event(1, EventType::Create, chronicle.clone())]);
+    idx.snapshot_now(store.clone()).await?;
+
+    let loaded = Arc::new(TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?);
+    assert_eq!(
+        loaded
+            .memory_report(EventPipelineStats::default())
+            .base
+            .manifest_only_entries,
+        1
+    );
+    assert_eq!(loaded.query_limit_detailed("编年史", 10).len(), 1);
+
+    loaded.apply_events(&[mk_event(2, EventType::Delete, parent.clone())]);
+    assert_eq!(
+        loaded.query_limit_detailed("编年史", 10).len(),
+        1,
+        "a path-only parent delete tombstone must not hide cold children"
+    );
+    loaded.snapshot_now(store.clone()).await?;
+
+    let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    let results = reloaded.query_limit_detailed("编年史", 10);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].meta.path, chronicle);
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())

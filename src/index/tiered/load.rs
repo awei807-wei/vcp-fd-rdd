@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::fs_policy::FsPolicyConfig;
@@ -529,59 +529,112 @@ impl TieredIndex {
         let stable_path = stable_v7_path_for(store.path());
         let stable_prev_path = stable_prev_v7_path_for(store.path());
         let legacy_v7_path = store.path().with_extension("v7");
-        let snapshot_candidates = [
-            ("stable", stable_path.as_path()),
-            ("stable-prev", stable_prev_path.as_path()),
-            ("legacy-v7", legacy_v7_path.as_path()),
-        ];
-
-        for (source, path) in snapshot_candidates {
-            match crate::storage::snapshot_v7::try_load_v7_cold(path, roots.as_slice()) {
-                Ok(Some(v7_data)) => {
-                    tracing::info!(
-                        "{} snapshot mounted as cold base: {} entries, {} manifest segment(s)",
-                        source,
-                        v7_data.file_count(),
-                        v7_data.cold_segments.len()
-                    );
-                    let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
-                    let idx = Self::new_with_base_and_io_governor(
-                        l1,
-                        l2,
-                        l3,
-                        roots,
-                        include_hidden,
-                        ignore_enabled,
-                        follow_symlinks,
-                        exclude_dirs,
-                        Some(v7_data),
-                        io_governor.clone(),
-                    );
-                    idx.attach_wal(store)?;
-                    let sidecar_path = quarantine_sidecar_path_for(store.path());
-                    if let Err(e) = idx.restore_quarantine_from_sidecar_path(&sidecar_path) {
-                        tracing::warn!(
-                            "quarantine sidecar restore failed for {}: {}",
-                            sidecar_path.display(),
-                            e
-                        );
+        let loaded_candidate = match crate::storage::snapshot_v7::try_load_v7_cold(
+            stable_path.as_path(),
+            roots.as_slice(),
+        ) {
+            Ok(Some(stable_data)) => {
+                let needs_prev_check = snapshot_file_suspiciously_smaller(
+                    stable_path.as_path(),
+                    stable_prev_path.as_path(),
+                );
+                if needs_prev_check {
+                    match crate::storage::snapshot_v7::try_load_v7_cold(
+                        stable_prev_path.as_path(),
+                        roots.as_slice(),
+                    ) {
+                        Ok(Some(prev_data))
+                            if snapshot_suspiciously_smaller(
+                                stable_data.file_count(),
+                                prev_data.file_count(),
+                            ) =>
+                        {
+                            tracing::warn!(
+                                "stable snapshot has {} entries but stable-prev has {}; using stable-prev",
+                                stable_data.file_count(),
+                                prev_data.file_count()
+                            );
+                            Some(("stable-prev", prev_data))
+                        }
+                        Ok(Some(_)) | Ok(None) => Some(("stable", stable_data)),
+                        Err(e) => {
+                            tracing::warn!("stable-prev load failed during shrink check: {}", e);
+                            Some(("stable", stable_data))
+                        }
                     }
-                    idx.set_root_case_policy_diagnostics(runtime_state.root_case_policies.clone());
-                    let checkpoint =
-                        choose_checkpoint(SnapshotCheckpointSource::from_label(source), &audit);
-                    let replay = idx.replay_wal_if_any(checkpoint);
-                    idx.set_startup_recovery_report(startup_report(
-                        source,
-                        &runtime_state,
-                        &audit,
-                        replay,
-                    ));
-                    maybe_trim_rss();
-                    return Ok(idx);
+                } else {
+                    Some(("stable", stable_data))
                 }
-                Ok(None) => {}
-                Err(e) => tracing::warn!("{} load failed: {}", source, e),
             }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("stable load failed: {}", e);
+                None
+            }
+        }
+        .or_else(|| {
+            match crate::storage::snapshot_v7::try_load_v7_cold(
+                stable_prev_path.as_path(),
+                roots.as_slice(),
+            ) {
+                Ok(Some(v7_data)) => Some(("stable-prev", v7_data)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("stable-prev load failed: {}", e);
+                    None
+                }
+            }
+        })
+        .or_else(|| {
+            match crate::storage::snapshot_v7::try_load_v7_cold(
+                legacy_v7_path.as_path(),
+                roots.as_slice(),
+            ) {
+                Ok(Some(v7_data)) => Some(("legacy-v7", v7_data)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("legacy-v7 load failed: {}", e);
+                    None
+                }
+            }
+        });
+
+        if let Some((source, v7_data)) = loaded_candidate {
+            tracing::info!(
+                "{} snapshot mounted as cold base: {} entries, {} manifest segment(s)",
+                source,
+                v7_data.file_count(),
+                v7_data.cold_segments.len()
+            );
+            let l2 = Arc::new(PersistentIndex::new_with_roots(roots.clone()));
+            let idx = Self::new_with_base_and_io_governor(
+                l1,
+                l2,
+                l3,
+                roots,
+                include_hidden,
+                ignore_enabled,
+                follow_symlinks,
+                exclude_dirs,
+                Some(v7_data),
+                io_governor.clone(),
+            );
+            idx.attach_wal(store)?;
+            let sidecar_path = quarantine_sidecar_path_for(store.path());
+            if let Err(e) = idx.restore_quarantine_from_sidecar_path(&sidecar_path) {
+                tracing::warn!(
+                    "quarantine sidecar restore failed for {}: {}",
+                    sidecar_path.display(),
+                    e
+                );
+            }
+            idx.set_root_case_policy_diagnostics(runtime_state.root_case_policies.clone());
+            let checkpoint =
+                choose_checkpoint(SnapshotCheckpointSource::from_label(source), &audit);
+            let replay = idx.replay_wal_if_any(checkpoint);
+            idx.set_startup_recovery_report(startup_report(source, &runtime_state, &audit, replay));
+            maybe_trim_rss();
+            return Ok(idx);
         }
 
         // 无可用快照：回退到空索引启动（由上层触发 rebuild）。
@@ -681,6 +734,27 @@ impl TieredIndex {
             }
         }
     }
+}
+
+fn snapshot_suspiciously_smaller(current: usize, previous: usize) -> bool {
+    if previous < 10_000 || current >= previous {
+        return false;
+    }
+    let allowed_loss = (previous / 10).max(10_000);
+    current < previous.saturating_sub(allowed_loss)
+}
+
+fn snapshot_file_suspiciously_smaller(current: &Path, previous: &Path) -> bool {
+    let Ok(current_len) = std::fs::metadata(current).map(|meta| meta.len()) else {
+        return false;
+    };
+    let Ok(previous_len) = std::fs::metadata(previous).map(|meta| meta.len()) else {
+        return false;
+    };
+    if previous_len < 1024 * 1024 || current_len >= previous_len {
+        return false;
+    }
+    current_len < previous_len.saturating_sub(previous_len / 10)
 }
 
 #[derive(Clone, Debug, Default)]
