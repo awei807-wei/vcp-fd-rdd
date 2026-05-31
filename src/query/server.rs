@@ -529,7 +529,9 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     } else if health.recovery_requires_repair {
         issues.push("recovery_audit: repair_required".to_string());
     }
-    if health.startup_repair_escalated {
+    if health.startup_repair_escalated
+        && (health.recovery_requires_rebuild || health.recovery_hard_rebuild_needed)
+    {
         issues.push("startup_repair: escalated to rebuild policy".to_string());
     }
     if health.fast_scan_enabled && !health.fast_scan_local_strict_ok {

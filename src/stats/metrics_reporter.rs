@@ -369,7 +369,9 @@ impl MetricsDiagnostics {
                 watch.watch_budget_utilization_pct
             ));
         }
-        if health.startup_repair_escalated {
+        if health.startup_repair_escalated
+            && (health.recovery_requires_rebuild || health.recovery_hard_rebuild_needed)
+        {
             issues.push("startup_repair_escalated=true".to_string());
         }
         if health.wal_gap_detected {

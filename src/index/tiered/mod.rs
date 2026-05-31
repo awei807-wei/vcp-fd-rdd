@@ -311,6 +311,36 @@ impl TieredIndex {
         self.recovery_status.lock().repair = repair;
     }
 
+    pub(crate) fn mark_rebuild_recovery_complete(&self) {
+        let mut status = self.recovery_status.lock();
+        let report = &mut status.report;
+        if !(report.startup_scan_required
+            || report.requires_repair
+            || report.requires_rebuild
+            || report.hard_rebuild_needed)
+        {
+            return;
+        }
+
+        report.startup_scan_required = false;
+        report.requires_repair = false;
+        report.requires_rebuild = false;
+        report.soft_repair_needed = false;
+        report.deferred_repair = false;
+        report.deferred_dirty_dirs.clear();
+        report.deferred_unknown_scope = false;
+        report.hard_rebuild_needed = false;
+        report.reasons.clear();
+        report.soft_reasons.clear();
+        report.hard_reasons.clear();
+        report.repair_reason_counts.clear();
+        report.audit.requires_repair = false;
+        report.audit.requires_rebuild = false;
+        report.audit.reasons.clear();
+        status.repair.escalated = false;
+        status.repair.escalation_reason.clear();
+    }
+
     pub fn set_stable_snapshot_enabled(&self, enabled: bool) {
         self.stable_snapshot_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);

@@ -252,8 +252,13 @@ impl TieredIndex {
     }
 
     pub(super) fn finish_rebuild(self: &Arc<Self>, new_l2: Arc<PersistentIndex>) -> bool {
+        enum FinishStep {
+            Complete(bool),
+            Apply(Vec<EventRecord>),
+        }
+
         loop {
-            let batch = {
+            let step = {
                 let mut st = self.rebuild_state.lock();
                 let mut db = self.delta_buffer.lock();
                 if db.is_empty() {
@@ -274,26 +279,32 @@ impl TieredIndex {
                     let again = st.requested;
                     st.requested = false;
                     st.scheduled = false;
-                    return again;
+                    FinishStep::Complete(again)
+                } else {
+                    let mut events: Vec<EventRecord> = db.live_records().cloned().collect();
+                    for path_bytes in db.deleted_paths() {
+                        let path = pathbuf_from_bytes(path_bytes);
+                        events.push(EventRecord {
+                            seq: 0,
+                            timestamp: std::time::SystemTime::UNIX_EPOCH,
+                            event_type: EventType::Delete,
+                            id: FileIdentifier::Path(path.clone()),
+                            path_hint: Some(path),
+                        });
+                    }
+                    events.sort_by_key(|e| e.seq);
+                    db.clear();
+                    FinishStep::Apply(events)
                 }
-
-                let mut events: Vec<EventRecord> = db.live_records().cloned().collect();
-                for path_bytes in db.deleted_paths() {
-                    let path = pathbuf_from_bytes(path_bytes);
-                    events.push(EventRecord {
-                        seq: 0,
-                        timestamp: std::time::SystemTime::UNIX_EPOCH,
-                        event_type: EventType::Delete,
-                        id: FileIdentifier::Path(path.clone()),
-                        path_hint: Some(path),
-                    });
-                }
-                events.sort_by_key(|e| e.seq);
-                db.clear();
-                events
             };
 
-            new_l2.apply_events(&batch);
+            match step {
+                FinishStep::Complete(again) => {
+                    self.mark_rebuild_recovery_complete();
+                    return again;
+                }
+                FinishStep::Apply(batch) => new_l2.apply_events(&batch),
+            }
         }
     }
 

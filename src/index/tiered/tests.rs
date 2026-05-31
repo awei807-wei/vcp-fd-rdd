@@ -613,6 +613,59 @@ fn rebuild_with_pending_events_no_loss() {
 }
 
 #[test]
+fn finish_rebuild_clears_current_recovery_rebuild_flags() {
+    let root = unique_tmp_dir("rebuild-clears-recovery");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    let reason = "snapshot_too_small_for_roots".to_string();
+    idx.set_startup_recovery_report(StartupRecoveryReport {
+        startup_scan_required: true,
+        requires_repair: true,
+        requires_rebuild: true,
+        hard_rebuild_needed: true,
+        reasons: vec![reason.clone()],
+        repair_reason_counts: vec![RecoveryReasonCount {
+            reason: reason.clone(),
+            count: 1,
+        }],
+        audit: RecoveryAuditReport {
+            requires_repair: true,
+            requires_rebuild: true,
+            reasons: vec![reason],
+            ..RecoveryAuditReport::default()
+        },
+        ..StartupRecoveryReport::default()
+    });
+    idx.set_startup_repair_stats(StartupRepairStats {
+        ran: true,
+        escalated: true,
+        escalation_reason: "hard_rebuild_evidence".to_string(),
+        ..StartupRepairStats::default()
+    });
+
+    assert!(idx.try_start_rebuild_force());
+    let new_l2 = Arc::new(PersistentIndex::new_with_roots(vec![root.clone()]));
+    assert!(!idx.finish_rebuild(new_l2));
+
+    let recovery = idx.recovery_status();
+    assert!(!recovery.report.startup_scan_required);
+    assert!(!recovery.report.requires_repair);
+    assert!(!recovery.report.requires_rebuild);
+    assert!(!recovery.report.hard_rebuild_needed);
+    assert!(recovery.report.reasons.is_empty());
+    assert!(recovery.report.repair_reason_counts.is_empty());
+    assert!(!recovery.report.audit.requires_repair);
+    assert!(!recovery.report.audit.requires_rebuild);
+    assert!(recovery.report.audit.reasons.is_empty());
+    assert!(recovery.repair.ran);
+    assert!(!recovery.repair.escalated);
+    assert!(recovery.repair.escalation_reason.is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn rebuild_in_progress_does_not_publish_partial_l2_as_ready() {
     let root = unique_tmp_dir("rebuild-partial-visibility");
     std::fs::create_dir_all(&root).unwrap();
