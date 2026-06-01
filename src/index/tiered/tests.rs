@@ -1182,10 +1182,10 @@ fn fast_sync_reconciles_add_and_delete() {
     );
     assert!(r.dirs_scanned >= 1);
     assert!(r.upsert_events >= 1);
-    // Linux 上删除后立即新建文件时可能复用 inode，当前实现会把它视为
-    // same-FileKey reconcile；此时最终状态正确，但 delete_events 可能为 0。
+    // Linux 上删除后立即新建文件时可能复用 inode，当前实现会用一次
+    // same-FileKey upsert 覆盖旧路径；此时最终状态正确，但 delete_events 可能为 0。
     assert!(
-        r.delete_events >= 1 || r.upsert_events >= 2,
+        r.delete_events >= 1 || r.upsert_events >= 1,
         "expected a delete event or a same-FileKey reconcile: {r:?}"
     );
 

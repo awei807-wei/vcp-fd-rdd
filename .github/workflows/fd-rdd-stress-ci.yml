@@ -941,13 +941,13 @@ jobs:
           ORIGINAL_COUNT=$(printf '%s' "$RESULT" | { grep -o "original.txt" || true; } | wc -l | tr -d ' ')
           HARDLINK_COUNT=$(printf '%s' "$RESULT" | { grep -o "hardlink.txt" || true; } | wc -l | tr -d ' ')
           TOTAL=$((ORIGINAL_COUNT + HARDLINK_COUNT))
-          if [ "$TOTAL" -eq 1 ]; then
-            echo "✅ PASS: exactly one hardlink alias is indexed"
-          elif [ "$TOTAL" -gt 1 ]; then
-            echo "❌ FAIL: hardlink aliases should be deduplicated by single-path policy"
+          if [ "$TOTAL" -eq 2 ] && [ "$ORIGINAL_COUNT" -eq 1 ] && [ "$HARDLINK_COUNT" -eq 1 ]; then
+            echo "✅ PASS: both hardlink aliases are indexed"
+          elif [ "$TOTAL" -gt 2 ]; then
+            echo "❌ FAIL: duplicate hardlink aliases returned"
             exit 1
           else
-            echo "❌ FAIL: no hardlink alias is searchable"
+            echo "❌ FAIL: expected both hardlink aliases to be searchable"
             exit 1
           fi
 
@@ -958,7 +958,7 @@ jobs:
           sleep 0.5
           RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=crossmount-main&limit=20")
           echo "Post-modify: $RESULT"
-          # 当前实现对 hardlink 采用同 inode 单路径策略，修改别名路径不应导致保留路径丢失
+          # 当前实现采用 PathEntry 多别名策略，修改任一 hardlink 后至少一个别名应保持可见。
           if echo "$RESULT" | grep -Eq "original.txt|hardlink.txt"; then
             echo "✅ Retained path still indexed after modify"
           else

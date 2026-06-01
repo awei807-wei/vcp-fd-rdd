@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 修复 CI 回归误报：`fast_sync_reconciles_add_and_delete` 允许 Linux inode 复用场景下以单次 same-FileKey upsert 完成旧路径遮蔽；stress CI hardlink 断言同步为 PathEntry 多别名语义，不再要求同 inode 单路径折叠。
 - L1/L2 tiered watcher 新增 fast scan lane：默认启用本地可信文件系统 5 秒覆盖目标，按 `/proc/self/mountinfo` 将 ext4/xfs/btrfs/tmpfs/f2fs 归为 `local_strict`，网络/FUSE/未知文件系统默认 `best_effort`，不会报告 strict SLA 成功。
 - 新增 fast scan 配置项：`tiered_watch.l1_l2_fast_scan_enabled`、target/tick/stat/readdir/bootstrap 预算，以及 `network_fast_scan_mode`、network stat/readdir 预算；配置解析、默认值、README 和 diagnostics 已同步。
 - fast scan sentinel 发现已知 L1/L2 目录变化后以 `DirtyReason::FastScanChangedDir` 进入 DirtyQueue，并复用现有 `fast_sync` depth=1 scan/apply 路径更新索引，避免扫描器直接写索引。
