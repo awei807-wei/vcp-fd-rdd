@@ -622,24 +622,16 @@ impl TieredWatchRuntime {
             return false;
         }
 
-        let mut l0_dirs = 0usize;
-        let mut has_non_l0_dir = false;
-        {
-            let dirs = self.dirs.read();
-            for state in dirs.values() {
-                if state.tier() == WatchTier::L0 {
-                    l0_dirs = l0_dirs.saturating_add(1);
-                } else {
-                    has_non_l0_dir = true;
-                }
-            }
-        }
+        let has_non_l0_dir = self
+            .dirs
+            .read()
+            .values()
+            .any(|state| state.tier() != WatchTier::L0);
         if !has_non_l0_dir {
             return false;
         }
 
-        let known_dirs = self.fast_scan_state.read().sentinels.len();
-        known_dirs.saturating_add(l0_dirs) < candidate_limit.max(1)
+        self.fast_scan_state.read().changed_dir_queue.len() < candidate_limit.max(1)
     }
 
     pub fn fast_scan_l0_roots(&self) -> Vec<PathBuf> {
@@ -740,6 +732,7 @@ impl TieredWatchRuntime {
                     coverage_lag_ms: 0,
                 },
             );
+            state.changed_dir_queue.push_back(path);
             inserted = inserted.saturating_add(1);
         }
         inserted
@@ -2664,7 +2657,11 @@ mod tests {
         };
         let initial = rt.fast_scan_tick(&table, cfg);
         assert_eq!(initial.checked_dirs, 1);
-        assert!(initial.changed_dirs.is_empty());
+        assert_eq!(initial.changed_dirs, vec![root.clone()]);
+
+        let settled = rt.fast_scan_tick(&table, cfg);
+        assert_eq!(settled.checked_dirs, 1);
+        assert!(settled.changed_dirs.is_empty());
 
         std::thread::sleep(std::time::Duration::from_millis(5));
         std::fs::write(root.join("created.txt"), b"new").unwrap();
@@ -2675,14 +2672,14 @@ mod tests {
         let report = rt.report();
         assert_eq!(report.fast_scan_known_dirs, 1);
         assert_eq!(report.fast_scan_local_trusted_dirs, 1);
-        assert_eq!(report.fast_scan_changed_dirs, 1);
+        assert_eq!(report.fast_scan_changed_dirs, 2);
         assert!(report.fast_scan_local_strict_ok);
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn fast_scan_bootstrap_counts_l0_roots_against_candidate_limit() {
+    fn fast_scan_bootstrap_budget_is_per_tick_not_total_cap() {
         let root = temp_root("fast-scan-bootstrap-limit");
         let hot = root.join("hot");
         let warm = root.join("warm");
@@ -2697,9 +2694,24 @@ mod tests {
             20,
         );
 
-        assert!(rt.should_bootstrap_fast_scan_dirs(2));
-        assert_eq!(rt.bootstrap_fast_scan_dirs(vec![warm], &table, 8), 1);
-        assert!(!rt.should_bootstrap_fast_scan_dirs(2));
+        assert!(rt.should_bootstrap_fast_scan_dirs(1));
+        assert_eq!(
+            rt.bootstrap_fast_scan_dirs(vec![warm.clone()], &table, 1),
+            1
+        );
+        assert!(!rt.should_bootstrap_fast_scan_dirs(1));
+
+        let drained = rt.fast_scan_tick(
+            &table,
+            FastScanTickConfig {
+                target_secs: 0,
+                local_stat_budget_per_tick: 8,
+                local_readdir_budget_per_tick: 8,
+                ..FastScanTickConfig::default()
+            },
+        );
+        assert_eq!(drained.changed_dirs, vec![warm.clone()]);
+        assert!(rt.should_bootstrap_fast_scan_dirs(1));
         assert_eq!(rt.fast_scan_l0_roots(), vec![hot.clone()]);
         let excluded = rt.fast_scan_bootstrap_excluded_roots();
         assert_eq!(excluded.len(), 2);

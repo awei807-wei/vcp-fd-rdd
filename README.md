@@ -234,7 +234,7 @@ L2/L3 periodic cold scan 会维护 directory manifest，用 `child_count`、`nam
 
 L1/L2 fast scan lane 默认启用，用目录 sentinel 对本地可信文件系统上的已知 L1/L2 目录提供 5 秒覆盖目标。它读取 `/proc/self/mountinfo` 分类 mount：`ext4`、`xfs`、`btrfs`、`tmpfs`、`f2fs` 进入 `local_strict`；`nfs`、`nfs4`、`cifs`、`smb3`、`fuse.*`、`sshfs`、`rclone` 和未知文件系统按 untrusted 处理，默认只报告 best-effort，不承诺 strict SLA。sentinel 发现目录项变化后会以 `FastScanChangedDir` 加入 DirtyQueue，并复用统一 depth=1 scan/apply 路径更新索引。
 
-fast scan bootstrap 只负责把非 L0 的已知目录注册为 sentinel；L0 已覆盖目录和已注册 sentinel 会被排除。候选池达到 `l1_l2_fast_scan_bootstrap_budget_per_tick`，或一次 bootstrap 未发现新候选时，调度层会跳过/冷却后续 bootstrap，避免对大规模 manifest-only cold snapshot 进行每秒全量目录枚举。
+fast scan bootstrap 只负责把非 L0 的已知目录注册为 sentinel；L0 已覆盖目录和已注册 sentinel 会被排除。`l1_l2_fast_scan_bootstrap_budget_per_tick` 是每 tick 注册预算，不是 sentinel 总量上限；新注册 sentinel 会先进入一次 `FastScanChangedDir` 初始补扫，补齐覆盖前已经发生的创建。一次 bootstrap 未发现新候选时会进入冷却，初始补扫队列积压达到单批预算时会暂停 bootstrap，避免对大规模 manifest-only cold snapshot 进行每秒全量目录枚举。
 
 `/watch-state` 暴露 fast scan 的 `fast_scan_enabled`、`fast_scan_mode`、`fast_scan_sla_ok`、`fast_scan_local_strict_ok`、known/local/untrusted dir 数量、pending changed-dir queue、checked/changed/generated counters、coverage lag p50/p95/p99、budget degraded 和最后 degraded reason。`/health` 会区分本地 strict 覆盖失败、预算降级和网络/FUSE best-effort，不把 untrusted 路径伪装成 strict 5 秒 SLA。
 
