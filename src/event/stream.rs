@@ -1097,6 +1097,44 @@ fn cleanup_pending_moves(pending: &mut PendingMoveMap) {
     pending.retain(|_, (t, _)| now.duration_since(*t) < PENDING_MOVE_TIMEOUT);
 }
 
+fn should_keep_existing_merged_event(existing: &EventType, incoming: &EventType) -> bool {
+    matches!(existing, EventType::Create | EventType::Rename { .. })
+        && matches!(incoming, EventType::Modify)
+}
+
+fn insert_merged_event(
+    seq: &mut u64,
+    scratch: &mut MergeScratch,
+    path: PathBuf,
+    timestamp: std::time::SystemTime,
+    event_type: EventType,
+    path_hint: Option<PathBuf>,
+) {
+    match scratch.merged.entry(path) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if should_keep_existing_merged_event(&entry.get().event_type, &event_type) {
+                return;
+            }
+            *seq += 1;
+            entry.insert(MergedEvent {
+                seq: *seq,
+                timestamp,
+                event_type,
+                path_hint,
+            });
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            *seq += 1;
+            entry.insert(MergedEvent {
+                seq: *seq,
+                timestamp,
+                event_type,
+                path_hint,
+            });
+        }
+    }
+}
+
 /// 合并事件：同一路径的多个事件合并为最终状态
 fn merge_events_in_place(seq: &mut u64, raw: &mut Vec<notify::Event>, scratch: &mut MergeScratch) {
     scratch.merged.clear();
@@ -1123,20 +1161,40 @@ fn merge_events_in_place(seq: &mut u64, raw: &mut Vec<notify::Event>, scratch: &
             // 移除 from 的旧事件
             scratch.merged.remove(&from);
 
-            *seq += 1;
-            scratch.merged.insert(
+            insert_merged_event(
+                seq,
+                scratch,
                 to,
-                MergedEvent {
-                    seq: *seq,
-                    timestamp: now,
-                    event_type: EventType::Rename {
-                        from: FileIdentifier::Path(from),
-                        // notify 提供的是 Path 身份，from 本身已包含路径，不需要重复 path_hint。
-                        from_path_hint: None,
-                    },
-                    // id=Path 时不重复存储 path_hint，避免多份 PathBuf clone 造成高水位。
-                    path_hint: None,
+                now,
+                EventType::Rename {
+                    from: FileIdentifier::Path(from),
+                    // notify 提供的是 Path 身份，from 本身已包含路径，不需要重复 path_hint。
+                    from_path_hint: None,
                 },
+                // id=Path 时不重复存储 path_hint，避免多份 PathBuf clone 造成高水位。
+                None,
+            );
+            continue;
+        }
+
+        if matches!(
+            kind,
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::To
+            ))
+        ) && paths.len() == 1
+        {
+            let Some(path) = paths.into_iter().next() else {
+                continue;
+            };
+            insert_merged_event(
+                seq,
+                scratch,
+                path,
+                now,
+                EventType::Create,
+                // id=Path 时不重复存储 path_hint，避免多份 PathBuf clone 造成高水位。
+                None,
             );
             continue;
         }
@@ -1149,17 +1207,10 @@ fn merge_events_in_place(seq: &mut u64, raw: &mut Vec<notify::Event>, scratch: &
 
         let event_type: EventType = kind.into();
 
-        // 合并策略：后到的事件覆盖先到的
-        *seq += 1;
-        scratch.merged.insert(
-            path,
-            MergedEvent {
-                seq: *seq,
-                timestamp: now,
-                event_type,
-                // id=Path 时不重复存储 path_hint，避免多份 PathBuf clone 造成高水位。
-                path_hint: None,
-            },
+        insert_merged_event(
+            seq, scratch, path, now, event_type,
+            // id=Path 时不重复存储 path_hint，避免多份 PathBuf clone 造成高水位。
+            None,
         );
     }
 
@@ -1216,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_dedup_last_wins_without_duplicate_path_hints() {
+    fn create_not_overwritten_by_modify() {
         let mut seq: u64 = 0;
         let mut raw: Vec<notify::Event> = Vec::new();
         let mut scratch = MergeScratch::default();
@@ -1224,6 +1275,137 @@ mod tests {
         let p = PathBuf::from("/tmp/a.txt");
         raw.push(mk_event(
             notify::EventKind::Create(notify::event::CreateKind::Any),
+            vec![p.clone()],
+        ));
+        raw.push(mk_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            vec![p.clone()],
+        ));
+
+        merge_events_in_place(&mut seq, &mut raw, &mut scratch);
+        assert_eq!(scratch.records.len(), 1);
+        let r = &scratch.records[0];
+        assert!(matches!(r.event_type, EventType::Create));
+        assert_eq!(r.id, FileIdentifier::Path(p));
+        assert!(r.path_hint.is_none());
+    }
+
+    #[test]
+    fn orphan_rename_to_treated_as_create() {
+        let mut seq: u64 = 0;
+        let mut raw: Vec<notify::Event> = Vec::new();
+        let mut scratch = MergeScratch::default();
+
+        let p = PathBuf::from("/tmp/download-finished.txt");
+        raw.push(mk_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::To,
+            )),
+            vec![p.clone()],
+        ));
+
+        merge_events_in_place(&mut seq, &mut raw, &mut scratch);
+        assert_eq!(scratch.records.len(), 1);
+        let r = &scratch.records[0];
+        assert!(matches!(r.event_type, EventType::Create));
+        assert_eq!(r.id, FileIdentifier::Path(p));
+        assert!(r.path_hint.is_none());
+    }
+
+    #[test]
+    fn orphan_rename_from_not_treated_as_create() {
+        let mut seq: u64 = 0;
+        let mut raw: Vec<notify::Event> = Vec::new();
+        let mut scratch = MergeScratch::default();
+
+        let p = PathBuf::from("/tmp/download.part");
+        raw.push(mk_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::From,
+            )),
+            vec![p.clone()],
+        ));
+
+        merge_events_in_place(&mut seq, &mut raw, &mut scratch);
+        assert_eq!(scratch.records.len(), 1);
+        let r = &scratch.records[0];
+        assert!(matches!(r.event_type, EventType::Modify));
+        assert_eq!(r.id, FileIdentifier::Path(p));
+        assert!(r.path_hint.is_none());
+    }
+
+    #[test]
+    fn orphan_rename_to_not_overwritten_by_modify() {
+        let mut seq: u64 = 0;
+        let mut raw: Vec<notify::Event> = Vec::new();
+        let mut scratch = MergeScratch::default();
+
+        let p = PathBuf::from("/tmp/download-finished.txt");
+        raw.push(mk_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::To,
+            )),
+            vec![p.clone()],
+        ));
+        raw.push(mk_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            vec![p.clone()],
+        ));
+
+        merge_events_in_place(&mut seq, &mut raw, &mut scratch);
+        assert_eq!(scratch.records.len(), 1);
+        let r = &scratch.records[0];
+        assert!(matches!(r.event_type, EventType::Create));
+        assert_eq!(r.id, FileIdentifier::Path(p));
+        assert!(r.path_hint.is_none());
+    }
+
+    #[test]
+    fn paired_rename_not_overwritten_by_modify() {
+        let mut seq: u64 = 0;
+        let mut raw: Vec<notify::Event> = Vec::new();
+        let mut scratch = MergeScratch::default();
+
+        let from_path = PathBuf::from("/tmp/download.part");
+        let to = PathBuf::from("/tmp/download-finished.txt");
+
+        raw.push(mk_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Any,
+            )),
+            vec![from_path.clone(), to.clone()],
+        ));
+        raw.push(mk_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            vec![to.clone()],
+        ));
+
+        merge_events_in_place(&mut seq, &mut raw, &mut scratch);
+        assert_eq!(scratch.records.len(), 1);
+        let r = &scratch.records[0];
+        assert_eq!(r.id, FileIdentifier::Path(to));
+        assert!(r.path_hint.is_none());
+        match &r.event_type {
+            EventType::Rename {
+                from,
+                from_path_hint,
+            } => {
+                assert_eq!(from, &FileIdentifier::Path(from_path));
+                assert!(from_path_hint.is_none());
+            }
+            _ => panic!("expected rename event type"),
+        }
+    }
+
+    #[test]
+    fn modify_after_delete_still_wins() {
+        let mut seq: u64 = 0;
+        let mut raw: Vec<notify::Event> = Vec::new();
+        let mut scratch = MergeScratch::default();
+
+        let p = PathBuf::from("/tmp/transient.txt");
+        raw.push(mk_event(
+            notify::EventKind::Remove(notify::event::RemoveKind::Any),
             vec![p.clone()],
         ));
         raw.push(mk_event(
@@ -1274,6 +1456,41 @@ mod tests {
             }
             _ => panic!("expected rename event type"),
         }
+    }
+
+    #[test]
+    fn orphan_rename_to_indexes_final_path_without_from_path() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-orphan-rename-to-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let from_path = root.join("payload.part");
+        let to = root.join("payload-final-visible.txt");
+        std::fs::write(&to, b"download complete").unwrap();
+
+        let mut seq: u64 = 0;
+        let mut raw = vec![mk_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::To,
+            )),
+            vec![to.clone()],
+        )];
+        let mut scratch = MergeScratch::default();
+        merge_events_in_place(&mut seq, &mut raw, &mut scratch);
+
+        let index = crate::index::TieredIndex::empty(vec![root.clone()]);
+        index.apply_events(&scratch.records);
+
+        let results = index.query("payload");
+        assert!(results.iter().any(|meta| meta.path == to));
+        assert!(!results.iter().any(|meta| meta.path == from_path));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

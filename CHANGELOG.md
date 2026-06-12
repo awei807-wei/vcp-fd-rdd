@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 修复 rename 事件窗口期导致新下载文件最终名搜不到的问题：事件合并阶段只把孤立 `RenameMode::To` 视为 `Create`，孤立 `RenameMode::From` 保持普通修改语义；同批次 `Create`/`Rename` 不再被后续 `Modify` 覆盖，避免下载器 `.part` → 最终名、编辑器原子保存和配对 rename 在 merge 阶段丢失结构性变化语义。
 - 修复 CI 回归误报：`fast_sync_reconciles_add_and_delete` 允许 Linux inode 复用场景下以单次 same-FileKey upsert 完成旧路径遮蔽；stress CI hardlink 断言同步为 PathEntry 多别名语义，不再要求同 inode 单路径折叠。
 - L1/L2 tiered watcher 新增 fast scan lane：默认启用本地可信文件系统 5 秒覆盖目标，按 `/proc/self/mountinfo` 将 ext4/xfs/btrfs/tmpfs/f2fs 归为 `local_strict`，网络/FUSE/未知文件系统默认 `best_effort`，不会报告 strict SLA 成功。
 - 新增 fast scan 配置项：`tiered_watch.l1_l2_fast_scan_enabled`、target/tick/stat/readdir/bootstrap 预算，以及 `network_fast_scan_mode`、network stat/readdir 预算；配置解析、默认值、README 和 diagnostics 已同步。
