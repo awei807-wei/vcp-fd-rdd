@@ -507,6 +507,10 @@ impl TieredIndex {
                         if self.path_is_frozen(meta.path.as_path()) {
                             continue;
                         }
+                        if self.path_blocked_by_runtime_subtree_tombstone(meta.path.as_path()) {
+                            self.stats.record_query_stale_hits(1);
+                            continue;
+                        }
                         let blocked = blocked_paths.contains(path_bytes)
                             || path_deleted_by_any(path_bytes, deleted_sources.as_slice());
                         if blocked {
@@ -632,6 +636,10 @@ impl TieredIndex {
                 if self.path_is_frozen(meta.path.as_path()) {
                     continue;
                 }
+                if self.path_blocked_by_runtime_subtree_tombstone(meta.path.as_path()) {
+                    self.stats.record_query_stale_hits(1);
+                    continue;
+                }
                 let blocked = blocked_paths.contains(path_bytes)
                     || layer_deleted.is_some_and(|paths| paths.contains(path_bytes))
                     || path_deleted_by_any(path_bytes, deleted_sources);
@@ -682,6 +690,10 @@ impl TieredIndex {
                 }
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
                 if self.path_is_frozen(meta.path.as_path()) {
+                    continue;
+                }
+                if self.path_blocked_by_runtime_subtree_tombstone(meta.path.as_path()) {
+                    self.stats.record_query_stale_hits(1);
                     continue;
                 }
                 let blocked = blocked_paths.contains(path_bytes)
@@ -747,6 +759,10 @@ impl TieredIndex {
         verify_budget: &mut QueryVerifyBudget,
     ) -> Option<QueryResultMeta> {
         if self.path_is_frozen(meta.path.as_path()) {
+            return None;
+        }
+        if self.path_blocked_by_runtime_subtree_tombstone(meta.path.as_path()) {
+            self.stats.record_query_stale_hits(1);
             return None;
         }
         let path_bytes = meta.path.as_os_str().as_encoded_bytes();

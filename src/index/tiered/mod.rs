@@ -43,6 +43,14 @@ pub use directory_manifest::DirectoryManifestReport;
 use directory_manifest::DirectoryManifestStore;
 
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
+const RUNTIME_SUBTREE_TOMBSTONE_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Debug)]
+pub(self) struct RuntimeSubtreeTombstone {
+    pub(self) root_path: PathBuf,
+    pub(self) generation: u64,
+    pub(self) expires_at: Instant,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanOutcome {
@@ -288,6 +296,7 @@ pub struct TieredIndex {
     pub(self) query_max_verify_per_query: AtomicU64,
     pub(self) query_verify_timeout_ms: AtomicU64,
     pub(self) query_allow_sync_readdir: AtomicBool,
+    pub(self) runtime_subtree_tombstones: Mutex<Vec<RuntimeSubtreeTombstone>>,
     pub(self) memory_report_cache: Mutex<MemoryReportCache>,
 }
 
@@ -376,6 +385,105 @@ impl TieredIndex {
         // 当前阶段不允许查询线程同步 readdir；该字段保留为显式硬门禁。
         self.query_allow_sync_readdir
             .store(false, Ordering::Relaxed);
+    }
+
+    fn cleanup_runtime_subtree_tombstones_locked(
+        tombstones: &mut Vec<RuntimeSubtreeTombstone>,
+        now: Instant,
+    ) {
+        tombstones.retain(|tombstone| tombstone.expires_at > now);
+    }
+
+    pub(self) fn path_blocked_by_runtime_subtree_tombstone(&self, path: &Path) -> bool {
+        let mut tombstones = self.runtime_subtree_tombstones.lock();
+        Self::cleanup_runtime_subtree_tombstones_locked(&mut tombstones, Instant::now());
+        tombstones
+            .iter()
+            .any(|tombstone| path.starts_with(tombstone.root_path.as_path()))
+    }
+
+    pub(self) fn note_runtime_subtree_tombstones_for_events(
+        &self,
+        events: &[crate::core::EventRecord],
+    ) {
+        let now = Instant::now();
+        let expires_at = now + RUNTIME_SUBTREE_TOMBSTONE_TTL;
+        let current_generation = self.event_seq.load(Ordering::Relaxed);
+        let mut tombstones = self.runtime_subtree_tombstones.lock();
+        Self::cleanup_runtime_subtree_tombstones_locked(&mut tombstones, now);
+
+        for ev in events {
+            let generation = ev.seq.max(current_generation.saturating_add(1));
+            match &ev.event_type {
+                crate::core::EventType::Delete => {
+                    if let Some(path) = ev.best_path() {
+                        tombstones.push(RuntimeSubtreeTombstone {
+                            root_path: normalize_path(path),
+                            generation,
+                            expires_at,
+                        });
+                    }
+                }
+                crate::core::EventType::Rename {
+                    from,
+                    from_path_hint,
+                } => {
+                    if let Some(from_path) = from_path_hint.as_deref().or_else(|| from.as_path()) {
+                        tombstones.push(RuntimeSubtreeTombstone {
+                            root_path: normalize_path(from_path),
+                            generation,
+                            expires_at,
+                        });
+                    }
+                    if let Some(to_path) = ev.best_path() {
+                        Self::clear_runtime_subtree_tombstones_for_path(
+                            &mut tombstones,
+                            normalize_path(to_path).as_path(),
+                            generation,
+                        );
+                    }
+                }
+                crate::core::EventType::Create | crate::core::EventType::Modify => {
+                    if let Some(path) = ev.best_path() {
+                        Self::clear_runtime_subtree_tombstones_for_path(
+                            &mut tombstones,
+                            normalize_path(path).as_path(),
+                            generation,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear_runtime_subtree_tombstones_for_path(
+        tombstones: &mut Vec<RuntimeSubtreeTombstone>,
+        path: &Path,
+        generation: u64,
+    ) {
+        tombstones.retain(|tombstone| {
+            if generation < tombstone.generation {
+                return true;
+            }
+            !(path.starts_with(tombstone.root_path.as_path())
+                || tombstone.root_path.starts_with(path))
+        });
+    }
+
+    #[cfg(test)]
+    fn force_expire_runtime_subtree_tombstones(&self) {
+        let mut tombstones = self.runtime_subtree_tombstones.lock();
+        for tombstone in tombstones.iter_mut() {
+            tombstone.expires_at = Instant::now();
+        }
+        Self::cleanup_runtime_subtree_tombstones_locked(&mut tombstones, Instant::now());
+    }
+
+    #[cfg(test)]
+    fn runtime_subtree_tombstone_count(&self) -> usize {
+        let mut tombstones = self.runtime_subtree_tombstones.lock();
+        Self::cleanup_runtime_subtree_tombstones_locked(&mut tombstones, Instant::now());
+        tombstones.len()
     }
 
     pub fn set_wal_durability(&self, durability: WalDurability) {

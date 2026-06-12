@@ -1883,8 +1883,8 @@ async fn tiny_stable_without_large_prev_requires_rebuild_after_root_probe() -> a
 }
 
 #[tokio::test]
-async fn snapshot_materialization_does_not_prune_cold_children_for_parent_delete(
-) -> anyhow::Result<()> {
+async fn subtree_tombstone_runtime_only_hides_cold_children_for_parent_delete() -> anyhow::Result<()>
+{
     let root = unique_tmp_dir("cold-parent-delete");
     let content_root = root.join("content");
     let state_root = root.join("state");
@@ -1912,9 +1912,10 @@ async fn snapshot_materialization_does_not_prune_cold_children_for_parent_delete
     loaded.apply_events(&[mk_event(2, EventType::Delete, parent.clone())]);
     assert_eq!(
         loaded.query_limit_detailed("编年史", 10).len(),
-        1,
-        "a path-only parent delete tombstone must not hide cold children"
+        0,
+        "runtime subtree tombstone should hide cold children before per-path stat"
     );
+    assert_eq!(loaded.stats_report().cold_validate_count, 1);
     loaded.snapshot_now(store.clone()).await?;
 
     let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
@@ -2328,6 +2329,92 @@ fn query_verify_budget_caps_wide_stale_candidate_stat_count() {
     assert!(results.is_empty());
     assert_eq!(idx.stats_report().cold_validate_count, 3);
     assert_eq!(idx.stats_report().query_stale_hit_count, 3);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn subtree_tombstone_filters_deleted_parent_before_query_verify() {
+    let root = unique_tmp_dir("subtree-tombstone-filter");
+    let deleted_parent = root.join("node_modules");
+    std::fs::create_dir_all(&deleted_parent).unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let mut events = Vec::new();
+    for i in 0..20 {
+        let path = deleted_parent.join(format!("subtree_tombstone_pkg_{i}.js"));
+        std::fs::write(&path, b"module").unwrap();
+        events.push(mk_event(i as u64 + 1, EventType::Create, path));
+    }
+    idx.apply_events(&events);
+    idx.refresh_base();
+
+    std::fs::remove_dir_all(&deleted_parent).unwrap();
+    idx.apply_events(&[mk_event(100, EventType::Delete, deleted_parent.clone())]);
+
+    let results = idx.query_limit_detailed("subtree_tombstone_pkg", 20);
+    assert!(results.is_empty());
+    assert_eq!(idx.stats_report().cold_validate_count, 0);
+    assert_eq!(idx.stats_report().query_stale_hit_count, 20);
+    assert_eq!(idx.runtime_subtree_tombstone_count(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn subtree_tombstone_ttl_cleanup_allows_runtime_filter_to_expire() {
+    let root = unique_tmp_dir("subtree-tombstone-ttl");
+    let deleted_parent = root.join("cache");
+    std::fs::create_dir_all(&deleted_parent).unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let path = deleted_parent.join("subtree_tombstone_ttl.txt");
+    std::fs::write(&path, b"cache").unwrap();
+    idx.apply_events(&[mk_event(1, EventType::Create, path.clone())]);
+    idx.refresh_base();
+
+    std::fs::remove_dir_all(&deleted_parent).unwrap();
+    idx.apply_events(&[mk_event(2, EventType::Delete, deleted_parent.clone())]);
+    assert_eq!(idx.runtime_subtree_tombstone_count(), 1);
+
+    idx.force_expire_runtime_subtree_tombstones();
+    assert_eq!(idx.runtime_subtree_tombstone_count(), 0);
+
+    let results = idx.query_limit_detailed("subtree_tombstone_ttl", 10);
+    assert!(results.is_empty());
+    assert_eq!(idx.stats_report().cold_validate_count, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn subtree_tombstone_does_not_hide_recreated_same_name_after_create_event() {
+    let root = unique_tmp_dir("subtree-tombstone-recreate");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let old_path = project.join("subtree_tombstone_recreated.txt");
+    std::fs::write(&old_path, b"old").unwrap();
+    idx.apply_events(&[mk_event(1, EventType::Create, old_path.clone())]);
+    idx.refresh_base();
+
+    std::fs::remove_dir_all(&project).unwrap();
+    idx.apply_events(&[mk_event(2, EventType::Delete, project.clone())]);
+    assert!(idx
+        .query_limit_detailed("subtree_tombstone_recreated", 10)
+        .is_empty());
+
+    std::fs::create_dir_all(&project).unwrap();
+    let new_path = project.join("subtree_tombstone_recreated.txt");
+    std::fs::write(&new_path, b"new").unwrap();
+    idx.apply_events(&[mk_event(3, EventType::Create, new_path.clone())]);
+
+    let results = idx.query_limit_detailed("subtree_tombstone_recreated", 10);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].meta.path, new_path);
+    assert_eq!(results[0].freshness, QueryResultFreshness::Fresh);
+    assert_eq!(idx.runtime_subtree_tombstone_count(), 0);
 
     let _ = std::fs::remove_dir_all(&root);
 }

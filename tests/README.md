@@ -49,6 +49,7 @@
 ## v7.0.0 测试相关变更
 
 - 全量 `cargo test -q` 覆盖 runtime boundary、mmap v7 cold segment、WAL/root state、query DSL、content index、tiered watcher 和 sim parity 等回归。
+- Runtime subtree tombstone 覆盖删除父目录后 cold/base 子路径验真前过滤、TTL 清理、同名目录重建解除过滤，以及 runtime-only 不持久化到 snapshot 的边界。
 - 查询验真新增默认同步校验和预算回归：删除的 cold/base 命中不返回，mtime/identity 变化返回 `Changed` 且已验证，宽泛 stale 查询的同步 `stat` 不超过 `query.max_verify_per_query`，lazy validation 需显式开启才作为后台补偿路径。
 - `src/event/stream.rs` 单元测试补齐孤立 `RenameMode::To`、孤立 `RenameMode::From`、Create/Rename 后续 Modify 合并优先级和 Delete 后 Modify 反例；`p1_visibility_latency.rs` 增加下载器 `.part` → 最终名 rename 可见性验证，防止新下载文件最终名因事件合并丢失而不可见。
 - 新增 `p1_fast_scan_sla.rs`，启动真实 tiered daemon 并隔离 `XDG_CONFIG_HOME`，强制构造 L1/L2 非 L0 目录，验证 create、delete、rename 在 fast scan SLA 窗口内更新搜索结果；CI 新增 `L1/L2 fast scan SLA` 专项 job。

@@ -292,6 +292,8 @@ L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` �
 
 默认查询路径会在返回冷层/base 结果前执行预算化 `stat` 验真；删除路径不会返回，mtime 或身份变化会以 `freshness = "changed"` 返回当前 metadata，并把父目录加入补偿队列。显式开启 `lazy_validation_enabled = true` 会把同步验真降级为后台补偿路径，适合低功耗环境，但返回结果会标记为 `freshness = "unknown"` / `validated = false`。
 
+删除父目录或目录 rename-from 会创建运行时 subtree tombstone。查询 cold/base 候选时先做 prefix filter，再消耗验真预算；因此删除 `node_modules` 这类大目录后，旧冷层子路径会被常数级运行时过滤挡住，不会逐个 `stat`。该 tombstone 只保留在运行时，带 TTL；同名目录重建并产生 Create/Modify/RenameTo 事件后会清理旧 tombstone，避免误伤新内容。
+
 `runtime_profile = "memory_light"` 适合更关注常驻内存上限、可接受更频繁 snapshot/flush 的环境。该模式会降低 DeltaBuffer 触发 flush 的路径数/字节门槛，给周期 flush 增加最大滞留时间，缩短 rebuild 合并冷却，并在 WAL 体积超过阈值时请求 snapshot 边界；强制 flush、退出前 final snapshot、WAL replay 和离线 root 的 Freeze Gate 保护不变。CLI 可用 `--runtime-profile memory_light` 临时覆盖。
 
 内容索引默认关闭，`content:` / `text:` 查询会返回明确的 unsupported 错误，避免默认文件名查询热路径读取文件内容。启用 `[content_index]` 后，后台低优先级 worker 会按 `max_file_size`、`include_ext`、`exclude_ext`、exclude 目录、mount policy 和 I/O governor 维护轻量文本索引；查询只读取该索引，不在热路径打开文件。`dupe:content` 不依赖内容索引开关，但会复用 frozen/offline、exclude 目录、mount policy 和 `content_index.max_file_size` 准入策略，并在 query generation guard 之外执行 partial/full hash。

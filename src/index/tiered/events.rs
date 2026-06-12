@@ -207,6 +207,7 @@ impl TieredIndex {
 
         // WAL：先写后用（best-effort）。replay 场景下禁用写回，避免重复追加。
         self.append_events_to_wal(events, log_to_wal);
+        self.note_runtime_subtree_tombstones_for_events(events);
 
         // 若 rebuild 在进行：先缓冲 pending 事件；并在持锁期间捕获当前 l2 指针，
         // 避免切换窗口导致"事件已缓冲但应用到了新索引"而重复回放。
