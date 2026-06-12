@@ -119,6 +119,18 @@ impl DirtyPriority {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirtyRepairCursor {
+    pub dir: PathBuf,
+    pub offset: i64,
+}
+
+impl DirtyRepairCursor {
+    pub fn new(dir: PathBuf, offset: i64) -> Self {
+        Self { dir, offset }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirtyQueueEntry {
     pub scope: DirtyScope,
     pub reason: DirtyReason,
@@ -127,6 +139,7 @@ pub struct DirtyQueueEntry {
     pub last_enqueue_ns: u64,
     pub not_before_ns: u64,
     pub attempts: u32,
+    pub repair_cursor: Option<DirtyRepairCursor>,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +230,28 @@ impl DirtyQueue {
         priority: DirtyPriority,
         now_ns: u64,
     ) {
+        self.enqueue_inner(scope, reason, priority, now_ns, None);
+    }
+
+    pub fn enqueue_repair_slice(
+        &mut self,
+        scope: DirtyScope,
+        reason: DirtyReason,
+        priority: DirtyPriority,
+        now_ns: u64,
+        cursor: DirtyRepairCursor,
+    ) {
+        self.enqueue_inner(scope, reason, priority, now_ns, Some(cursor));
+    }
+
+    fn enqueue_inner(
+        &mut self,
+        scope: DirtyScope,
+        reason: DirtyReason,
+        priority: DirtyPriority,
+        now_ns: u64,
+        repair_cursor: Option<DirtyRepairCursor>,
+    ) {
         let scope = scope.normalized();
         let key = DirtyScopeKey::from_scope(&scope);
         let not_before_ns = now_ns.saturating_add(self.debounce_ns);
@@ -227,6 +262,8 @@ impl DirtyQueue {
                 entry.priority = entry.priority.max(priority);
                 entry.last_enqueue_ns = now_ns;
                 entry.not_before_ns = not_before_ns;
+                entry.repair_cursor =
+                    merge_repair_cursor(entry.repair_cursor.take(), repair_cursor.clone());
             })
             .or_insert_with(|| DirtyQueueEntry {
                 scope,
@@ -236,6 +273,7 @@ impl DirtyQueue {
                 last_enqueue_ns: now_ns,
                 not_before_ns,
                 attempts: 0,
+                repair_cursor,
             });
     }
 
@@ -279,6 +317,7 @@ impl DirtyQueue {
             return false;
         }
         entry.scope = entry.scope.expanded_for_retry();
+        entry.repair_cursor = None;
         let delay = self
             .retry_base_delay_ns
             .saturating_mul(1u64 << entry.attempts.saturating_sub(1).min(16));
@@ -293,6 +332,8 @@ impl DirtyQueue {
                 existing.last_enqueue_ns = existing.last_enqueue_ns.max(entry.last_enqueue_ns);
                 existing.not_before_ns = existing.not_before_ns.min(entry.not_before_ns);
                 existing.attempts = existing.attempts.min(entry.attempts);
+                existing.repair_cursor =
+                    merge_repair_cursor(existing.repair_cursor.take(), entry.repair_cursor.clone());
             })
             .or_insert(entry);
         true
@@ -330,6 +371,24 @@ fn merge_reason(existing: DirtyReason, incoming: DirtyReason) -> DirtyReason {
         incoming
     } else {
         existing
+    }
+}
+
+fn merge_repair_cursor(
+    existing: Option<DirtyRepairCursor>,
+    incoming: Option<DirtyRepairCursor>,
+) -> Option<DirtyRepairCursor> {
+    match (existing, incoming) {
+        // A full rescan request is safer than any partial cursor.
+        (_, None) | (None, Some(_)) => None,
+        (Some(existing), Some(incoming)) if existing.dir == incoming.dir => {
+            Some(if existing.offset <= incoming.offset {
+                existing
+            } else {
+                incoming
+            })
+        }
+        (Some(_), Some(_)) => None,
     }
 }
 
@@ -390,6 +449,7 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].reason, DirtyReason::QueryHitStale);
         assert_eq!(ready[0].priority, DirtyPriority::High);
+        assert!(ready[0].repair_cursor.is_none());
     }
 
     #[test]
@@ -458,10 +518,56 @@ mod tests {
         let retry = q.pop_ready(25_000_000, 1).pop().unwrap();
         assert_eq!(retry.attempts, 1);
         assert_eq!(retry.scope.dir_paths(), &[PathBuf::from("/tmp/a")]);
+        assert!(retry.repair_cursor.is_none());
 
         assert!(q.retry(retry, 30_000_000));
         let second = q.pop_ready(40_000_000, 1).pop().unwrap();
         assert_eq!(second.scope.dir_paths(), &[PathBuf::from("/tmp")]);
         assert!(!q.retry(second, 50_000_000));
+    }
+
+    #[test]
+    fn dirty_queue_keeps_partial_repair_cursor_until_full_scan_arrives() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        let dir = PathBuf::from("/tmp/sliced");
+
+        q.enqueue_repair_slice(
+            DirtyScope::dirs(0, vec![dir.clone()]),
+            DirtyReason::PeriodicColdScan,
+            DirtyPriority::Low,
+            1,
+            DirtyRepairCursor::new(dir.clone(), 200),
+        );
+        q.enqueue_repair_slice(
+            DirtyScope::dirs(0, vec![dir.clone()]),
+            DirtyReason::PeriodicColdScan,
+            DirtyPriority::Low,
+            2,
+            DirtyRepairCursor::new(dir.clone(), 100),
+        );
+
+        let entry = q.pop_ready(2, 1).pop().unwrap();
+        assert_eq!(
+            entry.repair_cursor,
+            Some(DirtyRepairCursor::new(dir.clone(), 100))
+        );
+
+        q.enqueue_repair_slice(
+            DirtyScope::dirs(0, vec![dir.clone()]),
+            DirtyReason::PeriodicColdScan,
+            DirtyPriority::Low,
+            3,
+            DirtyRepairCursor::new(dir.clone(), 300),
+        );
+        q.enqueue(
+            DirtyScope::dirs(0, vec![dir]),
+            DirtyReason::InotifyEvent,
+            DirtyPriority::Normal,
+            4,
+        );
+
+        let full = q.pop_ready(4, 1).pop().unwrap();
+        assert!(full.repair_cursor.is_none());
+        assert_eq!(full.reason, DirtyReason::InotifyEvent);
     }
 }

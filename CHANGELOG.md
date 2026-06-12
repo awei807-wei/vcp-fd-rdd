@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 新增 M1-3 分片 repair：Periodic cold scan 对大目录按约 512 entries / 20ms 分片处理，未完成 slice 携带运行时 cursor 重新入 DirtyQueue，避免百万 entry 目录在单次冷层巡检中长阻塞；StartupRepairDeferred 保留递归 fast-sync 补偿启动期 rename subtree；`/health`、diagnostics 与 metrics JSONL 新增 `cold_sweep_last_completed`、`cold_sweep_period_estimate`、`dirty_backlog`，把“返回结果是真的，但候选集合可能暂时不全”的全局有界最终一致上界变成可观测字段。
 - 新增运行时 subtree tombstone：Delete 父目录和 rename-from 会创建带 TTL 的运行时前缀墓碑，cold/base 查询候选会在同步验真前被 prefix filter 屏蔽，避免删除大目录后宽泛查询对旧子路径逐个 `stat`；Create/Modify/RenameTo 会清理覆盖路径相关 tombstone，避免同名目录重建被误伤。第一版不持久化到 snapshot/WAL。
 - 查询冷层/base 结果改为默认返回前同步验真：新增 `[query] max_verify_per_query`、`verify_timeout_ms`、`allow_sync_readdir` 配置；默认单查询最多验证 150 个候选、75ms 超时且禁止查询线程同步 readdir。删除路径不返回，mtime 或 identity 变化会以 `freshness = "changed"` / `validated=true` 返回当前 metadata 并入 DirtyQueue；`lazy_validation_enabled` 默认关闭，显式开启时仅作为低功耗后台补偿路径。
 - 修复 rename 事件窗口期导致新下载文件最终名搜不到的问题：事件合并阶段只把孤立 `RenameMode::To` 视为 `Create`，孤立 `RenameMode::From` 保持普通修改语义；同批次 `Create`/`Rename` 不再被后续 `Modify` 覆盖，避免下载器 `.part` → 最终名、编辑器原子保存和配对 rename 在 merge 阶段丢失结构性变化语义。

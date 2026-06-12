@@ -1,11 +1,14 @@
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta, Task};
-use crate::event::sync::{now_ns, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyScope};
+use crate::event::sync::{
+    now_ns, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyRepairCursor, DirtyScope,
+};
 use crate::fs_policy::FsPolicy;
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
 use crate::index::PathFreshness;
@@ -18,6 +21,9 @@ use super::{
     TieredIndex,
 };
 
+const REPAIR_SLICE_MAX_ENTRIES: usize = 512;
+const REPAIR_SLICE_MAX_MS: u64 = 20;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RebuildAdmission {
     StartNow,
@@ -29,6 +35,19 @@ pub(super) enum RebuildAdmission {
 struct BudgetedScanOutcome {
     outcome: ScanOutcome,
     budget_exhausted: bool,
+}
+
+#[derive(Debug)]
+struct SlicedScanOutcome {
+    outcome: ScanOutcome,
+    manifest_skipped: bool,
+    completed: bool,
+    next_cursor: Option<DirtyRepairCursor>,
+}
+
+#[derive(Clone, Debug)]
+struct DirChildEntry {
+    path: PathBuf,
 }
 
 fn visit_dirs_since(
@@ -138,6 +157,114 @@ fn collect_dirs_changed_since(
     out.sort();
     out.dedup();
     out
+}
+
+struct ReadDirSlice {
+    entries: Vec<DirChildEntry>,
+    completed: bool,
+    next_offset: Option<i64>,
+}
+
+#[cfg(unix)]
+fn read_dir_slice(
+    dir: &Path,
+    start_offset: i64,
+    max_entries: usize,
+    max_elapsed: Duration,
+) -> std::io::Result<ReadDirSlice> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    struct DirHandle(*mut libc::DIR);
+
+    impl Drop for DirHandle {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+
+    let start = Instant::now();
+    let mut entries = Vec::new();
+    let mut completed = true;
+    let c_path = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has NUL byte"))?;
+    let raw = unsafe { libc::opendir(c_path.as_ptr()) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let handle = DirHandle(raw);
+    if start_offset > 0 {
+        unsafe {
+            libc::seekdir(handle.0, start_offset as libc::c_long);
+        }
+    }
+    let mut next_offset = start_offset;
+
+    loop {
+        if entries.len() >= max_entries || start.elapsed() >= max_elapsed {
+            completed = false;
+            break;
+        }
+        let entry = unsafe { libc::readdir(handle.0) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            next_offset = unsafe { libc::telldir(handle.0) as i64 };
+            continue;
+        }
+        let name = OsString::from_vec(name.to_vec());
+        entries.push(DirChildEntry {
+            path: dir.join(&name),
+        });
+        next_offset = unsafe { libc::telldir(handle.0) as i64 };
+    }
+
+    Ok(ReadDirSlice {
+        entries,
+        completed,
+        next_offset: (!completed).then_some(next_offset),
+    })
+}
+
+#[cfg(not(unix))]
+fn read_dir_slice(
+    dir: &Path,
+    start_offset: i64,
+    max_entries: usize,
+    max_elapsed: Duration,
+) -> std::io::Result<ReadDirSlice> {
+    let start = Instant::now();
+    let mut entries = Vec::new();
+    let mut skipped = 0i64;
+    let mut completed = true;
+
+    for child in std::fs::read_dir(dir)? {
+        if start.elapsed() >= max_elapsed {
+            completed = false;
+            break;
+        }
+        if skipped < start_offset {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        if entries.len() >= max_entries || start.elapsed() >= max_elapsed {
+            completed = false;
+            break;
+        }
+        let child = child?;
+        entries.push(DirChildEntry { path: child.path() });
+    }
+
+    let consumed = start_offset.saturating_add(entries.len() as i64);
+    Ok(ReadDirSlice {
+        entries,
+        completed,
+        next_offset: (!completed).then_some(consumed),
+    })
 }
 
 fn should_skip_dirty_dir(
@@ -389,6 +516,18 @@ impl TieredIndex {
         self.enqueue_dirty(DirtyScope::dirs(now_ns(), dirs), reason);
     }
 
+    pub fn set_cold_sweep_period_estimate_from_tiered_policy(
+        &self,
+        l2_scan_interval_secs: u64,
+        l3_scan_interval_secs: u64,
+    ) {
+        self.set_cold_sweep_period_estimate(
+            l2_scan_interval_secs
+                .max(1)
+                .max(l3_scan_interval_secs.max(1)),
+        );
+    }
+
     pub fn enqueue_dirty_with_priority(
         &self,
         scope: DirtyScope,
@@ -535,13 +674,41 @@ impl TieredIndex {
                                     | DirtyReason::StartupRepairDeferred
                                     | DirtyReason::FastScanChangedDir
                             );
-                            let (outcome, manifest_skipped) = self
-                                .scan_dirs_periodic_cold_outcome_with_project_markers(
-                                    std::slice::from_ref(dir),
-                                    project_markers,
-                                    allow_manifest_skip,
-                                    discard_if_event_seq_advances,
-                                );
+                            let (outcome, manifest_skipped) =
+                                if entry.reason == DirtyReason::PeriodicColdScan {
+                                    let sliced = self.scan_dir_repair_slice_with_project_markers(
+                                        dir,
+                                        entry.repair_cursor.as_ref(),
+                                        project_markers,
+                                        allow_manifest_skip,
+                                        discard_if_event_seq_advances,
+                                    );
+                                    if let Some(cursor) = sliced.next_cursor {
+                                        self.enqueue_dirty_repair_slice(
+                                            dir.clone(),
+                                            entry.reason,
+                                            entry.priority,
+                                            cursor,
+                                        );
+                                    }
+                                    if sliced.completed {
+                                        self.mark_cold_sweep_completed();
+                                    }
+                                    (sliced.outcome, sliced.manifest_skipped)
+                                } else {
+                                    (
+                                        self.scan_dirs_with_depth_and_project_markers_budgeted(
+                                            &[dir],
+                                            Some(1),
+                                            10_000,
+                                            project_markers,
+                                            None,
+                                            discard_if_event_seq_advances,
+                                        )
+                                        .outcome,
+                                        false,
+                                    )
+                                };
                             report.dirs_scanned = report.dirs_scanned.saturating_add(1);
                             report.changed = report.changed.saturating_add(outcome.changed);
                             report.elapsed_ms =
@@ -574,6 +741,26 @@ impl TieredIndex {
         }
 
         report
+    }
+
+    fn enqueue_dirty_repair_slice(
+        &self,
+        dir: PathBuf,
+        reason: DirtyReason,
+        priority: DirtyPriority,
+        cursor: DirtyRepairCursor,
+    ) {
+        {
+            let mut queue = self.dirty_queue.lock();
+            queue.enqueue_repair_slice(
+                DirtyScope::dirs(now_ns(), vec![dir]),
+                reason,
+                priority,
+                now_ns(),
+                cursor,
+            );
+        }
+        self.dirty_notify.notify_one();
     }
 
     pub(crate) fn fast_sync(
@@ -1014,49 +1201,217 @@ impl TieredIndex {
         }
     }
 
-    fn scan_dirs_periodic_cold_outcome_with_project_markers(
+    fn scan_dir_repair_slice_with_project_markers(
         &self,
-        dirs: &[PathBuf],
+        dir: &PathBuf,
+        cursor: Option<&DirtyRepairCursor>,
         project_markers: &[String],
         allow_manifest_skip: bool,
         discard_if_event_seq_advances: bool,
-    ) -> (ScanOutcome, bool) {
-        let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
-        if allow_manifest_skip && dirs.len() == 1 {
-            let dir = dirs[0];
-            if let Some(summary) = self.directory_manifest_summary(dir, project_markers) {
-                let trusted = self.clock_cutoff_trusted();
-                if self
-                    .directory_manifests
-                    .should_skip(dir.as_path(), &summary, trusted)
-                {
-                    self.directory_manifests.update(
-                        dir.clone(),
-                        summary,
-                        self.event_seq.load(Ordering::Relaxed),
-                    );
-                    return (
-                        ScanOutcome {
-                            elapsed_ms: 0,
-                            ..ScanOutcome::default()
-                        },
-                        true,
-                    );
+    ) -> SlicedScanOutcome {
+        if allow_manifest_skip && cursor.is_none() {
+            if let Some((summary, complete)) = self.directory_manifest_summary_bounded(
+                dir,
+                project_markers,
+                REPAIR_SLICE_MAX_ENTRIES,
+            ) {
+                if complete {
+                    let trusted = self.clock_cutoff_trusted();
+                    if self
+                        .directory_manifests
+                        .should_skip(dir.as_path(), &summary, trusted)
+                    {
+                        self.directory_manifests.update(
+                            dir.clone(),
+                            summary,
+                            self.event_seq.load(Ordering::Relaxed),
+                        );
+                        return SlicedScanOutcome {
+                            outcome: ScanOutcome {
+                                elapsed_ms: 0,
+                                ..ScanOutcome::default()
+                            },
+                            manifest_skipped: true,
+                            completed: true,
+                            next_cursor: None,
+                        };
+                    }
                 }
             }
         }
 
-        let outcome = self
-            .scan_dirs_with_depth_and_project_markers_budgeted(
-                &dirs,
-                Some(1),
-                10_000,
+        let start = Instant::now();
+        let scan_started_seq = self.event_seq.load(Ordering::Relaxed);
+        let start_offset = cursor
+            .filter(|cursor| cursor.dir == *dir)
+            .map(|cursor| cursor.offset.max(0))
+            .unwrap_or(0);
+        let slice = match read_dir_slice(
+            dir,
+            start_offset,
+            REPAIR_SLICE_MAX_ENTRIES,
+            Duration::from_millis(REPAIR_SLICE_MAX_MS),
+        ) {
+            Ok(slice) => slice,
+            Err(err) => {
+                tracing::debug!(
+                    "repair slice skipped unreadable dir {}: {}",
+                    dir.display(),
+                    err
+                );
+                return SlicedScanOutcome {
+                    outcome: ScanOutcome::default(),
+                    manifest_skipped: false,
+                    completed: true,
+                    next_cursor: None,
+                };
+            }
+        };
+
+        let mut upsert_events: Vec<EventRecord> = Vec::with_capacity(slice.entries.len());
+        let mut upsert_metas: Vec<FileMeta> = Vec::with_capacity(slice.entries.len());
+        let mut project_roots = Vec::new();
+        let mut scanned = 0usize;
+        let mut changed = 0usize;
+        let mut seq = 0u64;
+        let hidden_markers_enabled = project_markers.iter().any(|marker| marker.starts_with('.'));
+
+        for child in &slice.entries {
+            let path = super::normalize_path(child.path.as_path());
+            self.io_governor.before_io();
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(err) => {
+                    tracing::debug!(
+                        "repair slice metadata failed for {}: {}",
+                        path.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
+            if !meta.is_file() && !meta.is_dir() {
+                continue;
+            }
+            if !self.repair_slice_path_allowed(
+                dir.as_path(),
+                path.as_path(),
+                &meta,
                 project_markers,
-                None,
-                discard_if_event_seq_advances,
-            )
-            .outcome;
-        (outcome, false)
+                hidden_markers_enabled,
+            ) {
+                continue;
+            }
+            if let Some(project_root) = project_root_for_marker(path.as_path(), project_markers) {
+                project_roots.push(project_root);
+            }
+
+            let Some(file_key) = FileKey::from_path_and_metadata(&path, &meta) else {
+                continue;
+            };
+            let mtime = meta.modified().ok();
+            let mtime_ns = mtime_to_ns(mtime);
+            if self.path_freshness(&path, file_key, mtime_ns) != PathFreshness::Unchanged {
+                changed = changed.saturating_add(1);
+            }
+            seq = seq.wrapping_add(1);
+            upsert_metas.push(FileMeta {
+                file_key,
+                path: path.clone(),
+                size: meta.len(),
+                mtime,
+                ctime: meta.created().ok(),
+                atime: meta.accessed().ok(),
+                kind: FileKind::from_metadata(&meta),
+            });
+            upsert_events.push(EventRecord {
+                seq,
+                timestamp: std::time::SystemTime::now(),
+                event_type: EventType::Modify,
+                id: FileIdentifier::Path(path),
+                path_hint: None,
+            });
+            scanned = scanned.saturating_add(1);
+        }
+
+        let stale_low_priority_scan = discard_if_event_seq_advances
+            && self.event_seq.load(Ordering::Relaxed) > scan_started_seq;
+        if stale_low_priority_scan {
+            tracing::debug!(
+                "discarded stale low-priority repair slice after newer apply seq advanced"
+            );
+            changed = 0;
+        } else if !upsert_events.is_empty() {
+            self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
+        }
+
+        let completed = slice.completed;
+        if completed && !stale_low_priority_scan {
+            if let Some((summary, true)) = self.directory_manifest_summary_bounded(
+                dir,
+                project_markers,
+                REPAIR_SLICE_MAX_ENTRIES,
+            ) {
+                self.directory_manifests.update(
+                    dir.clone(),
+                    summary,
+                    self.event_seq.load(Ordering::Relaxed),
+                );
+            }
+        }
+
+        project_roots.sort();
+        project_roots.dedup();
+        SlicedScanOutcome {
+            outcome: ScanOutcome {
+                scanned,
+                changed,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                project_roots,
+            },
+            manifest_skipped: false,
+            completed,
+            next_cursor: if completed {
+                None
+            } else {
+                let offset = slice.next_offset.unwrap_or_else(|| {
+                    start_offset.saturating_add(REPAIR_SLICE_MAX_ENTRIES as i64)
+                });
+                Some(DirtyRepairCursor::new(dir.clone(), offset))
+            },
+        }
+    }
+
+    fn repair_slice_path_allowed(
+        &self,
+        root: &Path,
+        path: &Path,
+        meta: &std::fs::Metadata,
+        project_markers: &[String],
+        hidden_markers_enabled: bool,
+    ) -> bool {
+        if path_has_excluded_component(path, &self.exclude_dirs) {
+            return false;
+        }
+        if !self.follow_symlinks && meta.file_type().is_symlink() {
+            return false;
+        }
+        if !self.include_hidden
+            && path_has_hidden_component_after_root(path, root)
+            && !(hidden_markers_enabled && project_root_for_marker(path, project_markers).is_some())
+        {
+            return false;
+        }
+
+        FsPolicy::current_with_config(self.fs_policy_config())
+            .as_ref()
+            .map(|policy| {
+                policy
+                    .check_path_counted(path, Some(root), self.mount_policy_counters().as_ref())
+                    .is_allowed()
+            })
+            .unwrap_or(true)
+            && (meta.is_file() || meta.is_dir())
     }
 
     pub fn scan_dirs_immediate_outcome_with_project_markers(
@@ -1152,6 +1507,75 @@ impl TieredIndex {
         }
 
         Some(manifest.finish())
+    }
+
+    fn directory_manifest_summary_bounded(
+        &self,
+        dir: &Path,
+        project_markers: &[String],
+        max_entries: usize,
+    ) -> Option<(DirectoryManifestSummary, bool)> {
+        let hidden_markers_enabled = project_markers.iter().any(|marker| marker.starts_with('.'));
+        let mut manifest = DirectoryManifestBuilder::default();
+        let mut seen = 0usize;
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(err) => {
+                tracing::debug!(
+                    "directory manifest bounded skipped unreadable dir {}: {}",
+                    dir.display(),
+                    err
+                );
+                return None;
+            }
+        };
+
+        for child in rd {
+            let child = match child {
+                Ok(child) => child,
+                Err(err) => {
+                    tracing::debug!(
+                        "directory manifest bounded skipped entry under {}: {}",
+                        dir.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
+            if seen >= max_entries {
+                return Some((manifest.finish(), false));
+            }
+            let path = child.path();
+            self.io_governor.before_io();
+            let meta = match child.metadata() {
+                Ok(meta) => meta,
+                Err(err) => {
+                    tracing::debug!(
+                        "directory manifest bounded metadata failed for {}: {}",
+                        path.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
+            if !self.repair_slice_path_allowed(
+                dir,
+                path.as_path(),
+                &meta,
+                project_markers,
+                hidden_markers_enabled,
+            ) {
+                continue;
+            }
+            manifest.push_child(
+                path.as_path(),
+                FileKind::from_metadata(&meta),
+                mtime_to_ns(meta.modified().ok()),
+            );
+            seen = seen.saturating_add(1);
+        }
+
+        Some((manifest.finish(), true))
     }
 
     fn update_directory_manifests_for_dirs(&self, dirs: &[&PathBuf], project_markers: &[String]) {

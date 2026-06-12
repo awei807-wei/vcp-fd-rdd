@@ -383,6 +383,10 @@ async fn main() -> anyhow::Result<()> {
         exclude_dirs.clone(),
         startup_ignore_paths.clone(),
     );
+    index.set_cold_sweep_period_estimate_from_tiered_policy(
+        cfg.tiered_watch.l2_scan_interval_secs,
+        cfg.tiered_watch.l3_scan_interval_secs,
+    );
     if cfg.content_index.enable {
         index
             .spawn_content_index_worker(Duration::from_secs(snapshot_interval_secs.clamp(30, 300)));
@@ -452,6 +456,9 @@ async fn main() -> anyhow::Result<()> {
                 deferred_unknown_scope: recovery.report.deferred_unknown_scope,
                 wal_tail_dirty_dir_count: recovery.report.deferred_dirty_dirs.len(),
                 deferred_repair_queue_len: index.deferred_repair_queue_len(),
+                cold_sweep_last_completed: index.cold_sweep_last_completed(),
+                cold_sweep_period_estimate: index.cold_sweep_period_estimate(),
+                dirty_backlog: index.dirty_queue_len(),
                 lazy_validation_pending: lazy_validation.pending,
                 lazy_validation_rate_limited: lazy_validation.rate_limited,
                 lazy_validation_cache_hits: lazy_validation.cache_hits,
@@ -664,6 +671,9 @@ async fn main() -> anyhow::Result<()> {
                     deferred_unknown_scope: health.deferred_unknown_scope,
                     wal_tail_dirty_dir_count: health.wal_tail_dirty_dir_count,
                     deferred_repair_queue_len: health.deferred_repair_queue_len,
+                    cold_sweep_last_completed: health.cold_sweep_last_completed,
+                    cold_sweep_period_estimate: health.cold_sweep_period_estimate,
+                    dirty_backlog: health.dirty_backlog,
                     lazy_validation_pending: health.lazy_validation_pending,
                     lazy_validation_rate_limited: health.lazy_validation_rate_limited,
                     lazy_validation_cache_hits: health.lazy_validation_cache_hits,

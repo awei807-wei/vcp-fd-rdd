@@ -48,6 +48,7 @@
 
 ## v7.0.0 测试相关变更
 
+- M1-3 分片 repair 新增 `sliced_repair_*` 单元测试，覆盖 Periodic cold scan 大目录首次 slice 只处理约 512 entries、cursor 重新入队、后续 slice 继续补齐，以及 `/health` 新增 cold sweep/backlog 字段的 JSON 序列化；完整恢复审计继续覆盖 StartupRepairDeferred 的递归 rename subtree 补偿。
 - 全量 `cargo test -q` 覆盖 runtime boundary、mmap v7 cold segment、WAL/root state、query DSL、content index、tiered watcher 和 sim parity 等回归。
 - Runtime subtree tombstone 覆盖删除父目录后 cold/base 子路径验真前过滤、TTL 清理、同名目录重建解除过滤，以及 runtime-only 不持久化到 snapshot 的边界。
 - 查询验真新增默认同步校验和预算回归：删除的 cold/base 命中不返回，mtime/identity 变化返回 `Changed` 且已验证，宽泛 stale 查询的同步 `stat` 不超过 `query.max_verify_per_query`，lazy validation 需显式开启才作为后台补偿路径。

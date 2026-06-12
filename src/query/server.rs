@@ -55,6 +55,9 @@ pub struct HealthTelemetry {
     pub deferred_unknown_scope: bool,
     pub wal_tail_dirty_dir_count: usize,
     pub deferred_repair_queue_len: usize,
+    pub cold_sweep_last_completed: u64,
+    pub cold_sweep_period_estimate: u64,
+    pub dirty_backlog: usize,
     pub lazy_validation_pending: usize,
     pub lazy_validation_rate_limited: u64,
     pub lazy_validation_cache_hits: u64,
@@ -179,6 +182,9 @@ pub struct HealthResponse {
     pub deferred_unknown_scope: bool,
     pub wal_tail_dirty_dir_count: usize,
     pub deferred_repair_queue_len: usize,
+    pub cold_sweep_last_completed: u64,
+    pub cold_sweep_period_estimate: u64,
+    pub dirty_backlog: usize,
     pub lazy_validation_pending: usize,
     pub lazy_validation_rate_limited: u64,
     pub lazy_validation_cache_hits: u64,
@@ -587,6 +593,9 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     diagnostics.storage.deferred_unknown_scope = health.deferred_unknown_scope;
     diagnostics.storage.wal_tail_dirty_dir_count = health.wal_tail_dirty_dir_count;
     diagnostics.storage.deferred_repair_queue_len = health.deferred_repair_queue_len;
+    diagnostics.storage.cold_sweep_last_completed = health.cold_sweep_last_completed;
+    diagnostics.storage.cold_sweep_period_estimate = health.cold_sweep_period_estimate;
+    diagnostics.storage.dirty_backlog = health.dirty_backlog;
     diagnostics.storage.lazy_validation_pending = health.lazy_validation_pending;
     diagnostics.storage.lazy_validation_rate_limited = health.lazy_validation_rate_limited;
     diagnostics.storage.lazy_validation_cache_hits = health.lazy_validation_cache_hits;
@@ -648,6 +657,9 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         deferred_unknown_scope: health.deferred_unknown_scope,
         wal_tail_dirty_dir_count: health.wal_tail_dirty_dir_count,
         deferred_repair_queue_len: health.deferred_repair_queue_len,
+        cold_sweep_last_completed: health.cold_sweep_last_completed,
+        cold_sweep_period_estimate: health.cold_sweep_period_estimate,
+        dirty_backlog: health.dirty_backlog,
         lazy_validation_pending: health.lazy_validation_pending,
         lazy_validation_rate_limited: health.lazy_validation_rate_limited,
         lazy_validation_cache_hits: health.lazy_validation_cache_hits,
@@ -837,5 +849,103 @@ mod tests {
         assert_eq!(value["validated"], true);
         assert_eq!(value["reason"], "hardlink_same_file_key");
         assert_eq!(value["confidence"], 1.0);
+    }
+
+    #[test]
+    fn health_response_serializes_cold_sweep_bounds() {
+        let value = serde_json::to_value(HealthResponse {
+            status: "ok",
+            index_health: "ok",
+            uptime_secs: 1,
+            index_entries: 2,
+            version: "test",
+            last_snapshot_time: 0,
+            watch_enabled: true,
+            watch_failures: 0,
+            watcher_degraded: false,
+            degraded_roots: 0,
+            event_watcher_degraded: false,
+            event_degraded_roots: 0,
+            tiered_degraded: false,
+            tiered_unwatched_dirs: 0,
+            overflow_drops: 0,
+            rescan_signals: 0,
+            snapshot_source: String::new(),
+            wal_events_replayed: 0,
+            wal_sealed_used: 0,
+            wal_truncated_tail_records: 0,
+            wal_gap_detected: false,
+            wal_checkpoint_used: 0,
+            wal_durability: String::new(),
+            wal_sync_interval_ms: 0,
+            wal_sync_batch_records: 0,
+            startup_scan_required: false,
+            deferred_repair: false,
+            deferred_dirty_dir_count: 0,
+            deferred_unknown_scope: false,
+            wal_tail_dirty_dir_count: 0,
+            deferred_repair_queue_len: 0,
+            cold_sweep_last_completed: 123,
+            cold_sweep_period_estimate: 300,
+            dirty_backlog: 4,
+            lazy_validation_pending: 0,
+            lazy_validation_rate_limited: 0,
+            lazy_validation_cache_hits: 0,
+            lazy_validation_queue_full: 0,
+            lazy_validation_completed: 0,
+            lazy_validation_stale_hits: 0,
+            recovery_requires_repair: false,
+            recovery_requires_rebuild: false,
+            recovery_soft_repair_needed: false,
+            recovery_hard_rebuild_needed: false,
+            recovery_reasons: Vec::new(),
+            recovery_soft_reasons: Vec::new(),
+            recovery_hard_reasons: Vec::new(),
+            recovery_reason_counts: Vec::new(),
+            recovery_audit: RecoveryAuditReport::default(),
+            startup_repair_ran: false,
+            startup_repair_escalated: false,
+            startup_repair_scanned: 0,
+            startup_repair_changed: 0,
+            startup_repair_budget_ms: 0,
+            startup_repair_budget_exhausted: false,
+            startup_repair_escalation_reason: String::new(),
+            last_clean_shutdown: true,
+            l1_dirs: 0,
+            l2_dirs: 0,
+            l3_dirs: 0,
+            max_watch_dirs: 0,
+            l0_max_cost_per_root: 0,
+            watch_budget_utilization_pct: 0,
+            promotion_budget_blocked: 0,
+            watch_profile: String::new(),
+            system_max_user_watches: 0,
+            required_watch_cost: 0,
+            watch_budget_shortfall: 0,
+            strict_coverage_ok: true,
+            strict_coverage_failure: false,
+            strict_fail_on_budget_exceeded: false,
+            strict_uncovered_dirs: Vec::new(),
+            fast_scan_enabled: false,
+            fast_scan_sla_ok: true,
+            fast_scan_local_strict_ok: true,
+            fast_scan_known_dirs: 0,
+            fast_scan_local_trusted_dirs: 0,
+            fast_scan_untrusted_dirs: 0,
+            fast_scan_coverage_lag_p95_ms: 0,
+            fast_scan_budget_degraded: false,
+            fast_scan_last_degraded_reason: String::new(),
+            diagnostics: DiagnosticReport::default(),
+            issues: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(value["cold_sweep_last_completed"], 123);
+        assert_eq!(value["cold_sweep_period_estimate"], 300);
+        assert_eq!(value["dirty_backlog"], 4);
+        assert_eq!(
+            value["diagnostics"]["storage"]["cold_sweep_period_estimate"],
+            0
+        );
     }
 }

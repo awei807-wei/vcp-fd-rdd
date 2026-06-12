@@ -424,6 +424,99 @@ fn online_root_record_unfreezes_and_queues_prefix_reconciliation() {
     assert_eq!(idx.dirty_queue_len(), 1);
 }
 
+#[test]
+fn sliced_repair_processes_large_dir_in_bounded_chunks() {
+    let root = unique_tmp_dir("sliced-repair-large-dir");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    let mut expected = Vec::new();
+    for i in 0..700 {
+        let path = root.join(format!("sliced_repair_{i:04}.txt"));
+        std::fs::write(&path, b"slice").unwrap();
+        expected.push(path);
+    }
+    let manifest_seed = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    assert_eq!(manifest_seed.scanned, 700);
+    idx.refresh_base();
+    for path in &expected {
+        std::fs::remove_file(path).unwrap();
+    }
+    for path in &expected {
+        std::fs::write(path, b"slice-new").unwrap();
+    }
+
+    idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::PeriodicColdScan);
+    let first_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let first = idx.process_dirty_entry(first_entry, &[]);
+
+    assert!(!first.failed);
+    assert_eq!(first.dirs_scanned, 1);
+    assert_eq!(first.outcomes.len(), 1);
+    assert_eq!(first.outcomes[0].outcome.scanned, 512);
+    assert_eq!(idx.dirty_queue_len(), 1);
+    assert_eq!(idx.cold_sweep_last_completed(), 0);
+
+    let second_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let cursor = second_entry.repair_cursor.clone().unwrap();
+    assert_eq!(cursor.dir, root);
+    assert!(cursor.offset >= 512);
+
+    let second = idx.process_dirty_entry(second_entry, &[]);
+    assert!(!second.failed);
+    assert_eq!(second.dirs_scanned, 1);
+    assert!(second.outcomes[0].outcome.scanned >= 188);
+    assert_eq!(idx.dirty_queue_len(), 0);
+    assert!(idx.cold_sweep_last_completed() > 0);
+
+    for path in expected {
+        let query = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            idx.query_limit_detailed(&query, 1)
+                .iter()
+                .any(|result| result.meta.path == path),
+            "sliced repair should make {} searchable",
+            path.display()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn sliced_repair_cursor_resumes_after_first_chunk() {
+    let root = unique_tmp_dir("sliced-repair-cursor");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    for i in 0..620 {
+        let path = root.join(format!("sliced_cursor_{i:04}.txt"));
+        std::fs::write(path, b"slice").unwrap();
+    }
+    let manifest_seed = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    assert_eq!(manifest_seed.scanned, 620);
+    idx.refresh_base();
+    for i in 0..620 {
+        std::fs::remove_file(root.join(format!("sliced_cursor_{i:04}.txt"))).unwrap();
+    }
+    for i in 0..620 {
+        std::fs::write(root.join(format!("sliced_cursor_{i:04}.txt")), b"slice-new").unwrap();
+    }
+
+    idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::PeriodicColdScan);
+    let first_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let first = idx.process_dirty_entry(first_entry, &[]);
+    assert_eq!(first.outcomes[0].outcome.scanned, 512);
+    assert_eq!(first.outcomes[0].outcome.changed, 512);
+
+    let second_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let second = idx.process_dirty_entry(second_entry, &[]);
+    assert!(second.outcomes[0].outcome.scanned >= 108);
+    assert!(second.outcomes[0].outcome.changed >= 108);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn quarantine_sidecar_restore_installs_freeze_gate_before_events() -> anyhow::Result<()> {
     let root = unique_tmp_dir("quarantine-restore");

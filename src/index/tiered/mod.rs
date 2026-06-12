@@ -297,6 +297,8 @@ pub struct TieredIndex {
     pub(self) query_verify_timeout_ms: AtomicU64,
     pub(self) query_allow_sync_readdir: AtomicBool,
     pub(self) runtime_subtree_tombstones: Mutex<Vec<RuntimeSubtreeTombstone>>,
+    pub(self) cold_sweep_last_completed_unix_secs: AtomicU64,
+    pub(self) cold_sweep_period_estimate_secs: AtomicU64,
     pub(self) memory_report_cache: Mutex<MemoryReportCache>,
 }
 
@@ -304,6 +306,13 @@ pub struct TieredIndex {
 struct MemoryReportCache {
     report: Option<crate::stats::MemoryReport>,
     sampled_at: Option<Instant>,
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl TieredIndex {
@@ -484,6 +493,25 @@ impl TieredIndex {
         let mut tombstones = self.runtime_subtree_tombstones.lock();
         Self::cleanup_runtime_subtree_tombstones_locked(&mut tombstones, Instant::now());
         tombstones.len()
+    }
+
+    pub fn cold_sweep_last_completed(&self) -> u64 {
+        self.cold_sweep_last_completed_unix_secs
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn cold_sweep_period_estimate(&self) -> u64 {
+        self.cold_sweep_period_estimate_secs.load(Ordering::Relaxed)
+    }
+
+    pub fn set_cold_sweep_period_estimate(&self, secs: u64) {
+        self.cold_sweep_period_estimate_secs
+            .store(secs, Ordering::Relaxed);
+    }
+
+    pub(self) fn mark_cold_sweep_completed(&self) {
+        self.cold_sweep_last_completed_unix_secs
+            .store(unix_secs(), Ordering::Relaxed);
     }
 
     pub fn set_wal_durability(&self, durability: WalDurability) {

@@ -146,6 +146,9 @@ pub struct MetricsHealthSnapshot {
     pub deferred_unknown_scope: bool,
     pub wal_tail_dirty_dir_count: usize,
     pub deferred_repair_queue_len: usize,
+    pub cold_sweep_last_completed: u64,
+    pub cold_sweep_period_estimate: u64,
+    pub dirty_backlog: usize,
     pub lazy_validation_pending: usize,
     pub lazy_validation_rate_limited: u64,
     pub lazy_validation_cache_hits: u64,
@@ -295,6 +298,9 @@ impl MetricsDiagnostics {
         if watch.dirty_queue_len > 0 {
             issues.push(format!("dirty_queue_len={}", watch.dirty_queue_len));
         }
+        if health.dirty_backlog > 0 && health.dirty_backlog != watch.dirty_queue_len {
+            issues.push(format!("dirty_backlog={}", health.dirty_backlog));
+        }
         if watch.query_stale_hit_count > 0 {
             issues.push(format!(
                 "query_stale_hit_count={}",
@@ -395,6 +401,7 @@ impl MetricsDiagnostics {
             || (health.fast_scan_enabled && !health.fast_scan_local_strict_ok)
             || (health.fast_scan_enabled && health.fast_scan_budget_degraded)
             || watch.dirty_queue_len > 0
+            || health.dirty_backlog > 0
             || watch.query_stale_hit_count > 0
         {
             "degraded"

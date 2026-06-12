@@ -212,6 +212,8 @@ impl TieredIndex {
             query_verify_timeout_ms: AtomicU64::new(75),
             query_allow_sync_readdir: AtomicBool::new(false),
             runtime_subtree_tombstones: Mutex::new(Vec::new()),
+            cold_sweep_last_completed_unix_secs: AtomicU64::new(0),
+            cold_sweep_period_estimate_secs: AtomicU64::new(0),
             memory_report_cache: Mutex::new(super::MemoryReportCache::default()),
         }
     }
