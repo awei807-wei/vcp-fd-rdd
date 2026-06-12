@@ -129,6 +129,18 @@ pub struct MetricsHealthSnapshot {
     pub fast_scan_coverage_lag_p95_ms: u64,
     pub fast_scan_budget_degraded: bool,
     pub fast_scan_last_degraded_reason: String,
+    pub proc_sampler_enabled: bool,
+    pub proc_sampler_last_duration_ms: u64,
+    pub proc_sampler_pids_seen: u64,
+    pub proc_sampler_pids_scanned: u64,
+    pub proc_sampler_pids_denied: u64,
+    pub proc_sampler_fdinfo_read_count: u64,
+    pub proc_sampler_readlink_count: u64,
+    pub proc_sampler_write_fd_count: u64,
+    pub proc_sampler_sampled_dirs: u64,
+    pub proc_sampler_triggered_watches: u64,
+    pub proc_sampler_budget_exhausted: bool,
+    pub proc_sampler_unavailable: bool,
     pub watch_failures: u64,
     pub overflow_drops: u64,
     pub rescan_signals: u64,
@@ -362,6 +374,15 @@ impl MetricsDiagnostics {
                 "fast_scan_untrusted_dirs: {} best-effort directories",
                 health.fast_scan_untrusted_dirs
             ));
+        }
+        if health.proc_sampler_enabled && health.proc_sampler_budget_exhausted {
+            issues.push(format!(
+                "proc_sampler_budget_exhausted: pids_seen={} sampled_dirs={}",
+                health.proc_sampler_pids_seen, health.proc_sampler_sampled_dirs
+            ));
+        }
+        if health.proc_sampler_enabled && health.proc_sampler_unavailable {
+            issues.push("proc_sampler_unavailable=true".to_string());
         }
         if watch.eventually_consistent_dirs > 0 {
             issues.push(format!(
@@ -612,5 +633,34 @@ mod tests {
         assert_eq!(value["memory"]["process_rss_plus_swap_bytes"], 3072);
         assert_eq!(value["diagnostics"]["status"], "degraded");
         assert_eq!(value["diagnostics"]["non_l0_dirs"], 1);
+    }
+
+    #[test]
+    fn metrics_reports_proc_sampler_budget_issues() {
+        let health = MetricsHealthSnapshot {
+            proc_sampler_enabled: true,
+            proc_sampler_pids_seen: 64,
+            proc_sampler_sampled_dirs: 8,
+            proc_sampler_budget_exhausted: true,
+            proc_sampler_unavailable: true,
+            ..MetricsHealthSnapshot::default()
+        };
+
+        let diagnostics = super::MetricsDiagnostics::from_parts(
+            &WatchStateReport::default(),
+            &MetricsRuntimeSnapshot::default(),
+            &MetricsMemorySnapshot::default(),
+            &health,
+        );
+
+        assert_eq!(diagnostics.status, "warning");
+        assert!(diagnostics
+            .issues
+            .iter()
+            .any(|issue| issue.contains("proc_sampler_budget_exhausted")));
+        assert!(diagnostics
+            .issues
+            .iter()
+            .any(|issue| issue == "proc_sampler_unavailable=true"));
     }
 }

@@ -48,6 +48,7 @@
 
 ## v7.0.0 测试相关变更
 
+- M2 proc sampler 新增 `proc_sampler_*` 单元和序列化测试，覆盖 fdinfo flags 写权限解析、同 uid 写 fd 目录采样、非同 uid 拒绝后不读取 fdinfo、watch-state/health/metrics 中 proc sampler 观测字段与 budget/unavailable issue。
 - M1-3 分片 repair 新增 `sliced_repair_*` 单元测试，覆盖 Periodic cold scan 大目录首次 slice 只处理约 512 entries、cursor 重新入队、后续 slice 继续补齐，以及 `/health` 新增 cold sweep/backlog 字段的 JSON 序列化；完整恢复审计继续覆盖 StartupRepairDeferred 的递归 rename subtree 补偿。
 - 全量 `cargo test -q` 覆盖 runtime boundary、mmap v7 cold segment、WAL/root state、query DSL、content index、tiered watcher 和 sim parity 等回归。
 - Runtime subtree tombstone 覆盖删除父目录后 cold/base 子路径验真前过滤、TTL 清理、同名目录重建解除过滤，以及 runtime-only 不持久化到 snapshot 的边界。

@@ -207,6 +207,8 @@ one_file_system = true
 
 Tiered watcher 还支持 Ephemeral Watch：当同一 dirty scope 在短窗口内反复触发、正式 L0 晋升又不合适或预算受阻时，后台会按独立的 `ephemeral_watch_budget` 创建临时 watcher 租约。临时 watcher 不属于 L0/L1/L2/L3，也不会替代 DirtyQueue；它只覆盖小成本局部根，并会在 idle、TTL、连续无变化补扫、被正式 L0 覆盖或预算驱逐时自动移除。
 
+Linux tiered 模式默认启用 proc sampler。它按 `[proc_sampler]` 预算轮询 `/proc/<pid>/fdinfo` 和 `/proc/<pid>/fd` symlink，只处理同用户进程中带 `O_WRONLY` / `O_RDWR` 的写句柄；命中的索引根内目录会直接作为 Ephemeral Watch 候选，用于提前覆盖 ComfyUI、下载器、渲染器等持续写入目录。proc sampler 只提供新鲜度线索，不写索引、不参与返回正确性判断，也不会绕过返回前验真。`/watch-state`、`/health.diagnostics.watchers` 和 metrics JSONL 暴露 `proc_sampler_enabled`、`proc_sampler_last_duration_ms`、pid/fd/readlink 计数、`proc_sampler_sampled_dirs`、`proc_sampler_triggered_watches`、`proc_sampler_budget_exhausted` 和 `proc_sampler_unavailable`。
+
 Tiered watcher 的一致性 profile 用 `tiered_watch.profile` 控制：
 
 ```toml
@@ -265,6 +267,11 @@ L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` �
 | `query.max_verify_per_query` | `usize` | `150` | 单次查询返回前最多同步验真的冷层候选数 |
 | `query.verify_timeout_ms` | `u64` | `75` | 单次查询同步验真时间预算 |
 | `query.allow_sync_readdir` | `bool` | `false` | 查询线程同步 readdir 硬门禁；当前保持关闭 |
+| `proc_sampler.enabled` | `bool` | `true` | Linux tiered 模式采样同用户写 fd，并触发 Ephemeral Watch 新鲜度线索 |
+| `proc_sampler.interval_ms` | `u64` | `1000` | proc sampler 调度 tick，运行时最小按 100ms 保护 |
+| `proc_sampler.max_pids_per_tick` | `usize` | `128` | 每 tick 最多检查的 pid 数 |
+| `proc_sampler.max_fds_per_pid` | `usize` | `64` | 每个 pid 最多检查的 fdinfo 数 |
+| `proc_sampler.max_dirs_per_tick` | `usize` | `32` | 每 tick 最多产出的写入目录数 |
 | `mmap_warmup.enable` | `bool` | `false` | cold v7 mmap 预热开关，默认关闭 |
 | `mmap_warmup.max_bytes` | `u64` | `67108864` | 单次 best-effort 预热字节上限，0 表示不限制 |
 | `content_index.enable` | `bool` | `false` | 内容索引开关，默认关闭 |

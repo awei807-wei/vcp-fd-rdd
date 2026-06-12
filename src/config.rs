@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::event::proc_sampler::ProcSamplerConfig;
 use crate::fs_policy::FsPolicyConfig;
 use crate::io_governor::IoGovernorConfig;
 use crate::util::{default_exclude_dirs, normalize_exclude_dirs};
@@ -166,6 +167,8 @@ pub struct Config {
     pub watch_mode: WatchMode,
     /// Budgeted tiered watcher configuration.
     pub tiered_watch: TieredWatchConfig,
+    /// Linux `/proc/<pid>/fd` write handle sampler. It only feeds freshness hints.
+    pub proc_sampler: ProcSamplerConfig,
     /// Enable stable v7 snapshot rotation (`stable.v7` / `stable.prev.v7`).
     pub stable_snapshot_enabled: bool,
     /// Enable startup repair when previous shutdown or WAL replay is untrusted.
@@ -703,6 +706,7 @@ impl Default for Config {
             watch_enabled: true,
             watch_mode: WatchMode::Recursive,
             tiered_watch: TieredWatchConfig::default(),
+            proc_sampler: ProcSamplerConfig::default(),
             stable_snapshot_enabled: true,
             startup_repair_enabled: true,
             startup_repair_mode: "dirty-only".to_string(),
@@ -1141,6 +1145,47 @@ allow_sync_readdir = true
         let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
         assert!(toml.contains("[query]"));
         assert!(toml.contains("max_verify_per_query"));
+    }
+
+    #[test]
+    fn proc_sampler_defaults_and_overrides_parse() {
+        let default_cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+"#,
+        )
+        .expect("config should parse without proc_sampler table");
+
+        assert!(default_cfg.proc_sampler.enabled);
+        assert_eq!(default_cfg.proc_sampler.interval_ms, 1_000);
+        assert_eq!(default_cfg.proc_sampler.max_pids_per_tick, 128);
+        assert_eq!(default_cfg.proc_sampler.max_fds_per_pid, 64);
+        assert_eq!(default_cfg.proc_sampler.max_dirs_per_tick, 32);
+
+        let cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+
+[proc_sampler]
+enabled = false
+interval_ms = 250
+max_pids_per_tick = 7
+max_fds_per_pid = 8
+max_dirs_per_tick = 9
+"#,
+        )
+        .expect("proc sampler config should parse");
+
+        assert!(!cfg.proc_sampler.enabled);
+        assert_eq!(cfg.proc_sampler.interval_ms, 250);
+        assert_eq!(cfg.proc_sampler.max_pids_per_tick, 7);
+        assert_eq!(cfg.proc_sampler.max_fds_per_pid, 8);
+        assert_eq!(cfg.proc_sampler.max_dirs_per_tick, 9);
+
+        let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
+        assert!(toml.contains("[proc_sampler]"));
+        assert!(toml.contains("max_pids_per_tick"));
+        assert!(toml.contains("max_dirs_per_tick"));
     }
 
     #[test]

@@ -105,6 +105,18 @@ pub struct HealthTelemetry {
     pub fast_scan_coverage_lag_p95_ms: u64,
     pub fast_scan_budget_degraded: bool,
     pub fast_scan_last_degraded_reason: String,
+    pub proc_sampler_enabled: bool,
+    pub proc_sampler_last_duration_ms: u64,
+    pub proc_sampler_pids_seen: u64,
+    pub proc_sampler_pids_scanned: u64,
+    pub proc_sampler_pids_denied: u64,
+    pub proc_sampler_fdinfo_read_count: u64,
+    pub proc_sampler_readlink_count: u64,
+    pub proc_sampler_write_fd_count: u64,
+    pub proc_sampler_sampled_dirs: u64,
+    pub proc_sampler_triggered_watches: u64,
+    pub proc_sampler_budget_exhausted: bool,
+    pub proc_sampler_unavailable: bool,
     pub diagnostics: DiagnosticReport,
 }
 
@@ -232,6 +244,18 @@ pub struct HealthResponse {
     pub fast_scan_coverage_lag_p95_ms: u64,
     pub fast_scan_budget_degraded: bool,
     pub fast_scan_last_degraded_reason: String,
+    pub proc_sampler_enabled: bool,
+    pub proc_sampler_last_duration_ms: u64,
+    pub proc_sampler_pids_seen: u64,
+    pub proc_sampler_pids_scanned: u64,
+    pub proc_sampler_pids_denied: u64,
+    pub proc_sampler_fdinfo_read_count: u64,
+    pub proc_sampler_readlink_count: u64,
+    pub proc_sampler_write_fd_count: u64,
+    pub proc_sampler_sampled_dirs: u64,
+    pub proc_sampler_triggered_watches: u64,
+    pub proc_sampler_budget_exhausted: bool,
+    pub proc_sampler_unavailable: bool,
     pub diagnostics: DiagnosticReport,
     pub issues: Vec<String>,
 }
@@ -558,6 +582,15 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
             health.fast_scan_untrusted_dirs
         ));
     }
+    if health.proc_sampler_enabled && health.proc_sampler_budget_exhausted {
+        issues.push(format!(
+            "proc_sampler: budget exhausted pids_seen={} sampled_dirs={}",
+            health.proc_sampler_pids_seen, health.proc_sampler_sampled_dirs
+        ));
+    }
+    if health.proc_sampler_enabled && health.proc_sampler_unavailable {
+        issues.push("proc_sampler: /proc fd sampling unavailable".to_string());
+    }
     if health.last_snapshot_time == 0 {
         issues.push("snapshot_not_written_yet".to_string());
     }
@@ -624,6 +657,18 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     diagnostics.watchers.fast_scan_budget_degraded = health.fast_scan_budget_degraded;
     diagnostics.watchers.fast_scan_last_degraded_reason =
         health.fast_scan_last_degraded_reason.clone();
+    diagnostics.watchers.proc_sampler_enabled = health.proc_sampler_enabled;
+    diagnostics.watchers.proc_sampler_last_duration_ms = health.proc_sampler_last_duration_ms;
+    diagnostics.watchers.proc_sampler_pids_seen = health.proc_sampler_pids_seen;
+    diagnostics.watchers.proc_sampler_pids_scanned = health.proc_sampler_pids_scanned;
+    diagnostics.watchers.proc_sampler_pids_denied = health.proc_sampler_pids_denied;
+    diagnostics.watchers.proc_sampler_fdinfo_read_count = health.proc_sampler_fdinfo_read_count;
+    diagnostics.watchers.proc_sampler_readlink_count = health.proc_sampler_readlink_count;
+    diagnostics.watchers.proc_sampler_write_fd_count = health.proc_sampler_write_fd_count;
+    diagnostics.watchers.proc_sampler_sampled_dirs = health.proc_sampler_sampled_dirs;
+    diagnostics.watchers.proc_sampler_triggered_watches = health.proc_sampler_triggered_watches;
+    diagnostics.watchers.proc_sampler_budget_exhausted = health.proc_sampler_budget_exhausted;
+    diagnostics.watchers.proc_sampler_unavailable = health.proc_sampler_unavailable;
 
     Json(HealthResponse {
         status: "ok",
@@ -707,6 +752,18 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         fast_scan_coverage_lag_p95_ms: health.fast_scan_coverage_lag_p95_ms,
         fast_scan_budget_degraded: health.fast_scan_budget_degraded,
         fast_scan_last_degraded_reason: health.fast_scan_last_degraded_reason,
+        proc_sampler_enabled: health.proc_sampler_enabled,
+        proc_sampler_last_duration_ms: health.proc_sampler_last_duration_ms,
+        proc_sampler_pids_seen: health.proc_sampler_pids_seen,
+        proc_sampler_pids_scanned: health.proc_sampler_pids_scanned,
+        proc_sampler_pids_denied: health.proc_sampler_pids_denied,
+        proc_sampler_fdinfo_read_count: health.proc_sampler_fdinfo_read_count,
+        proc_sampler_readlink_count: health.proc_sampler_readlink_count,
+        proc_sampler_write_fd_count: health.proc_sampler_write_fd_count,
+        proc_sampler_sampled_dirs: health.proc_sampler_sampled_dirs,
+        proc_sampler_triggered_watches: health.proc_sampler_triggered_watches,
+        proc_sampler_budget_exhausted: health.proc_sampler_budget_exhausted,
+        proc_sampler_unavailable: health.proc_sampler_unavailable,
         diagnostics,
         issues,
     })
@@ -852,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn health_response_serializes_cold_sweep_bounds() {
+    fn health_response_serializes_cold_sweep_and_proc_sampler_bounds() {
         let value = serde_json::to_value(HealthResponse {
             status: "ok",
             index_health: "ok",
@@ -935,6 +992,18 @@ mod tests {
             fast_scan_coverage_lag_p95_ms: 0,
             fast_scan_budget_degraded: false,
             fast_scan_last_degraded_reason: String::new(),
+            proc_sampler_enabled: true,
+            proc_sampler_last_duration_ms: 2,
+            proc_sampler_pids_seen: 3,
+            proc_sampler_pids_scanned: 4,
+            proc_sampler_pids_denied: 5,
+            proc_sampler_fdinfo_read_count: 6,
+            proc_sampler_readlink_count: 7,
+            proc_sampler_write_fd_count: 8,
+            proc_sampler_sampled_dirs: 9,
+            proc_sampler_triggered_watches: 10,
+            proc_sampler_budget_exhausted: false,
+            proc_sampler_unavailable: false,
             diagnostics: DiagnosticReport::default(),
             issues: Vec::new(),
         })
@@ -945,6 +1014,22 @@ mod tests {
         assert_eq!(value["dirty_backlog"], 4);
         assert_eq!(
             value["diagnostics"]["storage"]["cold_sweep_period_estimate"],
+            0
+        );
+        assert_eq!(value["proc_sampler_enabled"], true);
+        assert_eq!(value["proc_sampler_last_duration_ms"], 2);
+        assert_eq!(value["proc_sampler_pids_seen"], 3);
+        assert_eq!(value["proc_sampler_pids_scanned"], 4);
+        assert_eq!(value["proc_sampler_pids_denied"], 5);
+        assert_eq!(value["proc_sampler_fdinfo_read_count"], 6);
+        assert_eq!(value["proc_sampler_readlink_count"], 7);
+        assert_eq!(value["proc_sampler_write_fd_count"], 8);
+        assert_eq!(value["proc_sampler_sampled_dirs"], 9);
+        assert_eq!(value["proc_sampler_triggered_watches"], 10);
+        assert_eq!(value["proc_sampler_budget_exhausted"], false);
+        assert_eq!(value["proc_sampler_unavailable"], false);
+        assert_eq!(
+            value["diagnostics"]["watchers"]["proc_sampler_triggered_watches"],
             0
         );
     }

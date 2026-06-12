@@ -6,6 +6,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::config::{L3ScanPolicy, NetworkFastScanMode, TieredWatchConfig};
+use crate::event::proc_sampler::ProcSamplerReport;
 use crate::fs_policy::{is_remote_fstype, MountTable};
 use crate::index::tiered::ScanOutcome;
 use crate::stats::WatchStateReport;
@@ -436,6 +437,18 @@ pub struct TieredWatchRuntime {
     fast_scan_bootstrap_next_unix_ms: AtomicU64,
     fast_scan_parent_fence_retries: AtomicU64,
     fast_scan_epoch_conflicts: AtomicU64,
+    proc_sampler_enabled: AtomicBool,
+    proc_sampler_last_duration_ms: AtomicU64,
+    proc_sampler_pids_seen: AtomicU64,
+    proc_sampler_pids_scanned: AtomicU64,
+    proc_sampler_pids_denied: AtomicU64,
+    proc_sampler_fdinfo_read_count: AtomicU64,
+    proc_sampler_readlink_count: AtomicU64,
+    proc_sampler_write_fd_count: AtomicU64,
+    proc_sampler_sampled_dirs: AtomicU64,
+    proc_sampler_triggered_watches: AtomicU64,
+    proc_sampler_budget_exhausted: AtomicBool,
+    proc_sampler_unavailable: AtomicBool,
     last_adjustment_unix_secs: AtomicU64,
 }
 
@@ -551,6 +564,18 @@ impl TieredWatchRuntime {
             fast_scan_bootstrap_next_unix_ms: AtomicU64::new(0),
             fast_scan_parent_fence_retries: AtomicU64::new(0),
             fast_scan_epoch_conflicts: AtomicU64::new(0),
+            proc_sampler_enabled: AtomicBool::new(false),
+            proc_sampler_last_duration_ms: AtomicU64::new(0),
+            proc_sampler_pids_seen: AtomicU64::new(0),
+            proc_sampler_pids_scanned: AtomicU64::new(0),
+            proc_sampler_pids_denied: AtomicU64::new(0),
+            proc_sampler_fdinfo_read_count: AtomicU64::new(0),
+            proc_sampler_readlink_count: AtomicU64::new(0),
+            proc_sampler_write_fd_count: AtomicU64::new(0),
+            proc_sampler_sampled_dirs: AtomicU64::new(0),
+            proc_sampler_triggered_watches: AtomicU64::new(0),
+            proc_sampler_budget_exhausted: AtomicBool::new(false),
+            proc_sampler_unavailable: AtomicBool::new(false),
             last_adjustment_unix_secs: AtomicU64::new(now),
         }
     }
@@ -582,6 +607,35 @@ impl TieredWatchRuntime {
             network_fast_scan_mode_to_u8(config.network_fast_scan_mode),
             Ordering::Relaxed,
         );
+    }
+
+    pub fn set_proc_sampler_enabled(&self, enabled: bool) {
+        self.proc_sampler_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn record_proc_sampler_report(&self, report: ProcSamplerReport, triggered_watches: u64) {
+        self.proc_sampler_last_duration_ms
+            .store(report.duration_ms, Ordering::Relaxed);
+        self.proc_sampler_pids_seen
+            .store(report.pids_seen, Ordering::Relaxed);
+        self.proc_sampler_pids_scanned
+            .store(report.pids_scanned, Ordering::Relaxed);
+        self.proc_sampler_pids_denied
+            .store(report.pids_denied, Ordering::Relaxed);
+        self.proc_sampler_fdinfo_read_count
+            .store(report.fdinfo_read_count, Ordering::Relaxed);
+        self.proc_sampler_readlink_count
+            .store(report.readlink_count, Ordering::Relaxed);
+        self.proc_sampler_write_fd_count
+            .store(report.write_fd_count, Ordering::Relaxed);
+        self.proc_sampler_sampled_dirs
+            .store(report.sampled_dirs, Ordering::Relaxed);
+        self.proc_sampler_triggered_watches
+            .store(triggered_watches, Ordering::Relaxed);
+        self.proc_sampler_budget_exhausted
+            .store(report.budget_exhausted, Ordering::Relaxed);
+        self.proc_sampler_unavailable
+            .store(report.unavailable, Ordering::Relaxed);
     }
 
     pub fn fast_scan_tick_config(&self) -> FastScanTickConfig {
@@ -2090,6 +2144,13 @@ impl TieredWatchRuntime {
                 fast_scan_last_degraded_reason
             ));
         }
+        if self.proc_sampler_enabled.load(Ordering::Relaxed) {
+            notes.push(format!(
+                "proc sampler write-fd dirs={} triggered_ephemeral={}",
+                self.proc_sampler_sampled_dirs.load(Ordering::Relaxed),
+                self.proc_sampler_triggered_watches.load(Ordering::Relaxed)
+            ));
+        }
         let watched_dirs_estimated = self.current_watch_cost.load(Ordering::Relaxed) as usize;
         let logical_watch_cost = l0_watch_cost
             .saturating_add(l1_watch_cost)
@@ -2206,6 +2267,26 @@ impl TieredWatchRuntime {
                 .fast_scan_parent_fence_retries
                 .load(Ordering::Relaxed),
             fast_scan_epoch_conflicts: self.fast_scan_epoch_conflicts.load(Ordering::Relaxed),
+            proc_sampler_enabled: self.proc_sampler_enabled.load(Ordering::Relaxed),
+            proc_sampler_last_duration_ms: self
+                .proc_sampler_last_duration_ms
+                .load(Ordering::Relaxed),
+            proc_sampler_pids_seen: self.proc_sampler_pids_seen.load(Ordering::Relaxed),
+            proc_sampler_pids_scanned: self.proc_sampler_pids_scanned.load(Ordering::Relaxed),
+            proc_sampler_pids_denied: self.proc_sampler_pids_denied.load(Ordering::Relaxed),
+            proc_sampler_fdinfo_read_count: self
+                .proc_sampler_fdinfo_read_count
+                .load(Ordering::Relaxed),
+            proc_sampler_readlink_count: self.proc_sampler_readlink_count.load(Ordering::Relaxed),
+            proc_sampler_write_fd_count: self.proc_sampler_write_fd_count.load(Ordering::Relaxed),
+            proc_sampler_sampled_dirs: self.proc_sampler_sampled_dirs.load(Ordering::Relaxed),
+            proc_sampler_triggered_watches: self
+                .proc_sampler_triggered_watches
+                .load(Ordering::Relaxed),
+            proc_sampler_budget_exhausted: self
+                .proc_sampler_budget_exhausted
+                .load(Ordering::Relaxed),
+            proc_sampler_unavailable: self.proc_sampler_unavailable.load(Ordering::Relaxed),
         }
     }
 
@@ -2787,6 +2868,45 @@ mod tests {
         assert_eq!(report.fast_scan_mode, "best_effort");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn proc_sampler_report_is_exposed_in_watch_state() {
+        let rt = runtime();
+        rt.set_proc_sampler_enabled(true);
+        rt.record_proc_sampler_report(
+            ProcSamplerReport {
+                duration_ms: 12,
+                pids_seen: 30,
+                pids_scanned: 20,
+                pids_denied: 10,
+                fdinfo_read_count: 40,
+                readlink_count: 5,
+                write_fd_count: 6,
+                sampled_dirs: 7,
+                budget_exhausted: true,
+                unavailable: false,
+            },
+            3,
+        );
+
+        let report = rt.report();
+        assert!(report.proc_sampler_enabled);
+        assert_eq!(report.proc_sampler_last_duration_ms, 12);
+        assert_eq!(report.proc_sampler_pids_seen, 30);
+        assert_eq!(report.proc_sampler_pids_scanned, 20);
+        assert_eq!(report.proc_sampler_pids_denied, 10);
+        assert_eq!(report.proc_sampler_fdinfo_read_count, 40);
+        assert_eq!(report.proc_sampler_readlink_count, 5);
+        assert_eq!(report.proc_sampler_write_fd_count, 6);
+        assert_eq!(report.proc_sampler_sampled_dirs, 7);
+        assert_eq!(report.proc_sampler_triggered_watches, 3);
+        assert!(report.proc_sampler_budget_exhausted);
+        assert!(!report.proc_sampler_unavailable);
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("proc sampler write-fd dirs=7")));
     }
 
     #[test]

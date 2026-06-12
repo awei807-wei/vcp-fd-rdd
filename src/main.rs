@@ -4,6 +4,9 @@ use fd_rdd::config::{
     WatchMode,
 };
 use fd_rdd::event::ignore_filter::IgnoreFilter;
+use fd_rdd::event::proc_sampler::{
+    sample_proc_write_dirs, ProcSamplerConfig, ProcSamplerCursor, ProcSamplerReport,
+};
 use fd_rdd::event::sync::{DirtyReason, DirtyScope};
 use fd_rdd::event::tiered_watch::{
     EphemeralWatchConfig, EphemeralWatchDecision, TieredWatchDebugDump, TieredWatchDebugSummary,
@@ -348,6 +351,9 @@ async fn main() -> anyhow::Result<()> {
     };
     if let Some(runtime) = tiered_runtime.as_ref() {
         runtime.apply_fast_scan_config(&cfg.tiered_watch);
+        runtime.set_proc_sampler_enabled(
+            cfg.proc_sampler.enabled && watch_enabled && effective_watch_mode == WatchMode::Tiered,
+        );
     }
     let watch_state = Arc::new(watch_plan.state.clone());
 
@@ -396,13 +402,26 @@ async fn main() -> anyhow::Result<()> {
             spawn_tiered_scan_loop(
                 index.clone(),
                 runtime,
-                watch_command_tx,
+                watch_command_tx.clone(),
                 cfg.tiered_watch.clone(),
             );
         }
         if cfg.tiered_watch.l1_l2_fast_scan_enabled {
             if let Some(runtime) = tiered_runtime.clone() {
                 spawn_tiered_fast_scan_loop(index.clone(), runtime, cfg.tiered_watch.clone());
+            }
+        }
+        if cfg.proc_sampler.enabled {
+            if let Some(runtime) = tiered_runtime.clone() {
+                spawn_proc_sampler_loop(
+                    runtime,
+                    watch_command_tx.clone(),
+                    cfg.proc_sampler.clone(),
+                    index.roots.clone(),
+                    startup_ignore_paths.clone(),
+                    exclude_dirs.clone(),
+                    cfg.tiered_watch.clone(),
+                );
             }
         }
     }
@@ -506,6 +525,18 @@ async fn main() -> anyhow::Result<()> {
                 fast_scan_coverage_lag_p95_ms: watch_state.fast_scan_coverage_lag_p95_ms,
                 fast_scan_budget_degraded: watch_state.fast_scan_budget_degraded,
                 fast_scan_last_degraded_reason: watch_state.fast_scan_last_degraded_reason,
+                proc_sampler_enabled: watch_state.proc_sampler_enabled,
+                proc_sampler_last_duration_ms: watch_state.proc_sampler_last_duration_ms,
+                proc_sampler_pids_seen: watch_state.proc_sampler_pids_seen,
+                proc_sampler_pids_scanned: watch_state.proc_sampler_pids_scanned,
+                proc_sampler_pids_denied: watch_state.proc_sampler_pids_denied,
+                proc_sampler_fdinfo_read_count: watch_state.proc_sampler_fdinfo_read_count,
+                proc_sampler_readlink_count: watch_state.proc_sampler_readlink_count,
+                proc_sampler_write_fd_count: watch_state.proc_sampler_write_fd_count,
+                proc_sampler_sampled_dirs: watch_state.proc_sampler_sampled_dirs,
+                proc_sampler_triggered_watches: watch_state.proc_sampler_triggered_watches,
+                proc_sampler_budget_exhausted: watch_state.proc_sampler_budget_exhausted,
+                proc_sampler_unavailable: watch_state.proc_sampler_unavailable,
                 diagnostics: fd_rdd::diagnostics::DiagnosticReport::default(),
             }
         })
@@ -654,6 +685,18 @@ async fn main() -> anyhow::Result<()> {
                     fast_scan_coverage_lag_p95_ms: health.fast_scan_coverage_lag_p95_ms,
                     fast_scan_budget_degraded: health.fast_scan_budget_degraded,
                     fast_scan_last_degraded_reason: health.fast_scan_last_degraded_reason,
+                    proc_sampler_enabled: health.proc_sampler_enabled,
+                    proc_sampler_last_duration_ms: health.proc_sampler_last_duration_ms,
+                    proc_sampler_pids_seen: health.proc_sampler_pids_seen,
+                    proc_sampler_pids_scanned: health.proc_sampler_pids_scanned,
+                    proc_sampler_pids_denied: health.proc_sampler_pids_denied,
+                    proc_sampler_fdinfo_read_count: health.proc_sampler_fdinfo_read_count,
+                    proc_sampler_readlink_count: health.proc_sampler_readlink_count,
+                    proc_sampler_write_fd_count: health.proc_sampler_write_fd_count,
+                    proc_sampler_sampled_dirs: health.proc_sampler_sampled_dirs,
+                    proc_sampler_triggered_watches: health.proc_sampler_triggered_watches,
+                    proc_sampler_budget_exhausted: health.proc_sampler_budget_exhausted,
+                    proc_sampler_unavailable: health.proc_sampler_unavailable,
                     watch_failures: health.watch_failures,
                     overflow_drops: health.overflow_drops,
                     rescan_signals: health.rescan_signals,
@@ -1391,6 +1434,79 @@ fn spawn_tiered_fast_scan_loop(
     });
 }
 
+fn spawn_proc_sampler_loop(
+    runtime: Arc<TieredWatchRuntime>,
+    watch_command_tx: tokio::sync::mpsc::Sender<WatchCommand>,
+    config: ProcSamplerConfig,
+    roots: Vec<PathBuf>,
+    ignore_prefixes: Vec<PathBuf>,
+    exclude_dirs: Vec<String>,
+    tiered: fd_rdd::config::TieredWatchConfig,
+) {
+    tokio::spawn(async move {
+        let interval = Duration::from_millis(config.interval_ms.max(100));
+        let mut cursor = ProcSamplerCursor::default();
+        let ephemeral_config = EphemeralWatchConfig {
+            budget: tiered.ephemeral_watch_budget,
+            ttl_secs: tiered.ephemeral_watch_ttl_secs,
+            idle_secs: tiered.ephemeral_idle_secs,
+            max_cost_per_root: tiered.ephemeral_max_cost_per_root,
+            repeat_threshold: 1,
+            ..EphemeralWatchConfig::default()
+        };
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let sample_config = config.clone();
+            let sample_roots = roots.clone();
+            let sample_ignore_prefixes = ignore_prefixes.clone();
+            let sample_exclude_dirs = exclude_dirs.clone();
+            let sample_cursor = cursor;
+            let sampled = tokio::task::spawn_blocking(move || {
+                sample_proc_write_dirs(
+                    &sample_config,
+                    sample_cursor,
+                    &sample_roots,
+                    &sample_ignore_prefixes,
+                    &sample_exclude_dirs,
+                )
+            })
+            .await;
+
+            let Ok(tick) = sampled else {
+                tracing::warn!("proc sampler task failed");
+                runtime.record_proc_sampler_report(
+                    ProcSamplerReport {
+                        unavailable: true,
+                        ..ProcSamplerReport::default()
+                    },
+                    0,
+                );
+                continue;
+            };
+
+            cursor = tick.cursor;
+            let mut triggered_watches = 0u64;
+            for dir in tick.dirs {
+                if maybe_send_ephemeral_watch_command(
+                    &runtime,
+                    &watch_command_tx,
+                    dir,
+                    1,
+                    &exclude_dirs,
+                    &ephemeral_config,
+                )
+                .await
+                {
+                    triggered_watches = triggered_watches.saturating_add(1);
+                }
+            }
+            runtime.record_proc_sampler_report(tick.report, triggered_watches);
+        }
+    });
+}
+
 fn fast_scan_bootstrap_retry_ms(tiered: &fd_rdd::config::TieredWatchConfig) -> u64 {
     tiered
         .l1_l2_fast_scan_target_secs
@@ -1447,13 +1563,13 @@ async fn maybe_send_ephemeral_watch_command(
     changed: usize,
     exclude_dirs: &[String],
     config: &EphemeralWatchConfig,
-) {
+) -> bool {
     if config.budget == 0 || !dir.is_dir() {
-        return;
+        return false;
     }
     if fd_rdd::util::path_has_excluded_component(dir.as_path(), exclude_dirs) {
         runtime.note_watch_exclude_rejected();
-        return;
+        return false;
     }
     let cost = estimate_notify_recursive_watch_count(
         dir.as_path(),
@@ -1467,6 +1583,9 @@ async fn maybe_send_ephemeral_watch_command(
                 .is_err()
             {
                 runtime.rollback_ephemeral_add(path.as_path());
+                false
+            } else {
+                true
             }
         }
         EphemeralWatchDecision::Replace { remove, add } => {
@@ -1479,12 +1598,16 @@ async fn maybe_send_ephemeral_watch_command(
                 .is_err()
             {
                 runtime.rollback_ephemeral_replace(remove.as_path(), add.as_path());
+                false
+            } else {
+                true
             }
         }
         EphemeralWatchDecision::BudgetBlocked => {
             tracing::debug!("tiered ephemeral watcher budget blocked for {:?}", dir);
+            false
         }
-        EphemeralWatchDecision::NotEligible => {}
+        EphemeralWatchDecision::NotEligible => false,
     }
 }
 

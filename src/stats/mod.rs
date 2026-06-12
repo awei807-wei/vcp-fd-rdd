@@ -289,6 +289,18 @@ pub struct WatchStateReport {
     pub fast_scan_last_degraded_reason: String,
     pub fast_scan_parent_fence_retries: u64,
     pub fast_scan_epoch_conflicts: u64,
+    pub proc_sampler_enabled: bool,
+    pub proc_sampler_last_duration_ms: u64,
+    pub proc_sampler_pids_seen: u64,
+    pub proc_sampler_pids_scanned: u64,
+    pub proc_sampler_pids_denied: u64,
+    pub proc_sampler_fdinfo_read_count: u64,
+    pub proc_sampler_readlink_count: u64,
+    pub proc_sampler_write_fd_count: u64,
+    pub proc_sampler_sampled_dirs: u64,
+    pub proc_sampler_triggered_watches: u64,
+    pub proc_sampler_budget_exhausted: bool,
+    pub proc_sampler_unavailable: bool,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]

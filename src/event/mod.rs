@@ -1,4 +1,5 @@
 pub mod ignore_filter;
+pub mod proc_sampler;
 pub mod stream;
 pub mod sync;
 pub mod tiered_watch;
