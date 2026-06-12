@@ -186,6 +186,8 @@ pub struct Config {
     pub lazy_validation_ttl_secs: u64,
     /// Global stat rate limit for lazy validation worker.
     pub lazy_validation_stat_per_sec: u64,
+    /// Query-time synchronous verification budget.
+    pub query: QueryConfig,
     /// Runtime resource profile. `memory_light` lowers hot-memory residency at higher I/O cost.
     pub runtime_profile: RuntimeProfile,
     /// WAL durability mode: `flush-only`, `sync-interval`, or `sync-always`.
@@ -241,6 +243,27 @@ impl RootConfig {
         Self {
             path,
             ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct QueryConfig {
+    /// Maximum cold/base candidates synchronously verified by one query.
+    pub max_verify_per_query: usize,
+    /// Maximum synchronous verification wall time per query.
+    pub verify_timeout_ms: u64,
+    /// Reserved hard gate for future query-thread readdir expansion. Currently kept false.
+    pub allow_sync_readdir: bool,
+}
+
+impl Default for QueryConfig {
+    fn default() -> Self {
+        Self {
+            max_verify_per_query: 150,
+            verify_timeout_ms: 75,
+            allow_sync_readdir: false,
         }
     }
 }
@@ -686,10 +709,11 @@ impl Default for Config {
             startup_repair_max_dirs: 16,
             startup_repair_budget_ms: 10_000,
             startup_repair_force_rebuild_ratio: 0.25,
-            lazy_validation_enabled: true,
+            lazy_validation_enabled: false,
             lazy_validation_cache_entries: 4096,
             lazy_validation_ttl_secs: 10,
             lazy_validation_stat_per_sec: 50,
+            query: QueryConfig::default(),
             runtime_profile: RuntimeProfile::Default,
             wal_durability: "flush-only".to_string(),
             wal_sync_interval_ms: 1000,
@@ -1082,6 +1106,41 @@ runtime_profile = "memory_light"
 
         let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
         assert!(toml.contains("runtime_profile"));
+    }
+
+    #[test]
+    fn query_verify_defaults_and_overrides_parse() {
+        let default_cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+"#,
+        )
+        .expect("config should parse without query table");
+
+        assert_eq!(default_cfg.query.max_verify_per_query, 150);
+        assert_eq!(default_cfg.query.verify_timeout_ms, 75);
+        assert!(!default_cfg.query.allow_sync_readdir);
+        assert!(!default_cfg.lazy_validation_enabled);
+
+        let cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+
+[query]
+max_verify_per_query = 123
+verify_timeout_ms = 60
+allow_sync_readdir = true
+"#,
+        )
+        .expect("query config should parse");
+
+        assert_eq!(cfg.query.max_verify_per_query, 123);
+        assert_eq!(cfg.query.verify_timeout_ms, 60);
+        assert!(cfg.query.allow_sync_readdir);
+
+        let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
+        assert!(toml.contains("[query]"));
+        assert!(toml.contains("max_verify_per_query"));
     }
 
     #[test]

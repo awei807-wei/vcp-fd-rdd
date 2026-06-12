@@ -32,6 +32,41 @@ const CONTENT_INDEX_UNSUPPORTED: &str =
     "content index is disabled; enable content_index before using content:/text:";
 type ContentMatcher<'a> = dyn Fn(&Path, &str) -> bool + 'a;
 
+struct QueryVerifyBudget {
+    remaining: usize,
+    deadline: Instant,
+    exhausted: bool,
+}
+
+impl QueryVerifyBudget {
+    fn new(index: &TieredIndex) -> Self {
+        let max_verify = index
+            .query_max_verify_per_query
+            .load(Ordering::Relaxed)
+            .max(1) as usize;
+        let timeout_ms = index.query_verify_timeout_ms.load(Ordering::Relaxed).max(1);
+        let _allow_sync_readdir = index.query_allow_sync_readdir.load(Ordering::Relaxed);
+        Self {
+            remaining: max_verify,
+            deadline: Instant::now() + std::time::Duration::from_millis(timeout_ms),
+            exhausted: false,
+        }
+    }
+
+    fn try_consume(&mut self) -> bool {
+        if self.remaining == 0 || Instant::now() >= self.deadline {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+}
+
 impl TieredIndex {
     /// 查询入口：L1 → L2 → DiskSegments（mmap），不扫真实文件系统
     pub fn query(&self, keyword: &str) -> Vec<FileMeta> {
@@ -148,10 +183,17 @@ impl TieredIndex {
     }
 
     pub(crate) fn annotate_query_results(&self, metas: Vec<FileMeta>) -> Vec<QueryResultMeta> {
-        metas
-            .into_iter()
-            .filter_map(|meta| self.annotate_query_result(meta))
-            .collect()
+        let mut budget = QueryVerifyBudget::new(self);
+        let mut results = Vec::with_capacity(metas.len());
+        for meta in metas {
+            if let Some(result) = self.annotate_query_result(meta, &mut budget) {
+                results.push(result);
+            }
+            if budget.exhausted() {
+                break;
+            }
+        }
+        results
     }
 
     pub(crate) fn collect_all_live_metas(&self) -> Vec<FileMeta> {
@@ -383,6 +425,7 @@ impl TieredIndex {
             let mut blocked_paths = PathArenaSet::default();
             let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
             let mut overlay_live_metas: Vec<FileMeta> = Vec::with_capacity(live_events.len());
+            let mut verify_budget = QueryVerifyBudget::new(self);
             for ev in &live_events {
                 if ev.best_path().is_some_and(|path| self.path_is_frozen(path)) {
                     continue;
@@ -477,11 +520,15 @@ impl TieredIndex {
                             } else {
                                 QueryResultIndexTier::ColdMmap
                             };
-                            if let Some(result) = self.validate_cold_result(meta, index_tier) {
+                            if let Some(result) =
+                                self.validate_cold_result(meta, index_tier, &mut verify_budget)
+                            {
                                 results.push(result);
                                 if results.len() >= scan_limit {
                                     break 'collect_results;
                                 }
+                            } else if verify_budget.exhausted() {
+                                break 'collect_results;
                             }
                         }
                     }
@@ -496,7 +543,11 @@ impl TieredIndex {
                     &mut results,
                     scan_limit,
                     content_matches,
+                    &mut verify_budget,
                 ) {
+                    break 'collect_results;
+                }
+                if verify_budget.exhausted() {
                     break 'collect_results;
                 }
 
@@ -510,6 +561,7 @@ impl TieredIndex {
                         &mut results,
                         scan_limit,
                         content_matches,
+                        &mut verify_budget,
                     ) {
                         break 'collect_results;
                     }
@@ -568,9 +620,13 @@ impl TieredIndex {
         results: &mut Vec<QueryResultMeta>,
         limit: usize,
         content_matches: Option<&ContentMatcher<'_>>,
+        verify_budget: &mut QueryVerifyBudget,
     ) -> bool {
         for anchor in plan.anchors() {
             for hit in layer.query_metas(anchor.as_ref()) {
+                if verify_budget.exhausted() {
+                    return true;
+                }
                 let meta = hit.meta;
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
                 if self.path_is_frozen(meta.path.as_path()) {
@@ -591,11 +647,14 @@ impl TieredIndex {
                     } else {
                         QueryResultIndexTier::ColdMmap
                     };
-                    if let Some(result) = self.validate_cold_result(meta, index_tier) {
+                    if let Some(result) = self.validate_cold_result(meta, index_tier, verify_budget)
+                    {
                         results.push(result);
                         if results.len() >= limit {
                             return true;
                         }
+                    } else if verify_budget.exhausted() {
+                        return true;
                     }
                 }
             }
@@ -614,9 +673,13 @@ impl TieredIndex {
         results: &mut Vec<QueryResultMeta>,
         limit: usize,
         content_matches: Option<&ContentMatcher<'_>>,
+        verify_budget: &mut QueryVerifyBudget,
     ) -> bool {
         for anchor in plan.anchors() {
             for meta in layer.query(anchor.as_ref(), limit.saturating_sub(results.len())) {
+                if verify_budget.exhausted() {
+                    return true;
+                }
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
                 if self.path_is_frozen(meta.path.as_path()) {
                     continue;
@@ -630,13 +693,17 @@ impl TieredIndex {
 
                 let _ = blocked_paths.insert(path_bytes);
                 if self.plan_matches(plan, &meta, content_matches) {
-                    if let Some(result) =
-                        self.validate_l2_warm_result(meta, QueryResultIndexTier::WarmMemory)
-                    {
+                    if let Some(result) = self.validate_l2_warm_result(
+                        meta,
+                        QueryResultIndexTier::WarmMemory,
+                        verify_budget,
+                    ) {
                         results.push(result);
                         if results.len() >= limit {
                             return true;
                         }
+                    } else if verify_budget.exhausted() {
+                        return true;
                     }
                 }
             }
@@ -649,15 +716,8 @@ impl TieredIndex {
         &self,
         meta: FileMeta,
         index_tier: QueryResultIndexTier,
+        verify_budget: &mut QueryVerifyBudget,
     ) -> Option<QueryResultMeta> {
-        if meta.mtime.is_none() {
-            return Some(QueryResultMeta::cold(
-                meta,
-                QueryResultFreshness::Unknown,
-                index_tier,
-                false,
-            ));
-        }
         if has_non_filesystem_file_key(&meta) {
             return Some(QueryResultMeta::cold(
                 meta,
@@ -666,7 +726,7 @@ impl TieredIndex {
                 false,
             ));
         }
-        self.validate_cold_result(meta, index_tier)
+        self.validate_cold_result(meta, index_tier, verify_budget)
     }
 
     fn plan_matches(
@@ -681,7 +741,11 @@ impl TieredIndex {
         }
     }
 
-    fn annotate_query_result(&self, meta: FileMeta) -> Option<QueryResultMeta> {
+    fn annotate_query_result(
+        &self,
+        meta: FileMeta,
+        verify_budget: &mut QueryVerifyBudget,
+    ) -> Option<QueryResultMeta> {
         if self.path_is_frozen(meta.path.as_path()) {
             return None;
         }
@@ -694,18 +758,19 @@ impl TieredIndex {
         } else {
             QueryResultIndexTier::ColdMmap
         };
-        self.validate_cold_result(meta, index_tier)
+        self.validate_cold_result(meta, index_tier, verify_budget)
     }
 
     fn validate_cold_result(
         &self,
         meta: FileMeta,
         index_tier: QueryResultIndexTier,
+        verify_budget: &mut QueryVerifyBudget,
     ) -> Option<QueryResultMeta> {
         if self.path_is_frozen(meta.path.as_path()) {
             return None;
         }
-        if meta.mtime.is_none() {
+        if has_non_filesystem_file_key(&meta) {
             return Some(QueryResultMeta::cold(
                 meta,
                 QueryResultFreshness::Unknown,
@@ -724,6 +789,10 @@ impl TieredIndex {
             ));
         }
 
+        if !verify_budget.try_consume() {
+            return None;
+        }
+
         self.stats.record_cold_validate(1);
 
         let fs_meta = match std::fs::metadata(&meta.path) {
@@ -735,14 +804,6 @@ impl TieredIndex {
                 return None;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if has_non_filesystem_file_key(&meta) {
-                    return Some(QueryResultMeta::cold(
-                        meta,
-                        QueryResultFreshness::Unknown,
-                        index_tier,
-                        false,
-                    ));
-                }
                 self.apply_query_delete(meta.path.as_path());
                 self.enqueue_dirty_parent(meta.path.as_path(), DirtyReason::QueryHitStale);
                 self.stats.record_query_stale_hits(1);

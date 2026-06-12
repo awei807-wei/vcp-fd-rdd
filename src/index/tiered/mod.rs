@@ -24,7 +24,7 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use crate::config::{ContentIndexConfig, MmapWarmupConfig, RuntimeProfileSettings};
+use crate::config::{ContentIndexConfig, MmapWarmupConfig, QueryConfig, RuntimeProfileSettings};
 use crate::core::AdaptiveScheduler;
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource, RootCasePolicyDiagnostics};
 use crate::event::sync::DirtyQueue;
@@ -285,6 +285,9 @@ pub struct TieredIndex {
     pub(self) lazy_validation_cache_hits: AtomicU64,
     pub(self) lazy_validation_rate_limited: AtomicU64,
     pub(self) lazy_validation_queue_full: AtomicU64,
+    pub(self) query_max_verify_per_query: AtomicU64,
+    pub(self) query_verify_timeout_ms: AtomicU64,
+    pub(self) query_allow_sync_readdir: AtomicBool,
     pub(self) memory_report_cache: Mutex<MemoryReportCache>,
 }
 
@@ -363,6 +366,16 @@ impl TieredIndex {
             .store(settings.rebuild_cooldown_secs.max(1), Ordering::Relaxed);
         self.wal_seal_bytes
             .store(settings.wal_seal_bytes, Ordering::Relaxed);
+    }
+
+    pub fn apply_query_config(&self, config: QueryConfig) {
+        self.query_max_verify_per_query
+            .store(config.max_verify_per_query.max(1) as u64, Ordering::Relaxed);
+        self.query_verify_timeout_ms
+            .store(config.verify_timeout_ms.max(1), Ordering::Relaxed);
+        // 当前阶段不允许查询线程同步 readdir；该字段保留为显式硬门禁。
+        self.query_allow_sync_readdir
+            .store(false, Ordering::Relaxed);
     }
 
     pub fn set_wal_durability(&self, durability: WalDurability) {

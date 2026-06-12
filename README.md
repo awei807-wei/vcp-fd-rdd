@@ -262,6 +262,9 @@ L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` �
 | `watch_enabled` | `bool` | `true` | 启用文件监听 |
 | `watch_mode` | `String` | `"recursive"` | `recursive` / `tiered` / `off` |
 | `runtime_profile` | `String` | `"default"` | `default` / `memory_light` |
+| `query.max_verify_per_query` | `usize` | `150` | 单次查询返回前最多同步验真的冷层候选数 |
+| `query.verify_timeout_ms` | `u64` | `75` | 单次查询同步验真时间预算 |
+| `query.allow_sync_readdir` | `bool` | `false` | 查询线程同步 readdir 硬门禁；当前保持关闭 |
 | `mmap_warmup.enable` | `bool` | `false` | cold v7 mmap 预热开关，默认关闭 |
 | `mmap_warmup.max_bytes` | `u64` | `67108864` | 单次 best-effort 预热字节上限，0 表示不限制 |
 | `content_index.enable` | `bool` | `false` | 内容索引开关，默认关闭 |
@@ -286,6 +289,8 @@ L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` �
 | `stable_snapshot_enabled` | `bool` | `true` | 稳定快照轮转 |
 | `startup_repair_enabled` | `bool` | `true` | 启动修复扫描 |
 | `log_level` | `String` | `"info"` | trace / debug / info / warn / error |
+
+默认查询路径会在返回冷层/base 结果前执行预算化 `stat` 验真；删除路径不会返回，mtime 或身份变化会以 `freshness = "changed"` 返回当前 metadata，并把父目录加入补偿队列。显式开启 `lazy_validation_enabled = true` 会把同步验真降级为后台补偿路径，适合低功耗环境，但返回结果会标记为 `freshness = "unknown"` / `validated = false`。
 
 `runtime_profile = "memory_light"` 适合更关注常驻内存上限、可接受更频繁 snapshot/flush 的环境。该模式会降低 DeltaBuffer 触发 flush 的路径数/字节门槛，给周期 flush 增加最大滞留时间，缩短 rebuild 合并冷却，并在 WAL 体积超过阈值时请求 snapshot 边界；强制 flush、退出前 final snapshot、WAL replay 和离线 root 的 Freeze Gate 保护不变。CLI 可用 `--runtime-profile memory_light` 临时覆盖。
 

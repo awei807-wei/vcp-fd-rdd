@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{ContentIndexConfig, MmapWarmupConfig, RuntimeProfile};
+use crate::config::{ContentIndexConfig, MmapWarmupConfig, QueryConfig, RuntimeProfile};
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta};
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::{DirtyReason, DirtyScope};
@@ -1815,6 +1815,7 @@ async fn stable_prev_used_when_stable_is_suspiciously_smaller() -> anyhow::Resul
         &stable_v7_path_for(store.path()),
         &small.to_base_index_data(),
     )?;
+    std::fs::write(&chronicle, b"chronicle")?;
 
     let loaded = TieredIndex::load_or_empty(&store, vec![content_root.clone()]).await?;
     assert_eq!(
@@ -2293,6 +2294,62 @@ fn cold_query_changed_result_enqueues_parent_rescan() {
     assert_eq!(hot_results.len(), 1);
     assert_eq!(hot_results[0].freshness, QueryResultFreshness::Fresh);
     assert!(!hot_results[0].validated);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn query_verify_budget_caps_wide_stale_candidate_stat_count() {
+    let root = unique_tmp_dir("query-verify-budget");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let mut events = Vec::new();
+    let mut paths = Vec::new();
+    for i in 0..10 {
+        let path = root.join(format!("query_verify_budget_{i}.txt"));
+        std::fs::write(&path, b"stale").unwrap();
+        events.push(mk_event(i as u64 + 1, EventType::Create, path.clone()));
+        paths.push(path);
+    }
+    idx.apply_events(&events);
+    idx.refresh_base();
+    idx.apply_query_config(QueryConfig {
+        max_verify_per_query: 3,
+        verify_timeout_ms: 1_000,
+        allow_sync_readdir: false,
+    });
+
+    for path in &paths {
+        std::fs::remove_file(path).unwrap();
+    }
+
+    let results = idx.query_limit_detailed("query_verify_budget", 10);
+    assert!(results.is_empty());
+    assert_eq!(idx.stats_report().cold_validate_count, 3);
+    assert_eq!(idx.stats_report().query_stale_hit_count, 3);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn query_verify_default_disables_lazy_validation_correctness_path() {
+    let root = unique_tmp_dir("query-verify-default");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let path = root.join("query_verify_default.txt");
+    std::fs::write(&path, b"stable").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, path.clone())]);
+    idx.refresh_base();
+
+    let results = idx.query_limit_detailed("query_verify_default", 10);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].freshness, QueryResultFreshness::StaleChecked);
+    assert!(results[0].validated);
+    assert_eq!(idx.lazy_validation_report().pending, 0);
+    assert_eq!(idx.stats_report().cold_validate_count, 1);
 
     let _ = std::fs::remove_dir_all(&root);
 }

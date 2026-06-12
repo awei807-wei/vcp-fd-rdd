@@ -260,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.lazy_validation_ttl_secs,
         cfg.lazy_validation_stat_per_sec,
     );
+    index.apply_query_config(cfg.query);
     index.spawn_lazy_validation_worker();
     let root_case_policies = index.refresh_root_case_policy_diagnostics();
     index.apply_mmap_warmup_config(cfg.mmap_warmup.clone());
