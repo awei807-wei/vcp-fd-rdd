@@ -9,8 +9,8 @@ use fd_rdd::event::proc_sampler::{
 };
 use fd_rdd::event::sync::{DirtyReason, DirtyScope};
 use fd_rdd::event::tiered_watch::{
-    EphemeralWatchConfig, EphemeralWatchDecision, TieredWatchDebugDump, TieredWatchDebugSummary,
-    WatchTier,
+    EphemeralWatchConfig, EphemeralWatchDecision, FastScanLeaseKind, TieredWatchDebugDump,
+    TieredWatchDebugSummary, WatchTier,
 };
 use fd_rdd::event::watcher::check_inotify_limit;
 use fd_rdd::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
@@ -354,6 +354,25 @@ async fn main() -> anyhow::Result<()> {
         runtime.set_proc_sampler_enabled(
             cfg.proc_sampler.enabled && watch_enabled && effective_watch_mode == WatchMode::Tiered,
         );
+        let restore_report = runtime.restore_fast_scan_registry(
+            store.path(),
+            &cfg.tiered_watch,
+            index.recovery_status().report.previous_clean_shutdown,
+            &index.recovery_status().report.snapshot_source,
+            index.recovery_status().report.wal_checkpoint_used,
+            &MountTable::current().unwrap_or_default(),
+        );
+        if restore_report.loaded_entries > 0 {
+            tracing::info!(
+                "fast scan hotset registry restore: trusted={} active={} unknown={} rejected={} reason={}",
+                restore_report.trusted,
+                restore_report.restored_active,
+                restore_report.restored_unknown,
+                restore_report.rejected_entries,
+                restore_report.reason
+            );
+        }
+        runtime.seed_fast_scan_explicit_leases(cfg.tiered_watch.hot_dirs.clone());
     }
     let watch_state = Arc::new(watch_plan.state.clone());
 
@@ -391,6 +410,7 @@ async fn main() -> anyhow::Result<()> {
     );
     index.set_cold_sweep_period_estimate_from_tiered_policy(
         cfg.tiered_watch.l2_scan_interval_secs,
+        cfg.tiered_watch.l3_scan_policy,
         cfg.tiered_watch.l3_scan_interval_secs,
     );
     if cfg.content_index.enable {
@@ -522,6 +542,18 @@ async fn main() -> anyhow::Result<()> {
                 fast_scan_known_dirs: watch_state.fast_scan_known_dirs,
                 fast_scan_local_trusted_dirs: watch_state.fast_scan_local_trusted_dirs,
                 fast_scan_untrusted_dirs: watch_state.fast_scan_untrusted_dirs,
+                fast_scan_hotset_lease_count: watch_state.fast_scan_hotset_lease_count,
+                fast_scan_hotset_sentinel_count: watch_state.fast_scan_hotset_sentinel_count,
+                fast_scan_explicit_lease_count: watch_state.fast_scan_explicit_lease_count,
+                fast_scan_auto_lease_count: watch_state.fast_scan_auto_lease_count,
+                fast_scan_lease_evictions: watch_state.fast_scan_lease_evictions,
+                fast_scan_lease_renewals: watch_state.fast_scan_lease_renewals,
+                fast_scan_initial_backfill_pending: watch_state.fast_scan_initial_backfill_pending,
+                fast_scan_real_changed_dirs: watch_state.fast_scan_real_changed_dirs,
+                fast_scan_apply_dropped_stale_batches: watch_state
+                    .fast_scan_apply_dropped_stale_batches,
+                fast_scan_scan_workers_active: watch_state.fast_scan_scan_workers_active,
+                fast_scan_io_budget_limited_count: watch_state.fast_scan_io_budget_limited_count,
                 fast_scan_coverage_lag_p95_ms: watch_state.fast_scan_coverage_lag_p95_ms,
                 fast_scan_budget_degraded: watch_state.fast_scan_budget_degraded,
                 fast_scan_last_degraded_reason: watch_state.fast_scan_last_degraded_reason,
@@ -599,7 +631,15 @@ async fn main() -> anyhow::Result<()> {
         .with_health_provider(health_provider.clone())
         .with_stats_provider(stats_provider.clone())
         .with_watch_state_provider(watch_state_provider.clone())
-        .with_tiered_watch_debug_provider(tiered_watch_debug_provider);
+        .with_tiered_watch_debug_provider(tiered_watch_debug_provider)
+        .with_fast_scan_lease_provider({
+            let tiered_runtime = tiered_runtime.clone();
+            Arc::new(move |dirs, kind| {
+                if let Some(runtime) = tiered_runtime.as_ref() {
+                    runtime.grant_fast_scan_leases(dirs, kind, None, 2);
+                }
+            })
+        });
     tokio::spawn(async move {
         if let Err(e) = query_server.run(http_port).await {
             tracing::error!("Query server error: {}", e);
@@ -682,6 +722,18 @@ async fn main() -> anyhow::Result<()> {
                     fast_scan_known_dirs: health.fast_scan_known_dirs,
                     fast_scan_local_trusted_dirs: health.fast_scan_local_trusted_dirs,
                     fast_scan_untrusted_dirs: health.fast_scan_untrusted_dirs,
+                    fast_scan_hotset_lease_count: health.fast_scan_hotset_lease_count,
+                    fast_scan_hotset_sentinel_count: health.fast_scan_hotset_sentinel_count,
+                    fast_scan_explicit_lease_count: health.fast_scan_explicit_lease_count,
+                    fast_scan_auto_lease_count: health.fast_scan_auto_lease_count,
+                    fast_scan_lease_evictions: health.fast_scan_lease_evictions,
+                    fast_scan_lease_renewals: health.fast_scan_lease_renewals,
+                    fast_scan_initial_backfill_pending: health.fast_scan_initial_backfill_pending,
+                    fast_scan_real_changed_dirs: health.fast_scan_real_changed_dirs,
+                    fast_scan_apply_dropped_stale_batches: health
+                        .fast_scan_apply_dropped_stale_batches,
+                    fast_scan_scan_workers_active: health.fast_scan_scan_workers_active,
+                    fast_scan_io_budget_limited_count: health.fast_scan_io_budget_limited_count,
                     fast_scan_coverage_lag_p95_ms: health.fast_scan_coverage_lag_p95_ms,
                     fast_scan_budget_degraded: health.fast_scan_budget_degraded,
                     fast_scan_last_degraded_reason: health.fast_scan_last_degraded_reason,
@@ -758,6 +810,27 @@ async fn main() -> anyhow::Result<()> {
     info!("Shutting down, writing final snapshot...");
     if let Err(e) = index.snapshot_now(store.clone()).await {
         tracing::error!("Final snapshot failed: {}", e);
+    }
+    if let Some(runtime) = tiered_runtime.as_ref() {
+        let registry_wal_checkpoint = read_recovery_runtime_state(store.path())
+            .map(|state| state.last_wal_seal_id)
+            .unwrap_or(index.recovery_status().report.wal_checkpoint_used);
+        let recovery_report = index.recovery_status().report;
+        let registry_snapshot_source = if cfg.stable_snapshot_enabled {
+            "stable".to_string()
+        } else {
+            recovery_report.snapshot_source
+        };
+        match runtime.persist_fast_scan_registry(
+            store.path(),
+            &cfg.tiered_watch,
+            &registry_snapshot_source,
+            registry_wal_checkpoint,
+            true,
+        ) {
+            Ok(entries) => tracing::info!("persisted hotset fast scan registry entries={entries}"),
+            Err(e) => tracing::warn!("failed to persist hotset fast scan registry: {}", e),
+        }
     }
     mark_runtime_state(
         store.path(),
@@ -1227,8 +1300,25 @@ fn spawn_dirty_queue_loop(
                 }
 
                 if let Some(runtime) = runtime.as_ref() {
-                    if entry.reason == DirtyReason::FastScanChangedDir {
+                    match entry.reason {
+                        DirtyReason::QueryHitStale => {
+                            runtime.grant_fast_scan_leases(
+                                entry.scope.dir_paths().iter().cloned(),
+                                FastScanLeaseKind::StaleHit,
+                                None,
+                                4,
+                            );
+                        }
+                        _ => {}
+                    }
+                    if matches!(
+                        entry.reason,
+                        DirtyReason::FastScanChangedDir | DirtyReason::FastScanBootstrapDir
+                    ) {
                         runtime.record_fast_scan_generated_events(report.changed);
+                        runtime.record_fast_scan_apply_dropped_stale_batches(
+                            report.dropped_stale_batches,
+                        );
                     }
                     for scan in report.outcomes {
                         let changed = scan.outcome.changed;
@@ -1411,12 +1501,10 @@ fn spawn_tiered_fast_scan_loop(
 
             let mount_table = MountTable::current().unwrap_or_default();
             if runtime.should_bootstrap_fast_scan_dirs(bootstrap_limit) {
-                let excluded_roots = runtime.fast_scan_bootstrap_excluded_roots();
-                let known_dirs =
-                    index.collect_fast_scan_known_dirs_excluding(bootstrap_limit, &excluded_roots);
-                let candidate_count = known_dirs.len();
+                let pending_dirs = runtime.pending_fast_scan_lease_dirs(bootstrap_limit);
+                let candidate_count = pending_dirs.len();
                 let inserted =
-                    runtime.bootstrap_fast_scan_dirs(known_dirs, &mount_table, bootstrap_limit);
+                    runtime.bootstrap_fast_scan_dirs(pending_dirs, &mount_table, bootstrap_limit);
                 runtime.record_fast_scan_bootstrap_result(
                     candidate_count,
                     inserted,
@@ -1425,11 +1513,23 @@ fn spawn_tiered_fast_scan_loop(
                 );
             }
 
-            let result = runtime.fast_scan_tick(&mount_table, runtime.fast_scan_tick_config());
-            if result.changed_dirs.is_empty() {
-                continue;
+            let stale_hit_dirs = index.drain_recent_stale_hit_dirs();
+            if !stale_hit_dirs.is_empty() {
+                runtime.grant_fast_scan_leases(
+                    stale_hit_dirs,
+                    FastScanLeaseKind::StaleHit,
+                    None,
+                    4,
+                );
             }
-            index.enqueue_dirty_dirs(result.changed_dirs, DirtyReason::FastScanChangedDir);
+
+            let result = runtime.fast_scan_tick(&mount_table, runtime.fast_scan_tick_config());
+            if !result.initial_dirs.is_empty() {
+                index.enqueue_dirty_dirs(result.initial_dirs, DirtyReason::FastScanBootstrapDir);
+            }
+            if !result.changed_dirs.is_empty() {
+                index.enqueue_dirty_dirs(result.changed_dirs, DirtyReason::FastScanChangedDir);
+            }
         }
     });
 }
@@ -1489,6 +1589,12 @@ fn spawn_proc_sampler_loop(
             cursor = tick.cursor;
             let mut triggered_watches = 0u64;
             for dir in tick.dirs {
+                runtime.grant_fast_scan_lease(
+                    dir.clone(),
+                    FastScanLeaseKind::ProcSampler,
+                    Some(tiered.l1_l2_fast_scan_proc_sampler_lease_ttl_secs),
+                    3,
+                );
                 if maybe_send_ephemeral_watch_command(
                     &runtime,
                     &watch_command_tx,

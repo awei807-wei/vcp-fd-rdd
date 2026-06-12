@@ -20,7 +20,7 @@
 - `p1_streaming_export.rs` — 流式导出字节一致性
 - `p1_compaction_fast.rs` — fast/legacy compaction 等价性
 - `p1_visibility_latency.rs` — 文件可见性延迟
-- `p1_fast_scan_sla.rs` — L1/L2 fast scan create/delete/rename SLA
+- `p1_fast_scan_sla.rs` — lease hotset fast scan SLA 与冷目录有界最终一致
 - `p1_api_e2e.rs` — HTTP API 与 `fd-rdd-query` 真实 daemon 端到端
 - `p1_real_watcher.rs` — 真实 watcher create/rename/delete 端到端
 - `p1_crash_recovery_matrix.rs` — abrupt kill、坏快照与启动修复组合恢复
@@ -54,7 +54,7 @@
 - Runtime subtree tombstone 覆盖删除父目录后 cold/base 子路径验真前过滤、TTL 清理、同名目录重建解除过滤，以及 runtime-only 不持久化到 snapshot 的边界。
 - 查询验真新增默认同步校验和预算回归：删除的 cold/base 命中不返回，mtime/identity 变化返回 `Changed` 且已验证，宽泛 stale 查询的同步 `stat` 不超过 `query.max_verify_per_query`，lazy validation 需显式开启才作为后台补偿路径。
 - `src/event/stream.rs` 单元测试补齐孤立 `RenameMode::To`、孤立 `RenameMode::From`、Create/Rename 后续 Modify 合并优先级和 Delete 后 Modify 反例；`p1_visibility_latency.rs` 增加下载器 `.part` → 最终名 rename 可见性验证，防止新下载文件最终名因事件合并丢失而不可见。
-- 新增 `p1_fast_scan_sla.rs`，启动真实 tiered daemon 并隔离 `XDG_CONFIG_HOME`，强制构造 L1/L2 非 L0 目录，验证 create、delete、rename 在 fast scan SLA 窗口内更新搜索结果；CI 新增 `L1/L2 fast scan SLA` 专项 job。
+- `p1_fast_scan_sla.rs` 启动真实 tiered daemon 并隔离 `XDG_CONFIG_HOME`，验证 active lease hotset 内 create/delete/rename 在 5 秒 SLA 窗口内更新搜索结果，同时验证冷目录不按 5 秒断言、而是在配置的 cold sweep 周期内最终追平；CI 专项 job 保留但口径改为 hotset SLA + cold eventual consistency。
 - `scripts/smoke-search-syntax.sh` 支持自建临时 root、临时 HTTP 端口和自启动 daemon；在 `--no-watch` 下会递归分批调用 `/scan`，完整覆盖 HTTP search DSL smoke 矩阵。
 - `dupe:content` 新增 exclude/oversized/mount policy 回归，确认内容重复扫描复用 frozen/offline、exclude 目录、mount policy 与 `content_index.max_file_size` 准入，并把 partial/full hash 慢 I/O 放在 query generation guard 外。
 - `memory_light` 的 RSS/P95、idle RSS 和默认 profile 对照仍需在非沙箱 daemon 或真实数据集环境采集；本地测试不伪造性能数值。

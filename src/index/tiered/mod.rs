@@ -118,6 +118,7 @@ pub struct DirtyProcessReport {
     pub elapsed_ms: u64,
     pub fast_sync_upserts: usize,
     pub fast_sync_deletes: usize,
+    pub dropped_stale_batches: usize,
     pub failed: bool,
     pub outcomes: Vec<DirtyScanOutcome>,
 }
@@ -297,6 +298,7 @@ pub struct TieredIndex {
     pub(self) query_verify_timeout_ms: AtomicU64,
     pub(self) query_allow_sync_readdir: AtomicBool,
     pub(self) runtime_subtree_tombstones: Mutex<Vec<RuntimeSubtreeTombstone>>,
+    pub(self) recent_stale_hit_dirs: Mutex<Vec<PathBuf>>,
     pub(self) cold_sweep_last_completed_unix_secs: AtomicU64,
     pub(self) cold_sweep_period_estimate_secs: AtomicU64,
     pub(self) memory_report_cache: Mutex<MemoryReportCache>,

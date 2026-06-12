@@ -891,7 +891,29 @@ impl TieredIndex {
         let Some(parent) = path.parent() else {
             return;
         };
+        if reason == DirtyReason::QueryHitStale {
+            self.record_recent_stale_hit_dir(parent.to_path_buf());
+        }
         self.enqueue_dirty_dirs(vec![parent.to_path_buf()], reason);
+    }
+
+    fn record_recent_stale_hit_dir(&self, dir: PathBuf) {
+        let mut dirs = self.recent_stale_hit_dirs.lock();
+        if !dirs.iter().any(|existing| existing == &dir) {
+            dirs.push(dir);
+        }
+        if dirs.len() > 256 {
+            let overflow = dirs.len().saturating_sub(256);
+            dirs.drain(0..overflow);
+        }
+    }
+
+    pub fn drain_recent_stale_hit_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = self.recent_stale_hit_dirs.lock();
+        let mut out = std::mem::take(&mut *dirs);
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn enqueue_query_miss(&self, keyword: &str) {

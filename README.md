@@ -236,11 +236,13 @@ strict_fail_on_budget_exceeded = true
 
 L2/L3 periodic cold scan 会维护 directory manifest，用 `child_count`、`names_hash`、`child_mtime_hash`、mtime range 和 scan generation 判断目录是否可跳过真实补扫。`/watch-state` 暴露 `directory_manifest_dirs`、`directory_manifest_skipped_scans`、`directory_manifest_changed_scans` 和 `directory_manifest_untrusted_clock_bypass`；clock cutoff 不可信时会绕过 manifest skip，优先执行真实对账。预算拒绝还会记录 `last_budget_blocked_kernel_watch_cost`、`last_budget_blocked_budget_remaining` 和 `last_budget_blocked_reason`，便于判断是 promotion 预算不足还是 ephemeral lease 预算不足。
 
-L1/L2 fast scan lane 默认启用，用目录 sentinel 对本地可信文件系统上的已知 L1/L2 目录提供 5 秒覆盖目标。它读取 `/proc/self/mountinfo` 分类 mount：`ext4`、`xfs`、`btrfs`、`tmpfs`、`f2fs` 进入 `local_strict`；`nfs`、`nfs4`、`cifs`、`smb3`、`fuse.*`、`sshfs`、`rclone` 和未知文件系统按 untrusted 处理，默认只报告 best-effort，不承诺 strict SLA。sentinel 发现目录项变化后会以 `FastScanChangedDir` 加入 DirtyQueue，并复用统一 depth=1 scan/apply 路径更新索引。
+L1/L2 fast scan lane 默认启用，但 5 秒覆盖目标只适用于 lease hotset，不再承诺全部 L1/L2 目录。lease 触发源包括查询命中父目录、返回前验真发现的 stale hit、project marker、L0 事件、proc sampler 写句柄采样，以及 `tiered_watch.hot_dirs` 显式配置。路径形态 query miss 仍只进入 DirtyQueue 做冷目录补偿，不会直接扩张 hotset。普通冷目录通过 DirtyQueue、PeriodicColdScan、query repair 和 cold sweep 保持有界最终一致，追平上界由 `/health.cold_sweep_period_estimate` 与 `/health.dirty_backlog` 解释。
 
-fast scan bootstrap 只负责把非 L0 的已知目录注册为 sentinel；L0 已覆盖目录和已注册 sentinel 会被排除。`l1_l2_fast_scan_bootstrap_budget_per_tick` 是每 tick 注册预算，不是 sentinel 总量上限；新注册 sentinel 会先进入一次 `FastScanChangedDir` 初始补扫，补齐覆盖前已经发生的创建。一次 bootstrap 未发现新候选时会进入冷却，初始补扫队列积压达到单批预算时会暂停 bootstrap，避免对大规模 manifest-only cold snapshot 进行每秒全量目录枚举。
+fast scan 对 lease hotset 维护目录 sentinel。它读取 `/proc/self/mountinfo` 分类 mount：`ext4`、`xfs`、`btrfs`、`tmpfs`、`f2fs` 进入 `local_strict`；`nfs`、`nfs4`、`cifs`、`smb3`、`fuse.*`、`sshfs`、`rclone` 和未知文件系统按 untrusted 处理，默认只报告 best-effort，不承诺 strict SLA。sentinel 发现目录项变化后会以 `FastScanChangedDir` 加入 DirtyQueue，并复用统一 depth=1 scan/apply 路径更新索引。
 
-`/watch-state` 暴露 fast scan 的 `fast_scan_enabled`、`fast_scan_mode`、`fast_scan_sla_ok`、`fast_scan_local_strict_ok`、known/local/untrusted dir 数量、pending changed-dir queue、checked/changed/generated counters、coverage lag p50/p95/p99、budget degraded 和最后 degraded reason。`/health` 会区分本地 strict 覆盖失败、预算降级和网络/FUSE best-effort，不把 untrusted 路径伪装成 strict 5 秒 SLA。
+fast scan bootstrap 只把尚未覆盖的有效 lease 注册为 sentinel；L0 已覆盖目录和已注册 sentinel 会被排除。`l1_l2_fast_scan_bootstrap_budget_per_tick` 是每 tick hotset sentinel 注册与初始 backfill 预算，不是全局 L1/L2 枚举预算；新注册 sentinel 会先进入一次低优先级 `FastScanBootstrapDir` 初始补扫，补齐覆盖前已经发生的创建。真实 sentinel 变化继续使用 `FastScanChangedDir`，优先级高于初始补扫。可信 clean shutdown 会把 hotset sentinel registry 持久化到稳定快照目录；恢复不可信、mount/config/WAL gate 不匹配时进入限速 backfill，不报告 hotset strict SLA ok。
+
+`/watch-state` 暴露 fast scan 的 `fast_scan_enabled`、`fast_scan_mode`、`fast_scan_sla_ok`、`fast_scan_local_strict_ok`、`fast_scan_hotset_lease_count`、`fast_scan_hotset_sentinel_count`、`fast_scan_explicit_lease_count`、`fast_scan_auto_lease_count`、`fast_scan_initial_backfill_pending`、`fast_scan_real_changed_dirs`、known/local/untrusted dir 数量、pending changed-dir queue、checked/changed/generated counters、coverage lag p50/p95/p99、budget degraded 和最后 degraded reason。`/health` 会区分 hotset 本地 strict 覆盖失败、预算降级、cold sweep backlog 与网络/FUSE best-effort，不把 untrusted 路径或未 backfill 的 hotset 伪装成 strict 5 秒 SLA。
 
 网络/FUSE 路径默认只做 best-effort 观测。强 5 秒网络路径 SLA 建议由远端节点上的 RemoteAgent 负责本地采集后同步事件；当前 runtime 不实现 RemoteAgent，也不会用 `statx(FORCE_SYNC)` 伪造网络 strict SLA。
 
@@ -283,12 +285,17 @@ L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` �
 | `tiered_watch.l0_max_cost_per_root` | `usize` | `8192` | 单个 L0 根的递归 watch 成本上限，0 表示按总预算关闭单根保护 |
 | `tiered_watch.project_markers` | `[String]` | 常见项目标记 | balanced watcher 识别项目根的 marker 名称 |
 | `tiered_watch.ephemeral_watch_budget` | `usize` | `256` | 临时 watcher lease 独立预算 |
-| `tiered_watch.l1_l2_fast_scan_enabled` | `bool` | `true` | 启用 L1/L2 已知目录 fast scan lane |
-| `tiered_watch.l1_l2_fast_scan_target_secs` | `u64` | `5` | 本地可信 L1/L2 目录 strict 覆盖目标 |
+| `tiered_watch.l1_l2_fast_scan_enabled` | `bool` | `true` | 启用 lease-hotset fast scan lane |
+| `tiered_watch.l1_l2_fast_scan_target_secs` | `u64` | `5` | 本地可信 active hotset 目录 strict 覆盖目标 |
 | `tiered_watch.l1_l2_fast_scan_tick_ms` | `u64` | `1000` | fast scan 调度 tick |
-| `tiered_watch.l1_l2_fast_scan_stat_budget_per_tick` | `usize` | `5000` | 每 tick 本地可信 sentinel stat 预算 |
+| `tiered_watch.l1_l2_fast_scan_stat_budget_per_tick` | `usize` | `5000` | 每 tick 本地可信 hotset sentinel stat 预算 |
 | `tiered_watch.l1_l2_fast_scan_readdir_budget_per_tick` | `usize` | `512` | 每 tick 本地可信 changed-dir readdir 预算 |
-| `tiered_watch.l1_l2_fast_scan_bootstrap_budget_per_tick` | `usize` | `2048` | 每 tick 已知目录 sentinel 注册预算 |
+| `tiered_watch.l1_l2_fast_scan_bootstrap_budget_per_tick` | `usize` | `2048` | 每 tick hotset sentinel 注册与初始 backfill 预算 |
+| `tiered_watch.l1_l2_fast_scan_hotset_max_leases` | `usize` | `512` | active fast scan lease 数量上限 |
+| `tiered_watch.l1_l2_fast_scan_lease_ttl_secs` | `u64` | `1800` | 自动 fast scan lease 默认 TTL |
+| `tiered_watch.l1_l2_fast_scan_proc_sampler_lease_ttl_secs` | `u64` | `300` | proc sampler lease TTL |
+| `tiered_watch.l1_l2_fast_scan_explicit_lease_ttl_secs` | `u64` | `0` | `hot_dirs` 显式 lease TTL，0 表示永久 |
+| `tiered_watch.l1_l2_fast_scan_sentinel_registry_max_entries` | `usize` | `512` | clean shutdown 持久化/恢复的 hotset sentinel 条目上限 |
 | `tiered_watch.network_fast_scan_mode` | `String` | `"best_effort"` | 网络/FUSE fast scan 模式：`best_effort` / `strict_poll` / `disabled` |
 | `tiered_watch.network_fast_scan_stat_budget_per_tick` | `usize` | `128` | 每 tick 网络/FUSE sentinel stat 预算 |
 | `tiered_watch.network_fast_scan_readdir_budget_per_tick` | `usize` | `16` | 每 tick 网络/FUSE strict_poll changed-dir readdir 预算 |

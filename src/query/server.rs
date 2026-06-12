@@ -1,6 +1,6 @@
 use crate::core::FileKind;
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
-use crate::event::tiered_watch::TieredWatchDebugDump;
+use crate::event::tiered_watch::{FastScanLeaseKind, TieredWatchDebugDump};
 use crate::index::tiered::RecoveryReasonCount;
 use crate::index::TieredIndex;
 use crate::query::scoring::{compute_highlights, score_result, ScoreConfig};
@@ -102,6 +102,17 @@ pub struct HealthTelemetry {
     pub fast_scan_known_dirs: usize,
     pub fast_scan_local_trusted_dirs: usize,
     pub fast_scan_untrusted_dirs: usize,
+    pub fast_scan_hotset_lease_count: usize,
+    pub fast_scan_hotset_sentinel_count: usize,
+    pub fast_scan_explicit_lease_count: usize,
+    pub fast_scan_auto_lease_count: usize,
+    pub fast_scan_lease_evictions: u64,
+    pub fast_scan_lease_renewals: u64,
+    pub fast_scan_initial_backfill_pending: usize,
+    pub fast_scan_real_changed_dirs: u64,
+    pub fast_scan_apply_dropped_stale_batches: u64,
+    pub fast_scan_scan_workers_active: u64,
+    pub fast_scan_io_budget_limited_count: u64,
     pub fast_scan_coverage_lag_p95_ms: u64,
     pub fast_scan_budget_degraded: bool,
     pub fast_scan_last_degraded_reason: String,
@@ -241,6 +252,17 @@ pub struct HealthResponse {
     pub fast_scan_known_dirs: usize,
     pub fast_scan_local_trusted_dirs: usize,
     pub fast_scan_untrusted_dirs: usize,
+    pub fast_scan_hotset_lease_count: usize,
+    pub fast_scan_hotset_sentinel_count: usize,
+    pub fast_scan_explicit_lease_count: usize,
+    pub fast_scan_auto_lease_count: usize,
+    pub fast_scan_lease_evictions: u64,
+    pub fast_scan_lease_renewals: u64,
+    pub fast_scan_initial_backfill_pending: usize,
+    pub fast_scan_real_changed_dirs: u64,
+    pub fast_scan_apply_dropped_stale_batches: u64,
+    pub fast_scan_scan_workers_active: u64,
+    pub fast_scan_io_budget_limited_count: u64,
     pub fast_scan_coverage_lag_p95_ms: u64,
     pub fast_scan_budget_degraded: bool,
     pub fast_scan_last_degraded_reason: String,
@@ -298,6 +320,7 @@ struct QueryServerState {
     stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync>,
     watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
     tiered_watch_debug_provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync>,
+    fast_scan_lease_provider: Arc<dyn Fn(Vec<PathBuf>, FastScanLeaseKind) + Send + Sync>,
     scan_reject_count: Arc<AtomicU64>,
     http_policy: HttpPolicy,
 }
@@ -309,6 +332,7 @@ pub struct QueryServer {
     stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync>,
     watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
     tiered_watch_debug_provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync>,
+    fast_scan_lease_provider: Arc<dyn Fn(Vec<PathBuf>, FastScanLeaseKind) + Send + Sync>,
     scan_reject_count: Arc<AtomicU64>,
     http_policy: HttpPolicy,
 }
@@ -322,6 +346,7 @@ impl QueryServer {
             stats_provider: Arc::new(EventPipelineStats::default),
             watch_state_provider: Arc::new(WatchStateReport::default),
             tiered_watch_debug_provider: Arc::new(|_| TieredWatchDebugDump::default()),
+            fast_scan_lease_provider: Arc::new(|_, _| {}),
             scan_reject_count: Arc::new(AtomicU64::new(0)),
             http_policy: effective_http_policy(None, RunningIdentity::current()),
         }
@@ -359,6 +384,14 @@ impl QueryServer {
         self
     }
 
+    pub fn with_fast_scan_lease_provider(
+        mut self,
+        provider: Arc<dyn Fn(Vec<PathBuf>, FastScanLeaseKind) + Send + Sync>,
+    ) -> Self {
+        self.fast_scan_lease_provider = provider;
+        self
+    }
+
     pub fn with_http_policy(mut self, policy: HttpPolicy) -> Self {
         self.http_policy = policy;
         self
@@ -377,6 +410,7 @@ impl QueryServer {
             stats_provider: self.stats_provider,
             watch_state_provider: self.watch_state_provider,
             tiered_watch_debug_provider: self.tiered_watch_debug_provider,
+            fast_scan_lease_provider: self.fast_scan_lease_provider,
             scan_reject_count: self.scan_reject_count,
             http_policy: self.http_policy,
         };
@@ -464,6 +498,10 @@ async fn search_handler(
     state
         .index
         .record_query_metric(query_started.elapsed().as_micros() as u64);
+    let lease_dirs = query_hotset_dirs(&results);
+    if !lease_dirs.is_empty() {
+        (state.fast_scan_lease_provider)(lease_dirs, FastScanLeaseKind::Query);
+    }
 
     let config = ScoreConfig::from_query(&keyword);
     let response = results
@@ -487,6 +525,23 @@ async fn search_handler(
         .collect();
 
     Ok(Json(response))
+}
+
+fn query_hotset_dirs(results: &[crate::index::tiered::QueryResultMeta]) -> Vec<PathBuf> {
+    let mut dirs = results
+        .iter()
+        .take(32)
+        .filter_map(|result| {
+            if result.meta.kind.is_directory() {
+                Some(result.meta.path.clone())
+            } else {
+                result.meta.path.parent().map(PathBuf::from)
+            }
+        })
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 async fn status_handler(State(state): State<QueryServerState>) -> Json<StatusResponse> {
@@ -653,6 +708,20 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     diagnostics.watchers.fast_scan_known_dirs = health.fast_scan_known_dirs;
     diagnostics.watchers.fast_scan_local_trusted_dirs = health.fast_scan_local_trusted_dirs;
     diagnostics.watchers.fast_scan_untrusted_dirs = health.fast_scan_untrusted_dirs;
+    diagnostics.watchers.fast_scan_hotset_lease_count = health.fast_scan_hotset_lease_count;
+    diagnostics.watchers.fast_scan_hotset_sentinel_count = health.fast_scan_hotset_sentinel_count;
+    diagnostics.watchers.fast_scan_explicit_lease_count = health.fast_scan_explicit_lease_count;
+    diagnostics.watchers.fast_scan_auto_lease_count = health.fast_scan_auto_lease_count;
+    diagnostics.watchers.fast_scan_lease_evictions = health.fast_scan_lease_evictions;
+    diagnostics.watchers.fast_scan_lease_renewals = health.fast_scan_lease_renewals;
+    diagnostics.watchers.fast_scan_initial_backfill_pending =
+        health.fast_scan_initial_backfill_pending;
+    diagnostics.watchers.fast_scan_real_changed_dirs = health.fast_scan_real_changed_dirs;
+    diagnostics.watchers.fast_scan_apply_dropped_stale_batches =
+        health.fast_scan_apply_dropped_stale_batches;
+    diagnostics.watchers.fast_scan_scan_workers_active = health.fast_scan_scan_workers_active;
+    diagnostics.watchers.fast_scan_io_budget_limited_count =
+        health.fast_scan_io_budget_limited_count;
     diagnostics.watchers.fast_scan_coverage_lag_p95_ms = health.fast_scan_coverage_lag_p95_ms;
     diagnostics.watchers.fast_scan_budget_degraded = health.fast_scan_budget_degraded;
     diagnostics.watchers.fast_scan_last_degraded_reason =
@@ -749,6 +818,17 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         fast_scan_known_dirs: health.fast_scan_known_dirs,
         fast_scan_local_trusted_dirs: health.fast_scan_local_trusted_dirs,
         fast_scan_untrusted_dirs: health.fast_scan_untrusted_dirs,
+        fast_scan_hotset_lease_count: health.fast_scan_hotset_lease_count,
+        fast_scan_hotset_sentinel_count: health.fast_scan_hotset_sentinel_count,
+        fast_scan_explicit_lease_count: health.fast_scan_explicit_lease_count,
+        fast_scan_auto_lease_count: health.fast_scan_auto_lease_count,
+        fast_scan_lease_evictions: health.fast_scan_lease_evictions,
+        fast_scan_lease_renewals: health.fast_scan_lease_renewals,
+        fast_scan_initial_backfill_pending: health.fast_scan_initial_backfill_pending,
+        fast_scan_real_changed_dirs: health.fast_scan_real_changed_dirs,
+        fast_scan_apply_dropped_stale_batches: health.fast_scan_apply_dropped_stale_batches,
+        fast_scan_scan_workers_active: health.fast_scan_scan_workers_active,
+        fast_scan_io_budget_limited_count: health.fast_scan_io_budget_limited_count,
         fast_scan_coverage_lag_p95_ms: health.fast_scan_coverage_lag_p95_ms,
         fast_scan_budget_degraded: health.fast_scan_budget_degraded,
         fast_scan_last_degraded_reason: health.fast_scan_last_degraded_reason,
@@ -859,6 +939,9 @@ async fn debug_tiered_watch_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{FileKey, FileKind, FileMeta};
+    use crate::index::tiered::QueryResultMeta;
+    use std::time::SystemTime;
 
     #[test]
     fn normalize_search_limit_clamps_to_server_bounds() {
@@ -906,6 +989,59 @@ mod tests {
         assert_eq!(value["validated"], true);
         assert_eq!(value["reason"], "hardlink_same_file_key");
         assert_eq!(value["confidence"], 1.0);
+    }
+
+    #[test]
+    fn query_hotset_dirs_uses_result_parent_dirs() {
+        let base = PathBuf::from("/workspace/project/src");
+        let result = QueryResultMeta::hot(FileMeta {
+            file_key: FileKey {
+                dev: 2,
+                ino: 1,
+                generation: 0,
+            },
+            path: base.join("main.rs"),
+            size: 4,
+            mtime: Some(SystemTime::UNIX_EPOCH),
+            ctime: None,
+            atime: None,
+            kind: FileKind::File,
+        });
+        let duplicate = QueryResultMeta::hot(FileMeta {
+            file_key: FileKey {
+                dev: 2,
+                ino: 2,
+                generation: 0,
+            },
+            path: base.join("lib.rs"),
+            size: 4,
+            mtime: Some(SystemTime::UNIX_EPOCH),
+            ctime: None,
+            atime: None,
+            kind: FileKind::File,
+        });
+
+        assert_eq!(query_hotset_dirs(&[result, duplicate]), vec![base]);
+    }
+
+    #[test]
+    fn query_hotset_dirs_uses_directory_results_directly() {
+        let dir = PathBuf::from("/workspace/project");
+        let result = QueryResultMeta::hot(FileMeta {
+            file_key: FileKey {
+                dev: 2,
+                ino: 3,
+                generation: 0,
+            },
+            path: dir.clone(),
+            size: 0,
+            mtime: Some(SystemTime::UNIX_EPOCH),
+            ctime: None,
+            atime: None,
+            kind: FileKind::Directory,
+        });
+
+        assert_eq!(query_hotset_dirs(&[result]), vec![dir]);
     }
 
     #[test]
@@ -989,6 +1125,17 @@ mod tests {
             fast_scan_known_dirs: 0,
             fast_scan_local_trusted_dirs: 0,
             fast_scan_untrusted_dirs: 0,
+            fast_scan_hotset_lease_count: 0,
+            fast_scan_hotset_sentinel_count: 0,
+            fast_scan_explicit_lease_count: 0,
+            fast_scan_auto_lease_count: 0,
+            fast_scan_lease_evictions: 0,
+            fast_scan_lease_renewals: 0,
+            fast_scan_initial_backfill_pending: 0,
+            fast_scan_real_changed_dirs: 0,
+            fast_scan_apply_dropped_stale_batches: 0,
+            fast_scan_scan_workers_active: 0,
+            fast_scan_io_budget_limited_count: 0,
             fast_scan_coverage_lag_p95_ms: 0,
             fast_scan_budget_degraded: false,
             fast_scan_last_degraded_reason: String::new(),

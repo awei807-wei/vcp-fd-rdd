@@ -3,7 +3,7 @@ use crate::config::{ContentIndexConfig, MmapWarmupConfig, QueryConfig, RuntimePr
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta};
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
 use crate::event::sync::{DirtyReason, DirtyScope};
-use crate::event::tiered_watch::{FastScanTickConfig, TieredWatchRuntime};
+use crate::event::tiered_watch::{FastScanLeaseKind, FastScanTickConfig, TieredWatchRuntime};
 use crate::fs_policy::{FsPolicyConfig, FsPolicyDecision, MountTable};
 use crate::index::tiered::events::event_record_estimated_bytes;
 use crate::index::tiered::sync::RebuildAdmission;
@@ -2713,6 +2713,7 @@ fn fast_scan_changed_dir_reuses_dirty_apply_and_finds_deep_known_dir_create() {
         "1 0 0:1 / {} rw - ext4 source rw\n",
         root.display()
     ));
+    assert!(rt.grant_fast_scan_lease(deep.clone(), FastScanLeaseKind::Query, None, 1));
     assert!(rt.bootstrap_fast_scan_dirs(known_dirs, &mount_table, 128) >= 1);
 
     let cfg = FastScanTickConfig {
@@ -2721,7 +2722,11 @@ fn fast_scan_changed_dir_reuses_dirty_apply_and_finds_deep_known_dir_create() {
         local_readdir_budget_per_tick: 128,
         ..FastScanTickConfig::default()
     };
-    let _ = rt.fast_scan_tick(&mount_table, cfg);
+    let initial = rt.fast_scan_tick(&mount_table, cfg);
+    assert!(
+        initial.initial_dirs.iter().any(|dir| dir == &deep),
+        "fast scan should backfill the leased deep directory first: {initial:?}"
+    );
 
     std::thread::sleep(std::time::Duration::from_millis(5));
     let created = deep.join("fast_created.rs");

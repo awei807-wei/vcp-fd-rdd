@@ -7,21 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- M3 fast scan 正式收缩为 lease hotset 语义：5 秒 SLA 只覆盖 active lease hotset，lease 来源包括查询命中、stale hit、project marker、L0 事件、proc sampler 和 `hot_dirs` 显式配置；路径形态 query miss 保持 DirtyQueue 冷目录补偿，不直接扩张 hotset；普通冷目录改由 PeriodicColdScan / dirty repair / query repair 提供有界最终一致。
+- 新增 fast scan lease TTL、hotset 总预算和 sentinel registry 持久化配置；clean shutdown 仅持久化 hotset sentinel，恢复时校验 snapshot source、WAL checkpoint、配置 fingerprint 与 mount identity，不可信 registry 进入限速 backfill 且不报告 strict SLA ok。
+- fast scan 初始补扫拆成低优先级 `FastScanBootstrapDir`，真实 sentinel 变化继续使用 `FastScanChangedDir`；`/watch-state`、`/health`、diagnostics 与 metrics JSONL 新增 hotset lease/sentinel、explicit/auto lease、lease evictions/renewals、initial backfill、real changed dirs、apply dropped stale batches、scan workers 和 IO budget limited 字段。
+- `p1_fast_scan_sla` 集成测试改写为“hotset 内 5 秒 + 冷目录有界最终一致”，并同步 README、tests README 与 watcher wiki 的 SLA 口径，不再断言全部 L1/L2 目录 5 秒覆盖。
 - 新增 M2 proc sampler：Linux tiered 模式下按预算采样 `/proc/<pid>/fdinfo` 与 `fd` symlink，只处理同用户进程的写句柄，将索引根内正在被写入的目录作为新鲜度线索送入现有 Ephemeral Watch lease 入口；采样结果不作为查询正确性来源，查询仍由返回前验真保证。`/watch-state`、`/health`、diagnostics 与 metrics JSONL 新增 `proc_sampler_*` 字段，暴露采样耗时、pid/fd 预算、命中目录、触发临时 watcher 数、预算耗尽和不可用状态。
 - 新增 M1-3 分片 repair：Periodic cold scan 对大目录按约 512 entries / 20ms 分片处理，未完成 slice 携带运行时 cursor 重新入 DirtyQueue，避免百万 entry 目录在单次冷层巡检中长阻塞；StartupRepairDeferred 保留递归 fast-sync 补偿启动期 rename subtree；`/health`、diagnostics 与 metrics JSONL 新增 `cold_sweep_last_completed`、`cold_sweep_period_estimate`、`dirty_backlog`，把“返回结果是真的，但候选集合可能暂时不全”的全局有界最终一致上界变成可观测字段。
 - 新增运行时 subtree tombstone：Delete 父目录和 rename-from 会创建带 TTL 的运行时前缀墓碑，cold/base 查询候选会在同步验真前被 prefix filter 屏蔽，避免删除大目录后宽泛查询对旧子路径逐个 `stat`；Create/Modify/RenameTo 会清理覆盖路径相关 tombstone，避免同名目录重建被误伤。第一版不持久化到 snapshot/WAL。
 - 查询冷层/base 结果改为默认返回前同步验真：新增 `[query] max_verify_per_query`、`verify_timeout_ms`、`allow_sync_readdir` 配置；默认单查询最多验证 150 个候选、75ms 超时且禁止查询线程同步 readdir。删除路径不返回，mtime 或 identity 变化会以 `freshness = "changed"` / `validated=true` 返回当前 metadata 并入 DirtyQueue；`lazy_validation_enabled` 默认关闭，显式开启时仅作为低功耗后台补偿路径。
 - 修复 rename 事件窗口期导致新下载文件最终名搜不到的问题：事件合并阶段只把孤立 `RenameMode::To` 视为 `Create`，孤立 `RenameMode::From` 保持普通修改语义；同批次 `Create`/`Rename` 不再被后续 `Modify` 覆盖，避免下载器 `.part` → 最终名、编辑器原子保存和配对 rename 在 merge 阶段丢失结构性变化语义。
 - 修复 CI 回归误报：`fast_sync_reconciles_add_and_delete` 允许 Linux inode 复用场景下以单次 same-FileKey upsert 完成旧路径遮蔽；stress CI hardlink 断言同步为 PathEntry 多别名语义，不再要求同 inode 单路径折叠。
-- L1/L2 tiered watcher 新增 fast scan lane：默认启用本地可信文件系统 5 秒覆盖目标，按 `/proc/self/mountinfo` 将 ext4/xfs/btrfs/tmpfs/f2fs 归为 `local_strict`，网络/FUSE/未知文件系统默认 `best_effort`，不会报告 strict SLA 成功。
-- 新增 fast scan 配置项：`tiered_watch.l1_l2_fast_scan_enabled`、target/tick/stat/readdir/bootstrap 预算，以及 `network_fast_scan_mode`、network stat/readdir 预算；配置解析、默认值、README 和 diagnostics 已同步。
-- fast scan sentinel 发现已知 L1/L2 目录变化后以 `DirtyReason::FastScanChangedDir` 进入 DirtyQueue，并复用现有 `fast_sync` depth=1 scan/apply 路径更新索引，避免扫描器直接写索引。
-- 修复 fast scan bootstrap 把单批预算误当 sentinel 总量上限的问题：`l1_l2_fast_scan_bootstrap_budget_per_tick` 现在只限制每 tick 注册数量，已注册 sentinel 不会阻止后续已知目录继续覆盖。
-- 新注册 fast scan sentinel 会进入一次 `FastScanChangedDir` 初始补扫，补齐 sentinel 覆盖前已经发生的文件创建；当初始补扫队列积压达到单批预算时暂停 bootstrap，避免大规模冷段枚举和补扫队列失控。
-- fast scan bootstrap 不再每个 tick 通过 diagnostics 路径全量物化 cold snapshot：冷段目录候选收集改为流式早停，调度层在候选耗尽时冷却 bootstrap，避免 80 万级 manifest-only base 被每秒枚举造成 CPU 常驻和 RSS 高水位。
-- `/watch-state`、`/health`、diagnostics 与 metrics JSONL 暴露 fast scan enabled/mode/SLA、known/local/untrusted dir 数、pending queue、checked/changed/generated counters、coverage lag p50/p95/p99、budget degraded 和 degraded reason；health 区分本地 strict 失败、预算降级与网络/FUSE best-effort。
+- L1/L2 tiered watcher 新增 fast scan lane；M3 后该 lane 只对 active lease hotset 提供本地可信文件系统 5 秒覆盖目标，按 `/proc/self/mountinfo` 将 ext4/xfs/btrfs/tmpfs/f2fs 归为 `local_strict`，网络/FUSE/未知文件系统默认 `best_effort`，不会报告 strict SLA 成功。
+- 新增 fast scan 配置项：`tiered_watch.l1_l2_fast_scan_enabled`、target/tick/stat/readdir/bootstrap 预算、lease TTL、hotset 总预算、sentinel registry 上限，以及 `network_fast_scan_mode`、network stat/readdir 预算；配置解析、默认值、README 和 diagnostics 已同步。
+- fast scan sentinel 发现 hotset 目录变化后以 `DirtyReason::FastScanChangedDir` 进入 DirtyQueue，并复用现有 `fast_sync` depth=1 scan/apply 路径更新索引，避免扫描器直接写索引。
+- 修复 fast scan bootstrap 把单批预算误当 sentinel 总量上限的问题：`l1_l2_fast_scan_bootstrap_budget_per_tick` 现在只限制每 tick hotset sentinel 注册与初始 backfill 数量，已覆盖 sentinel 不会阻止后续 hotset lease 继续覆盖。
+- 新注册 fast scan sentinel 会进入一次低优先级 `FastScanBootstrapDir` 初始补扫，补齐 sentinel 覆盖前已经发生的文件创建；真实变化继续使用 `FastScanChangedDir`，避免大规模冷段枚举和补扫队列失控。
+- fast scan bootstrap 不再每个 tick 枚举全部 L1/L2/cold snapshot：调度层只处理尚未覆盖的 hotset lease，候选耗尽时冷却 bootstrap，避免 80 万级 manifest-only base 被每秒枚举造成 CPU 常驻和 RSS 高水位。
+- `/watch-state`、`/health`、diagnostics 与 metrics JSONL 暴露 fast scan enabled/mode/SLA、hotset lease/sentinel、known/local/untrusted dir 数、pending queue、checked/changed/generated counters、coverage lag p50/p95/p99、budget degraded 和 degraded reason；health 区分 hotset 本地 strict 失败、预算降级、冷目录 backlog 与网络/FUSE best-effort。
 - 根 README 中 `fd-rdd-sim` 长手册迁移到 `src/sim/README.md`，根 README 只保留入口说明；runtime/sim 字段映射明确 fast scan 为 runtime-only，当前 sim 不强行建模该成本。
-- 新增 fast scan 回归测试，覆盖 mount 分类、预算不足降级、本地 sentinel 目录项变化、untrusted mount 不报告 strict SLA，以及深层已知目录通过 `FastScanChangedDir` 复用 dirty apply 后可被搜索；新增真实 daemon `p1_fast_scan_sla` 集成测试和 CI 专项 job，强制构造 L1/L2 非 L0 目录并验证 create/delete/rename 均在 SLA 窗口内更新搜索结果。
+- 新增 fast scan 回归测试，覆盖 mount 分类、预算不足降级、本地 sentinel 目录项变化、untrusted mount 不报告 strict SLA，以及深层 leased 目录通过 `FastScanChangedDir` 复用 dirty apply 后可被搜索；真实 daemon `p1_fast_scan_sla` 集成测试和 CI 专项 job 改为验证 hotset create/delete/rename 均在 SLA 窗口内更新搜索结果，冷目录在 cold sweep 周期内最终追平。
 - 修复 manifest-only cold segment 在最终快照边界被 overlay 父目录删除误剪的问题：path-only delete tombstone 只屏蔽精确路径，snapshot materialization 会拒绝把大 Base 异常缩水成小快照；启动加载若发现 `stable.v7` 相比 `stable.prev.v7` 灾难性缩水，会自动回退 `stable.prev.v7`，避免整库索引被坏 stable 覆盖后继续扩大损失。
 - 启动恢复新增 tiny stable root probe：当 `stable.v7`/`stable.prev.v7` 都已被旧版本覆盖成小快照、无法通过 prev 回退时，会用相同扫描过滤规则抽样根目录；若真实根目录明显大于已加载快照，则标记 `snapshot_too_small_for_roots` 并触发 rebuild 策略。
 - rebuild 成功发布新 Base 后会清理当前恢复阻塞标志，避免 `/health` 和 metrics 在索引已恢复后继续报告 `recovery_requires_rebuild` 或 startup repair escalation issue。

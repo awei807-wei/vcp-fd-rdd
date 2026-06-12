@@ -344,18 +344,28 @@ pub struct TieredWatchConfig {
     pub l3_scan_policy: L3ScanPolicy,
     /// Low-frequency L3 verification interval used when l3_scan_policy = "interval".
     pub l3_scan_interval_secs: u64,
-    /// Enable the L1/L2 fast scan lane for known directories outside L0.
+    /// Enable the lease-hotset fast scan lane for directories outside L0.
     pub l1_l2_fast_scan_enabled: bool,
-    /// Target coverage window for local trusted L1/L2 directories.
+    /// Target coverage window for local trusted lease-hotset directories.
     pub l1_l2_fast_scan_target_secs: u64,
     /// Fast scan scheduler tick interval.
     pub l1_l2_fast_scan_tick_ms: u64,
-    /// Local trusted directory sentinel checks allowed per tick.
+    /// Local trusted hotset sentinel checks allowed per tick.
     pub l1_l2_fast_scan_stat_budget_per_tick: usize,
     /// Local trusted changed-dir readdir work allowed per tick.
     pub l1_l2_fast_scan_readdir_budget_per_tick: usize,
-    /// Known-directory bootstrap registrations allowed per tick.
+    /// Hotset sentinel registrations/backfill directories allowed per tick.
     pub l1_l2_fast_scan_bootstrap_budget_per_tick: usize,
+    /// Maximum active lease-hotset directories tracked by fast scan.
+    pub l1_l2_fast_scan_hotset_max_leases: usize,
+    /// Default TTL for automatic fast scan leases.
+    pub l1_l2_fast_scan_lease_ttl_secs: u64,
+    /// TTL for proc-sampler fast scan leases.
+    pub l1_l2_fast_scan_proc_sampler_lease_ttl_secs: u64,
+    /// TTL for explicit hot_dirs fast scan leases. 0 means permanent while configured.
+    pub l1_l2_fast_scan_explicit_lease_ttl_secs: u64,
+    /// Maximum hotset sentinel entries restored or kept active.
+    pub l1_l2_fast_scan_sentinel_registry_max_entries: usize,
     /// Network/FUSE fast scan mode. Default best-effort never reports strict SLA success.
     pub network_fast_scan_mode: NetworkFastScanMode,
     /// Network/FUSE sentinel checks allowed per tick.
@@ -523,6 +533,11 @@ impl Default for TieredWatchConfig {
             l1_l2_fast_scan_stat_budget_per_tick: 5_000,
             l1_l2_fast_scan_readdir_budget_per_tick: 512,
             l1_l2_fast_scan_bootstrap_budget_per_tick: 2_048,
+            l1_l2_fast_scan_hotset_max_leases: 512,
+            l1_l2_fast_scan_lease_ttl_secs: 1_800,
+            l1_l2_fast_scan_proc_sampler_lease_ttl_secs: 300,
+            l1_l2_fast_scan_explicit_lease_ttl_secs: 0,
+            l1_l2_fast_scan_sentinel_registry_max_entries: 512,
             network_fast_scan_mode: NetworkFastScanMode::BestEffort,
             network_fast_scan_stat_budget_per_tick: 128,
             network_fast_scan_readdir_budget_per_tick: 16,
@@ -564,6 +579,11 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             l1_l2_fast_scan_stat_budget_per_tick: usize,
             l1_l2_fast_scan_readdir_budget_per_tick: usize,
             l1_l2_fast_scan_bootstrap_budget_per_tick: usize,
+            l1_l2_fast_scan_hotset_max_leases: usize,
+            l1_l2_fast_scan_lease_ttl_secs: u64,
+            l1_l2_fast_scan_proc_sampler_lease_ttl_secs: u64,
+            l1_l2_fast_scan_explicit_lease_ttl_secs: u64,
+            l1_l2_fast_scan_sentinel_registry_max_entries: usize,
             network_fast_scan_mode: NetworkFastScanMode,
             network_fast_scan_stat_budget_per_tick: usize,
             network_fast_scan_readdir_budget_per_tick: usize,
@@ -602,6 +622,14 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
                         .l1_l2_fast_scan_readdir_budget_per_tick,
                     l1_l2_fast_scan_bootstrap_budget_per_tick: defaults
                         .l1_l2_fast_scan_bootstrap_budget_per_tick,
+                    l1_l2_fast_scan_hotset_max_leases: defaults.l1_l2_fast_scan_hotset_max_leases,
+                    l1_l2_fast_scan_lease_ttl_secs: defaults.l1_l2_fast_scan_lease_ttl_secs,
+                    l1_l2_fast_scan_proc_sampler_lease_ttl_secs: defaults
+                        .l1_l2_fast_scan_proc_sampler_lease_ttl_secs,
+                    l1_l2_fast_scan_explicit_lease_ttl_secs: defaults
+                        .l1_l2_fast_scan_explicit_lease_ttl_secs,
+                    l1_l2_fast_scan_sentinel_registry_max_entries: defaults
+                        .l1_l2_fast_scan_sentinel_registry_max_entries,
                     network_fast_scan_mode: defaults.network_fast_scan_mode,
                     network_fast_scan_stat_budget_per_tick: defaults
                         .network_fast_scan_stat_budget_per_tick,
@@ -642,6 +670,13 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             l1_l2_fast_scan_readdir_budget_per_tick: raw.l1_l2_fast_scan_readdir_budget_per_tick,
             l1_l2_fast_scan_bootstrap_budget_per_tick: raw
                 .l1_l2_fast_scan_bootstrap_budget_per_tick,
+            l1_l2_fast_scan_hotset_max_leases: raw.l1_l2_fast_scan_hotset_max_leases,
+            l1_l2_fast_scan_lease_ttl_secs: raw.l1_l2_fast_scan_lease_ttl_secs,
+            l1_l2_fast_scan_proc_sampler_lease_ttl_secs: raw
+                .l1_l2_fast_scan_proc_sampler_lease_ttl_secs,
+            l1_l2_fast_scan_explicit_lease_ttl_secs: raw.l1_l2_fast_scan_explicit_lease_ttl_secs,
+            l1_l2_fast_scan_sentinel_registry_max_entries: raw
+                .l1_l2_fast_scan_sentinel_registry_max_entries,
             network_fast_scan_mode: raw.network_fast_scan_mode,
             network_fast_scan_stat_budget_per_tick: raw.network_fast_scan_stat_budget_per_tick,
             network_fast_scan_readdir_budget_per_tick: raw
@@ -1059,6 +1094,11 @@ l1_l2_fast_scan_tick_ms = 250
 l1_l2_fast_scan_stat_budget_per_tick = 111
 l1_l2_fast_scan_readdir_budget_per_tick = 22
 l1_l2_fast_scan_bootstrap_budget_per_tick = 333
+l1_l2_fast_scan_hotset_max_leases = 77
+l1_l2_fast_scan_lease_ttl_secs = 88
+l1_l2_fast_scan_proc_sampler_lease_ttl_secs = 99
+l1_l2_fast_scan_explicit_lease_ttl_secs = 11
+l1_l2_fast_scan_sentinel_registry_max_entries = 55
 network_fast_scan_mode = "strict_poll"
 network_fast_scan_stat_budget_per_tick = 44
 network_fast_scan_readdir_budget_per_tick = 5
@@ -1074,6 +1114,18 @@ network_fast_scan_readdir_budget_per_tick = 5
         assert_eq!(
             cfg.tiered_watch.l1_l2_fast_scan_bootstrap_budget_per_tick,
             333
+        );
+        assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_hotset_max_leases, 77);
+        assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_lease_ttl_secs, 88);
+        assert_eq!(
+            cfg.tiered_watch.l1_l2_fast_scan_proc_sampler_lease_ttl_secs,
+            99
+        );
+        assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_explicit_lease_ttl_secs, 11);
+        assert_eq!(
+            cfg.tiered_watch
+                .l1_l2_fast_scan_sentinel_registry_max_entries,
+            55
         );
         assert_eq!(
             cfg.tiered_watch.network_fast_scan_mode,

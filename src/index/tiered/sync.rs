@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crate::config::L3ScanPolicy;
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta, Task};
 use crate::event::sync::{
     now_ns, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyRepairCursor, DirtyScope,
@@ -35,6 +36,7 @@ pub(super) enum RebuildAdmission {
 struct BudgetedScanOutcome {
     outcome: ScanOutcome,
     budget_exhausted: bool,
+    dropped_stale_batch: bool,
 }
 
 #[derive(Debug)]
@@ -43,6 +45,7 @@ struct SlicedScanOutcome {
     manifest_skipped: bool,
     completed: bool,
     next_cursor: Option<DirtyRepairCursor>,
+    dropped_stale_batch: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -519,13 +522,14 @@ impl TieredIndex {
     pub fn set_cold_sweep_period_estimate_from_tiered_policy(
         &self,
         l2_scan_interval_secs: u64,
+        l3_scan_policy: L3ScanPolicy,
         l3_scan_interval_secs: u64,
     ) {
-        self.set_cold_sweep_period_estimate(
-            l2_scan_interval_secs
-                .max(1)
-                .max(l3_scan_interval_secs.max(1)),
-        );
+        let mut estimate = l2_scan_interval_secs.max(1);
+        if l3_scan_policy.schedules_periodic_scan() {
+            estimate = estimate.max(l3_scan_interval_secs.max(1));
+        }
+        self.set_cold_sweep_period_estimate(estimate);
     }
 
     pub fn enqueue_dirty_with_priority(
@@ -672,9 +676,10 @@ impl TieredIndex {
                                 entry.reason,
                                 DirtyReason::PeriodicColdScan
                                     | DirtyReason::StartupRepairDeferred
+                                    | DirtyReason::FastScanBootstrapDir
                                     | DirtyReason::FastScanChangedDir
                             );
-                            let (outcome, manifest_skipped) =
+                            let (outcome, manifest_skipped, dropped_stale_batch) =
                                 if entry.reason == DirtyReason::PeriodicColdScan {
                                     let sliced = self.scan_dir_repair_slice_with_project_markers(
                                         dir,
@@ -694,21 +699,27 @@ impl TieredIndex {
                                     if sliced.completed {
                                         self.mark_cold_sweep_completed();
                                     }
-                                    (sliced.outcome, sliced.manifest_skipped)
-                                } else {
                                     (
-                                        self.scan_dirs_with_depth_and_project_markers_budgeted(
+                                        sliced.outcome,
+                                        sliced.manifest_skipped,
+                                        sliced.dropped_stale_batch,
+                                    )
+                                } else {
+                                    let scanned = self
+                                        .scan_dirs_with_depth_and_project_markers_budgeted(
                                             &[dir],
                                             Some(1),
                                             10_000,
                                             project_markers,
                                             None,
                                             discard_if_event_seq_advances,
-                                        )
-                                        .outcome,
-                                        false,
-                                    )
+                                        );
+                                    (scanned.outcome, false, scanned.dropped_stale_batch)
                                 };
+                            if dropped_stale_batch {
+                                report.dropped_stale_batches =
+                                    report.dropped_stale_batches.saturating_add(1);
+                            }
                             report.dirs_scanned = report.dirs_scanned.saturating_add(1);
                             report.changed = report.changed.saturating_add(outcome.changed);
                             report.elapsed_ms =
@@ -1198,6 +1209,7 @@ impl TieredIndex {
                 project_roots,
             },
             budget_exhausted,
+            dropped_stale_batch: stale_low_priority_scan,
         }
     }
 
@@ -1234,6 +1246,7 @@ impl TieredIndex {
                             manifest_skipped: true,
                             completed: true,
                             next_cursor: None,
+                            dropped_stale_batch: false,
                         };
                     }
                 }
@@ -1264,6 +1277,7 @@ impl TieredIndex {
                     manifest_skipped: false,
                     completed: true,
                     next_cursor: None,
+                    dropped_stale_batch: false,
                 };
             }
         };
@@ -1379,6 +1393,7 @@ impl TieredIndex {
                 });
                 Some(DirtyRepairCursor::new(dir.clone(), offset))
             },
+            dropped_stale_batch: stale_low_priority_scan,
         }
     }
 

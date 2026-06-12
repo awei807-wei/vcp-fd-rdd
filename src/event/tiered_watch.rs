@@ -1,15 +1,19 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{L3ScanPolicy, NetworkFastScanMode, TieredWatchConfig};
 use crate::event::proc_sampler::ProcSamplerReport;
 use crate::fs_policy::{is_remote_fstype, MountTable};
 use crate::index::tiered::ScanOutcome;
 use crate::stats::WatchStateReport;
+use crate::storage::snapshot::stable_snapshot_dir_for;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchTier {
@@ -115,7 +119,8 @@ struct DirState {
     high_priority_scan: AtomicBool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FastScanMountClass {
     LocalTrusted,
     NetworkUntrusted,
@@ -146,7 +151,7 @@ pub fn classify_fast_scan_fstype(fstype: &str) -> FastScanMountClass {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct DirSentinelSignature {
     dev: u64,
     ino: u64,
@@ -188,15 +193,79 @@ fn dir_sentinel_signature(meta: &std::fs::Metadata) -> DirSentinelSignature {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastScanLeaseKind {
+    Explicit,
+    Query,
+    StaleHit,
+    ProjectMarker,
+    L0Event,
+    ProcSampler,
+}
+
+impl FastScanLeaseKind {
+    fn priority(self) -> u32 {
+        match self {
+            Self::Explicit => 1_000,
+            Self::StaleHit => 900,
+            Self::ProcSampler => 850,
+            Self::L0Event => 700,
+            Self::Query => 650,
+            Self::ProjectMarker => 600,
+        }
+    }
+
+    fn is_explicit(self) -> bool {
+        self == Self::Explicit
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastScanSentinelState {
+    Active,
+    Unknown,
+    BackfillPending,
+}
+
+impl Default for FastScanSentinelState {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FastScanLease {
+    lease_kind: FastScanLeaseKind,
+    created_unix_secs: u64,
+    expires_unix_secs: u64,
+    last_used_unix_secs: u64,
+    priority: u32,
+    estimated_scan_cost: u64,
+    strict_sla_allowed: bool,
+    source_score: u64,
+    renew_count: u64,
+    sentinel_state: FastScanSentinelState,
+}
+
+impl FastScanLease {
+    fn expired(&self, now: u64) -> bool {
+        self.expires_unix_secs != u64::MAX && self.expires_unix_secs <= now
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DirSentinel {
     mount_id: u32,
     fstype: String,
     class: FastScanMountClass,
+    lease_kind: FastScanLeaseKind,
     signature: DirSentinelSignature,
     trust_clock: bool,
     trust_nlink: bool,
     strict_sla_allowed: bool,
+    sentinel_state: FastScanSentinelState,
     last_checked_unix_ms: u64,
     last_changed_unix_ms: u64,
     coverage_lag_ms: u64,
@@ -204,7 +273,9 @@ struct DirSentinel {
 
 #[derive(Debug, Default)]
 struct FastScanState {
+    leases: HashMap<PathBuf, FastScanLease>,
     sentinels: HashMap<PathBuf, DirSentinel>,
+    initial_backfill_queue: VecDeque<PathBuf>,
     changed_dir_queue: VecDeque<PathBuf>,
     last_degraded_reason: String,
 }
@@ -218,6 +289,12 @@ pub struct FastScanTickConfig {
     pub network_stat_budget_per_tick: usize,
     pub local_readdir_budget_per_tick: usize,
     pub network_readdir_budget_per_tick: usize,
+    pub initial_backfill_budget_per_tick: usize,
+    pub max_hotset_leases: usize,
+    pub lease_ttl_secs: u64,
+    pub proc_sampler_lease_ttl_secs: u64,
+    pub explicit_lease_ttl_secs: u64,
+    pub sentinel_registry_max_entries: usize,
     pub network_mode: NetworkFastScanMode,
 }
 
@@ -232,6 +309,12 @@ impl Default for FastScanTickConfig {
             network_stat_budget_per_tick: defaults.network_fast_scan_stat_budget_per_tick,
             local_readdir_budget_per_tick: defaults.l1_l2_fast_scan_readdir_budget_per_tick,
             network_readdir_budget_per_tick: defaults.network_fast_scan_readdir_budget_per_tick,
+            initial_backfill_budget_per_tick: defaults.l1_l2_fast_scan_bootstrap_budget_per_tick,
+            max_hotset_leases: defaults.l1_l2_fast_scan_hotset_max_leases,
+            lease_ttl_secs: defaults.l1_l2_fast_scan_lease_ttl_secs,
+            proc_sampler_lease_ttl_secs: defaults.l1_l2_fast_scan_proc_sampler_lease_ttl_secs,
+            explicit_lease_ttl_secs: defaults.l1_l2_fast_scan_explicit_lease_ttl_secs,
+            sentinel_registry_max_entries: defaults.l1_l2_fast_scan_sentinel_registry_max_entries,
             network_mode: defaults.network_fast_scan_mode,
         }
     }
@@ -240,8 +323,51 @@ impl Default for FastScanTickConfig {
 #[derive(Clone, Debug, Default)]
 pub struct FastScanTickResult {
     pub checked_dirs: usize,
+    pub initial_dirs: Vec<PathBuf>,
     pub changed_dirs: Vec<PathBuf>,
     pub budget_degraded: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FastScanRegistryRestoreReport {
+    pub loaded_entries: usize,
+    pub restored_active: usize,
+    pub restored_unknown: usize,
+    pub rejected_entries: usize,
+    pub trusted: bool,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FastScanPersistedRegistry {
+    version: u32,
+    clean_shutdown: bool,
+    snapshot_source: String,
+    wal_checkpoint_used: u64,
+    config_fingerprint: u64,
+    created_unix_secs: u64,
+    entries: Vec<FastScanPersistedEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FastScanPersistedEntry {
+    path: PathBuf,
+    lease_kind: FastScanLeaseKind,
+    created_unix_secs: u64,
+    expires_unix_secs: u64,
+    last_used_unix_secs: u64,
+    priority: u32,
+    estimated_scan_cost: u64,
+    strict_sla_allowed: bool,
+    source_score: u64,
+    renew_count: u64,
+    sentinel_state: FastScanSentinelState,
+    mount_id: u32,
+    fstype: String,
+    class: FastScanMountClass,
+    signature: DirSentinelSignature,
+    last_checked_unix_ms: u64,
+    last_changed_unix_ms: u64,
 }
 
 impl DirState {
@@ -427,6 +553,12 @@ pub struct TieredWatchRuntime {
     fast_scan_network_stat_budget_per_tick: AtomicUsize,
     fast_scan_local_readdir_budget_per_tick: AtomicUsize,
     fast_scan_network_readdir_budget_per_tick: AtomicUsize,
+    fast_scan_initial_backfill_budget_per_tick: AtomicUsize,
+    fast_scan_hotset_max_leases: AtomicUsize,
+    fast_scan_lease_ttl_secs: AtomicU64,
+    fast_scan_proc_sampler_lease_ttl_secs: AtomicU64,
+    fast_scan_explicit_lease_ttl_secs: AtomicU64,
+    fast_scan_sentinel_registry_max_entries: AtomicUsize,
     fast_scan_network_mode: AtomicU8,
     fast_scan_state: RwLock<FastScanState>,
     fast_scan_checked_dirs: AtomicU64,
@@ -437,6 +569,12 @@ pub struct TieredWatchRuntime {
     fast_scan_bootstrap_next_unix_ms: AtomicU64,
     fast_scan_parent_fence_retries: AtomicU64,
     fast_scan_epoch_conflicts: AtomicU64,
+    fast_scan_lease_evictions: AtomicU64,
+    fast_scan_lease_renewals: AtomicU64,
+    fast_scan_real_changed_dirs: AtomicU64,
+    fast_scan_apply_dropped_stale_batches: AtomicU64,
+    fast_scan_scan_workers_active: AtomicU64,
+    fast_scan_io_budget_limited_count: AtomicU64,
     proc_sampler_enabled: AtomicBool,
     proc_sampler_last_duration_ms: AtomicU64,
     proc_sampler_pids_seen: AtomicU64,
@@ -552,6 +690,12 @@ impl TieredWatchRuntime {
             fast_scan_network_stat_budget_per_tick: AtomicUsize::new(128),
             fast_scan_local_readdir_budget_per_tick: AtomicUsize::new(512),
             fast_scan_network_readdir_budget_per_tick: AtomicUsize::new(16),
+            fast_scan_initial_backfill_budget_per_tick: AtomicUsize::new(2_048),
+            fast_scan_hotset_max_leases: AtomicUsize::new(512),
+            fast_scan_lease_ttl_secs: AtomicU64::new(1_800),
+            fast_scan_proc_sampler_lease_ttl_secs: AtomicU64::new(300),
+            fast_scan_explicit_lease_ttl_secs: AtomicU64::new(0),
+            fast_scan_sentinel_registry_max_entries: AtomicUsize::new(512),
             fast_scan_network_mode: AtomicU8::new(network_fast_scan_mode_to_u8(
                 NetworkFastScanMode::BestEffort,
             )),
@@ -564,6 +708,12 @@ impl TieredWatchRuntime {
             fast_scan_bootstrap_next_unix_ms: AtomicU64::new(0),
             fast_scan_parent_fence_retries: AtomicU64::new(0),
             fast_scan_epoch_conflicts: AtomicU64::new(0),
+            fast_scan_lease_evictions: AtomicU64::new(0),
+            fast_scan_lease_renewals: AtomicU64::new(0),
+            fast_scan_real_changed_dirs: AtomicU64::new(0),
+            fast_scan_apply_dropped_stale_batches: AtomicU64::new(0),
+            fast_scan_scan_workers_active: AtomicU64::new(0),
+            fast_scan_io_budget_limited_count: AtomicU64::new(0),
             proc_sampler_enabled: AtomicBool::new(false),
             proc_sampler_last_duration_ms: AtomicU64::new(0),
             proc_sampler_pids_seen: AtomicU64::new(0),
@@ -601,6 +751,30 @@ impl TieredWatchRuntime {
         );
         self.fast_scan_network_readdir_budget_per_tick.store(
             config.network_fast_scan_readdir_budget_per_tick,
+            Ordering::Relaxed,
+        );
+        self.fast_scan_initial_backfill_budget_per_tick.store(
+            config.l1_l2_fast_scan_bootstrap_budget_per_tick.max(1),
+            Ordering::Relaxed,
+        );
+        self.fast_scan_hotset_max_leases.store(
+            config.l1_l2_fast_scan_hotset_max_leases.max(1),
+            Ordering::Relaxed,
+        );
+        self.fast_scan_lease_ttl_secs.store(
+            config.l1_l2_fast_scan_lease_ttl_secs.max(1),
+            Ordering::Relaxed,
+        );
+        self.fast_scan_proc_sampler_lease_ttl_secs.store(
+            config.l1_l2_fast_scan_proc_sampler_lease_ttl_secs.max(1),
+            Ordering::Relaxed,
+        );
+        self.fast_scan_explicit_lease_ttl_secs.store(
+            config.l1_l2_fast_scan_explicit_lease_ttl_secs,
+            Ordering::Relaxed,
+        );
+        self.fast_scan_sentinel_registry_max_entries.store(
+            config.l1_l2_fast_scan_sentinel_registry_max_entries.max(1),
             Ordering::Relaxed,
         );
         self.fast_scan_network_mode.store(
@@ -655,6 +829,20 @@ impl TieredWatchRuntime {
             network_readdir_budget_per_tick: self
                 .fast_scan_network_readdir_budget_per_tick
                 .load(Ordering::Relaxed),
+            initial_backfill_budget_per_tick: self
+                .fast_scan_initial_backfill_budget_per_tick
+                .load(Ordering::Relaxed),
+            max_hotset_leases: self.fast_scan_hotset_max_leases.load(Ordering::Relaxed),
+            lease_ttl_secs: self.fast_scan_lease_ttl_secs.load(Ordering::Relaxed),
+            proc_sampler_lease_ttl_secs: self
+                .fast_scan_proc_sampler_lease_ttl_secs
+                .load(Ordering::Relaxed),
+            explicit_lease_ttl_secs: self
+                .fast_scan_explicit_lease_ttl_secs
+                .load(Ordering::Relaxed),
+            sentinel_registry_max_entries: self
+                .fast_scan_sentinel_registry_max_entries
+                .load(Ordering::Relaxed),
             network_mode: network_fast_scan_mode_from_u8(
                 self.fast_scan_network_mode.load(Ordering::Relaxed),
             ),
@@ -676,16 +864,14 @@ impl TieredWatchRuntime {
             return false;
         }
 
-        let has_non_l0_dir = self
-            .dirs
-            .read()
-            .values()
-            .any(|state| state.tier() != WatchTier::L0);
-        if !has_non_l0_dir {
-            return false;
-        }
-
-        self.fast_scan_state.read().changed_dir_queue.len() < candidate_limit.max(1)
+        let state = self.fast_scan_state.read();
+        let now_secs = unix_secs();
+        let has_uncovered_lease = state.leases.iter().any(|(path, lease)| {
+            !lease.expired(now_secs)
+                && !state.sentinels.contains_key(path)
+                && !matches!(self.covering_tier(path.as_path()), Some(WatchTier::L0))
+        });
+        has_uncovered_lease && state.initial_backfill_queue.len() < candidate_limit.max(1)
     }
 
     pub fn fast_scan_l0_roots(&self) -> Vec<PathBuf> {
@@ -709,6 +895,424 @@ impl TieredWatchRuntime {
         roots
     }
 
+    pub fn pending_fast_scan_lease_dirs(&self, limit: usize) -> Vec<PathBuf> {
+        let limit = limit.max(1);
+        let now = unix_secs();
+        let state = self.fast_scan_state.read();
+        let mut dirs = state
+            .leases
+            .iter()
+            .filter_map(|(path, lease)| {
+                if lease.expired(now) || state.sentinels.contains_key(path) {
+                    return None;
+                }
+                if matches!(self.covering_tier(path.as_path()), Some(WatchTier::L0)) {
+                    return None;
+                }
+                Some(path.clone())
+            })
+            .collect::<Vec<_>>();
+        dirs.sort();
+        dirs.truncate(limit);
+        dirs
+    }
+
+    pub fn seed_fast_scan_explicit_leases(&self, dirs: impl IntoIterator<Item = PathBuf>) -> usize {
+        dirs.into_iter()
+            .filter(|path| {
+                std::fs::symlink_metadata(path)
+                    .map(|meta| meta.is_dir())
+                    .unwrap_or(false)
+            })
+            .map(|path| self.grant_fast_scan_lease(path, FastScanLeaseKind::Explicit, None, 1))
+            .filter(|inserted| *inserted)
+            .count()
+    }
+
+    pub fn grant_fast_scan_leases(
+        &self,
+        dirs: impl IntoIterator<Item = PathBuf>,
+        kind: FastScanLeaseKind,
+        ttl_secs: Option<u64>,
+        source_score: u64,
+    ) -> usize {
+        dirs.into_iter()
+            .filter(|path| {
+                std::fs::symlink_metadata(path)
+                    .map(|meta| meta.is_dir())
+                    .unwrap_or(false)
+            })
+            .map(|path| self.grant_fast_scan_lease(path, kind, ttl_secs, source_score))
+            .filter(|inserted| *inserted)
+            .count()
+    }
+
+    pub fn grant_fast_scan_lease(
+        &self,
+        path: PathBuf,
+        kind: FastScanLeaseKind,
+        ttl_secs: Option<u64>,
+        source_score: u64,
+    ) -> bool {
+        if !self.fast_scan_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let now = unix_secs();
+        let ttl = ttl_secs.unwrap_or_else(|| self.default_fast_scan_lease_ttl(kind));
+        let expires = if kind.is_explicit() && ttl == 0 {
+            u64::MAX
+        } else {
+            now.saturating_add(ttl.max(1))
+        };
+        let path = normalize_fast_scan_dir(path);
+        let mut state = self.fast_scan_state.write();
+        self.prune_expired_fast_scan_leases_locked(&mut state, now);
+
+        if state.leases.contains_key(path.as_path()) {
+            let lease_kind = {
+                let lease = state
+                    .leases
+                    .get_mut(path.as_path())
+                    .expect("checked lease existence");
+                lease.last_used_unix_secs = now;
+                lease.expires_unix_secs = lease.expires_unix_secs.max(expires);
+                lease.priority = lease.priority.max(kind.priority());
+                lease.source_score = lease.source_score.saturating_add(source_score.max(1));
+                lease.renew_count = lease.renew_count.saturating_add(1);
+                if kind.priority() >= lease.lease_kind.priority() {
+                    lease.lease_kind = kind;
+                }
+                lease.lease_kind
+            };
+            if let Some(sentinel) = state.sentinels.get_mut(path.as_path()) {
+                sentinel.lease_kind = lease_kind;
+            } else {
+                self.fast_scan_bootstrap_next_unix_ms
+                    .store(0, Ordering::Relaxed);
+            }
+            self.fast_scan_lease_renewals
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        let max_leases = self
+            .fast_scan_hotset_max_leases
+            .load(Ordering::Relaxed)
+            .max(1);
+        if state.leases.len() >= max_leases && !self.evict_one_fast_scan_lease_locked(&mut state) {
+            self.fast_scan_budget_degraded
+                .store(true, Ordering::Relaxed);
+            state.last_degraded_reason =
+                format!("lease hotset budget full: max_leases={max_leases}");
+            return false;
+        }
+
+        state.leases.insert(
+            path.clone(),
+            FastScanLease {
+                lease_kind: kind,
+                created_unix_secs: now,
+                expires_unix_secs: expires,
+                last_used_unix_secs: now,
+                priority: kind.priority(),
+                estimated_scan_cost: 1,
+                strict_sla_allowed: false,
+                source_score: source_score.max(1),
+                renew_count: 0,
+                sentinel_state: FastScanSentinelState::BackfillPending,
+            },
+        );
+        self.fast_scan_bootstrap_next_unix_ms
+            .store(0, Ordering::Relaxed);
+        true
+    }
+
+    fn default_fast_scan_lease_ttl(&self, kind: FastScanLeaseKind) -> u64 {
+        match kind {
+            FastScanLeaseKind::Explicit => self
+                .fast_scan_explicit_lease_ttl_secs
+                .load(Ordering::Relaxed),
+            FastScanLeaseKind::ProcSampler => self
+                .fast_scan_proc_sampler_lease_ttl_secs
+                .load(Ordering::Relaxed)
+                .max(1),
+            _ => self.fast_scan_lease_ttl_secs.load(Ordering::Relaxed).max(1),
+        }
+    }
+
+    fn prune_expired_fast_scan_leases_locked(&self, state: &mut FastScanState, now: u64) {
+        let expired = state
+            .leases
+            .iter()
+            .filter_map(|(path, lease)| lease.expired(now).then_some(path.clone()))
+            .collect::<Vec<_>>();
+        for path in expired {
+            state.leases.remove(path.as_path());
+            state.sentinels.remove(path.as_path());
+            remove_queued_path(&mut state.initial_backfill_queue, path.as_path());
+            remove_queued_path(&mut state.changed_dir_queue, path.as_path());
+            self.fast_scan_lease_evictions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn evict_one_fast_scan_lease_locked(&self, state: &mut FastScanState) -> bool {
+        let Some(victim) = state
+            .leases
+            .iter()
+            .filter(|(_, lease)| !lease.lease_kind.is_explicit())
+            .min_by_key(|(path, lease)| {
+                (
+                    lease.priority,
+                    lease.source_score,
+                    lease.renew_count,
+                    std::cmp::Reverse(lease.expires_unix_secs),
+                    (*path).clone(),
+                )
+            })
+            .map(|(path, _)| path.clone())
+        else {
+            return false;
+        };
+        state.leases.remove(victim.as_path());
+        state.sentinels.remove(victim.as_path());
+        remove_queued_path(&mut state.initial_backfill_queue, victim.as_path());
+        remove_queued_path(&mut state.changed_dir_queue, victim.as_path());
+        self.fast_scan_lease_evictions
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    pub fn restore_fast_scan_registry(
+        &self,
+        snapshot_path: &Path,
+        config: &TieredWatchConfig,
+        previous_clean_shutdown: bool,
+        snapshot_source: &str,
+        wal_checkpoint_used: u64,
+        mount_table: &MountTable,
+    ) -> FastScanRegistryRestoreReport {
+        let path = fast_scan_registry_path_for(snapshot_path);
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return FastScanRegistryRestoreReport {
+                    trusted: false,
+                    reason: "registry_missing".to_string(),
+                    ..FastScanRegistryRestoreReport::default()
+                };
+            }
+        };
+        let registry = match serde_json::from_slice::<FastScanPersistedRegistry>(&bytes) {
+            Ok(registry) => registry,
+            Err(_) => {
+                return FastScanRegistryRestoreReport {
+                    trusted: false,
+                    reason: "registry_parse_failed".to_string(),
+                    ..FastScanRegistryRestoreReport::default()
+                };
+            }
+        };
+
+        let config_fingerprint = fast_scan_config_fingerprint(config);
+        let gate_trusted = previous_clean_shutdown
+            && registry.clean_shutdown
+            && registry.snapshot_source == snapshot_source
+            && registry.wal_checkpoint_used == wal_checkpoint_used
+            && registry.config_fingerprint == config_fingerprint
+            && matches!(snapshot_source, "stable" | "stable-prev" | "legacy-v7");
+        let reason = if gate_trusted {
+            "trusted".to_string()
+        } else if !previous_clean_shutdown || !registry.clean_shutdown {
+            "unclean_shutdown".to_string()
+        } else if registry.snapshot_source != snapshot_source {
+            "snapshot_source_mismatch".to_string()
+        } else if registry.wal_checkpoint_used != wal_checkpoint_used {
+            "wal_checkpoint_mismatch".to_string()
+        } else if registry.config_fingerprint != config_fingerprint {
+            "config_fingerprint_mismatch".to_string()
+        } else {
+            "snapshot_not_stable".to_string()
+        };
+
+        let mut report = FastScanRegistryRestoreReport {
+            loaded_entries: registry.entries.len(),
+            trusted: gate_trusted,
+            reason,
+            ..FastScanRegistryRestoreReport::default()
+        };
+        let now = unix_secs();
+        let now_ms = unix_millis();
+        let max_entries = config
+            .l1_l2_fast_scan_sentinel_registry_max_entries
+            .max(1)
+            .min(
+                self.fast_scan_hotset_max_leases
+                    .load(Ordering::Relaxed)
+                    .max(1),
+            );
+        let mut state = self.fast_scan_state.write();
+        for entry in registry.entries.into_iter().take(max_entries) {
+            let path = normalize_fast_scan_dir(entry.path);
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                report.rejected_entries = report.rejected_entries.saturating_add(1);
+                continue;
+            };
+            if !meta.is_dir() {
+                report.rejected_entries = report.rejected_entries.saturating_add(1);
+                continue;
+            }
+            let (mount_id, fstype, class) = fast_scan_mount_info(path.as_path(), mount_table);
+            let mount_matches = mount_id == entry.mount_id && fstype == entry.fstype;
+            let active = gate_trusted && mount_matches;
+            let sentinel_state = if active {
+                FastScanSentinelState::Active
+            } else {
+                FastScanSentinelState::BackfillPending
+            };
+            let strict_sla_allowed = class.strict_sla_allowed();
+            let expires_unix_secs = if entry.lease_kind.is_explicit()
+                && config.l1_l2_fast_scan_explicit_lease_ttl_secs == 0
+            {
+                u64::MAX
+            } else {
+                if entry.expires_unix_secs <= now {
+                    report.rejected_entries = report.rejected_entries.saturating_add(1);
+                    continue;
+                }
+                entry.expires_unix_secs
+            };
+
+            state.leases.insert(
+                path.clone(),
+                FastScanLease {
+                    lease_kind: entry.lease_kind,
+                    created_unix_secs: entry.created_unix_secs,
+                    expires_unix_secs,
+                    last_used_unix_secs: entry.last_used_unix_secs.max(now),
+                    priority: entry.priority,
+                    estimated_scan_cost: entry.estimated_scan_cost,
+                    strict_sla_allowed,
+                    source_score: entry.source_score,
+                    renew_count: entry.renew_count,
+                    sentinel_state,
+                },
+            );
+            let signature = if active {
+                entry.signature
+            } else {
+                dir_sentinel_signature(&meta)
+            };
+            state.sentinels.insert(
+                path.clone(),
+                DirSentinel {
+                    mount_id,
+                    fstype,
+                    class,
+                    lease_kind: entry.lease_kind,
+                    signature,
+                    trust_clock: strict_sla_allowed,
+                    trust_nlink: strict_sla_allowed,
+                    strict_sla_allowed,
+                    sentinel_state,
+                    last_checked_unix_ms: if active {
+                        entry.last_checked_unix_ms
+                    } else {
+                        0
+                    },
+                    last_changed_unix_ms: entry.last_changed_unix_ms.max(now_ms),
+                    coverage_lag_ms: 0,
+                },
+            );
+            if active {
+                report.restored_active = report.restored_active.saturating_add(1);
+            } else {
+                report.restored_unknown = report.restored_unknown.saturating_add(1);
+                if !state
+                    .initial_backfill_queue
+                    .iter()
+                    .any(|queued| queued == &path)
+                {
+                    state.initial_backfill_queue.push_back(path);
+                }
+            }
+        }
+        if report.restored_unknown > 0 {
+            self.fast_scan_budget_degraded
+                .store(true, Ordering::Relaxed);
+            state.last_degraded_reason = format!(
+                "hotset registry restore untrusted: reason={} unknown={}",
+                report.reason, report.restored_unknown
+            );
+        }
+        report
+    }
+
+    pub fn persist_fast_scan_registry(
+        &self,
+        snapshot_path: &Path,
+        config: &TieredWatchConfig,
+        snapshot_source: &str,
+        wal_checkpoint_used: u64,
+        clean_shutdown: bool,
+    ) -> anyhow::Result<usize> {
+        let max_entries = config.l1_l2_fast_scan_sentinel_registry_max_entries.max(1);
+        let state = self.fast_scan_state.read();
+        let mut entries = state
+            .sentinels
+            .iter()
+            .filter_map(|(path, sentinel)| {
+                let lease = state.leases.get(path)?;
+                let persist = lease.lease_kind.is_explicit()
+                    || lease.sentinel_state == FastScanSentinelState::Active
+                    || sentinel.sentinel_state == FastScanSentinelState::Active;
+                if !persist {
+                    return None;
+                }
+                Some(FastScanPersistedEntry {
+                    path: path.clone(),
+                    lease_kind: lease.lease_kind,
+                    created_unix_secs: lease.created_unix_secs,
+                    expires_unix_secs: lease.expires_unix_secs,
+                    last_used_unix_secs: lease.last_used_unix_secs,
+                    priority: lease.priority,
+                    estimated_scan_cost: lease.estimated_scan_cost,
+                    strict_sla_allowed: lease.strict_sla_allowed,
+                    source_score: lease.source_score,
+                    renew_count: lease.renew_count,
+                    sentinel_state: lease.sentinel_state,
+                    mount_id: sentinel.mount_id,
+                    fstype: sentinel.fstype.clone(),
+                    class: sentinel.class,
+                    signature: sentinel.signature,
+                    last_checked_unix_ms: sentinel.last_checked_unix_ms,
+                    last_changed_unix_ms: sentinel.last_changed_unix_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| {
+            (
+                std::cmp::Reverse(entry.lease_kind.priority()),
+                std::cmp::Reverse(entry.source_score),
+                entry.path.clone(),
+            )
+        });
+        entries.truncate(max_entries);
+        let count = entries.len();
+        let registry = FastScanPersistedRegistry {
+            version: 1,
+            clean_shutdown,
+            snapshot_source: snapshot_source.to_string(),
+            wal_checkpoint_used,
+            config_fingerprint: fast_scan_config_fingerprint(config),
+            created_unix_secs: unix_secs(),
+            entries,
+        };
+        write_fast_scan_registry_atomic(snapshot_path, &registry)?;
+        Ok(count)
+    }
+
     pub fn record_fast_scan_bootstrap_result(
         &self,
         candidate_count: usize,
@@ -727,13 +1331,13 @@ impl TieredWatchRuntime {
 
     pub fn record_fast_scan_bootstrap_result_at(
         &self,
-        candidate_count: usize,
+        _candidate_count: usize,
         inserted: usize,
-        candidate_limit: usize,
+        _candidate_limit: usize,
         exhausted_retry_ms: u64,
         now_ms: u64,
     ) {
-        if inserted == 0 || candidate_count < candidate_limit.max(1) {
+        if inserted == 0 {
             self.fast_scan_bootstrap_next_unix_ms.store(
                 now_ms.saturating_add(exhausted_retry_ms.max(1_000)),
                 Ordering::Relaxed,
@@ -755,9 +1359,19 @@ impl TieredWatchRuntime {
         }
         let mut inserted = 0usize;
         let now_ms = unix_millis();
+        let now_secs = unix_secs();
         let mut state = self.fast_scan_state.write();
-        for path in dirs.into_iter().take(limit.max(1)) {
+        self.prune_expired_fast_scan_leases_locked(&mut state, now_secs);
+        for raw_path in dirs.into_iter().take(limit.max(1)) {
+            let path = normalize_fast_scan_dir(raw_path);
             if state.sentinels.contains_key(path.as_path()) {
+                continue;
+            }
+            if !state
+                .leases
+                .get(path.as_path())
+                .is_some_and(|lease| !lease.expired(now_secs))
+            {
                 continue;
             }
             if matches!(self.covering_tier(path.as_path()), Some(WatchTier::L0)) {
@@ -771,22 +1385,37 @@ impl TieredWatchRuntime {
             }
             let (mount_id, fstype, class) = fast_scan_mount_info(path.as_path(), mount_table);
             let strict_sla_allowed = class.strict_sla_allowed();
+            let lease_kind = if let Some(lease) = state.leases.get_mut(path.as_path()) {
+                lease.strict_sla_allowed = strict_sla_allowed;
+                lease.sentinel_state = FastScanSentinelState::BackfillPending;
+                lease.lease_kind
+            } else {
+                FastScanLeaseKind::Query
+            };
             state.sentinels.insert(
                 path.clone(),
                 DirSentinel {
                     mount_id,
                     fstype,
                     class,
+                    lease_kind,
                     signature: dir_sentinel_signature(&meta),
                     trust_clock: strict_sla_allowed,
                     trust_nlink: strict_sla_allowed,
                     strict_sla_allowed,
+                    sentinel_state: FastScanSentinelState::BackfillPending,
                     last_checked_unix_ms: 0,
                     last_changed_unix_ms: now_ms,
                     coverage_lag_ms: 0,
                 },
             );
-            state.changed_dir_queue.push_back(path);
+            if !state
+                .initial_backfill_queue
+                .iter()
+                .any(|queued| queued == &path)
+            {
+                state.initial_backfill_queue.push_back(path);
+            }
             inserted = inserted.saturating_add(1);
         }
         inserted
@@ -802,6 +1431,7 @@ impl TieredWatchRuntime {
         }
 
         let now_ms = unix_millis();
+        let now_secs = unix_secs();
         let target_ms = config.target_secs.saturating_mul(1_000);
         let tick_ms = config.tick_ms.max(1);
         let mut local_budget = config.local_stat_budget_per_tick.max(1);
@@ -813,10 +1443,31 @@ impl TieredWatchRuntime {
         let mut checked_dirs = 0usize;
 
         let mut state = self.fast_scan_state.write();
+        self.prune_expired_fast_scan_leases_locked(&mut state, now_secs);
+        let stale_sentinels = state
+            .sentinels
+            .keys()
+            .filter(|path| {
+                !state
+                    .leases
+                    .get(path.as_path())
+                    .is_some_and(|lease| !lease.expired(now_secs))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in stale_sentinels {
+            state.sentinels.remove(path.as_path());
+            remove_queued_path(&mut state.initial_backfill_queue, path.as_path());
+            remove_queued_path(&mut state.changed_dir_queue, path.as_path());
+        }
+
         let local_known = state
             .sentinels
             .values()
-            .filter(|sentinel| sentinel.strict_sla_allowed)
+            .filter(|sentinel| {
+                sentinel.strict_sla_allowed
+                    && sentinel.sentinel_state == FastScanSentinelState::Active
+            })
             .count();
         let required_local_per_tick = required_fast_scan_budget(local_known, target_ms, tick_ms);
         let budget_degraded =
@@ -842,16 +1493,22 @@ impl TieredWatchRuntime {
                 }
                 Some((
                     sentinel.strict_sla_allowed,
+                    sentinel.sentinel_state == FastScanSentinelState::Active,
                     sentinel.last_checked_unix_ms,
                     path.clone(),
                 ))
             })
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|(strict, last_checked, path)| {
-            (std::cmp::Reverse(*strict), *last_checked, path.clone())
+        candidates.sort_by_key(|(strict, active, last_checked, path)| {
+            (
+                std::cmp::Reverse(*strict),
+                std::cmp::Reverse(*active),
+                *last_checked,
+                path.clone(),
+            )
         });
 
-        for (strict_sla_allowed, _, path) in candidates {
+        for (strict_sla_allowed, _, _, path) in candidates {
             if strict_sla_allowed {
                 if local_budget == 0 {
                     continue;
@@ -875,32 +1532,68 @@ impl TieredWatchRuntime {
                 state.sentinels.remove(path.as_path());
                 continue;
             };
-            let Some(sentinel) = state.sentinels.get_mut(path.as_path()) else {
+            let Some((changed, sentinel_strict, sentinel_state)) = ({
+                let Some(sentinel) = state.sentinels.get_mut(path.as_path()) else {
+                    continue;
+                };
+
+                let (mount_id, fstype, class) = fast_scan_mount_info(path.as_path(), mount_table);
+                let signature = dir_sentinel_signature(&meta);
+                let strict_poll = !sentinel.strict_sla_allowed
+                    && config.network_mode == NetworkFastScanMode::StrictPoll;
+                let changed = strict_poll || signature != sentinel.signature;
+                sentinel.mount_id = mount_id;
+                sentinel.fstype = fstype;
+                sentinel.class = class;
+                sentinel.strict_sla_allowed = class.strict_sla_allowed();
+                sentinel.trust_clock = sentinel.strict_sla_allowed;
+                sentinel.trust_nlink = sentinel.strict_sla_allowed;
+                sentinel.signature = signature;
+                sentinel.last_checked_unix_ms = now_ms;
+                sentinel.coverage_lag_ms = 0;
+                checked_dirs = checked_dirs.saturating_add(1);
+                if changed {
+                    sentinel.last_changed_unix_ms = now_ms;
+                }
+                Some((
+                    changed,
+                    sentinel.strict_sla_allowed,
+                    sentinel.sentinel_state,
+                ))
+            }) else {
                 continue;
             };
-
-            let (mount_id, fstype, class) = fast_scan_mount_info(path.as_path(), mount_table);
-            let signature = dir_sentinel_signature(&meta);
-            let strict_poll = !sentinel.strict_sla_allowed
-                && config.network_mode == NetworkFastScanMode::StrictPoll;
-            let changed = strict_poll || signature != sentinel.signature;
-            sentinel.mount_id = mount_id;
-            sentinel.fstype = fstype;
-            sentinel.class = class;
-            sentinel.strict_sla_allowed = class.strict_sla_allowed();
-            sentinel.trust_clock = sentinel.strict_sla_allowed;
-            sentinel.trust_nlink = sentinel.strict_sla_allowed;
-            sentinel.signature = signature;
-            sentinel.last_checked_unix_ms = now_ms;
-            sentinel.coverage_lag_ms = 0;
-            checked_dirs = checked_dirs.saturating_add(1);
-            if changed {
-                sentinel.last_changed_unix_ms = now_ms;
+            if let Some(lease) = state.leases.get_mut(path.as_path()) {
+                lease.strict_sla_allowed = sentinel_strict;
+                lease.last_used_unix_secs = now_secs;
+                lease.sentinel_state = sentinel_state;
             }
 
             if changed && !state.changed_dir_queue.iter().any(|queued| queued == &path) {
                 state.changed_dir_queue.push_back(path);
             }
+        }
+
+        let initial_budget = config.initial_backfill_budget_per_tick.max(1);
+        let mut initial_dirs = Vec::new();
+        while initial_dirs.len() < initial_budget {
+            let Some(path) = state.initial_backfill_queue.pop_front() else {
+                break;
+            };
+            if !state
+                .leases
+                .get(path.as_path())
+                .is_some_and(|lease| !lease.expired(now_secs))
+            {
+                continue;
+            }
+            if let Some(sentinel) = state.sentinels.get_mut(path.as_path()) {
+                sentinel.sentinel_state = FastScanSentinelState::Active;
+            }
+            if let Some(lease) = state.leases.get_mut(path.as_path()) {
+                lease.sentinel_state = FastScanSentinelState::Active;
+            }
+            initial_dirs.push(path);
         }
 
         let changed_budget = config
@@ -915,20 +1608,31 @@ impl TieredWatchRuntime {
             changed_dirs.push(path);
         }
         let pending = state.changed_dir_queue.len();
+        let pending_initial = state.initial_backfill_queue.len();
         self.fast_scan_pending_changed_dirs
             .store(pending, Ordering::Relaxed);
         self.fast_scan_checked_dirs
             .fetch_add(checked_dirs as u64, Ordering::Relaxed);
-        self.fast_scan_changed_dirs
+        self.fast_scan_changed_dirs.fetch_add(
+            initial_dirs.len().saturating_add(changed_dirs.len()) as u64,
+            Ordering::Relaxed,
+        );
+        self.fast_scan_real_changed_dirs
             .fetch_add(changed_dirs.len() as u64, Ordering::Relaxed);
         if pending > 0 {
             self.fast_scan_budget_degraded
                 .store(true, Ordering::Relaxed);
             state.last_degraded_reason = format!("changed-dir queue pending={pending}");
+            self.fast_scan_io_budget_limited_count
+                .fetch_add(1, Ordering::Relaxed);
+        } else if pending_initial > 0 {
+            state.last_degraded_reason =
+                format!("initial hotset backfill pending={pending_initial}");
         }
 
         FastScanTickResult {
             checked_dirs,
+            initial_dirs,
             changed_dirs,
             budget_degraded: self.fast_scan_budget_degraded.load(Ordering::Relaxed),
         }
@@ -936,6 +1640,11 @@ impl TieredWatchRuntime {
 
     pub fn record_fast_scan_generated_events(&self, count: usize) {
         self.fast_scan_generated_events
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_fast_scan_apply_dropped_stale_batches(&self, count: usize) {
+        self.fast_scan_apply_dropped_stale_batches
             .fetch_add(count as u64, Ordering::Relaxed);
     }
 
@@ -953,6 +1662,7 @@ impl TieredWatchRuntime {
         self.record_ephemeral_events(&paths, now);
         let dirs = self.dirs.read();
         let mut dirty_dirs = Vec::new();
+        let mut l0_event_lease_dirs = Vec::new();
         for path in paths {
             for (root, state) in dirs.iter() {
                 if !path_is_under_or_equal(path, root) {
@@ -969,6 +1679,9 @@ impl TieredWatchRuntime {
                         .ok();
                     state.dirty.store(false, Ordering::Relaxed);
                     state.set_freshness(Freshness::Fresh);
+                    if let Some(parent) = path.parent() {
+                        l0_event_lease_dirs.push(parent.to_path_buf());
+                    }
                 } else {
                     state.dirty.store(true, Ordering::Relaxed);
                     state.dirty_since_unix_secs.store(now, Ordering::Relaxed);
@@ -979,6 +1692,10 @@ impl TieredWatchRuntime {
                 }
             }
         }
+        drop(dirs);
+        l0_event_lease_dirs.sort();
+        l0_event_lease_dirs.dedup();
+        self.grant_fast_scan_leases(l0_event_lease_dirs, FastScanLeaseKind::L0Event, None, 2);
         dirty_dirs.sort();
         dirty_dirs.dedup();
         dirty_dirs
@@ -1574,6 +2291,7 @@ impl TieredWatchRuntime {
 
         state.watch_cost.store(watch_cost as u64, Ordering::Relaxed);
 
+        self.grant_fast_scan_lease(path.clone(), FastScanLeaseKind::ProjectMarker, None, 4);
         self.try_reserve_promotion(path.as_path())
     }
 
@@ -1916,6 +2634,7 @@ impl TieredWatchRuntime {
             self.last_adjustment_unix_secs
                 .store(unix_secs(), Ordering::Relaxed);
         }
+        self.grant_fast_scan_lease(path.to_path_buf(), FastScanLeaseKind::L0Event, None, 2);
     }
 
     pub fn rollback_promote(&self, path: &Path) {
@@ -2032,18 +2751,42 @@ impl TieredWatchRuntime {
         let fast_scan_now_ms = unix_millis();
         let fast_state = self.fast_scan_state.read();
         let fast_scan_known_dirs = fast_state.sentinels.len();
+        let fast_scan_hotset_lease_count = fast_state.leases.len();
+        let fast_scan_hotset_sentinel_count = fast_state.sentinels.len();
+        let fast_scan_explicit_lease_count = fast_state
+            .leases
+            .values()
+            .filter(|lease| lease.lease_kind.is_explicit())
+            .count();
+        let fast_scan_auto_lease_count =
+            fast_scan_hotset_lease_count.saturating_sub(fast_scan_explicit_lease_count);
         let fast_scan_local_trusted_dirs = fast_state
             .sentinels
             .values()
-            .filter(|sentinel| sentinel.strict_sla_allowed)
+            .filter(|sentinel| {
+                sentinel.strict_sla_allowed
+                    && sentinel.sentinel_state == FastScanSentinelState::Active
+            })
             .count();
         let fast_scan_untrusted_dirs =
             fast_scan_known_dirs.saturating_sub(fast_scan_local_trusted_dirs);
         let fast_scan_pending_changed_dirs = fast_state.changed_dir_queue.len();
+        let fast_scan_initial_backfill_pending = fast_state.initial_backfill_queue.len();
+        let fast_scan_uncovered_lease_count = fast_state
+            .leases
+            .keys()
+            .filter(|path| {
+                !fast_state.sentinels.contains_key(path.as_path())
+                    && !matches!(self.covering_tier(path.as_path()), Some(WatchTier::L0))
+            })
+            .count();
         let mut fast_lags = Vec::with_capacity(fast_scan_known_dirs);
         let mut last_overdue_dir = String::new();
         let mut max_lag = 0u64;
         for (path, sentinel) in fast_state.sentinels.iter() {
+            if sentinel.sentinel_state != FastScanSentinelState::Active {
+                continue;
+            }
             let lag = if sentinel.last_checked_unix_ms == 0 {
                 fast_scan_target_ms
             } else {
@@ -2063,9 +2806,13 @@ impl TieredWatchRuntime {
         drop(fast_state);
 
         let fast_scan_budget_degraded = self.fast_scan_budget_degraded.load(Ordering::Relaxed);
+        let fast_scan_backfill_pending =
+            fast_scan_initial_backfill_pending > 0 || fast_scan_uncovered_lease_count > 0;
         let fast_scan_local_strict_ok = !fast_scan_enabled
-            || fast_scan_local_trusted_dirs == 0
-            || (!fast_scan_budget_degraded && fast_scan_coverage_lag_p99_ms <= fast_scan_target_ms);
+            || (!fast_scan_backfill_pending
+                && (fast_scan_local_trusted_dirs == 0
+                    || (!fast_scan_budget_degraded
+                        && fast_scan_coverage_lag_p99_ms <= fast_scan_target_ms)));
         let fast_scan_sla_ok = fast_scan_local_strict_ok && fast_scan_untrusted_dirs == 0;
         let fast_scan_mode = fast_scan_mode_label(
             fast_scan_enabled,
@@ -2130,12 +2877,16 @@ impl TieredWatchRuntime {
         }
         if fast_scan_enabled {
             notes.push(format!(
-                "fast scan mode={} known_dirs={} local_trusted={} untrusted={} target_secs={}",
+                "fast scan mode={} hotset_leases={} hotset_sentinels={} local_trusted={} untrusted={} target_secs={}",
                 fast_scan_mode,
-                fast_scan_known_dirs,
+                fast_scan_hotset_lease_count,
+                fast_scan_hotset_sentinel_count,
                 fast_scan_local_trusted_dirs,
                 fast_scan_untrusted_dirs,
                 fast_scan_target_secs
+            ));
+            notes.push(format!(
+                "fast scan SLA applies to active lease hotset; cold dirs are bounded by cold_sweep_period_estimate and dirty_backlog"
             ));
         }
         if fast_scan_budget_degraded && !fast_scan_last_degraded_reason.is_empty() {
@@ -2253,6 +3004,23 @@ impl TieredWatchRuntime {
             fast_scan_known_dirs,
             fast_scan_local_trusted_dirs,
             fast_scan_untrusted_dirs,
+            fast_scan_hotset_lease_count,
+            fast_scan_hotset_sentinel_count,
+            fast_scan_explicit_lease_count,
+            fast_scan_auto_lease_count,
+            fast_scan_lease_evictions: self.fast_scan_lease_evictions.load(Ordering::Relaxed),
+            fast_scan_lease_renewals: self.fast_scan_lease_renewals.load(Ordering::Relaxed),
+            fast_scan_initial_backfill_pending,
+            fast_scan_real_changed_dirs: self.fast_scan_real_changed_dirs.load(Ordering::Relaxed),
+            fast_scan_apply_dropped_stale_batches: self
+                .fast_scan_apply_dropped_stale_batches
+                .load(Ordering::Relaxed),
+            fast_scan_scan_workers_active: self
+                .fast_scan_scan_workers_active
+                .load(Ordering::Relaxed),
+            fast_scan_io_budget_limited_count: self
+                .fast_scan_io_budget_limited_count
+                .load(Ordering::Relaxed),
             fast_scan_pending_changed_dirs,
             fast_scan_checked_dirs: self.fast_scan_checked_dirs.load(Ordering::Relaxed),
             fast_scan_changed_dirs: self.fast_scan_changed_dirs.load(Ordering::Relaxed),
@@ -2607,6 +3375,77 @@ fn fast_scan_mount_info(
     )
 }
 
+fn normalize_fast_scan_dir(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
+}
+
+fn remove_queued_path(queue: &mut VecDeque<PathBuf>, path: &Path) {
+    queue.retain(|queued| queued.as_path() != path);
+}
+
+fn fast_scan_registry_path_for(snapshot_path: &Path) -> PathBuf {
+    stable_snapshot_dir_for(snapshot_path).join("fast-scan-hotset-registry.json")
+}
+
+fn write_fast_scan_registry_atomic(
+    snapshot_path: &Path,
+    registry: &FastScanPersistedRegistry,
+) -> anyhow::Result<()> {
+    let dir = stable_snapshot_dir_for(snapshot_path);
+    std::fs::create_dir_all(&dir)?;
+    let path = fast_scan_registry_path_for(snapshot_path);
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        serde_json::to_writer_pretty(&mut file, registry)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    if let Ok(dir_file) = std::fs::File::open(&dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
+fn fast_scan_config_fingerprint(config: &TieredWatchConfig) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.l1_l2_fast_scan_enabled.hash(&mut hasher);
+    config.l1_l2_fast_scan_target_secs.hash(&mut hasher);
+    config.l1_l2_fast_scan_tick_ms.hash(&mut hasher);
+    config
+        .l1_l2_fast_scan_stat_budget_per_tick
+        .hash(&mut hasher);
+    config
+        .l1_l2_fast_scan_readdir_budget_per_tick
+        .hash(&mut hasher);
+    config
+        .l1_l2_fast_scan_bootstrap_budget_per_tick
+        .hash(&mut hasher);
+    config.l1_l2_fast_scan_hotset_max_leases.hash(&mut hasher);
+    config.l1_l2_fast_scan_lease_ttl_secs.hash(&mut hasher);
+    config
+        .l1_l2_fast_scan_proc_sampler_lease_ttl_secs
+        .hash(&mut hasher);
+    config
+        .l1_l2_fast_scan_explicit_lease_ttl_secs
+        .hash(&mut hasher);
+    config
+        .l1_l2_fast_scan_sentinel_registry_max_entries
+        .hash(&mut hasher);
+    network_fast_scan_mode_to_u8(config.network_fast_scan_mode).hash(&mut hasher);
+    config
+        .network_fast_scan_stat_budget_per_tick
+        .hash(&mut hasher);
+    config
+        .network_fast_scan_readdir_budget_per_tick
+        .hash(&mut hasher);
+    for dir in &config.hot_dirs {
+        dir.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn choose_ephemeral_victim(
     leases: &HashMap<PathBuf, EphemeralWatchLease>,
     candidate: &Path,
@@ -2725,6 +3564,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let table = mount_table_for(root.as_path(), "ext4");
         let rt = TieredWatchRuntime::new(Vec::new(), vec![(root.clone(), 1)], 16, 5_000, 20);
+        assert!(rt.grant_fast_scan_lease(root.clone(), FastScanLeaseKind::Explicit, None, 1));
         assert_eq!(
             rt.bootstrap_fast_scan_dirs(vec![root.clone()], &table, 8),
             1
@@ -2738,7 +3578,8 @@ mod tests {
         };
         let initial = rt.fast_scan_tick(&table, cfg);
         assert_eq!(initial.checked_dirs, 1);
-        assert_eq!(initial.changed_dirs, vec![root.clone()]);
+        assert_eq!(initial.initial_dirs, vec![root.clone()]);
+        assert!(initial.changed_dirs.is_empty());
 
         let settled = rt.fast_scan_tick(&table, cfg);
         assert_eq!(settled.checked_dirs, 1);
@@ -2760,7 +3601,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_scan_bootstrap_budget_is_per_tick_not_total_cap() {
+    fn fast_scan_bootstrap_is_driven_by_uncovered_hotset_leases() {
         let root = temp_root("fast-scan-bootstrap-limit");
         let hot = root.join("hot");
         let warm = root.join("warm");
@@ -2775,6 +3616,7 @@ mod tests {
             20,
         );
 
+        assert!(rt.grant_fast_scan_lease(warm.clone(), FastScanLeaseKind::Explicit, None, 1));
         assert!(rt.should_bootstrap_fast_scan_dirs(1));
         assert_eq!(
             rt.bootstrap_fast_scan_dirs(vec![warm.clone()], &table, 1),
@@ -2791,12 +3633,17 @@ mod tests {
                 ..FastScanTickConfig::default()
             },
         );
-        assert_eq!(drained.changed_dirs, vec![warm.clone()]);
+        assert_eq!(drained.initial_dirs, vec![warm.clone()]);
+        assert!(drained.changed_dirs.is_empty());
+        let second = root.join("second");
+        std::fs::create_dir_all(&second).unwrap();
+        assert!(rt.grant_fast_scan_lease(second.clone(), FastScanLeaseKind::Query, None, 1));
         assert!(rt.should_bootstrap_fast_scan_dirs(1));
         assert_eq!(rt.fast_scan_l0_roots(), vec![hot.clone()]);
         let excluded = rt.fast_scan_bootstrap_excluded_roots();
         assert_eq!(excluded.len(), 2);
         assert!(excluded.contains(&hot));
+        assert!(excluded.contains(&warm));
 
         let l0_only = TieredWatchRuntime::new(vec![(hot.clone(), 1)], Vec::new(), 16, 5_000, 20);
         assert!(!l0_only.should_bootstrap_fast_scan_dirs(2_048));
@@ -2809,11 +3656,137 @@ mod tests {
         let warm = PathBuf::from("/tmp/warm");
         let rt = TieredWatchRuntime::new(Vec::new(), vec![(warm, 1)], 16, 5_000, 20);
 
+        assert!(rt.grant_fast_scan_lease(
+            PathBuf::from("/tmp/warm"),
+            FastScanLeaseKind::Query,
+            None,
+            1
+        ));
         assert!(rt.should_bootstrap_fast_scan_dirs_at(2_048, 10_000));
         rt.record_fast_scan_bootstrap_result_at(0, 0, 2_048, 60_000, 10_000);
 
         assert!(!rt.should_bootstrap_fast_scan_dirs_at(2_048, 69_999));
+        rt.record_fast_scan_bootstrap_result_at(1, 1, 2_048, 60_000, 20_000);
+        assert!(rt.should_bootstrap_fast_scan_dirs_at(2_048, 20_000));
+        rt.record_fast_scan_bootstrap_result_at(0, 0, 2_048, 60_000, 10_000);
         assert!(rt.should_bootstrap_fast_scan_dirs_at(2_048, 70_000));
+    }
+
+    #[test]
+    fn fast_scan_uncovered_or_backfill_pending_lease_blocks_strict_ok() {
+        let root = temp_root("fast-scan-pending-strict");
+        std::fs::create_dir_all(&root).unwrap();
+        let table = mount_table_for(root.as_path(), "ext4");
+        let rt = TieredWatchRuntime::new(Vec::new(), vec![(root.clone(), 1)], 16, 5_000, 20);
+
+        assert!(rt.grant_fast_scan_lease(root.clone(), FastScanLeaseKind::Query, None, 1));
+        let uncovered = rt.report();
+        assert_eq!(uncovered.fast_scan_hotset_lease_count, 1);
+        assert_eq!(uncovered.fast_scan_hotset_sentinel_count, 0);
+        assert!(!uncovered.fast_scan_local_strict_ok);
+
+        assert_eq!(
+            rt.bootstrap_fast_scan_dirs(vec![root.clone()], &table, 8),
+            1
+        );
+        let backfill_pending = rt.report();
+        assert_eq!(backfill_pending.fast_scan_hotset_sentinel_count, 1);
+        assert_eq!(backfill_pending.fast_scan_initial_backfill_pending, 1);
+        assert!(!backfill_pending.fast_scan_local_strict_ok);
+
+        let warmed = rt.fast_scan_tick(
+            &table,
+            FastScanTickConfig {
+                target_secs: 0,
+                local_stat_budget_per_tick: 8,
+                initial_backfill_budget_per_tick: 8,
+                ..FastScanTickConfig::default()
+            },
+        );
+        assert_eq!(warmed.initial_dirs, vec![root.clone()]);
+        assert!(rt.report().fast_scan_local_strict_ok);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fast_scan_record_scan_does_not_create_implicit_lease() {
+        let root = temp_root("fast-scan-no-scan-lease");
+        std::fs::create_dir_all(&root).unwrap();
+        let rt = TieredWatchRuntime::new(Vec::new(), vec![(root.clone(), 1)], 16, 5_000, 20);
+
+        rt.record_scan(
+            root.as_path(),
+            ScanOutcome {
+                scanned: 1,
+                changed: 1,
+                elapsed_ms: 0,
+                project_roots: Vec::new(),
+            },
+        );
+
+        let report = rt.report();
+        assert_eq!(report.fast_scan_hotset_lease_count, 0);
+        assert_eq!(report.fast_scan_hotset_sentinel_count, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fast_scan_registry_restore_trust_gate_controls_backfill() {
+        let root = temp_root("fast-scan-registry");
+        let hot = root.join("hot");
+        let snapshot = root.join("snapshot.v7");
+        std::fs::create_dir_all(&hot).unwrap();
+        let table = mount_table_for(root.as_path(), "ext4");
+        let cfg = TieredWatchConfig::default();
+
+        let rt = TieredWatchRuntime::new(Vec::new(), vec![(hot.clone(), 1)], 16, 5_000, 20);
+        rt.apply_fast_scan_config(&cfg);
+        assert!(rt.grant_fast_scan_lease(hot.clone(), FastScanLeaseKind::Query, None, 1));
+        assert_eq!(rt.bootstrap_fast_scan_dirs(vec![hot.clone()], &table, 8), 1);
+        let warm = rt.fast_scan_tick(
+            &table,
+            FastScanTickConfig {
+                target_secs: 0,
+                local_stat_budget_per_tick: 8,
+                initial_backfill_budget_per_tick: 8,
+                ..FastScanTickConfig::default()
+            },
+        );
+        assert_eq!(warm.initial_dirs, vec![hot.clone()]);
+        assert_eq!(
+            rt.persist_fast_scan_registry(&snapshot, &cfg, "stable", 42, true)
+                .unwrap(),
+            1
+        );
+
+        let trusted = TieredWatchRuntime::new(Vec::new(), vec![(hot.clone(), 1)], 16, 5_000, 20);
+        trusted.apply_fast_scan_config(&cfg);
+        let trusted_restore =
+            trusted.restore_fast_scan_registry(&snapshot, &cfg, true, "stable", 42, &table);
+        assert!(trusted_restore.trusted);
+        assert_eq!(trusted_restore.restored_active, 1);
+        assert_eq!(trusted_restore.restored_unknown, 0);
+        let trusted_report = trusted.report();
+        assert_eq!(trusted_report.fast_scan_hotset_sentinel_count, 1);
+        assert_eq!(trusted_report.fast_scan_initial_backfill_pending, 0);
+        assert!(trusted_report.fast_scan_local_strict_ok);
+
+        let untrusted = TieredWatchRuntime::new(Vec::new(), vec![(hot.clone(), 1)], 16, 5_000, 20);
+        untrusted.apply_fast_scan_config(&cfg);
+        let untrusted_restore =
+            untrusted.restore_fast_scan_registry(&snapshot, &cfg, false, "stable", 42, &table);
+        assert!(!untrusted_restore.trusted);
+        assert_eq!(untrusted_restore.reason, "unclean_shutdown");
+        assert_eq!(untrusted_restore.restored_active, 0);
+        assert_eq!(untrusted_restore.restored_unknown, 1);
+        let untrusted_report = untrusted.report();
+        assert_eq!(untrusted_report.fast_scan_hotset_sentinel_count, 1);
+        assert_eq!(untrusted_report.fast_scan_initial_backfill_pending, 1);
+        assert!(!untrusted_report.fast_scan_local_strict_ok);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2825,10 +3798,22 @@ mod tests {
         std::fs::create_dir_all(&second).unwrap();
         let table = mount_table_for(root.as_path(), "ext4");
         let rt = TieredWatchRuntime::new(Vec::new(), vec![(root.clone(), 1)], 16, 5_000, 20);
+        assert!(rt.grant_fast_scan_lease(first.clone(), FastScanLeaseKind::Query, None, 1));
+        assert!(rt.grant_fast_scan_lease(second.clone(), FastScanLeaseKind::Query, None, 1));
         assert_eq!(
             rt.bootstrap_fast_scan_dirs(vec![first, second], &table, 8),
             2
         );
+        let warmup = rt.fast_scan_tick(
+            &table,
+            FastScanTickConfig {
+                target_secs: 0,
+                local_stat_budget_per_tick: 2,
+                initial_backfill_budget_per_tick: 2,
+                ..FastScanTickConfig::default()
+            },
+        );
+        assert_eq!(warmup.initial_dirs.len(), 2);
 
         let tick = rt.fast_scan_tick(
             &table,
@@ -2857,6 +3842,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let table = mount_table_for(root.as_path(), "nfs4");
         let rt = TieredWatchRuntime::new(Vec::new(), vec![(root.clone(), 1)], 16, 5_000, 20);
+        assert!(rt.grant_fast_scan_lease(root.clone(), FastScanLeaseKind::Explicit, None, 1));
         assert_eq!(
             rt.bootstrap_fast_scan_dirs(vec![root.clone()], &table, 8),
             1
