@@ -303,6 +303,36 @@ pub fn wait_for_indexed_count(
 /// Poll `/search` until the file at `path` appears in results.
 ///
 /// Returns `true` if the file was found before the timeout.
+/// Wait until the live watcher actually covers the roots, so a file created
+/// after this returns reliably produces an inotify event.
+///
+/// `wait_for_indexed_count` only proves the startup *scan* found files; the
+/// *watch* can still be arming. A file created in that gap has its CREATE event
+/// missed and never becomes visible (the failure mode seen in CI). Gate on
+/// `strict_coverage_ok` (the watcher's own coverage signal) plus at least one
+/// watched dir across tiers. Returns false on timeout so callers can decide.
+#[allow(dead_code)]
+pub fn wait_for_watch_coverage(port: u16, timeout_secs: u64) -> bool {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+    loop {
+        if let Some(ws) = fd_rdd_client::watch_state(port) {
+            let coverage_ok = ws["strict_coverage_ok"].as_bool().unwrap_or(false);
+            let watched_dirs: u64 = ["l0_dirs", "l1_dirs", "l2_dirs", "l3_dirs"]
+                .iter()
+                .map(|k| ws[*k].as_u64().unwrap_or(0))
+                .sum();
+            if coverage_ok && watched_dirs >= 1 {
+                return true;
+            }
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 pub fn wait_for_file_visible(port: u16, path: &Path, timeout_secs: u64) -> bool {
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);

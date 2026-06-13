@@ -76,6 +76,16 @@ pub fn health_json(port: u16) -> Option<serde_json::Value> {
     }
 }
 
+/// Fetch `/watch-state` and return the parsed JSON value.
+#[allow(dead_code)]
+pub fn watch_state(port: u16) -> Option<serde_json::Value> {
+    let url = format!("http://127.0.0.1:{}/watch-state", port);
+    match client().get(&url).send() {
+        Ok(resp) if resp.status().is_success() => resp.json().ok(),
+        _ => None,
+    }
+}
+
 /// Query `/search` and deserialize into a typed `Vec<SearchResult>`.
 pub fn search(port: u16, q: &str, limit: usize) -> Vec<SearchResult> {
     let url = format!("http://127.0.0.1:{}/search", port);
