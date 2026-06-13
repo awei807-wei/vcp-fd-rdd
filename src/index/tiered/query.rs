@@ -273,8 +273,10 @@ impl TieredIndex {
     }
 
     pub(crate) fn collect_live_metas_for_diagnostics(&self) -> Vec<FileMeta> {
-        let base = self.base.load_full();
+        // Lock the overlay before loading base for a consistent (base, overlay)
+        // snapshot vs. finish_rebuild's atomic publish (see execute_query_plan).
         let db = self.delta_buffer.lock();
+        let base = self.base.load_full();
         let mut del = PathArenaSet::default();
         for p in db.deleted_paths() {
             let _ = del.insert(p);
@@ -412,8 +414,15 @@ impl TieredIndex {
         };
         let (results, hardlink_dupe_keys, content_dupe_metas) = {
             let _guard = QueryGenerationGuard::new(self);
-            let base = self.base.load_full();
+            // Capture `base` while holding the delta_buffer lock so the (base, overlay)
+            // pair is consistent with finish_rebuild / materialize_snapshot_base, which
+            // publish `base` and clear the overlay atomically under this same lock.
+            // Loading base *before* locking races with that publish: a query can read
+            // the pre-publish (empty) base together with the post-publish (cleared)
+            // overlay and return [] even though the index is fully populated — the
+            // transient-empty-result race seen in the large-scale CI query test.
             let db = self.delta_buffer.lock();
+            let base = self.base.load_full();
             let mut del = PathArenaSet::default();
             for p in db.deleted_paths() {
                 let _ = del.insert(p);
