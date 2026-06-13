@@ -46,10 +46,10 @@ const REBUILD_COOLDOWN: Duration = Duration::from_secs(60);
 const RUNTIME_SUBTREE_TOMBSTONE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
-pub(self) struct RuntimeSubtreeTombstone {
-    pub(self) root_path: PathBuf,
-    pub(self) generation: u64,
-    pub(self) expires_at: Instant,
+struct RuntimeSubtreeTombstone {
+    root_path: PathBuf,
+    generation: u64,
+    expires_at: Instant,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

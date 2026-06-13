@@ -221,18 +221,13 @@ impl FastScanLeaseKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FastScanSentinelState {
     Active,
+    #[default]
     Unknown,
     BackfillPending,
-}
-
-impl Default for FastScanSentinelState {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1369,10 +1364,10 @@ impl TieredWatchRuntime {
             if state.sentinels.contains_key(path.as_path()) {
                 continue;
             }
-            if !state
+            if state
                 .leases
                 .get(path.as_path())
-                .is_some_and(|lease| !lease.expired(now_secs))
+                .is_none_or(|lease| lease.expired(now_secs))
             {
                 continue;
             }
@@ -1450,10 +1445,10 @@ impl TieredWatchRuntime {
             .sentinels
             .keys()
             .filter(|path| {
-                !state
+                state
                     .leases
                     .get(path.as_path())
-                    .is_some_and(|lease| !lease.expired(now_secs))
+                    .is_none_or(|lease| lease.expired(now_secs))
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1582,10 +1577,10 @@ impl TieredWatchRuntime {
             let Some(path) = state.initial_backfill_queue.pop_front() else {
                 break;
             };
-            if !state
+            if state
                 .leases
                 .get(path.as_path())
-                .is_some_and(|lease| !lease.expired(now_secs))
+                .is_none_or(|lease| lease.expired(now_secs))
             {
                 continue;
             }
@@ -2887,9 +2882,7 @@ impl TieredWatchRuntime {
                 fast_scan_untrusted_dirs,
                 fast_scan_target_secs
             ));
-            notes.push(format!(
-                "fast scan SLA applies to active lease hotset; cold dirs are bounded by cold_sweep_period_estimate and dirty_backlog"
-            ));
+            notes.push("fast scan SLA applies to active lease hotset; cold dirs are bounded by cold_sweep_period_estimate and dirty_backlog".to_string());
         }
         if fast_scan_budget_degraded && !fast_scan_last_degraded_reason.is_empty() {
             notes.push(format!(

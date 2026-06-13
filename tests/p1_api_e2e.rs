@@ -193,19 +193,25 @@ fn fd_rdd_query_cli_streams_results_from_real_uds_socket() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let output = Command::new(fd_rdd_query_exe_path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--limit")
-        .arg("10")
-        .arg("cli_socket_probe")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "fd-rdd-query failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // Retry: the socket file may exist before the daemon is ready to accept.
+    let mut output = None;
+    let query_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < query_deadline {
+        let o = Command::new(fd_rdd_query_exe_path())
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--limit")
+            .arg("10")
+            .arg("cli_socket_probe")
+            .output()
+            .unwrap();
+        if o.status.success() {
+            output = Some(o);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let output = output.expect("fd-rdd-query did not succeed within 5s after socket appeared");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cli_socket_probe.txt"));
 

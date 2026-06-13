@@ -1304,16 +1304,13 @@ fn spawn_dirty_queue_loop(
                 }
 
                 if let Some(runtime) = runtime.as_ref() {
-                    match entry.reason {
-                        DirtyReason::QueryHitStale => {
-                            runtime.grant_fast_scan_leases(
-                                entry.scope.dir_paths().iter().cloned(),
-                                FastScanLeaseKind::StaleHit,
-                                None,
-                                4,
-                            );
-                        }
-                        _ => {}
+                    if entry.reason == DirtyReason::QueryHitStale {
+                        runtime.grant_fast_scan_leases(
+                            entry.scope.dir_paths().iter().cloned(),
+                            FastScanLeaseKind::StaleHit,
+                            None,
+                            4,
+                        );
                     }
                     if matches!(
                         entry.reason,
