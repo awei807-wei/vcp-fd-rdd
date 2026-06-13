@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- 修复 daemon 集成测试的并发串扰：`FdRddProcess` 现在默认为每个子进程隔离 `XDG_CONFIG_HOME` 与 `XDG_RUNTIME_DIR`，避免 `--no-watch` 测试持久化的配置影响 crash recovery/watcher 测试。
+
 ## [0.7.1] - 2026-06-13
 
 ### 质量加固
