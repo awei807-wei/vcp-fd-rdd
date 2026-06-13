@@ -32,10 +32,23 @@ const CONTENT_INDEX_UNSUPPORTED: &str =
     "content index is disabled; enable content_index before using content:/text:";
 type ContentMatcher<'a> = dyn Fn(&Path, &str) -> bool + 'a;
 
+/// Outcome of requesting one cold-result fs verification from the per-query budget.
+enum VerifyGrant {
+    /// Budget available — perform the fs verification.
+    Verify,
+    /// Per-query verification *count* cap reached: a deliberate load cap, so the
+    /// remaining cold candidates are dropped (their freshness stays unverified).
+    CountCapped,
+    /// Per-query verification *deadline* elapsed: usually cold-mmap page-fault
+    /// latency right after a snapshot remount rather than genuine verification
+    /// load. The candidate is returned unvalidated instead of dropped.
+    TimedOut,
+}
+
 struct QueryVerifyBudget {
     remaining: usize,
     deadline: Instant,
-    exhausted: bool,
+    count_capped: bool,
 }
 
 impl QueryVerifyBudget {
@@ -48,21 +61,29 @@ impl QueryVerifyBudget {
         Self {
             remaining: max_verify,
             deadline: Instant::now() + std::time::Duration::from_millis(timeout_ms),
-            exhausted: false,
+            count_capped: false,
         }
     }
 
-    fn try_consume(&mut self) -> bool {
-        if self.remaining == 0 || Instant::now() >= self.deadline {
-            self.exhausted = true;
-            return false;
+    fn try_consume(&mut self) -> VerifyGrant {
+        // Count cap takes precedence over the deadline: once the verification
+        // quota is spent we deliberately stop verifying and drop the rest.
+        if self.remaining == 0 {
+            self.count_capped = true;
+            return VerifyGrant::CountCapped;
+        }
+        if Instant::now() >= self.deadline {
+            return VerifyGrant::TimedOut;
         }
         self.remaining -= 1;
-        true
+        VerifyGrant::Verify
     }
 
-    fn exhausted(&self) -> bool {
-        self.exhausted
+    /// True once the verification *count* cap is spent. A deadline timeout does
+    /// not set this — timed-out candidates are returned unvalidated, so the scan
+    /// keeps collecting up to `limit` instead of bailing out to an empty result.
+    fn count_capped(&self) -> bool {
+        self.count_capped
     }
 }
 
@@ -188,7 +209,7 @@ impl TieredIndex {
             if let Some(result) = self.annotate_query_result(meta, &mut budget) {
                 results.push(result);
             }
-            if budget.exhausted() {
+            if budget.count_capped() {
                 break;
             }
         }
@@ -539,7 +560,7 @@ impl TieredIndex {
                                 if results.len() >= scan_limit {
                                     break 'collect_results;
                                 }
-                            } else if verify_budget.exhausted() {
+                            } else if verify_budget.count_capped() {
                                 break 'collect_results;
                             }
                         }
@@ -559,7 +580,7 @@ impl TieredIndex {
                 ) {
                     break 'collect_results;
                 }
-                if verify_budget.exhausted() {
+                if verify_budget.count_capped() {
                     break 'collect_results;
                 }
 
@@ -636,7 +657,7 @@ impl TieredIndex {
     ) -> bool {
         for anchor in plan.anchors() {
             for hit in layer.query_metas(anchor.as_ref()) {
-                if verify_budget.exhausted() {
+                if verify_budget.count_capped() {
                     return true;
                 }
                 let meta = hit.meta;
@@ -669,7 +690,7 @@ impl TieredIndex {
                         if results.len() >= limit {
                             return true;
                         }
-                    } else if verify_budget.exhausted() {
+                    } else if verify_budget.count_capped() {
                         return true;
                     }
                 }
@@ -693,7 +714,7 @@ impl TieredIndex {
     ) -> bool {
         for anchor in plan.anchors() {
             for meta in layer.query(anchor.as_ref(), limit.saturating_sub(results.len())) {
-                if verify_budget.exhausted() {
+                if verify_budget.count_capped() {
                     return true;
                 }
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
@@ -722,7 +743,7 @@ impl TieredIndex {
                         if results.len() >= limit {
                             return true;
                         }
-                    } else if verify_budget.exhausted() {
+                    } else if verify_budget.count_capped() {
                         return true;
                     }
                 }
@@ -813,8 +834,25 @@ impl TieredIndex {
             ));
         }
 
-        if !verify_budget.try_consume() {
-            return None;
+        match verify_budget.try_consume() {
+            VerifyGrant::Verify => {}
+            VerifyGrant::CountCapped => return None,
+            VerifyGrant::TimedOut => {
+                // Deadline elapsed before this cold candidate could be verified —
+                // typically cold-mmap page-fault latency right after a snapshot
+                // remount, not genuine verification load. The entry is present in
+                // the cold index, so return it unvalidated (Unknown freshness)
+                // rather than dropping it. Dropping here is what made the
+                // large-scale CI query test return [] for a fully-populated index
+                // once the 75ms verify deadline was consumed by the cold base walk
+                // before any result was validated.
+                return Some(QueryResultMeta::cold(
+                    meta,
+                    QueryResultFreshness::Unknown,
+                    index_tier,
+                    false,
+                ));
+            }
         }
 
         self.stats.record_cold_validate(1);
@@ -1307,4 +1345,50 @@ fn collect_live_meta(
 
     let _ = blocked_paths.insert(path_bytes);
     results.push(meta);
+}
+
+#[cfg(test)]
+mod verify_budget_tests {
+    use super::{QueryVerifyBudget, VerifyGrant};
+    use std::time::{Duration, Instant};
+
+    fn budget(remaining: usize, deadline: Instant) -> QueryVerifyBudget {
+        QueryVerifyBudget {
+            remaining,
+            deadline,
+            count_capped: false,
+        }
+    }
+
+    #[test]
+    fn grants_verification_until_count_is_spent() {
+        let mut b = budget(2, Instant::now() + Duration::from_secs(60));
+        assert!(matches!(b.try_consume(), VerifyGrant::Verify));
+        assert!(matches!(b.try_consume(), VerifyGrant::Verify));
+        // Quota spent: drop the rest and flag the count cap so the scan can bail.
+        assert!(matches!(b.try_consume(), VerifyGrant::CountCapped));
+        assert!(b.count_capped());
+    }
+
+    #[test]
+    fn timeout_yields_unvalidated_without_setting_count_cap() {
+        // Deadline already in the past with quota still available: the candidate
+        // is returned unvalidated (TimedOut) and the scan keeps going — count_capped
+        // must stay false so the layered query does not truncate to an empty result.
+        let mut b = budget(5, Instant::now() - Duration::from_millis(1));
+        assert!(matches!(b.try_consume(), VerifyGrant::TimedOut));
+        assert!(!b.count_capped());
+        // A timeout consumes no quota, so it keeps timing out (never count-caps).
+        assert!(matches!(b.try_consume(), VerifyGrant::TimedOut));
+        assert!(!b.count_capped());
+    }
+
+    #[test]
+    fn count_cap_takes_precedence_over_timeout() {
+        // Both exhausted: the count cap wins so deleted-but-unverified entries are
+        // dropped rather than resurrected as Unknown results.
+        let mut b = budget(0, Instant::now() - Duration::from_millis(1));
+        assert!(matches!(b.try_consume(), VerifyGrant::CountCapped));
+        assert!(b.count_capped());
+    }
 }
