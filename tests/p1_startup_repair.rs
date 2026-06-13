@@ -1,21 +1,15 @@
 //! P1 — Startup repair tests.
 
-use std::path::PathBuf;
+#[allow(dead_code)]
+mod common;
 
+use common::unique_tmp_dir;
 use fd_rdd::core::{FileKey, FileMeta};
 use fd_rdd::index::l2_partition::PersistentIndex;
 use fd_rdd::index::TieredIndex;
 use fd_rdd::storage::snapshot::{
     write_recovery_runtime_state, write_stable_v7_atomic, RecoveryRuntimeState, SnapshotStore,
 };
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-startup-repair-{}-{}", tag, nanos))
-}
 
 fn one_physical_file_base(
     root: &std::path::Path,

@@ -185,7 +185,7 @@ fn large_scale_hybrid_workspace_correctness() {
     // -----------------------------------------------------------------------
     // 3. 启动 fd-rdd（此时目录已包含 80 万文件，full_build 可完整索引）
     // -----------------------------------------------------------------------
-    let port = 17060;
+    let port = unique_port();
     let snapshot = root.join("snapshot");
     let process = FdRddProcess::spawn(
         &root,
@@ -210,7 +210,7 @@ fn large_scale_hybrid_workspace_correctness() {
     // 4. 等待初始索引完成（等待 indexed_count 稳定 5 秒）
     // -----------------------------------------------------------------------
     let (_, m) = monitor_phase("initial_indexing", pid, || {
-        wait_for_index_stable(port, 5, 600).expect("initial indexing timeout")
+        wait_for_index_stable(port, 5, 120).expect("initial indexing timeout")
     });
     all_metrics.push(m);
 

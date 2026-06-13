@@ -1,28 +1,11 @@
 //! P1 — WAL durability configuration tests.
 
-use std::path::PathBuf;
+#[allow(dead_code)]
+mod common;
 
+use common::{create_event, unique_tmp_dir};
 use fd_rdd::config::Config;
-use fd_rdd::core::{EventRecord, EventType, FileIdentifier};
 use fd_rdd::storage::wal::{WalDurability, WalStore};
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-wal-durability-{}-{}", tag, nanos))
-}
-
-fn create_event(path: PathBuf) -> EventRecord {
-    EventRecord {
-        seq: 1,
-        timestamp: std::time::SystemTime::now(),
-        event_type: EventType::Create,
-        id: FileIdentifier::Path(path.clone()),
-        path_hint: Some(path),
-    }
-}
 
 #[test]
 fn wal_default_durability_is_flush_only() {

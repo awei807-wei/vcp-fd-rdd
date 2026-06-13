@@ -2,31 +2,14 @@
 //!
 //! Validates WAL corruption handling, crash recovery, and version compatibility.
 
-use std::io::Write;
-use std::path::PathBuf;
+#[allow(dead_code)]
+mod common;
 
+use std::io::Write;
+
+use common::{crc32_simple, unique_tmp_dir, WAL_MAGIC};
 use fd_rdd::core::{EventRecord, EventType, FileIdentifier};
 use fd_rdd::storage::wal::WalStore;
-
-const WAL_MAGIC: u32 = 0x314C_4157;
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-wal-recovery-{}-{}", tag, nanos))
-}
-
-/// Legacy WAL checksum (v1/v2 format)
-fn crc32_simple(data: &[u8]) -> u32 {
-    let mut s: u32 = 0;
-    for &b in data {
-        s = s.wrapping_add(b as u32);
-        s = s.rotate_left(3);
-    }
-    s
-}
 
 /// 14. WAL 损坏记录跳过（不丢后续事件）
 #[test]

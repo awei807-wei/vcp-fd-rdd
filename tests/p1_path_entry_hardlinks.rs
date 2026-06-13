@@ -1,20 +1,16 @@
 //! P1 — path-entry hardlink alias behavior.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::{Path, PathBuf};
 
+use common::unique_tmp_dir;
 use fd_rdd::core::{BuildRDD, EventRecord, EventType, FileIdentifier, FsScanRDD};
 use fd_rdd::index::l2_partition::PersistentIndex;
 use fd_rdd::query::matcher::create_matcher;
 use fd_rdd::storage::snapshot::{stable_v7_path_for, write_stable_v7_atomic};
 use fd_rdd::storage::snapshot_v7::try_load_v7_cold;
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-hardlinks-{}-{}", tag, nanos))
-}
 
 fn build_index(root: &Path) -> PersistentIndex {
     let idx = PersistentIndex::new_with_roots(vec![root.to_path_buf()]);

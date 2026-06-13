@@ -3,20 +3,16 @@
 //! Validates that a newly created file becomes query-visible through the real
 //! event pipeline within the expected SLA.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use common::unique_tmp_dir;
 use fd_rdd::event::EventPipeline;
 use fd_rdd::index::TieredIndex;
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-visibility-{}-{}", tag, nanos))
-}
 
 async fn wait_until_visible(index: &TieredIndex, query: &str, path: &PathBuf, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;

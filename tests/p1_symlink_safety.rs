@@ -3,17 +3,13 @@
 //! Validates that `--follow-symlinks=false` (default) prevents scanning into
 //! symlinked directories, while still indexing the symlink file itself.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::PathBuf;
 
+use common::unique_tmp_dir;
 use fd_rdd::core::{BuildRDD, FileMeta, FsScanRDD};
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-symlink-{}-{}", tag, nanos))
-}
 
 /// 1. `follow_links=false` 时扫描不进入符号链接目录
 #[test]

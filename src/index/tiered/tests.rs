@@ -277,7 +277,7 @@ async fn mmap_warmup_default_disabled_and_reports_enabled_cold_snapshot() {
     let mut report = DiagnosticReport::default();
     idx.collect(&mut report);
     assert!(report.storage.mmap_warmup_enabled);
-    assert!(report.storage.mmap_warmup_pages >= 1);
+    assert_eq!(report.storage.mmap_warmup_pages, 1);
     assert!(matches!(
         report.storage.mmap_warmup_cancel_reason.as_str(),
         "" | "max_bytes"
@@ -465,7 +465,7 @@ fn sliced_repair_processes_large_dir_in_bounded_chunks() {
     let second = idx.process_dirty_entry(second_entry, &[]);
     assert!(!second.failed);
     assert_eq!(second.dirs_scanned, 1);
-    assert!(second.outcomes[0].outcome.scanned >= 188);
+    assert_eq!(second.outcomes[0].outcome.scanned, 188);
     assert_eq!(idx.dirty_queue_len(), 0);
     assert!(idx.cold_sweep_last_completed() > 0);
 
@@ -511,8 +511,8 @@ fn sliced_repair_cursor_resumes_after_first_chunk() {
 
     let second_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
     let second = idx.process_dirty_entry(second_entry, &[]);
-    assert!(second.outcomes[0].outcome.scanned >= 108);
-    assert!(second.outcomes[0].outcome.changed >= 108);
+    assert_eq!(second.outcomes[0].outcome.scanned, 108);
+    assert_eq!(second.outcomes[0].outcome.changed, 108);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -578,7 +578,7 @@ fn quarantine_verify_online_appends_wal_unfreezes_and_queues_scan() -> anyhow::R
     let dirty_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
     let report = idx.process_dirty_entry(dirty_entry, &[]);
     assert!(!report.failed);
-    assert!(!idx.query("restored_after_online").is_empty());
+    assert_eq!(idx.query("restored_after_online").len(), 1);
 
     let updated = QuarantineSidecar::read_from(&sidecar_path)?;
     assert_eq!(updated.active_roots().count(), 0);
@@ -663,7 +663,7 @@ async fn wal_online_root_replay_unfreezes_before_following_file_events() -> anyh
     let idx = TieredIndex::load_or_empty(&store, vec![content_root.clone()]).await?;
 
     assert!(!idx.path_is_frozen(&prefix));
-    assert!(!idx.query("wal_restored_after_online").is_empty());
+    assert_eq!(idx.query("wal_restored_after_online").len(), 1);
     assert_eq!(idx.freeze_gate.lock().blocked_events(), 0);
 
     let _ = std::fs::remove_dir_all(&root);
@@ -701,8 +701,8 @@ fn rebuild_with_pending_events_no_loss() {
     idx.finish_rebuild(new_l2);
     assert!(!idx.rebuild_in_progress());
 
-    assert!(!idx.query("old_aaa").is_empty());
-    assert!(!idx.query("new_bbb").is_empty());
+    assert_eq!(idx.query("old_aaa").len(), 1);
+    assert_eq!(idx.query("new_bbb").len(), 1);
 }
 
 #[test]
@@ -1053,11 +1053,11 @@ fn memory_report_tracks_generation_strong_refs() {
     let with_refs = idx.memory_report(EventPipelineStats::default()).generation;
 
     assert!(
-        with_refs.base_strong_refs > baseline.base_strong_refs,
+        with_refs.base_strong_refs == baseline.base_strong_refs + 1,
         "base strong refs should include externally held Arc generations: baseline={baseline:?} with_refs={with_refs:?}"
     );
     assert!(
-        with_refs.l2_strong_refs > baseline.l2_strong_refs,
+        with_refs.l2_strong_refs == baseline.l2_strong_refs + 1,
         "l2 strong refs should include externally held Arc generations: baseline={baseline:?} with_refs={with_refs:?}"
     );
 
@@ -1180,7 +1180,7 @@ fn memory_report_tracks_query_guard_holds() {
     let after = idx.memory_report(EventPipelineStats::default()).query_guard;
 
     assert_eq!(after.active_count, 0);
-    assert!(after.hold_count > before.hold_count);
+    assert_eq!(after.hold_count, before.hold_count + 1);
     assert!(after.last_hold_us <= after.hold_max_us);
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1605,7 +1605,7 @@ fn enabled_content_index_supports_content_and_text_filters() -> anyhow::Result<(
 
     let report = idx.rebuild_content_index_now();
     assert_eq!(report.indexed_paths, 2);
-    assert!(report.indexed_bytes > 0);
+    assert_eq!(report.indexed_bytes, 64);
 
     let content_results = idx.query_limit_detailed_strict("content:needle", 10)?;
     let paths = content_results
@@ -1747,12 +1747,12 @@ async fn v7_load_mounts_base_without_l2_hydration_and_preserves_next_snapshot() 
         "v7 load should mount BaseIndexData directly instead of hydrating L2"
     );
     assert_eq!(loaded.file_count(), 1);
-    assert!(!loaded.query("alpha_direct_v7").is_empty());
+    assert_eq!(loaded.query("alpha_direct_v7").len(), 1);
 
     let beta = content_root.join("beta_after_direct_load.txt");
     std::fs::write(&beta, b"beta")?;
     loaded.apply_events(&[mk_event(2, EventType::Create, beta.clone())]);
-    assert!(!loaded.query("beta_after_direct_load").is_empty());
+    assert_eq!(loaded.query("beta_after_direct_load").len(), 1);
     loaded.snapshot_now(store.clone()).await?;
 
     let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
@@ -1762,8 +1762,8 @@ async fn v7_load_mounts_base_without_l2_hydration_and_preserves_next_snapshot() 
         "reloaded v7 snapshot should still avoid L2 hydration"
     );
     assert_eq!(reloaded.file_count(), 2);
-    assert!(!reloaded.query("alpha_direct_v7").is_empty());
-    assert!(!reloaded.query("beta_after_direct_load").is_empty());
+    assert_eq!(reloaded.query("alpha_direct_v7").len(), 1);
+    assert_eq!(reloaded.query("beta_after_direct_load").len(), 1);
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -1915,7 +1915,7 @@ async fn stable_prev_used_when_stable_is_suspiciously_smaller() -> anyhow::Resul
         loaded.recovery_status().report.snapshot_source,
         "stable-prev"
     );
-    assert!(loaded.file_count() >= 12_001);
+    assert_eq!(loaded.file_count(), 12_001);
     let results = loaded.query_limit_detailed("编年史", 10);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].meta.path, chronicle);
@@ -2411,7 +2411,6 @@ fn query_verify_budget_caps_wide_stale_candidate_stat_count() {
     idx.apply_query_config(QueryConfig {
         max_verify_per_query: 3,
         verify_timeout_ms: 1_000,
-        allow_sync_readdir: false,
     });
 
     for path in &paths {
@@ -2714,7 +2713,7 @@ fn fast_scan_changed_dir_reuses_dirty_apply_and_finds_deep_known_dir_create() {
         root.display()
     ));
     assert!(rt.grant_fast_scan_lease(deep.clone(), FastScanLeaseKind::Query, None, 1));
-    assert!(rt.bootstrap_fast_scan_dirs(known_dirs, &mount_table, 128) >= 1);
+    assert_eq!(rt.bootstrap_fast_scan_dirs(known_dirs, &mount_table, 128), 1);
 
     let cfg = FastScanTickConfig {
         target_secs: 0,
@@ -2744,12 +2743,12 @@ fn fast_scan_changed_dir_reuses_dirty_apply_and_finds_deep_known_dir_create() {
 
     rt.record_fast_scan_generated_events(report.changed);
     assert!(!report.failed);
-    assert!(report.changed >= 1);
+    assert_eq!(report.changed, 1);
     assert!(idx
         .query_limit_detailed("fast_created", 10)
         .iter()
         .any(|result| result.meta.path == created));
-    assert!(rt.report().fast_scan_generated_events >= 1);
+    assert_eq!(rt.report().fast_scan_generated_events, 1);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -2880,7 +2879,7 @@ fn periodic_cold_scan_detects_directory_manifest_hash_change() {
     assert_eq!(report.outcomes.len(), 1);
     assert!(!report.outcomes[0].manifest_skipped);
     assert_eq!(report.outcomes[0].outcome.scanned, 2);
-    assert!(report.outcomes[0].outcome.changed >= 1);
+    assert_eq!(report.outcomes[0].outcome.changed, 1);
 
     let manifest = idx.directory_manifest_report();
     assert_eq!(manifest.skipped_scans, 0);

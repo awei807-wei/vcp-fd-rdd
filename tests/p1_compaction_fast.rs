@@ -3,18 +3,12 @@
 //! Validates that `export_segments_v6_compacted` produces equivalent output
 //! to `export_segments_v6` for live metas (no tombstones).
 
-use std::path::PathBuf;
+#[allow(dead_code)]
+mod common;
 
+use common::unique_tmp_dir;
 use fd_rdd::core::{FileKey, FileMeta};
 use fd_rdd::index::PersistentIndex;
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-compaction-{}-{}", tag, nanos))
-}
 
 #[test]
 fn fast_compaction_equivalence() {

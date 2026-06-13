@@ -3,23 +3,19 @@
 //! Validates filter effectiveness, fuzzy matching, streaming UDS queries,
 //! UDS permission checks, and short query optimization.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use common::unique_tmp_dir;
 use fd_rdd::config::ContentIndexConfig;
 use fd_rdd::core::{FileKey, FileKind, FileMeta};
 use fd_rdd::diagnostics::{DiagnosticReport, DiagnosticSource};
 use fd_rdd::index::{IndexBuilder, TieredIndex};
 use fd_rdd::query::{execute_query, QueryMode, SortColumn, SortOrder};
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-query-{}-{}", tag, nanos))
-}
 
 fn build_index_with_files(root: &Path, files: &[(&str, u64)]) -> Arc<TieredIndex> {
     let index = Arc::new(TieredIndex::empty(vec![root.to_path_buf()]));
@@ -112,8 +108,8 @@ fn fuzzy_query_matches() {
 
     // "my" should match files starting with "my"
     let results = index.query("my");
-    assert!(
-        results.len() >= 2,
+    assert_eq!(
+        results.len(), 2,
         "Should find at least 2 files matching 'my'"
     );
 
@@ -130,32 +126,8 @@ fn smart_case_handles_case_distinct_siblings() {
     let index = build_index_with_metas(
         &root,
         &[
-            FileMeta {
-                file_key: FileKey {
-                    dev: 1,
-                    ino: 1,
-                    generation: 0,
-                },
-                path: upper.clone(),
-                size: 10,
-                mtime: None,
-                ctime: None,
-                atime: None,
-                kind: Default::default(),
-            },
-            FileMeta {
-                file_key: FileKey {
-                    dev: 1,
-                    ino: 2,
-                    generation: 0,
-                },
-                path: lower.clone(),
-                size: 10,
-                mtime: None,
-                ctime: None,
-                atime: None,
-                kind: Default::default(),
-            },
+            common::test_meta(1, upper.clone(), 10),
+            common::test_meta(2, lower.clone(), 10),
         ],
     );
 
@@ -192,32 +164,8 @@ fn score_sort_prefers_basename_match_over_path_segment_match() {
     let index = build_index_with_metas(
         &root,
         &[
-            FileMeta {
-                file_key: FileKey {
-                    dev: 1,
-                    ino: 1,
-                    generation: 0,
-                },
-                path: basename_hit.clone(),
-                size: 10,
-                mtime: None,
-                ctime: None,
-                atime: None,
-                kind: Default::default(),
-            },
-            FileMeta {
-                file_key: FileKey {
-                    dev: 1,
-                    ino: 2,
-                    generation: 0,
-                },
-                path: path_hit.clone(),
-                size: 10,
-                mtime: None,
-                ctime: None,
-                atime: None,
-                kind: Default::default(),
-            },
+            common::test_meta(1, basename_hit.clone(), 10),
+            common::test_meta(2, path_hit.clone(), 10),
         ],
     );
 
@@ -244,32 +192,8 @@ fn score_sort_prefers_boundary_hit_for_env_style_files() {
     let index = build_index_with_metas(
         &root,
         &[
-            FileMeta {
-                file_key: FileKey {
-                    dev: 1,
-                    ino: 1,
-                    generation: 0,
-                },
-                path: dot_env.clone(),
-                size: 10,
-                mtime: None,
-                ctime: None,
-                atime: None,
-                kind: Default::default(),
-            },
-            FileMeta {
-                file_key: FileKey {
-                    dev: 1,
-                    ino: 2,
-                    generation: 0,
-                },
-                path: path_segment_hit.clone(),
-                size: 10,
-                mtime: None,
-                ctime: None,
-                atime: None,
-                kind: Default::default(),
-            },
+            common::test_meta(1, dot_env.clone(), 10),
+            common::test_meta(2, path_segment_hit.clone(), 10),
         ],
     );
 
@@ -296,32 +220,8 @@ fn score_sort_demotes_node_modules_when_query_has_no_node_hint() {
     let index = build_index_with_metas(
         &root,
         &[
-            FileMeta {
-                file_key: FileKey {
-                    dev: 1,
-                    ino: 1,
-                    generation: 0,
-                },
-                path: src_hit.clone(),
-                size: 10,
-                mtime: None,
-                ctime: None,
-                atime: None,
-                kind: Default::default(),
-            },
-            FileMeta {
-                file_key: FileKey {
-                    dev: 1,
-                    ino: 2,
-                    generation: 0,
-                },
-                path: node_hit.clone(),
-                size: 10,
-                mtime: None,
-                ctime: None,
-                atime: None,
-                kind: Default::default(),
-            },
+            common::test_meta(1, src_hit.clone(), 10),
+            common::test_meta(2, node_hit.clone(), 10),
         ],
     );
 
@@ -348,32 +248,8 @@ fn score_sort_uses_shorter_basename_as_tiebreaker() {
     let index = build_index_with_metas(
         &root,
         &[
-            FileMeta {
-                file_key: FileKey {
-                    dev: 1,
-                    ino: 1,
-                    generation: 0,
-                },
-                path: short.clone(),
-                size: 10,
-                mtime: None,
-                ctime: None,
-                atime: None,
-                kind: Default::default(),
-            },
-            FileMeta {
-                file_key: FileKey {
-                    dev: 1,
-                    ino: 2,
-                    generation: 0,
-                },
-                path: long.clone(),
-                size: 10,
-                mtime: None,
-                ctime: None,
-                atime: None,
-                kind: Default::default(),
-            },
+            common::test_meta(1, short.clone(), 10),
+            common::test_meta(2, long.clone(), 10),
         ],
     );
 
@@ -403,24 +279,12 @@ fn large_result_set_query_does_not_oom() {
     // Insert 10,000 files with similar names
     for i in 0..10_000u64 {
         let path = root.join(format!("data_{:05}.txt", i));
-        l2.upsert(FileMeta {
-            file_key: FileKey {
-                dev: 1,
-                ino: i + 1,
-                generation: 0,
-            },
-            path,
-            size: 100,
-            mtime: None,
-            ctime: None,
-            atime: None,
-            kind: Default::default(),
-        });
+        l2.upsert(common::test_meta(i + 1, path, 100));
     }
 
     // Query that matches all files
     let results = index.query_limit("data", 10_000);
-    assert!(!results.is_empty(), "Should return results for broad query");
+    assert_eq!(results.len(), 10_000, "Should return all 10,000 data files");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -443,16 +307,16 @@ fn short_query_works() {
 
     // Single character query
     let results = index.query("a");
-    assert!(
-        results.len() >= 3,
+    assert_eq!(
+        results.len(), 3,
         "Single char 'a' should match a.txt, ab.txt, abc.txt; got {}",
         results.len()
     );
 
     // Two character query
     let results = index.query("ab");
-    assert!(
-        results.len() >= 2,
+    assert_eq!(
+        results.len(), 2,
         "Two char 'ab' should match ab.txt, abc.txt; got {}",
         results.len()
     );
@@ -511,71 +375,11 @@ fn depth_len_and_type_filters_work() {
     let type_file = root.join("typeprobe.txt");
 
     let metas = vec![
-        FileMeta {
-            file_key: FileKey {
-                dev: 1,
-                ino: 1,
-                generation: 0,
-            },
-            path: shallow.clone(),
-            size: 10,
-            mtime: None,
-            ctime: None,
-            atime: None,
-            kind: Default::default(),
-        },
-        FileMeta {
-            file_key: FileKey {
-                dev: 1,
-                ino: 2,
-                generation: 0,
-            },
-            path: deep.clone(),
-            size: 20,
-            mtime: None,
-            ctime: None,
-            atime: None,
-            kind: Default::default(),
-        },
-        FileMeta {
-            file_key: FileKey {
-                dev: 1,
-                ino: 3,
-                generation: 0,
-            },
-            path: short_name.clone(),
-            size: 30,
-            mtime: None,
-            ctime: None,
-            atime: None,
-            kind: Default::default(),
-        },
-        FileMeta {
-            file_key: FileKey {
-                dev: 1,
-                ino: 4,
-                generation: 0,
-            },
-            path: long_name.clone(),
-            size: 40,
-            mtime: None,
-            ctime: None,
-            atime: None,
-            kind: Default::default(),
-        },
-        FileMeta {
-            file_key: FileKey {
-                dev: 1,
-                ino: 5,
-                generation: 0,
-            },
-            path: type_file.clone(),
-            size: 50,
-            mtime: None,
-            ctime: None,
-            atime: None,
-            kind: Default::default(),
-        },
+        common::test_meta(1, shallow.clone(), 10),
+        common::test_meta(2, deep.clone(), 20),
+        common::test_meta(3, short_name.clone(), 30),
+        common::test_meta(4, long_name.clone(), 40),
+        common::test_meta(5, type_file.clone(), 50),
     ];
     let index = build_index_with_metas(&root, &metas);
 

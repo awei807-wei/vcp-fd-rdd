@@ -3,17 +3,13 @@
 //! Validates that .gitignore / .ignore rules are applied consistently across
 //! cold scan, incremental scan, and event filtering.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::PathBuf;
 
+use common::unique_tmp_dir;
 use fd_rdd::core::{BuildRDD, FileMeta, FsScanRDD};
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-ignore-{}-{}", tag, nanos))
-}
 
 /// 6. ignore 规则贯通：冷扫时 .gitignore 规则生效
 #[test]

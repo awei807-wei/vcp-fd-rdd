@@ -2,17 +2,11 @@
 //!
 //! Validates handling of extreme inputs: very long paths, large directories.
 
-use std::path::PathBuf;
+#[allow(dead_code)]
+mod common;
 
+use common::unique_tmp_dir;
 use fd_rdd::core::{BuildRDD, FileMeta, FsScanRDD};
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-edge-{}-{}", tag, nanos))
-}
 
 /// 9. 超长路径容错：创建深层嵌套目录，确保扫描不 panic
 #[test]

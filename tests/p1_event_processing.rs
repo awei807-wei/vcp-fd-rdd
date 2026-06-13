@@ -2,19 +2,14 @@
 //!
 //! Validates rename/delete event handling and high-load event processing.
 
-use std::path::PathBuf;
+#[allow(dead_code)]
+mod common;
+
 use std::sync::Arc;
 
+use common::unique_tmp_dir;
 use fd_rdd::core::{EventRecord, EventType, FileIdentifier};
 use fd_rdd::index::TieredIndex;
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-event-{}-{}", tag, nanos))
-}
 
 /// 11. 高负载事件处理（模拟 git clone 批量创建）— 标记 `#[ignore]`
 #[test]
@@ -43,7 +38,19 @@ fn high_load_event_processing() {
         index.apply_events(chunk);
     }
 
-    // Should not panic or OOM
+    // Verify events were actually applied
+    assert!(
+        index.file_count() > 0,
+        "file_count should be positive after applying 10,000 create events"
+    );
+
+    // Query for a known inserted filename
+    let results = index.query("file_00042");
+    assert!(
+        !results.is_empty(),
+        "Should find file_00042 after high-load event processing"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 

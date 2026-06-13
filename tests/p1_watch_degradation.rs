@@ -3,19 +3,14 @@
 //! Validates that when inotify watch fails, the system degrades gracefully
 //! (e.g., to polling) without crashing.
 
-use std::path::PathBuf;
+#[allow(dead_code)]
+mod common;
+
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
+use common::unique_tmp_dir;
 use fd_rdd::event::watcher::{watch_roots, EventWatcher};
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-watch-{}-{}", tag, nanos))
-}
 
 /// 26. watch 降级到轮询时正常工作
 ///     When watching a non-existent directory, watch_roots should report failure

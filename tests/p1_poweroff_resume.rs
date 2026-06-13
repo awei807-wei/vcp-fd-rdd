@@ -3,18 +3,10 @@
 #[allow(dead_code)]
 mod common;
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use common::{unique_tmp_dir, wait_for_file_visible, wait_for_indexed_count, FdRddProcess};
+use common::{
+    unique_port, unique_tmp_dir, wait_for_file_visible, wait_for_indexed_count, FdRddProcess,
+};
 use fd_rdd::storage::snapshot::{read_recovery_runtime_state, stable_v7_path_for};
-
-fn unique_port() -> u16 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
-    18_000 + (nanos % 1_000) as u16
-}
 
 #[test]
 fn sigterm_final_snapshot_resumes_incremental_changes() {

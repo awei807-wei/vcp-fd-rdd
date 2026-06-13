@@ -18,6 +18,7 @@ const STATE_COMMITTED: u32 = 0x0000_0001;
 const STATE_INCOMPLETE: u32 = 0xFFFF_FFFF;
 const HEADER_SIZE: usize = 20; // magic + version + state + data_len + checksum
 
+// Canonical version: common::WAL_MAGIC
 const WAL_MAGIC: u32 = 0x314C_4157;
 
 fn tmp_dir(tag: &str) -> PathBuf {
@@ -60,6 +61,7 @@ fn simple_checksum(data: &[u8]) -> u32 {
 }
 
 /// WAL-style simple checksum (different algorithm from snapshot).
+// Canonical version: common::crc32_simple
 fn wal_crc32_simple(data: &[u8]) -> u32 {
     let mut s: u32 = 0;
     for &b in data {

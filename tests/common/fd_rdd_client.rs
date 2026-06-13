@@ -103,6 +103,23 @@ pub fn search_raw(port: u16, q: &str, limit: usize) -> String {
     }
 }
 
+/// Query `/search` and return typed results, distinguishing server errors from empty results.
+#[allow(dead_code)]
+pub fn search_checked(port: u16, q: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+    let url = format!("http://127.0.0.1:{}/search", port);
+    match client()
+        .get(&url)
+        .query(&[("q", q), ("limit", &limit.to_string())])
+        .send()
+    {
+        Ok(resp) if resp.status().is_success() => {
+            Ok(resp.json().unwrap_or_default())
+        }
+        Ok(resp) => Err(format!("HTTP {}", resp.status())),
+        Err(e) => Err(format!("request failed: {e}")),
+    }
+}
+
 /// Convenience helper to read the `indexed_count` field from `/status`.
 pub fn indexed_count(port: u16) -> Option<usize> {
     status(port)

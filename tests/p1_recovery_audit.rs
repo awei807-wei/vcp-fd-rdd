@@ -1,8 +1,12 @@
 //! P1 — recovery ledger audit tests.
 
-use std::path::{Path, PathBuf};
+#[allow(dead_code)]
+mod common;
 
-use fd_rdd::core::{EventRecord, EventType, FileIdentifier, FileKey, FileMeta};
+use std::path::Path;
+
+use common::{create_event, delete_event, unique_tmp_dir, WAL_MAGIC};
+use fd_rdd::core::{FileKey, FileMeta};
 use fd_rdd::index::l2_partition::PersistentIndex;
 use fd_rdd::index::TieredIndex;
 use fd_rdd::storage::recovery_audit::audit_recovery_ledger;
@@ -12,16 +16,6 @@ use fd_rdd::storage::snapshot::{
 };
 use fd_rdd::storage::snapshot_v7::write_v7_snapshot_atomic;
 use fd_rdd::storage::wal::WalStore;
-
-const WAL_MAGIC: u32 = 0x314C_4157;
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-recovery-audit-{}-{}", tag, nanos))
-}
 
 fn one_file_base(root: &Path, name: &str) -> fd_rdd::index::base_index::BaseIndexData {
     let path = root.join(name);
@@ -44,26 +38,6 @@ fn one_file_base(root: &Path, name: &str) -> fd_rdd::index::base_index::BaseInde
 
 fn empty_base(root: &Path) -> fd_rdd::index::base_index::BaseIndexData {
     PersistentIndex::new_with_roots(vec![root.to_path_buf()]).to_base_index_data()
-}
-
-fn create_event(path: PathBuf) -> EventRecord {
-    EventRecord {
-        seq: 1,
-        timestamp: std::time::SystemTime::now(),
-        event_type: EventType::Create,
-        id: FileIdentifier::Path(path.clone()),
-        path_hint: Some(path),
-    }
-}
-
-fn delete_event(path: PathBuf) -> EventRecord {
-    EventRecord {
-        seq: 1,
-        timestamp: std::time::SystemTime::now(),
-        event_type: EventType::Delete,
-        id: FileIdentifier::Path(path.clone()),
-        path_hint: Some(path),
-    }
 }
 
 #[tokio::test]

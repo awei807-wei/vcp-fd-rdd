@@ -4,24 +4,13 @@
 mod common;
 
 use common::{
-    fd_rdd_query_exe_path, unique_port, unique_tmp_dir, wait_for_file_visible,
+    fd_rdd_query_exe_path, get_json, unique_port, unique_tmp_dir, wait_for_file_visible,
     wait_for_index_stable, FdRddProcess,
 };
 use reqwest::blocking::Client;
 use serde_json::json;
 use std::process::Command;
 use std::time::{Duration, Instant};
-
-fn get_json(port: u16, path: &str) -> serde_json::Value {
-    Client::new()
-        .get(format!("http://127.0.0.1:{port}{path}"))
-        .send()
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .unwrap()
-}
 
 #[test]
 fn http_api_manual_scan_and_observability_endpoints_work() {
@@ -71,8 +60,8 @@ fn http_api_manual_scan_and_observability_endpoints_work() {
     assert_eq!(status["is_rebuilding"], false);
 
     let memory = get_json(port, "/memory");
-    assert!(memory["process_rss_bytes"].as_u64().unwrap_or(0) > 0);
-    assert!(memory.get("process_swap_bytes").is_some());
+    assert!(memory["process_rss_bytes"].as_u64().unwrap_or(0) > 1024);
+    assert!(memory["process_swap_bytes"].as_u64().is_some());
     assert_eq!(memory["sample_depth"], "light");
 
     let memory_full = get_json(port, "/memory?full=true");
@@ -142,7 +131,7 @@ fn http_api_manual_scan_and_observability_endpoints_work() {
         .unwrap()
         .json()
         .unwrap();
-    assert!(scan_resp["scanned"].as_u64().unwrap_or(0) >= 2);
+    assert!(scan_resp["scanned"].as_u64().unwrap_or(0) >= 4);
     assert!(
         wait_for_file_visible(port, &late, 5),
         "manual /scan should make late file searchable"
@@ -219,6 +208,92 @@ fn fd_rdd_query_cli_streams_results_from_real_uds_socket() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cli_socket_probe.txt"));
+
+    process.kill();
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn search_missing_query_param_returns_error() {
+    let root = unique_tmp_dir("api-missing-q");
+    let state = unique_tmp_dir("api-missing-q-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(root.join("probe.txt"), b"probe").unwrap();
+
+    let port = unique_port();
+    let snapshot = state.join("index.db");
+    let process = FdRddProcess::spawn(
+        &root,
+        port,
+        &snapshot,
+        &["--no-watch", "--snapshot-interval-secs", "3600"],
+    );
+    common::wait_for_index_stable(port, 1, 15).unwrap();
+
+    let client = Client::new();
+
+    // Missing `q` param entirely
+    let resp = client
+        .get(format!("http://127.0.0.1:{port}/search"))
+        .send()
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "/search without q param should return 4xx, got {}",
+        resp.status()
+    );
+
+    // Empty query `q=`
+    let resp_empty = client
+        .get(format!("http://127.0.0.1:{port}/search?q="))
+        .send()
+        .unwrap();
+    // Empty query may return 200 with empty results or 400 — just verify it doesn't 500
+    assert!(
+        resp_empty.status().is_success() || resp_empty.status().is_client_error(),
+        "/search?q= should return 2xx or 4xx, got {}",
+        resp_empty.status()
+    );
+
+    process.kill();
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn health_reports_ok_when_watch_is_enabled() {
+    let root = unique_tmp_dir("api-health-watch");
+    let state = unique_tmp_dir("api-health-watch-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(root.join("probe.txt"), b"probe").unwrap();
+
+    let port = unique_port();
+    let snapshot = state.join("index.db");
+    let process = FdRddProcess::spawn(
+        &root,
+        port,
+        &snapshot,
+        &["--snapshot-interval-secs", "3600", "--debounce-ms", "20"],
+    );
+    common::wait_for_index_stable(port, 1, 15).unwrap();
+
+    let health: serde_json::Value = Client::new()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+
+    assert_eq!(health["status"], "ok");
+    // With watch enabled (default), index_health should be "ok" not "static"
+    assert_eq!(
+        health["index_health"], "ok",
+        "index_health should be 'ok' when watch is enabled: {health}"
+    );
+    assert_eq!(health["watch_enabled"], true);
 
     process.kill();
     let _ = std::fs::remove_dir_all(&root);

@@ -3,20 +3,15 @@
 //! Validates that LSM compaction correctly merges segments and reclaims disk space,
 //! and that old sealed WAL files and expired LSM segments are properly cleaned up.
 
-use std::path::PathBuf;
+#[allow(dead_code)]
+mod common;
+
 use std::sync::Arc;
 
+use common::unique_tmp_dir;
 use fd_rdd::core::{EventRecord, EventType, FileIdentifier};
 use fd_rdd::index::TieredIndex;
 use fd_rdd::storage::snapshot::SnapshotStore;
-
-fn unique_tmp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fd-rdd-lsm-{}-{}", tag, nanos))
-}
 
 /// 19. LSM compaction: write snapshot, apply events, write another snapshot
 ///     Verifies the basic snapshot write/load cycle works.
@@ -91,7 +86,7 @@ fn wal_sealed_files_cleaned_up() {
                 .unwrap_or(false)
         })
         .count();
-    assert!(sealed_count >= 3, "Should have at least 3 sealed WAL files");
+    assert_eq!(sealed_count, 3, "Should have exactly 3 sealed WAL files");
 
     // Cleanup all sealed files
     wal.cleanup_sealed_up_to(u64::MAX).unwrap();

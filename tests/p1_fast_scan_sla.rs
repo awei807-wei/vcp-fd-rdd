@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::{
-    fd_rdd_client, unique_port, unique_tmp_dir, wait_for_file_gone, wait_for_file_visible,
-    wait_for_indexed_count, FdRddProcess,
+    fd_rdd_client, get_json, unique_port, unique_tmp_dir, wait_for_file_gone,
+    wait_for_file_visible, wait_for_indexed_count, FdRddProcess,
 };
 
 const HOTSET_SLA_SECS: u64 = 5;
@@ -79,17 +79,6 @@ fn create_tree(root: &Path) -> PathBuf {
     std::fs::write(hotset.join("hotset_seed_probe.txt"), b"seed").unwrap();
     std::fs::write(root.join("root_seed_probe.txt"), b"seed").unwrap();
     hotset
-}
-
-fn get_json(port: u16, path: &str) -> serde_json::Value {
-    reqwest::blocking::Client::new()
-        .get(format!("http://127.0.0.1:{port}{path}"))
-        .send()
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .unwrap()
 }
 
 fn wait_for_watch_state(
@@ -242,7 +231,7 @@ fn tiered_fast_scan_hotset_sla_and_cold_eventual_consistency() {
         |watch| {
             watch["fast_scan_checked_dirs"].as_u64().unwrap_or(0) > 0
                 && watch["fast_scan_real_changed_dirs"].as_u64().unwrap_or(0) >= 1
-                && watch["fast_scan_generated_events"].as_u64().unwrap_or(0) >= 3
+                && watch["fast_scan_generated_events"].as_u64().unwrap_or(0) >= 4
                 && watch["dirty_queue_len"].as_u64().unwrap_or(0) == 0
         },
         "hotset fast scan changes and cold repair drained",

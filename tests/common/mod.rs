@@ -189,6 +189,14 @@ impl FdRddProcess {
     }
 }
 
+impl Drop for FdRddProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.work_dir);
+    }
+}
+
 /// Resolve the path to the `fd-rdd` binary in the Cargo target directory.
 ///
 /// Works for both `cargo test` (debug) and `cargo test --release`.
@@ -339,5 +347,75 @@ pub fn wait_for_file_gone(port: u16, path: &Path, timeout_secs: u64) -> bool {
         }
 
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Legacy WAL checksum used by v1/v2 WAL format tests.
+#[allow(dead_code)]
+pub fn crc32_simple(data: &[u8]) -> u32 {
+    let mut s: u32 = 0;
+    for &b in data {
+        s = s.wrapping_add(b as u32);
+        s = s.rotate_left(3);
+    }
+    s
+}
+
+/// WAL header magic constant for test construction.
+#[allow(dead_code)]
+pub const WAL_MAGIC: u32 = 0x314C_4157;
+
+/// Construct a `Create` EventRecord for testing.
+#[allow(dead_code)]
+pub fn create_event(path: PathBuf) -> fd_rdd::core::EventRecord {
+    fd_rdd::core::EventRecord {
+        seq: 1,
+        timestamp: std::time::SystemTime::now(),
+        event_type: fd_rdd::core::EventType::Create,
+        id: fd_rdd::core::FileIdentifier::Path(path.clone()),
+        path_hint: Some(path),
+    }
+}
+
+/// Construct a `Delete` EventRecord for testing.
+#[allow(dead_code)]
+pub fn delete_event(path: PathBuf) -> fd_rdd::core::EventRecord {
+    fd_rdd::core::EventRecord {
+        seq: 1,
+        timestamp: std::time::SystemTime::now(),
+        event_type: fd_rdd::core::EventType::Delete,
+        id: fd_rdd::core::FileIdentifier::Path(path.clone()),
+        path_hint: Some(path),
+    }
+}
+
+/// HTTP GET helper that fetches JSON from a local fd-rdd endpoint.
+#[allow(dead_code)]
+pub fn get_json(port: u16, path: &str) -> serde_json::Value {
+    reqwest::blocking::Client::new()
+        .get(format!("http://127.0.0.1:{port}{path}"))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap()
+}
+
+/// Construct a `FileMeta` with default timestamps for testing.
+#[allow(dead_code)]
+pub fn test_meta(ino: u64, path: PathBuf, size: u64) -> fd_rdd::core::FileMeta {
+    fd_rdd::core::FileMeta {
+        file_key: fd_rdd::core::FileKey {
+            dev: 1,
+            ino,
+            generation: 0,
+        },
+        path,
+        size,
+        mtime: None,
+        ctime: None,
+        atime: None,
+        kind: Default::default(),
     }
 }
