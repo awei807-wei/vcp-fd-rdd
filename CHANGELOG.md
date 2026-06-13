@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [7.1.0] - 2026-06-13
+## [0.7.1] - 2026-06-13
 
 ### 质量加固
 
@@ -72,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 新增 v7 cold mmap `MatchAll` full-scan 回归测试，确认路径缓冲区复用后仍只返回 live entry，并保持 tombstone 过滤与 metadata 结果正确。
 - 新增 `/health` cold diagnostics 回归测试，确认 manifest-only 冷段中即使存在 hardlink，也不会通过健康检查触发全段 metadata 枚举。
 
-## [7.0.0] - 2026-05-30
+## [0.7.0] - 2026-05-30
 
 - `dupe:content` 补齐查询期内容读取边界：复用内容索引的 frozen/offline、exclude 目录、mount policy 与 `content_index.max_file_size` 准入策略，并把 partial/full hash 慢 I/O 移出 query generation guard，避免内容重复扫描延长 base generation 强引用。
 - `scripts/smoke-search-syntax.sh` 支持无 `--root` 默认自建临时 root，并在 HTTP daemon 不可用时自动启动本仓库 `fd-rdd` 做自包含 smoke；仍可用 `--no-auto-spawn` 保持只联调既有 daemon。

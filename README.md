@@ -22,7 +22,7 @@
 - **Proc Sampler**：采样 `/proc/<pid>/fd` 写句柄，自动覆盖 ComfyUI/下载器等持续写入目录
 - **Tiered Watcher**：预算受控的热点目录监听，避免 inotify 耗尽系统 watch 配额
 
-当前版本 **v7.1.0** · [更新日志](CHANGELOG.md) · [编年史](fd-rdd-编年史.md)
+当前版本 **v0.7.1** · [更新日志](CHANGELOG.md) · [编年史](fd-rdd-编年史.md)
 
 </details>
 
@@ -43,7 +43,7 @@
 - **Proc Sampler**: samples `/proc/<pid>/fd` write handles to auto-cover directories with active writes (ComfyUI, downloaders, renderers)
 - **Tiered Watcher**: budget-constrained hot-directory watching to avoid exhausting inotify limits
 
-Current version **v7.1.0** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-编年史.md)
+Current version **v0.7.1** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-编年史.md)
 
 </details>
 
@@ -64,7 +64,7 @@ Current version **v7.1.0** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-�
 - **Proc Sampler**: `/proc/<pid>/fd` の書き込みハンドルをサンプリングし、アクティブな書き込みディレクトリを自動カバー
 - **Tiered Watcher**: 予算制約付きのホットディレクトリ監視、inotify 枯渇の防止
 
-現在のバージョン **v7.1.0** · [変更履歴](CHANGELOG.md) · [年代記](fd-rdd-编年史.md)
+現在のバージョン **v0.7.1** · [変更履歴](CHANGELOG.md) · [年代記](fd-rdd-编年史.md)
 
 </details>
 

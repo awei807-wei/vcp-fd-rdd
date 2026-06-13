@@ -46,7 +46,7 @@
 - `stress-hybrid-large-scale` workflow 继续显式运行 `p2_large_scale_hybrid` 的 80 万文件混合工作区测试，并保持 `continue-on-error`，避免 GitHub runner 资源波动阻塞普通分支推进。
 - 新增 `p1_api_e2e.rs`、`p1_real_watcher.rs`、`p1_crash_recovery_matrix.rs`，补齐 daemon HTTP/UDS 真实链路、真实 watcher 文件事件、坏快照/非干净退出后的启动修复组合。
 
-## v7.0.0 测试相关变更
+## v0.7.0 测试相关变更
 
 - M2 proc sampler 新增 `proc_sampler_*` 单元和序列化测试，覆盖 fdinfo flags 写权限解析、同 uid 写 fd 目录采样、非同 uid 拒绝后不读取 fdinfo、watch-state/health/metrics 中 proc sampler 观测字段与 budget/unavailable issue。
 - M1-3 分片 repair 新增 `sliced_repair_*` 单元测试，覆盖 Periodic cold scan 大目录首次 slice 只处理约 512 entries、cursor 重新入队、后续 slice 继续补齐，以及 `/health` 新增 cold sweep/backlog 字段的 JSON 序列化；完整恢复审计继续覆盖 StartupRepairDeferred 的递归 rename subtree 补偿。
