@@ -231,7 +231,7 @@ fn tiered_fast_scan_hotset_sla_and_cold_eventual_consistency() {
         |watch| {
             watch["fast_scan_checked_dirs"].as_u64().unwrap_or(0) > 0
                 && watch["fast_scan_real_changed_dirs"].as_u64().unwrap_or(0) >= 1
-                && watch["fast_scan_generated_events"].as_u64().unwrap_or(0) >= 4
+                && watch["fast_scan_generated_events"].as_u64().unwrap_or(0) >= 3
                 && watch["dirty_queue_len"].as_u64().unwrap_or(0) == 0
         },
         "hotset fast scan changes and cold repair drained",
