@@ -89,8 +89,12 @@ impl TieredIndex {
                 tracing::warn!("stable v7 snapshot write failed: {}", e);
             } else {
                 remount_path = Some(stable_v7_path_for(store.path()));
+                // Once a shutdown is in progress every snapshot belongs to the
+                // clean-shutdown sequence, so mark it clean. During normal
+                // operation the marker stays false so an actual crash is
+                // detected on the next start.
                 let state = RecoveryRuntimeState {
-                    last_clean_shutdown: false,
+                    last_clean_shutdown: self.is_shutting_down(),
                     last_snapshot_unix_secs: unix_secs(),
                     last_wal_seal_id: wal_seal_id,
                     last_startup_source: self.recovery_status().report.snapshot_source,
@@ -145,6 +149,13 @@ impl TieredIndex {
             Some(std::time::Duration::from_secs(interval_secs))
         };
         loop {
+            // Stop snapshotting once shutdown begins; the final snapshot and
+            // clean-shutdown marker are driven explicitly from main.
+            if self.is_shutting_down() {
+                tracing::debug!("snapshot loop exiting: shutdown in progress");
+                return;
+            }
+
             // flush 请求优先：避免 overlay 长期积压。
             if self.flush_requested.load(Ordering::Acquire) {
                 // Enforce minimum interval to prevent back-to-back snapshot storms
@@ -197,6 +208,12 @@ impl TieredIndex {
                     self.periodic_flush_min_bytes.load(Ordering::Relaxed),
                 );
                 continue;
+            }
+
+            // A shutdown notification can also wake the select above; don't fire
+            // one last snapshot here — the explicit final snapshot owns that.
+            if self.is_shutting_down() {
+                return;
             }
 
             if let Err(e) = self.snapshot_now(store.clone()).await {

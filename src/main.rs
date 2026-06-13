@@ -812,6 +812,10 @@ async fn main() -> anyhow::Result<()> {
     // 9) 优雅退出：SIGINT/SIGTERM → 最终快照
     shutdown_signal().await?;
     info!("Shutting down, writing final snapshot...");
+    // Stop the periodic snapshot loop and switch snapshots into clean-shutdown
+    // mode before the final snapshot, so no background snapshot can race the
+    // clean-shutdown marker back to false.
+    index.begin_shutdown();
     if let Err(e) = index.snapshot_now(store.clone()).await {
         tracing::error!("Final snapshot failed: {}", e);
     }
