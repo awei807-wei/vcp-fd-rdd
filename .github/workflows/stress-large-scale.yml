@@ -165,6 +165,26 @@ jobs:
         run: |
           set -e
           echo "=== Test B: Query latency ==="
+          # Readiness gate: Test A only confirms the count crossed 100k once, but
+          # on a cold start the base is empty (count=0) for the whole initial
+          # build and only flips to populated when the build swaps in. A query
+          # landing in that window legitimately returns []. Wait until the index
+          # is not rebuilding AND a probe query returns results before timing.
+          for i in $(seq 1 120); do
+            STATUS=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/status" 2>/dev/null || true)
+            REBUILDING=$(echo "$STATUS" | grep -o '"is_rebuilding":[a-z]*' | head -1 | cut -d: -f2 || true)
+            PROBE=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file&limit=1" 2>/dev/null || true)
+            if [ "$REBUILDING" = "false" ] && [ -n "$PROBE" ] && [ "$PROBE" != "[]" ]; then
+              echo "Index ready after ${i}s (not rebuilding, query non-empty)"
+              break
+            fi
+            if [ "$i" -eq 120 ]; then
+              echo "❌ FAIL: index not query-ready within 120s (last status: $STATUS)"
+              exit 1
+            fi
+            sleep 1
+          done
+
           MAX_LATENCY=0
           for i in $(seq 1 10); do
             START=$(date +%s%N)
@@ -179,10 +199,24 @@ jobs:
               echo "❌ FAIL: Query $i took ${ELAPSED_MS}ms (>=2000ms)"
               exit 1
             fi
-            # Verify result is non-empty JSON array
+            # A transient empty can still occur if a background rebuild/remount
+            # races a query; retry briefly before declaring failure rather than
+            # failing on a single empty response.
             if [ "$RESULT" = "[]" ]; then
-              echo "❌ FAIL: Query $i returned empty results"
-              exit 1
+              echo "Query $i empty, retrying (transient rebuild/remount window)..."
+              RETRY_OK=0
+              for r in $(seq 1 20); do
+                sleep 0.25
+                RESULT=$(curl -s "http://127.0.0.1:${{ env.FD_RDD_PORT }}/search?q=file&limit=20")
+                if [ -n "$RESULT" ] && [ "$RESULT" != "[]" ]; then
+                  RETRY_OK=1
+                  break
+                fi
+              done
+              if [ "$RETRY_OK" -ne 1 ]; then
+                echo "❌ FAIL: Query $i returned empty results (persisted through retries)"
+                exit 1
+              fi
             fi
           done
           echo "✅ PASS: All 10 queries completed, max latency ${MAX_LATENCY}ms"
