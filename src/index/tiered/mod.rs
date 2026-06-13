@@ -296,7 +296,7 @@ pub struct TieredIndex {
     pub(self) lazy_validation_queue_full: AtomicU64,
     pub(self) query_max_verify_per_query: AtomicU64,
     pub(self) query_verify_timeout_ms: AtomicU64,
-    pub(self) query_allow_sync_readdir: AtomicBool,
+    pub(self) runtime_subtree_tombstone_ttl_secs: AtomicU64,
     pub(self) runtime_subtree_tombstones: Mutex<Vec<RuntimeSubtreeTombstone>>,
     pub(self) recent_stale_hit_dirs: Mutex<Vec<PathBuf>>,
     pub(self) cold_sweep_last_completed_unix_secs: AtomicU64,
@@ -388,14 +388,16 @@ impl TieredIndex {
             .store(settings.wal_seal_bytes, Ordering::Relaxed);
     }
 
+    pub fn set_runtime_subtree_tombstone_ttl_secs(&self, secs: u64) {
+        self.runtime_subtree_tombstone_ttl_secs
+            .store(secs, Ordering::Relaxed);
+    }
+
     pub fn apply_query_config(&self, config: QueryConfig) {
         self.query_max_verify_per_query
             .store(config.max_verify_per_query.max(1) as u64, Ordering::Relaxed);
         self.query_verify_timeout_ms
             .store(config.verify_timeout_ms.max(1), Ordering::Relaxed);
-        // 当前阶段不允许查询线程同步 readdir；该字段保留为显式硬门禁。
-        self.query_allow_sync_readdir
-            .store(false, Ordering::Relaxed);
     }
 
     fn cleanup_runtime_subtree_tombstones_locked(
@@ -405,6 +407,7 @@ impl TieredIndex {
         tombstones.retain(|tombstone| tombstone.expires_at > now);
     }
 
+    // TODO: consider trie or sorted vec + binary search when tombstone count > 16.
     pub(self) fn path_blocked_by_runtime_subtree_tombstone(&self, path: &Path) -> bool {
         let mut tombstones = self.runtime_subtree_tombstones.lock();
         Self::cleanup_runtime_subtree_tombstones_locked(&mut tombstones, Instant::now());
@@ -418,7 +421,8 @@ impl TieredIndex {
         events: &[crate::core::EventRecord],
     ) {
         let now = Instant::now();
-        let expires_at = now + RUNTIME_SUBTREE_TOMBSTONE_TTL;
+        let ttl_secs = self.runtime_subtree_tombstone_ttl_secs.load(Ordering::Relaxed);
+        let expires_at = now + Duration::from_secs(ttl_secs);
         let current_generation = self.event_seq.load(Ordering::Relaxed);
         let mut tombstones = self.runtime_subtree_tombstones.lock();
         Self::cleanup_runtime_subtree_tombstones_locked(&mut tombstones, now);

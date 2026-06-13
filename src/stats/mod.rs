@@ -264,6 +264,7 @@ pub struct WatchStateReport {
     pub dirty_queue_len: usize,
     pub cold_validate_count: u64,
     pub query_stale_hit_count: u64,
+    pub query_permission_denied_count: u64,
     pub directory_manifest_dirs: usize,
     pub directory_manifest_skipped_scans: u64,
     pub directory_manifest_changed_scans: u64,
@@ -846,6 +847,7 @@ pub struct StatsReport {
     pub fuzzy_full_scan_last_elapsed_us: u64,
     pub cold_validate_count: u64,
     pub query_stale_hit_count: u64,
+    pub query_permission_denied_count: u64,
     pub events_applied: u64,
     pub events_dropped: u64,
     pub snapshot_count: u64,
@@ -874,6 +876,7 @@ pub struct StatsCollector {
     fuzzy_full_scan_last_elapsed_us: std::sync::atomic::AtomicU64,
     cold_validate_count: std::sync::atomic::AtomicU64,
     query_stale_hit_count: std::sync::atomic::AtomicU64,
+    query_permission_denied_count: std::sync::atomic::AtomicU64,
     events_applied: std::sync::atomic::AtomicU64,
     events_dropped: std::sync::atomic::AtomicU64,
     snapshot_count: std::sync::atomic::AtomicU64,
@@ -958,6 +961,14 @@ impl StatsCollector {
             return;
         }
         self.query_stale_hit_count
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_query_permission_denied(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.query_permission_denied_count
             .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -1047,6 +1058,9 @@ impl StatsCollector {
                 .load(std::sync::atomic::Ordering::Relaxed),
             query_stale_hit_count: self
                 .query_stale_hit_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            query_permission_denied_count: self
+                .query_permission_denied_count
                 .load(std::sync::atomic::Ordering::Relaxed),
             events_applied: self
                 .events_applied

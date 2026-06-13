@@ -45,7 +45,6 @@ impl QueryVerifyBudget {
             .load(Ordering::Relaxed)
             .max(1) as usize;
         let timeout_ms = index.query_verify_timeout_ms.load(Ordering::Relaxed).max(1);
-        let _allow_sync_readdir = index.query_allow_sync_readdir.load(Ordering::Relaxed);
         Self {
             remaining: max_verify,
             deadline: Instant::now() + std::time::Duration::from_millis(timeout_ms),
@@ -826,6 +825,9 @@ impl TieredIndex {
                 return None;
             }
             Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    self.stats.record_query_permission_denied(1);
+                }
                 tracing::debug!(
                     "cold query validation skipped unreadable path {}: {}",
                     meta.path.display(),

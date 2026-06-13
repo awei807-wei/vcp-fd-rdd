@@ -546,6 +546,7 @@ pub struct TieredWatchRuntime {
     cold_validate_count: AtomicU64,
     dirty_queue_len: AtomicUsize,
     query_stale_hit_count: AtomicU64,
+    query_permission_denied_count: AtomicU64,
     fast_scan_enabled: AtomicBool,
     fast_scan_target_secs: AtomicU64,
     fast_scan_tick_ms: AtomicU64,
@@ -683,6 +684,7 @@ impl TieredWatchRuntime {
             cold_validate_count: AtomicU64::new(0),
             dirty_queue_len: AtomicUsize::new(0),
             query_stale_hit_count: AtomicU64::new(0),
+            query_permission_denied_count: AtomicU64::new(0),
             fast_scan_enabled: AtomicBool::new(true),
             fast_scan_target_secs: AtomicU64::new(5),
             fast_scan_tick_ms: AtomicU64::new(1_000),
@@ -2991,6 +2993,9 @@ impl TieredWatchRuntime {
             dirty_queue_len: self.dirty_queue_len.load(Ordering::Relaxed),
             cold_validate_count: self.cold_validate_count.load(Ordering::Relaxed),
             query_stale_hit_count: self.query_stale_hit_count.load(Ordering::Relaxed),
+            query_permission_denied_count: self
+                .query_permission_denied_count
+                .load(Ordering::Relaxed),
             directory_manifest_dirs: 0,
             directory_manifest_skipped_scans: 0,
             directory_manifest_changed_scans: 0,
@@ -3064,6 +3069,11 @@ impl TieredWatchRuntime {
 
     pub fn set_query_stale_hit_count(&self, count: u64) {
         self.query_stale_hit_count.store(count, Ordering::Relaxed);
+    }
+
+    pub fn set_query_permission_denied_count(&self, count: u64) {
+        self.query_permission_denied_count
+            .store(count, Ordering::Relaxed);
     }
 
     fn state(&self, path: &Path) -> Option<Arc<DirState>> {

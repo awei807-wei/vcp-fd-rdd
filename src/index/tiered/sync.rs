@@ -168,6 +168,12 @@ struct ReadDirSlice {
     next_offset: Option<i64>,
 }
 
+// telldir/seekdir behavior across closedir/opendir cycles is filesystem-dependent:
+// some filesystems (e.g. NFS, FUSE) may invalidate or reorder cookies after the
+// directory handle is closed and reopened. This is acceptable for cold repair because
+// the repair loop only requires eventual consistency -- missed or duplicated entries
+// are corrected by subsequent repair passes, and the hot watcher provides a fallback
+// for actively changing directories.
 #[cfg(unix)]
 fn read_dir_slice(
     dir: &Path,

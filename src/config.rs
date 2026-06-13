@@ -257,8 +257,25 @@ pub struct QueryConfig {
     pub max_verify_per_query: usize,
     /// Maximum synchronous verification wall time per query.
     pub verify_timeout_ms: u64,
-    /// Reserved hard gate for future query-thread readdir expansion. Currently kept false.
-    pub allow_sync_readdir: bool,
+}
+
+impl QueryConfig {
+    /// Validates cross-field constraints. Returns `Err` with a description on failure.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_verify_per_query < 1 {
+            return Err(format!(
+                "max_verify_per_query must be >= 1, got {}",
+                self.max_verify_per_query
+            ));
+        }
+        if self.verify_timeout_ms < 1 {
+            return Err(format!(
+                "verify_timeout_ms must be >= 1, got {}",
+                self.verify_timeout_ms
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for QueryConfig {
@@ -266,7 +283,6 @@ impl Default for QueryConfig {
         Self {
             max_verify_per_query: 150,
             verify_timeout_ms: 75,
-            allow_sync_readdir: false,
         }
     }
 }
@@ -388,6 +404,8 @@ pub struct TieredWatchConfig {
     pub project_markers: Vec<String>,
     /// Initial hot directory candidates. `~` is expanded during config load.
     pub hot_dirs: Vec<PathBuf>,
+    /// TTL in seconds for runtime subtree tombstones (default 300).
+    pub runtime_subtree_tombstone_ttl_secs: u64,
     /// Directories that must be covered by L0 when profile = "strict".
     pub strict_required_hot_dirs: Vec<PathBuf>,
     /// Treat strict required coverage shortfall as degraded health instead of warning.
@@ -514,6 +532,24 @@ impl std::str::FromStr for L3ScanPolicy {
     }
 }
 
+impl TieredWatchConfig {
+    /// Validates cross-field constraints. Returns `Err` with a description on failure.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.l1_l2_fast_scan_tick_ms < 100 {
+            return Err(format!(
+                "l1_l2_fast_scan_tick_ms must be >= 100, got {}",
+                self.l1_l2_fast_scan_tick_ms
+            ));
+        }
+        if self.l1_l2_fast_scan_stat_budget_per_tick < 1 {
+            return Err(
+                "l1_l2_fast_scan_stat_budget_per_tick must be >= 1".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for TieredWatchConfig {
     fn default() -> Self {
         Self {
@@ -547,6 +583,7 @@ impl Default for TieredWatchConfig {
             ephemeral_watch_ttl_secs: 600,
             ephemeral_idle_secs: 120,
             ephemeral_max_cost_per_root: 64,
+            runtime_subtree_tombstone_ttl_secs: 300,
             project_markers: default_project_markers(),
             hot_dirs: default_hot_dirs(),
             strict_required_hot_dirs: default_hot_dirs(),
@@ -575,8 +612,8 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             l3_scan_interval_secs: u64,
             l1_l2_fast_scan_enabled: bool,
             l1_l2_fast_scan_target_secs: u64,
-            l1_l2_fast_scan_tick_ms: u64,
-            l1_l2_fast_scan_stat_budget_per_tick: usize,
+            l1_l2_fast_scan_tick_ms: Option<u64>,
+            l1_l2_fast_scan_stat_budget_per_tick: Option<usize>,
             l1_l2_fast_scan_readdir_budget_per_tick: usize,
             l1_l2_fast_scan_bootstrap_budget_per_tick: usize,
             l1_l2_fast_scan_hotset_max_leases: usize,
@@ -593,6 +630,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             ephemeral_watch_ttl_secs: u64,
             ephemeral_idle_secs: u64,
             ephemeral_max_cost_per_root: usize,
+            runtime_subtree_tombstone_ttl_secs: u64,
             project_markers: Vec<String>,
             hot_dirs: Vec<PathBuf>,
             strict_required_hot_dirs: Vec<PathBuf>,
@@ -615,9 +653,8 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
                     l3_scan_interval_secs: defaults.l3_scan_interval_secs,
                     l1_l2_fast_scan_enabled: defaults.l1_l2_fast_scan_enabled,
                     l1_l2_fast_scan_target_secs: defaults.l1_l2_fast_scan_target_secs,
-                    l1_l2_fast_scan_tick_ms: defaults.l1_l2_fast_scan_tick_ms,
-                    l1_l2_fast_scan_stat_budget_per_tick: defaults
-                        .l1_l2_fast_scan_stat_budget_per_tick,
+                    l1_l2_fast_scan_tick_ms: None,
+                    l1_l2_fast_scan_stat_budget_per_tick: None,
                     l1_l2_fast_scan_readdir_budget_per_tick: defaults
                         .l1_l2_fast_scan_readdir_budget_per_tick,
                     l1_l2_fast_scan_bootstrap_budget_per_tick: defaults
@@ -641,6 +678,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
                     ephemeral_watch_ttl_secs: defaults.ephemeral_watch_ttl_secs,
                     ephemeral_idle_secs: defaults.ephemeral_idle_secs,
                     ephemeral_max_cost_per_root: defaults.ephemeral_max_cost_per_root,
+                    runtime_subtree_tombstone_ttl_secs: defaults.runtime_subtree_tombstone_ttl_secs,
                     project_markers: defaults.project_markers,
                     hot_dirs: defaults.hot_dirs,
                     strict_required_hot_dirs: defaults.strict_required_hot_dirs,
@@ -651,6 +689,21 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
 
         let raw = RawTieredWatchConfig::deserialize(deserializer)?;
         let max_watch_dirs = raw.max_watch_dirs.unwrap_or(DEFAULT_TIERED_MAX_WATCH_DIRS);
+        let defaults = TieredWatchConfig::default();
+
+        // Profile-specific defaults: LowPower tunes fast scan parameters down
+        // when the user hasn't explicitly set them.
+        let (default_tick_ms, default_stat_budget) = match raw.profile {
+            TieredWatchProfile::LowPower => (2_000, 1_000),
+            _ => (
+                defaults.l1_l2_fast_scan_tick_ms,
+                defaults.l1_l2_fast_scan_stat_budget_per_tick,
+            ),
+        };
+        let l1_l2_fast_scan_tick_ms = raw.l1_l2_fast_scan_tick_ms.unwrap_or(default_tick_ms);
+        let l1_l2_fast_scan_stat_budget_per_tick = raw
+            .l1_l2_fast_scan_stat_budget_per_tick
+            .unwrap_or(default_stat_budget);
 
         Ok(Self {
             profile: raw.profile,
@@ -665,8 +718,8 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             l3_scan_interval_secs: raw.l3_scan_interval_secs,
             l1_l2_fast_scan_enabled: raw.l1_l2_fast_scan_enabled,
             l1_l2_fast_scan_target_secs: raw.l1_l2_fast_scan_target_secs,
-            l1_l2_fast_scan_tick_ms: raw.l1_l2_fast_scan_tick_ms,
-            l1_l2_fast_scan_stat_budget_per_tick: raw.l1_l2_fast_scan_stat_budget_per_tick,
+            l1_l2_fast_scan_tick_ms,
+            l1_l2_fast_scan_stat_budget_per_tick,
             l1_l2_fast_scan_readdir_budget_per_tick: raw.l1_l2_fast_scan_readdir_budget_per_tick,
             l1_l2_fast_scan_bootstrap_budget_per_tick: raw
                 .l1_l2_fast_scan_bootstrap_budget_per_tick,
@@ -687,6 +740,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             ephemeral_watch_ttl_secs: raw.ephemeral_watch_ttl_secs,
             ephemeral_idle_secs: raw.ephemeral_idle_secs,
             ephemeral_max_cost_per_root: raw.ephemeral_max_cost_per_root,
+            runtime_subtree_tombstone_ttl_secs: raw.runtime_subtree_tombstone_ttl_secs,
             project_markers: raw.project_markers,
             hot_dirs: raw.hot_dirs,
             strict_required_hot_dirs: raw.strict_required_hot_dirs,
@@ -1175,7 +1229,6 @@ roots = ["~"]
 
         assert_eq!(default_cfg.query.max_verify_per_query, 150);
         assert_eq!(default_cfg.query.verify_timeout_ms, 75);
-        assert!(!default_cfg.query.allow_sync_readdir);
         assert!(!default_cfg.lazy_validation_enabled);
 
         let cfg: Config = toml::from_str(
@@ -1185,14 +1238,23 @@ roots = ["~"]
 [query]
 max_verify_per_query = 123
 verify_timeout_ms = 60
-allow_sync_readdir = true
 "#,
         )
         .expect("query config should parse");
 
         assert_eq!(cfg.query.max_verify_per_query, 123);
         assert_eq!(cfg.query.verify_timeout_ms, 60);
-        assert!(cfg.query.allow_sync_readdir);
+
+        // Old config files with allow_sync_readdir should still parse (field is ignored).
+        let _legacy: Config = toml::from_str(
+            r#"
+roots = ["~"]
+
+[query]
+allow_sync_readdir = true
+"#,
+        )
+        .expect("legacy config with allow_sync_readdir should still parse");
 
         let toml = toml::to_string_pretty(&Config::default()).expect("serialize default config");
         assert!(toml.contains("[query]"));

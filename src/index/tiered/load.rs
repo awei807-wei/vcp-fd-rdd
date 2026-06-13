@@ -210,7 +210,9 @@ impl TieredIndex {
             lazy_validation_queue_full: AtomicU64::new(0),
             query_max_verify_per_query: AtomicU64::new(150),
             query_verify_timeout_ms: AtomicU64::new(75),
-            query_allow_sync_readdir: AtomicBool::new(false),
+            runtime_subtree_tombstone_ttl_secs: AtomicU64::new(
+                super::RUNTIME_SUBTREE_TOMBSTONE_TTL.as_secs(),
+            ),
             runtime_subtree_tombstones: Mutex::new(Vec::new()),
             recent_stale_hit_dirs: Mutex::new(Vec::new()),
             cold_sweep_last_completed_unix_secs: AtomicU64::new(0),

@@ -58,6 +58,7 @@ pub struct MetricsRuntimeSnapshot {
     pub fuzzy_full_scan_last_elapsed_us: u64,
     pub cold_validate_count: u64,
     pub query_stale_hit_count: u64,
+    pub query_permission_denied_count: u64,
     pub events_applied: u64,
     pub events_dropped: u64,
     pub snapshot_count: u64,
@@ -245,6 +246,7 @@ impl MetricsRuntimeSnapshot {
             fuzzy_full_scan_last_elapsed_us: stats.fuzzy_full_scan_last_elapsed_us,
             cold_validate_count: stats.cold_validate_count,
             query_stale_hit_count: stats.query_stale_hit_count,
+            query_permission_denied_count: stats.query_permission_denied_count,
             events_applied: stats.events_applied,
             events_dropped: stats.events_dropped,
             snapshot_count: stats.snapshot_count,
@@ -328,6 +330,12 @@ impl MetricsDiagnostics {
             issues.push(format!(
                 "query_stale_hit_count={}",
                 watch.query_stale_hit_count
+            ));
+        }
+        if watch.query_permission_denied_count > 0 {
+            issues.push(format!(
+                "query_permission_denied_count={}",
+                watch.query_permission_denied_count
             ));
         }
         if watch.stale_dirs > 0 || watch.dirty_dirs > 0 {
