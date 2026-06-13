@@ -15,11 +15,14 @@
 **核心思路**：借鉴 Everything 的即时体验，但不走内核驱动路线——用 mmap 段式快照实现冷启动秒开，用 LSM（base + delta）层控制长期运行的内存与段数增长，用事件溢出补偿（fast-sync → rebuild）兜住 watcher 不可靠的现实。
 
 - **冷启动快**：优先加载 mmap 段式快照，按需触页，不 hydration 全量索引
+- **返回前验真**：查询冷层结果在返回前同步 stat 校验，删除文件不会出现在结果中；预算化验真（默认 150 候选 / 75ms）避免查询线程阻塞
 - **可恢复**：快照/段损坏可识别并隔离，必要时重建兜底；断电后通过 stable snapshot + WAL 回放恢复
 - **长期稳定**：compaction 做物理回收；heap high-water 主动 trim；内存报告可量化 RSS 组成
+- **Lease Hotset**：fast scan 只覆盖活跃 lease hotset（查询命中、stale hit、项目标记、L0 事件、proc sampler、显式配置），冷目录由 DirtyQueue / cold sweep 有界最终一致
+- **Proc Sampler**：采样 `/proc/<pid>/fd` 写句柄，自动覆盖 ComfyUI/下载器等持续写入目录
 - **Tiered Watcher**：预算受控的热点目录监听，避免 inotify 耗尽系统 watch 配额
 
-当前版本 **v7.0.0** · [更新日志](CHANGELOG.md) · [编年史](fd-rdd-编年史.md)
+当前版本 **v7.1.0** · [更新日志](CHANGELOG.md) · [编年史](fd-rdd-编年史.md)
 
 </details>
 
@@ -33,11 +36,14 @@
 **Design**: Everything-like instant search, but without kernel drivers — mmap-based segment snapshots for fast cold starts, LSM (base + delta) layers to bound long-running memory and segment count, and an overflow recovery chain (fast-sync → rebuild) to handle the reality that inotify WILL drop events under load.
 
 - **Fast cold start**: mmap segment snapshots with demand paging, no full-index hydration
+- **Verify-before-return**: cold query hits are stat-validated before return; deleted files never appear in results; budgeted verification (default 150 candidates / 75ms) prevents query thread blocking
 - **Recoverable**: corrupted segments detected & isolated; power-off recovery via stable snapshot + WAL replay
 - **Stable long-running**: compaction reclaims storage; proactive heap trim; attributed memory reports
+- **Lease Hotset**: fast scan covers only active lease hotset (query hits, stale hits, project markers, L0 events, proc sampler, explicit config); cold directories reach bounded eventual consistency via DirtyQueue / cold sweep
+- **Proc Sampler**: samples `/proc/<pid>/fd` write handles to auto-cover directories with active writes (ComfyUI, downloaders, renderers)
 - **Tiered Watcher**: budget-constrained hot-directory watching to avoid exhausting inotify limits
 
-Current version **v7.0.0** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-编年史.md)
+Current version **v7.1.0** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-编年史.md)
 
 </details>
 
@@ -51,11 +57,14 @@ Current version **v7.0.0** · [Changelog](CHANGELOG.md) · [Chronicle](fd-rdd-�
 **設計思想**: Everything のような即時検索体験を、カーネルドライバに依存せず実現 — mmap セグメントスナップショットによる高速コールドスタート、LSM（base + delta）層による長期実行時のメモリとセグメント数の制御、そして inotify のイベント損失を前提とした回復チェーン（fast-sync → rebuild）。
 
 - **高速コールドスタート**: mmap セグメントスナップショット（デマンドページング）
+- **返却前検証**: コールド層のクエリ結果を返却前に stat で検証、削除済みファイルは結果に含まれない；予算化検証（デフォルト 150 候補 / 75ms）
 - **回復可能**: 破損セグメントの検出と隔離、電源断後の stable snapshot + WAL 再生による復旧
 - **長期安定**: compaction による物理的回収、ヒープ高水位の積極的トリム、RSS 構成の可視化
+- **Lease Hotset**: fast scan はアクティブな lease hotset のみをカバー；コールドディレクトリは DirtyQueue / cold sweep で有界最終一致
+- **Proc Sampler**: `/proc/<pid>/fd` の書き込みハンドルをサンプリングし、アクティブな書き込みディレクトリを自動カバー
 - **Tiered Watcher**: 予算制約付きのホットディレクトリ監視、inotify 枯渇の防止
 
-現在のバージョン **v7.0.0** · [変更履歴](CHANGELOG.md) · [年代記](fd-rdd-编年史.md)
+現在のバージョン **v7.1.0** · [変更履歴](CHANGELOG.md) · [年代記](fd-rdd-编年史.md)
 
 </details>
 
@@ -268,7 +277,6 @@ L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` �
 | `runtime_profile` | `String` | `"default"` | `default` / `memory_light` |
 | `query.max_verify_per_query` | `usize` | `150` | 单次查询返回前最多同步验真的冷层候选数 |
 | `query.verify_timeout_ms` | `u64` | `75` | 单次查询同步验真时间预算 |
-| `query.allow_sync_readdir` | `bool` | `false` | 查询线程同步 readdir 硬门禁；当前保持关闭 |
 | `proc_sampler.enabled` | `bool` | `true` | Linux tiered 模式采样同用户写 fd，并触发 Ephemeral Watch 新鲜度线索 |
 | `proc_sampler.interval_ms` | `u64` | `1000` | proc sampler 调度 tick，运行时最小按 100ms 保护 |
 | `proc_sampler.max_pids_per_tick` | `usize` | `128` | 每 tick 最多检查的 pid 数 |
@@ -299,6 +307,7 @@ L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` �
 | `tiered_watch.network_fast_scan_mode` | `String` | `"best_effort"` | 网络/FUSE fast scan 模式：`best_effort` / `strict_poll` / `disabled` |
 | `tiered_watch.network_fast_scan_stat_budget_per_tick` | `usize` | `128` | 每 tick 网络/FUSE sentinel stat 预算 |
 | `tiered_watch.network_fast_scan_readdir_budget_per_tick` | `usize` | `16` | 每 tick 网络/FUSE strict_poll changed-dir readdir 预算 |
+| `tiered_watch.runtime_subtree_tombstone_ttl_secs` | `u64` | `300` | 运行时 subtree tombstone TTL，过期后冷层候选回退到同步验真 |
 | `snapshot_interval_secs` | `u64` | `300` | 快照落盘周期 |
 | `stable_snapshot_enabled` | `bool` | `true` | 稳定快照轮转 |
 | `startup_repair_enabled` | `bool` | `true` | 启动修复扫描 |

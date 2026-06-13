@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.1.0] - 2026-06-13
+
+### 质量加固
+
+- Config 新增跨字段校验（`TieredWatchConfig::validate()`、`QueryConfig::validate()`），拦截 `tick_ms=0` 等退化值。
+- 移除 `query.allow_sync_readdir` 死配置字段；该门禁改为内部硬编码 `false`，旧配置文件中的该字段会被静默忽略。
+- Subtree tombstone TTL 改为可配置：`tiered_watch.runtime_subtree_tombstone_ttl_secs`，默认 300s。
+- `LowPower` profile 自动调低 fast scan 参数：`stat_budget_per_tick` 降为 1000，`tick_ms` 升为 2000（仅在用户未显式覆盖时生效）。
+- 新增 `query_permission_denied_count` metric，暴露因权限拒绝而无法验真的冷层候选累积计数。
+- 收紧 26 处测试断言：`!is_empty()` → `len() == 1`、`>= N` → `== N` ��，确保功能退化时测试必须失败。
+- 统一 17 处 `unique_tmp_dir` 复制品到 `tests/common/`；统一 `crc32_simple`、`WAL_MAGIC`、`create_event`、`get_json` 等 6 组重复 helper。
+- 新增 `test_meta()` helper 减少 `p1_query.rs` 约 250 行 FileMeta 构造样板。
+- `FdRddProcess` 新增 `Drop` guard，测试 panic 后自动清理子进程。
+- `fd_rdd_client` 新增 `search_checked()` 返回 `Result`，区分"服务返回空结果"与"服务不可达"。
+- `high_load_event_processing` 补充断言（file_count > 0 + 已知文件可查询），不再是零断言死测试。
+- 新增查询错误响应测试（缺参数 → 4xx、空查询 → 200）和 watch 启用时 `index_health = "ok"` 测试。
+- `p2_large_scale_hybrid` 端口改为动态分配，超时从 600s 收紧到 120s。
+
+### 功能（从 Unreleased 合入）
+
 - M3 fast scan 正式收缩为 lease hotset 语义：5 秒 SLA 只覆盖 active lease hotset，lease 来源包括查询命中、stale hit、project marker、L0 事件、proc sampler 和 `hot_dirs` 显式配置；路径形态 query miss 保持 DirtyQueue 冷目录补偿，不直接扩张 hotset；普通冷目录改由 PeriodicColdScan / dirty repair / query repair 提供有界最终一致。
 - 新增 fast scan lease TTL、hotset 总预算和 sentinel registry 持久化配置；clean shutdown 仅持久化 hotset sentinel，恢复时校验 snapshot source、WAL checkpoint、配置 fingerprint 与 mount identity，不可信 registry 进入限速 backfill 且不报告 strict SLA ok。
 - fast scan 初始补扫拆成低优先级 `FastScanBootstrapDir`，真实 sentinel 变化继续使用 `FastScanChangedDir`；`/watch-state`、`/health`、diagnostics 与 metrics JSONL 新增 hotset lease/sentinel、explicit/auto lease、lease evictions/renewals、initial backfill、real changed dirs、apply dropped stale batches、scan workers 和 IO budget limited 字段。
