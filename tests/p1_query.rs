@@ -109,7 +109,8 @@ fn fuzzy_query_matches() {
     // "my" should match files starting with "my"
     let results = index.query("my");
     assert_eq!(
-        results.len(), 2,
+        results.len(),
+        2,
         "Should find at least 2 files matching 'my'"
     );
 
@@ -308,7 +309,8 @@ fn short_query_works() {
     // Single character query
     let results = index.query("a");
     assert_eq!(
-        results.len(), 3,
+        results.len(),
+        3,
         "Single char 'a' should match a.txt, ab.txt, abc.txt; got {}",
         results.len()
     );
@@ -316,7 +318,8 @@ fn short_query_works() {
     // Two character query
     let results = index.query("ab");
     assert_eq!(
-        results.len(), 2,
+        results.len(),
+        2,
         "Two char 'ab' should match ab.txt, abc.txt; got {}",
         results.len()
     );

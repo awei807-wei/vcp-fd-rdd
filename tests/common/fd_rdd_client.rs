@@ -112,9 +112,7 @@ pub fn search_checked(port: u16, q: &str, limit: usize) -> Result<Vec<SearchResu
         .query(&[("q", q), ("limit", &limit.to_string())])
         .send()
     {
-        Ok(resp) if resp.status().is_success() => {
-            Ok(resp.json().unwrap_or_default())
-        }
+        Ok(resp) if resp.status().is_success() => Ok(resp.json().unwrap_or_default()),
         Ok(resp) => Err(format!("HTTP {}", resp.status())),
         Err(e) => Err(format!("request failed: {e}")),
     }

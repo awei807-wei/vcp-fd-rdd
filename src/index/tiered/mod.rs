@@ -421,7 +421,9 @@ impl TieredIndex {
         events: &[crate::core::EventRecord],
     ) {
         let now = Instant::now();
-        let ttl_secs = self.runtime_subtree_tombstone_ttl_secs.load(Ordering::Relaxed);
+        let ttl_secs = self
+            .runtime_subtree_tombstone_ttl_secs
+            .load(Ordering::Relaxed);
         let expires_at = now + Duration::from_secs(ttl_secs);
         let current_generation = self.event_seq.load(Ordering::Relaxed);
         let mut tombstones = self.runtime_subtree_tombstones.lock();

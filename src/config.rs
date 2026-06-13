@@ -542,9 +542,7 @@ impl TieredWatchConfig {
             ));
         }
         if self.l1_l2_fast_scan_stat_budget_per_tick < 1 {
-            return Err(
-                "l1_l2_fast_scan_stat_budget_per_tick must be >= 1".to_string(),
-            );
+            return Err("l1_l2_fast_scan_stat_budget_per_tick must be >= 1".to_string());
         }
         Ok(())
     }

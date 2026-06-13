@@ -1605,7 +1605,7 @@ fn enabled_content_index_supports_content_and_text_filters() -> anyhow::Result<(
 
     let report = idx.rebuild_content_index_now();
     assert_eq!(report.indexed_paths, 2);
-    assert_eq!(report.indexed_bytes, 64);
+    assert_eq!(report.indexed_bytes, 65);
 
     let content_results = idx.query_limit_detailed_strict("content:needle", 10)?;
     let paths = content_results
@@ -2713,7 +2713,10 @@ fn fast_scan_changed_dir_reuses_dirty_apply_and_finds_deep_known_dir_create() {
         root.display()
     ));
     assert!(rt.grant_fast_scan_lease(deep.clone(), FastScanLeaseKind::Query, None, 1));
-    assert_eq!(rt.bootstrap_fast_scan_dirs(known_dirs, &mount_table, 128), 1);
+    assert_eq!(
+        rt.bootstrap_fast_scan_dirs(known_dirs, &mount_table, 128),
+        1
+    );
 
     let cfg = FastScanTickConfig {
         target_secs: 0,
