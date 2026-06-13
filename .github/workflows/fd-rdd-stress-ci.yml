@@ -430,12 +430,23 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
-          wait $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
-          sleep 1
-          for i in $(seq 1 5); do
-            rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* 2>/dev/null && break || sleep 1
+          # 先等守护进程退出再删,避免 rm 与关闭时的最后一次快照写入竞争(ENOTEMPTY)。
+          set +e
+          if [ -f /tmp/fd-rdd.pid ]; then
+            DAEMON_PID=$(cat /tmp/fd-rdd.pid)
+            kill "$DAEMON_PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$DAEMON_PID" 2>/dev/null || break
+              sleep 0.2
+            done
+            kill -9 "$DAEMON_PID" 2>/dev/null || true
+          fi
+          fuser -k ${{ env.FD_RDD_PORT }}/tcp 2>/dev/null || true
+          for _ in $(seq 1 5); do
+            rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* && break
+            sleep 0.5
           done
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* 2>/dev/null || true
 
   # ───────────────────────────────────────────────────────────────────────────
   # Job 4: 并发中间状态 + 物理删除原子性 + 事件风暴
@@ -586,8 +597,23 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
-          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* /tmp/query_results.log
+          # 先等守护进程退出再删,避免 rm 与关闭时的最后一次快照写入竞争(ENOTEMPTY)。
+          set +e
+          if [ -f /tmp/fd-rdd.pid ]; then
+            DAEMON_PID=$(cat /tmp/fd-rdd.pid)
+            kill "$DAEMON_PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$DAEMON_PID" 2>/dev/null || break
+              sleep 0.2
+            done
+            kill -9 "$DAEMON_PID" 2>/dev/null || true
+          fi
+          fuser -k ${{ env.FD_RDD_PORT }}/tcp 2>/dev/null || true
+          for _ in $(seq 1 5); do
+            rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* /tmp/query_results.log && break
+            sleep 0.5
+          done
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* /tmp/query_results.log 2>/dev/null || true
 
   # ───────────────────────────────────────────────────────────────────────────
   # Job 5: Mmap 安全 + Compaction 竞态 + I/O 停顿
@@ -732,8 +758,23 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
-          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+          # 先等守护进程退出再删,避免 rm 与关闭时的最后一次快照写入竞争(ENOTEMPTY)。
+          set +e
+          if [ -f /tmp/fd-rdd.pid ]; then
+            DAEMON_PID=$(cat /tmp/fd-rdd.pid)
+            kill "$DAEMON_PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$DAEMON_PID" 2>/dev/null || break
+              sleep 0.2
+            done
+            kill -9 "$DAEMON_PID" 2>/dev/null || true
+          fi
+          fuser -k ${{ env.FD_RDD_PORT }}/tcp 2>/dev/null || true
+          for _ in $(seq 1 5); do
+            rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* && break
+            sleep 0.5
+          done
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* 2>/dev/null || true
 
   # ───────────────────────────────────────────────────────────────────────────
   # Job 6: Trigram 倾斜 + 长路径爆炸
@@ -876,8 +917,23 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
-          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+          # 先等守护进程退出再删,避免 rm 与关闭时的最后一次快照写入竞争(ENOTEMPTY)。
+          set +e
+          if [ -f /tmp/fd-rdd.pid ]; then
+            DAEMON_PID=$(cat /tmp/fd-rdd.pid)
+            kill "$DAEMON_PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$DAEMON_PID" 2>/dev/null || break
+              sleep 0.2
+            done
+            kill -9 "$DAEMON_PID" 2>/dev/null || true
+          fi
+          fuser -k ${{ env.FD_RDD_PORT }}/tcp 2>/dev/null || true
+          for _ in $(seq 1 5); do
+            rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* && break
+            sleep 0.5
+          done
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* 2>/dev/null || true
 
   # ───────────────────────────────────────────────────────────────────────────
   # Job 7: 硬链接 + 跨挂载点移动
@@ -1013,9 +1069,24 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
+          # 先等守护进程退出再删,避免 rm 与关闭时的最后一次快照写入竞争(ENOTEMPTY)。
+          set +e
+          if [ -f /tmp/fd-rdd.pid ]; then
+            DAEMON_PID=$(cat /tmp/fd-rdd.pid)
+            kill "$DAEMON_PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$DAEMON_PID" 2>/dev/null || break
+              sleep 0.2
+            done
+            kill -9 "$DAEMON_PID" 2>/dev/null || true
+          fi
+          fuser -k ${{ env.FD_RDD_PORT }}/tcp 2>/dev/null || true
           sudo umount /tmp/fd-rdd-ci-test/crossmount-tmpfs 2>/dev/null || true
-          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+          for _ in $(seq 1 5); do
+            rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* && break
+            sleep 0.5
+          done
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* 2>/dev/null || true
 
   # ───────────────────────────────────────────────────────────────────────────
   # Job 8: Crash 恢复 + WAL Replay 一致性
@@ -1196,8 +1267,25 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
-          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+          # 等待守护进程真正退出再删快照目录。kill 是异步的:若 rm -rf 在守护进程
+          # 关闭时仍在向 ${SNAPSHOT}_recovery.d 落最后一次快照,rm 会先清空目录再
+          # rmdir,中途被新写入的文件撞上 -> "Directory not empty" -> 退出码 1。
+          set +e
+          if [ -f /tmp/fd-rdd.pid ]; then
+            DAEMON_PID=$(cat /tmp/fd-rdd.pid)
+            kill "$DAEMON_PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$DAEMON_PID" 2>/dev/null || break
+              sleep 0.2
+            done
+            kill -9 "$DAEMON_PID" 2>/dev/null || true
+          fi
+          fuser -k ${{ env.FD_RDD_PORT }}/tcp 2>/dev/null || true
+          for _ in $(seq 1 5); do
+            rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* && break
+            sleep 0.5
+          done
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* 2>/dev/null || true
 
   # ───────────────────────────────────────────────────────────────────────────
   # Job 9: 长时压力 soak test（工作流调度触发）
@@ -1350,5 +1438,20 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kill $(cat /tmp/fd-rdd.pid) 2>/dev/null || true
-          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}*
+          # 先等守护进程退出再删,避免 rm 与关闭时的最后一次快照写入竞争(ENOTEMPTY)。
+          set +e
+          if [ -f /tmp/fd-rdd.pid ]; then
+            DAEMON_PID=$(cat /tmp/fd-rdd.pid)
+            kill "$DAEMON_PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$DAEMON_PID" 2>/dev/null || break
+              sleep 0.2
+            done
+            kill -9 "$DAEMON_PID" 2>/dev/null || true
+          fi
+          fuser -k ${{ env.FD_RDD_PORT }}/tcp 2>/dev/null || true
+          for _ in $(seq 1 5); do
+            rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* && break
+            sleep 0.5
+          done
+          rm -rf /tmp/fd-rdd-ci-test ${{ env.FD_RDD_SNAPSHOT }}* 2>/dev/null || true
