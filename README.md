@@ -418,6 +418,8 @@ jq '.dirty_queue_len' reports/metrics/metrics_$(date -u +%F_%H).json
 jq 'select(.query_stale_hit_count > 100)' reports/metrics/metrics_*.json
 ```
 
+M2 冷层轮转 VM 压测可用 `scripts/m2-cold-window-vm-bench.py` 启动隔离 daemon，并复用上述内建指标；测试场景、通过标准和报告模板见 `helloagents/wiki/m2-cold-window-vm-benchmark.md`。
+
 新增嵌套对象：
 
 - `runtime`：查询、事件、snapshot、fast-sync 计数。
