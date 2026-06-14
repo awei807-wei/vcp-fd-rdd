@@ -25,3 +25,125 @@
 | npm_install | 0% | 0ms | 0KB |
 
 说明：冷启动全量扫描使用保守串行策略和批次节流，优先满足事件/查询可用性与 CPU 峰值约束。v7 快照启动改为直接挂载 `BaseIndexData`，不再把快照逐条回灌到 L2。
+
+## M2 冷层轮转 VM 验证计划
+
+M2 `Rotating Cold Freshness Window` 不能只用“正常情况下能搜到”证明可用。验证目标是：在事件丢失、后台扫描滞后、删除风暴、重命名风暴、冷段 mmap、Tombstone overlay、Lazy Validation、`apply_seq` 竞态同时存在时，系统仍然不爆 RSS、不拖死前台查询、不复活幽灵文件、不用后台旧事实覆盖 watcher 新事实。
+
+现有指标可以复用：daemon 已经每 30 秒写 `reports/metrics/metrics_YYYY-MM-DD_HH.json`，顶层兼容 `/watch-state`，嵌套包含 `runtime`、`memory`、`health`、`diagnostics`。`scripts/m2-cold-window-vm-bench.py` 负责隔离启动 fd-rdd、周期采集 HTTP 端点和 `/proc/<pid>`，并把内建 metrics 一并保存在单次 run 目录。
+
+### 总不变量
+
+| 类别 | 不变量 |
+|---|---|
+| 前台查询 | 查询延迟不能被后台 scan / validation / compaction 明显拖死；同步验真必须受 `max_verify_per_query` 和 `verify_timeout_ms` 预算限制；lazy validation 模式下前台查询不得调用 stat。 |
+| 正确性 | Watcher 新事实优先于 deferred scanner 旧事实；删除事实不得被 anti-entropy 复活；Dirty Scope 合并不能导致无限全量扫；Tombstone 多层叠加不能让 hot path 退化成解释型历史回放；启动恢复不能无脑全盘重建。 |
+| 资源 | stable.v7 不整体反序列化进堆；RSS 增长有上界；mmap page fault 可观测；后台 stat/s 有上限；scan slice 受 entries/time/I/O token budget 限制；PSI 升高时后台任务应降速或撤销 BoostLease。 |
+
+### 先做的 12 个架构骨头测试
+
+| 优先级 | 测试 | 目标 |
+|---|---|---|
+| P0 | 初始 build + query | 基础索引与查询正确。 |
+| P0 | create event -> L2 可查 | 新文件不依赖立即 rebuild stable.v7。 |
+| P0 | delete event -> tombstone 过滤 L3 | 删除不返回旧 cold/base 结果。 |
+| P0 | subtree tombstone 不逐文件展开 | 大目录删除不产生海量逐文件墓碑。 |
+| P0 | scanner 旧事实不能覆盖 watcher 新事实 | `apply_seq` 竞态下新事实胜出。 |
+| P0 | 删除后 anti-entropy 不复活幽灵文件 | 后台补扫不能反向恢复删除事实。 |
+| P1 | 父级 dirty coalescing 不触发全量 scan | 父级合并只降低精度，不放大为无预算递归扫。 |
+| P1 | scan slice 遵守 entries/time budget | 每轮处理数、耗时和 I/O token 受控。 |
+| P1 | lazy 模式下前台 query 不 stat | lazy validation 的“只入队不等待”语义成立。 |
+| P1 | validation worker 遵守 stat/s 限速 | 后台验证不抢前台资源。 |
+| P1 | stable.v7 启动不整体反序列化 | VIRT 可增，RSS 不能随冷段大小线性暴涨。 |
+| P1 | tombstone overlay 超阈值触发 compiled/compaction | 查询成本不随 tombstone 层数线性退化。 |
+
+### VM 场景分层
+
+| 场景 | 内容 | 主要观察 |
+|---|---|---|
+| S0 空闲基线 | 启动后不做操作，运行 10–15 分钟。 | RSS、CPU、DirtyQueue、cold freshness age 是否稳定。 |
+| S1 日常桌面 | 小文件 create/edit/rename/delete，编辑器原子保存，下载器 `.part -> final`。 | canary 延迟、旧路径隐藏、hotset SLA。 |
+| S2 冷目录追平 | 在 L2/L3 大目录持续制造 canary。 | 冷层 p95/p99 是否优于 baseline。 |
+| S3 大目录压力 | 批量创建/移动/删除 1 万到 10 万文件，删除整棵子树。 | scan-only/分片 repair、RSS、DirtyQueue 回落。 |
+| S4 热层保护 | 冷目录压力同时操作 L0/hotset 项目目录。 | fast scan p99、L0 watch cost、hotset lease 是否被挤占。 |
+| S5 预算受限 | 降低 watch、L0 单根和 rotating budget。 | blocked 指标是否可解释，是否突破预算。 |
+| S6 Rename 风暴 | 10 万级 rename，覆盖 old/new 查询。 | `apply_seq` 单调、旧名不复活、L2 不无限膨胀。 |
+| S7 Git checkout 风暴 | 在临时仓库反复 checkout / clean / reset。 | 最终分支文件正确，删除文件不幽灵复活。 |
+| S8 Watcher 丢事件 | 暂停/降级 watcher 后制造磁盘变化，再恢复对账。 | 最终收敛，前台不等待后台对账。 |
+
+### VM workload driver 设计
+
+`m2-cold-window-vm-bench.py` 保持为 **runner + collector**；另增独立 workload driver，避免把“启动采集”和“制造压力”混在一起。计划命令形态：
+
+```bash
+python3 scripts/m2-cold-window-workload.py \
+  --root "$HOME/fd-rdd-vm-workload" \
+  --scenario daily,cold-canary,delete-storm,rename-storm,git-storm \
+  --duration-secs 3600 \
+  --rate normal \
+  --seed 42 \
+  --events-jsonl workload-events.jsonl
+```
+
+设计原则：
+
+- 只操作 `--root` 下的测试沙箱；不碰项目仓库和用户真实 `$HOME` 顶层。
+- 拒绝危险 root：`/`、真实 `$HOME` 顶层、项目仓库根目录和空路径都不允许运行；cleanup 只清理 sandbox 内由 driver 创建的路径。
+- 支持 `--dry-run`，先输出 fixture 和操作计划，用于确认 VM 压力规模。
+- 所有阶段写 `workload-events.jsonl`，记录 phase、operation、path、count、started_at、finished_at、expected_query。
+- deterministic seed：同一 seed 下 baseline / experiment 能复现相同操作顺序。
+- rate limit：`daily`、`normal`、`stress`、`chaos` 四档，避免一上来把 VM 打死。
+- phase 化：先生成 fixture，再按场景执行，再做 cleanup，便于和 metrics 时间线对齐。
+- canary 与风暴分离：canary 用于可见性延迟，storm 用于资源和正确性压力。
+- 查询验证不放在 driver 热路径；driver 只写预期，collector/analyzer 负责查 fd-rdd 和判定。
+
+实现分层：
+
+| 模块 | 职责 |
+|---|---|
+| `SandboxGuard` | 解析和校验 `--root`，提供 sandbox 内路径创建、rename、删除封装。 |
+| `RateLimiter` | 按 `daily/normal/stress/chaos` 控制每秒操作数、批次大小和阶段休眠。 |
+| `FixtureBuilder` | 生成小树、大树、rename 集合、git repo 和 canary 目录。 |
+| `ScenarioRunner` | 执行 `daily`、`cold-canary`、`delete-storm`、`rename-storm`、`git-storm`、`watcher-drop-proxy`。 |
+| `EventSink` | 追加写 `workload-events.jsonl`，记录操作开始、结束、预期查询和错误。 |
+| `SummaryWriter` | 输出 workload 摘要，供 bench runner 的报告引用。 |
+
+第一版 workload driver 场景：
+
+| 场景 | 操作 |
+|---|---|
+| `daily` | 小文件 create/edit/rename/delete、编辑器临时文件、下载器 `.part` rename。 |
+| `cold-canary` | 在指定冷目录周期创建/rename/delete 唯一文件名。 |
+| `delete-storm` | 生成大子树后删除文件批次或整个 subtree。 |
+| `rename-storm` | 批量 `file_i -> file_i_new -> file_i`，覆盖 rename 合并与 tombstone。 |
+| `git-storm` | 在临时 git repo 中创建分支、checkout、clean、reset，模拟真实工作区震荡。 |
+| `watcher-drop-proxy` | 不直接控制内核 watcher；通过短时间 `--no-watch` baseline 或暂停 daemon 后磁盘变更，再重启观察 deferred repair。 |
+
+### A/B 判定标准
+
+| 类别 | 通过条件 |
+|---|---|
+| 正确性 | canary create 可见、rename 新路径可见且旧路径隐藏、delete 隐藏；delete/rename storm 后旧结果不复活。 |
+| 冷层收益 | 冷层 canary p95 比 baseline 下降 ≥ 40%；p99 下降 ≥ 30%；如果 baseline 已很快，实验组 p95/p99 增幅不超过 10%。 |
+| 热层不退 | `fast_scan_coverage_lag_p99_ms <= 5000`，或相对 baseline 增幅不超过 10%。 |
+| 资源成本 | CPU p95 增幅不超过 5–10 个百分点；RSS max 增幅不超过 32 MiB 或 10%；swap 不应持续非 0。 |
+| 队列预算 | `dirty_queue_len` 操作后可回落；`rotating_cold_window_budget_blocked` / `ephemeral_watch_budget_blocked` 不能持续单调增长且无对应回落。 |
+| watcher | `watch_failures` 和 `overflow_drops` 不应持续增长，除非测试明确在验证 overflow recovery。 |
+
+### 推荐指标补齐
+
+后续应优先补齐这些 metrics，便于把 VM 黑盒现象和 Rust 白盒不变量接起来：
+
+- `foreground_stat_count`
+- `background_stat_count_per_sec`
+- `scan_slice_entries_processed`
+- `scan_slice_time_ms`
+- `scan_cursor_advance_count`
+- `tombstone_overlay_layers`
+- `tombstone_compaction_count`
+- `tombstone_segment_skip_count`
+- `scanner_result_discarded_by_seq_count`
+- `ghost_resurrection_prevented_count`
+- `boost_lease_granted_count`
+- `boost_lease_revoked_count`
+- `psi_throttle_count`
