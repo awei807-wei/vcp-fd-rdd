@@ -32,13 +32,23 @@ impl TieredIndex {
     }
 
     pub fn file_count(&self) -> usize {
+        // Read the rebuild flag *before* locking the overlay to preserve the same
+        // rebuild_state → delta_buffer lock order as finish_rebuild (acquiring them
+        // in the opposite order would risk an AB-BA deadlock). Then capture
+        // (base, overlay) under a single delta_buffer lock so the pair is consistent
+        // with finish_rebuild's atomic publish; otherwise a torn read at publish time
+        // can momentarily report the empty post-reset l2 count instead of the freshly
+        // published base count. See execute_query_plan for the matching query-path fix.
+        let rebuild_in_progress = self.rebuild_in_progress();
+        let db = self.delta_buffer.lock();
         let base_count = self.base.load().file_count();
+        let overlay_upserts = db.upserted_paths().count();
+        drop(db);
         if base_count > 0 {
-            let overlay_upserts = self.delta_buffer.lock().upserted_paths().count();
             return base_count.saturating_add(overlay_upserts);
         }
-        if self.rebuild_in_progress() {
-            return self.delta_buffer.lock().upserted_paths().count();
+        if rebuild_in_progress {
+            return overlay_upserts;
         }
         self.l2.load().file_count()
     }
