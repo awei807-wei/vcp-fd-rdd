@@ -138,6 +138,7 @@ impl TieredIndex {
             base,
             flush_requested: AtomicBool::new(false),
             flush_notify: Notify::new(),
+            shutting_down: AtomicBool::new(false),
             auto_flush_overlay_paths: AtomicU64::new(250_000),
             auto_flush_overlay_bytes: AtomicU64::new(64 * 1024 * 1024),
             // Periodic snapshot materializes the full visible base. Keep tiny

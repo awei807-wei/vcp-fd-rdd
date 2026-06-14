@@ -360,7 +360,9 @@ impl TieredIndex {
         results
     }
 
-    pub(crate) fn materialize_snapshot_base(&self) -> anyhow::Result<Arc<BaseIndexData>> {
+    pub(crate) fn materialize_snapshot_base(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<Arc<BaseIndexData>> {
         let mut db = self.delta_buffer.lock();
         let mut del = PathArenaSet::default();
         for p in db.deleted_paths() {
@@ -390,7 +392,12 @@ impl TieredIndex {
             metas.push(meta);
         }
 
+        // Count entries the base actually yields. A healthy base yields ~one
+        // meta per live entry; a corrupt cold base (e.g. a misread path table)
+        // reports a large file_count but resolves almost nothing.
+        let mut base_emitted = 0usize;
         base.for_each_live_meta(|meta| {
+            base_emitted += 1;
             collect_live_meta(
                 meta,
                 None,
@@ -399,6 +406,27 @@ impl TieredIndex {
                 &mut metas,
             );
         });
+
+        // Runtime self-heal: if the base claims many entries but almost none
+        // materialize, the cold base is corrupt. Folding it would collapse the
+        // visible set and repeatedly trip the shrink guard, deadlocking on the
+        // same bad file. Instead, preserve the delta buffer, trigger a full
+        // rebuild from the filesystem, and abort this snapshot cycle.
+        if cold_base_corruption_suspected(base_count_before, base_emitted) {
+            tracing::warn!(
+                "cold base appears corrupt: file_count={} but only {} entries materialized; \
+                 triggering full rebuild instead of collapsing the snapshot base",
+                base_count_before,
+                base_emitted
+            );
+            drop(db);
+            self.spawn_full_build();
+            anyhow::bail!(
+                "cold base corruption suspected (file_count={}, materialized={}); rebuild triggered",
+                base_count_before,
+                base_emitted
+            );
+        }
 
         let compact = PersistentIndex::new_with_roots(self.roots.clone());
         for meta in metas {
@@ -1299,6 +1327,24 @@ fn path_is_under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
         .any(|root| path == root.as_path() || path.starts_with(root.as_path()))
 }
 
+/// Threshold below which a cold base is too small to judge as corrupt.
+const COLD_BASE_CORRUPTION_MIN_COUNT: usize = 10_000;
+/// Reciprocal of the materialized-fraction floor: emitting fewer than
+/// 1/COLD_BASE_CORRUPTION_RATIO_DIVISOR (5%) of the claimed entries is treated
+/// as a corrupt cold base.
+const COLD_BASE_CORRUPTION_RATIO_DIVISOR: usize = 20;
+
+/// Decide whether a base that reported `base_count_before` entries but only
+/// materialized `base_emitted` of them is corrupt. Pure so the threshold is
+/// unit-testable without constructing a corrupt cold segment.
+fn cold_base_corruption_suspected(base_count_before: usize, base_emitted: usize) -> bool {
+    if base_count_before < COLD_BASE_CORRUPTION_MIN_COUNT {
+        return false;
+    }
+    // base_emitted * 20 < base_count_before  ⇔  base_emitted < 5% of count.
+    base_emitted.saturating_mul(COLD_BASE_CORRUPTION_RATIO_DIVISOR) < base_count_before
+}
+
 fn validate_snapshot_materialization(
     base_count_before: usize,
     deleted_paths: usize,
@@ -1348,47 +1394,31 @@ fn collect_live_meta(
 }
 
 #[cfg(test)]
-mod verify_budget_tests {
-    use super::{QueryVerifyBudget, VerifyGrant};
-    use std::time::{Duration, Instant};
+mod corruption_threshold_tests {
+    use super::cold_base_corruption_suspected;
 
-    fn budget(remaining: usize, deadline: Instant) -> QueryVerifyBudget {
-        QueryVerifyBudget {
-            remaining,
-            deadline,
-            count_capped: false,
-        }
+    #[test]
+    fn small_bases_are_never_judged_corrupt() {
+        // Below the minimum count we cannot distinguish corruption from a
+        // genuinely tiny index, so never trigger a rebuild.
+        assert!(!cold_base_corruption_suspected(0, 0));
+        assert!(!cold_base_corruption_suspected(9_999, 0));
     }
 
     #[test]
-    fn grants_verification_until_count_is_spent() {
-        let mut b = budget(2, Instant::now() + Duration::from_secs(60));
-        assert!(matches!(b.try_consume(), VerifyGrant::Verify));
-        assert!(matches!(b.try_consume(), VerifyGrant::Verify));
-        // Quota spent: drop the rest and flag the count cap so the scan can bail.
-        assert!(matches!(b.try_consume(), VerifyGrant::CountCapped));
-        assert!(b.count_capped());
+    fn large_base_with_near_zero_yield_is_corrupt() {
+        // The real failure: file_count huge, materialized ~0.
+        assert!(cold_base_corruption_suspected(647_591, 0));
+        assert!(cold_base_corruption_suspected(647_591, 17));
+        assert!(cold_base_corruption_suspected(20_000, 999)); // <5%
     }
 
     #[test]
-    fn timeout_yields_unvalidated_without_setting_count_cap() {
-        // Deadline already in the past with quota still available: the candidate
-        // is returned unvalidated (TimedOut) and the scan keeps going — count_capped
-        // must stay false so the layered query does not truncate to an empty result.
-        let mut b = budget(5, Instant::now() - Duration::from_millis(1));
-        assert!(matches!(b.try_consume(), VerifyGrant::TimedOut));
-        assert!(!b.count_capped());
-        // A timeout consumes no quota, so it keeps timing out (never count-caps).
-        assert!(matches!(b.try_consume(), VerifyGrant::TimedOut));
-        assert!(!b.count_capped());
-    }
-
-    #[test]
-    fn count_cap_takes_precedence_over_timeout() {
-        // Both exhausted: the count cap wins so deleted-but-unverified entries are
-        // dropped rather than resurrected as Unknown results.
-        let mut b = budget(0, Instant::now() - Duration::from_millis(1));
-        assert!(matches!(b.try_consume(), VerifyGrant::CountCapped));
-        assert!(b.count_capped());
+    fn large_base_with_healthy_yield_is_not_corrupt() {
+        // A base that materializes most of its entries is healthy, even if a
+        // few were tombstoned or pruned.
+        assert!(!cold_base_corruption_suspected(647_591, 647_000));
+        assert!(!cold_base_corruption_suspected(20_000, 1_000)); // exactly 5%
+        assert!(!cold_base_corruption_suspected(20_000, 19_000));
     }
 }

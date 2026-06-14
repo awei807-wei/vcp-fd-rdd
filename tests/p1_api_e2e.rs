@@ -193,9 +193,14 @@ fn fd_rdd_query_cli_streams_results_from_real_uds_socket() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Retry: the socket file may exist before the daemon is ready to accept.
-    let mut output = None;
-    let query_deadline = Instant::now() + Duration::from_secs(5);
+    // Retry until the probe actually shows up. The socket may exist before the
+    // daemon accepts connections, and a connection can briefly succeed with an
+    // empty result set before the keyword is servable. A bare `status.success()`
+    // check would break on that empty-but-successful response and race; gate on
+    // the expected content instead so we only fail on a genuine timeout.
+    let mut last_stdout = String::new();
+    let mut matched = false;
+    let query_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < query_deadline {
         let o = Command::new(fd_rdd_query_exe_path())
             .arg("--socket")
@@ -206,14 +211,18 @@ fn fd_rdd_query_cli_streams_results_from_real_uds_socket() {
             .output()
             .unwrap();
         if o.status.success() {
-            output = Some(o);
-            break;
+            last_stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+            if last_stdout.contains("cli_socket_probe.txt") {
+                matched = true;
+                break;
+            }
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let output = output.expect("fd-rdd-query did not succeed within 5s after socket appeared");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("cli_socket_probe.txt"));
+    assert!(
+        matched,
+        "fd-rdd-query did not return cli_socket_probe.txt within 10s; last stdout: {last_stdout:?}"
+    );
 
     process.kill();
     let _ = std::fs::remove_dir_all(&root);
