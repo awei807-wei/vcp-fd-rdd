@@ -216,6 +216,8 @@ one_file_system = true
 
 Tiered watcher 还支持 Ephemeral Watch：当同一 dirty scope 在短窗口内反复触发、正式 L0 晋升又不合适或预算受阻时，后台会按独立的 `ephemeral_watch_budget` 创建临时 watcher 租约。临时 watcher 不属于 L0/L1/L2/L3，也不会替代 DirtyQueue；它只覆盖小成本局部根，并会在 idle、TTL、连续无变化补扫、被正式 L0 覆盖或预算驱逐时自动移除。
 
+实验性的 Rotating Cold Freshness Window 可通过 `tiered_watch.rotating_cold_window_enabled` 开启。它不会把 L2/L3 目录提升成正式 L0，也不会抢占正式 hotset watcher 预算；调度器只按独立窗口预算从 L2/L3 中轮转选择最久未扫、event score 较高、dirty/stale 信号较强的目录。小成本目录尝试 Ephemeral Watch，中等成本目录发放 `RotatingColdWindow` fast scan lease，大成本目录只进入 `PeriodicColdScan` 分片补扫。`/watch-state` 暴露 active dirs、cycle id、progress、ephemeral/fast-scan/scan-only 计数、budget blocked 和 cold freshness age p50/p95/p99；`/debug/tiered-watch` 会显示单目录是否处于轮转窗口、动作、到期时间和分数。该能力当前定位为原型门禁，默认关闭。
+
 Linux tiered 模式默认启用 proc sampler。它按 `[proc_sampler]` 预算轮询 `/proc/<pid>/fdinfo` 和 `/proc/<pid>/fd` symlink，只处理同用户进程中带 `O_WRONLY` / `O_RDWR` 的写句柄；命中的索引根内目录会直接作为 Ephemeral Watch 候选，用于提前覆盖 ComfyUI、下载器、渲染器等持续写入目录。proc sampler 只提供新鲜度线索，不写索引、不参与返回正确性判断，也不会绕过返回前验真。`/watch-state`、`/health.diagnostics.watchers` 和 metrics JSONL 暴露 `proc_sampler_enabled`、`proc_sampler_last_duration_ms`、pid/fd/readlink 计数、`proc_sampler_sampled_dirs`、`proc_sampler_triggered_watches`、`proc_sampler_budget_exhausted` 和 `proc_sampler_unavailable`。
 
 Tiered watcher 的一致性 profile 用 `tiered_watch.profile` 控制：
@@ -293,6 +295,12 @@ L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` �
 | `tiered_watch.l0_max_cost_per_root` | `usize` | `8192` | 单个 L0 根的递归 watch 成本上限，0 表示按总预算关闭单根保护 |
 | `tiered_watch.project_markers` | `[String]` | 常见项目标记 | balanced watcher 识别项目根的 marker 名称 |
 | `tiered_watch.ephemeral_watch_budget` | `usize` | `256` | 临时 watcher lease 独立预算 |
+| `tiered_watch.rotating_cold_window_enabled` | `bool` | `false` | 启用实验性 L2/L3 冷层轮转新鲜度窗口 |
+| `tiered_watch.rotating_cold_window_budget` | `usize` | `128` | 同时处于轮转窗口的冷目录数量上限 |
+| `tiered_watch.rotating_cold_window_tick_secs` | `u64` | `30` | 冷层轮转调度 tick |
+| `tiered_watch.rotating_cold_window_ttl_secs` | `u64` | `180` | 单个轮转窗口 lease 的 TTL |
+| `tiered_watch.rotating_cold_window_max_cost_per_root` | `usize` | `64` | 可尝试 Ephemeral Watch 的单根递归 watch 成本上限 |
+| `tiered_watch.rotating_cold_window_max_dirs_per_tick` | `usize` | `8` | 每 tick 最多选择的冷目录数 |
 | `tiered_watch.l1_l2_fast_scan_enabled` | `bool` | `true` | 启用 lease-hotset fast scan lane |
 | `tiered_watch.l1_l2_fast_scan_target_secs` | `u64` | `5` | 本地可信 active hotset 目录 strict 覆盖目标 |
 | `tiered_watch.l1_l2_fast_scan_tick_ms` | `u64` | `1000` | fast scan 调度 tick |

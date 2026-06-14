@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 原型
+
+- 新增 M2 Rotating Cold Freshness Window 原型：默认关闭，通过 `tiered_watch.rotating_cold_window_*` 配置在独立窗口预算内轮转 L2/L3 冷目录；小成本目录走 Ephemeral Watch，中等成本目录走 `RotatingColdWindow` fast scan lease，大成本目录只入 `PeriodicColdScan` 分片补扫，正式 L0/L1/L2/L3 tier 不交换、不抢占 hotset。
+- `/watch-state` 与 `/debug/tiered-watch` 新增冷层轮转观测字段，暴露 active dirs、cycle progress、动作计数、budget blocked、cold freshness age p50/p95/p99 和单目录轮转动作/到期/分数，用于判断机制可实施性。
+
 ## [7.1.0] - 2026-06-13
 
 ### 质量加固

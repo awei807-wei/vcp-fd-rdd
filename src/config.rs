@@ -360,6 +360,18 @@ pub struct TieredWatchConfig {
     pub l3_scan_policy: L3ScanPolicy,
     /// Low-frequency L3 verification interval used when l3_scan_policy = "interval".
     pub l3_scan_interval_secs: u64,
+    /// Prototype: rotate a bounded freshness window over L2/L3 without changing formal tiers.
+    pub rotating_cold_window_enabled: bool,
+    /// Maximum concurrently active rotating cold-window leases.
+    pub rotating_cold_window_budget: usize,
+    /// Scheduler tick interval for the rotating cold-window prototype.
+    pub rotating_cold_window_tick_secs: u64,
+    /// TTL for one rotating cold-window coverage lease.
+    pub rotating_cold_window_ttl_secs: u64,
+    /// Maximum estimated recursive watcher cost eligible for ephemeral watch coverage.
+    pub rotating_cold_window_max_cost_per_root: usize,
+    /// Maximum cold directories selected by one rotating cold-window tick.
+    pub rotating_cold_window_max_dirs_per_tick: usize,
     /// Enable the lease-hotset fast scan lane for directories outside L0.
     pub l1_l2_fast_scan_enabled: bool,
     /// Target coverage window for local trusted lease-hotset directories.
@@ -544,6 +556,23 @@ impl TieredWatchConfig {
         if self.l1_l2_fast_scan_stat_budget_per_tick < 1 {
             return Err("l1_l2_fast_scan_stat_budget_per_tick must be >= 1".to_string());
         }
+        if self.rotating_cold_window_enabled {
+            if self.rotating_cold_window_budget < 1 {
+                return Err("rotating_cold_window_budget must be >= 1".to_string());
+            }
+            if self.rotating_cold_window_tick_secs < 1 {
+                return Err("rotating_cold_window_tick_secs must be >= 1".to_string());
+            }
+            if self.rotating_cold_window_ttl_secs < 1 {
+                return Err("rotating_cold_window_ttl_secs must be >= 1".to_string());
+            }
+            if self.rotating_cold_window_max_cost_per_root < 1 {
+                return Err("rotating_cold_window_max_cost_per_root must be >= 1".to_string());
+            }
+            if self.rotating_cold_window_max_dirs_per_tick < 1 {
+                return Err("rotating_cold_window_max_dirs_per_tick must be >= 1".to_string());
+            }
+        }
         Ok(())
     }
 }
@@ -561,6 +590,12 @@ impl Default for TieredWatchConfig {
             l2_scan_interval_secs: 300,
             l3_scan_policy: L3ScanPolicy::Interval,
             l3_scan_interval_secs: DEFAULT_L3_SCAN_INTERVAL_SECS,
+            rotating_cold_window_enabled: false,
+            rotating_cold_window_budget: 128,
+            rotating_cold_window_tick_secs: 30,
+            rotating_cold_window_ttl_secs: 180,
+            rotating_cold_window_max_cost_per_root: 64,
+            rotating_cold_window_max_dirs_per_tick: 8,
             l1_l2_fast_scan_enabled: true,
             l1_l2_fast_scan_target_secs: 5,
             l1_l2_fast_scan_tick_ms: 1_000,
@@ -608,6 +643,12 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             l2_scan_interval_secs: u64,
             l3_scan_policy: L3ScanPolicy,
             l3_scan_interval_secs: u64,
+            rotating_cold_window_enabled: bool,
+            rotating_cold_window_budget: usize,
+            rotating_cold_window_tick_secs: u64,
+            rotating_cold_window_ttl_secs: u64,
+            rotating_cold_window_max_cost_per_root: usize,
+            rotating_cold_window_max_dirs_per_tick: usize,
             l1_l2_fast_scan_enabled: bool,
             l1_l2_fast_scan_target_secs: u64,
             l1_l2_fast_scan_tick_ms: Option<u64>,
@@ -649,6 +690,14 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
                     l2_scan_interval_secs: defaults.l2_scan_interval_secs,
                     l3_scan_policy: defaults.l3_scan_policy,
                     l3_scan_interval_secs: defaults.l3_scan_interval_secs,
+                    rotating_cold_window_enabled: defaults.rotating_cold_window_enabled,
+                    rotating_cold_window_budget: defaults.rotating_cold_window_budget,
+                    rotating_cold_window_tick_secs: defaults.rotating_cold_window_tick_secs,
+                    rotating_cold_window_ttl_secs: defaults.rotating_cold_window_ttl_secs,
+                    rotating_cold_window_max_cost_per_root: defaults
+                        .rotating_cold_window_max_cost_per_root,
+                    rotating_cold_window_max_dirs_per_tick: defaults
+                        .rotating_cold_window_max_dirs_per_tick,
                     l1_l2_fast_scan_enabled: defaults.l1_l2_fast_scan_enabled,
                     l1_l2_fast_scan_target_secs: defaults.l1_l2_fast_scan_target_secs,
                     l1_l2_fast_scan_tick_ms: None,
@@ -714,6 +763,12 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             l2_scan_interval_secs: raw.l2_scan_interval_secs,
             l3_scan_policy: raw.l3_scan_policy,
             l3_scan_interval_secs: raw.l3_scan_interval_secs,
+            rotating_cold_window_enabled: raw.rotating_cold_window_enabled,
+            rotating_cold_window_budget: raw.rotating_cold_window_budget,
+            rotating_cold_window_tick_secs: raw.rotating_cold_window_tick_secs,
+            rotating_cold_window_ttl_secs: raw.rotating_cold_window_ttl_secs,
+            rotating_cold_window_max_cost_per_root: raw.rotating_cold_window_max_cost_per_root,
+            rotating_cold_window_max_dirs_per_tick: raw.rotating_cold_window_max_dirs_per_tick,
             l1_l2_fast_scan_enabled: raw.l1_l2_fast_scan_enabled,
             l1_l2_fast_scan_target_secs: raw.l1_l2_fast_scan_target_secs,
             l1_l2_fast_scan_tick_ms,
@@ -1097,6 +1152,12 @@ max_watch_dirs = 16
         assert_eq!(cfg.tiered_watch.ephemeral_watch_ttl_secs, 600);
         assert_eq!(cfg.tiered_watch.ephemeral_idle_secs, 120);
         assert_eq!(cfg.tiered_watch.ephemeral_max_cost_per_root, 64);
+        assert!(!cfg.tiered_watch.rotating_cold_window_enabled);
+        assert_eq!(cfg.tiered_watch.rotating_cold_window_budget, 128);
+        assert_eq!(cfg.tiered_watch.rotating_cold_window_tick_secs, 30);
+        assert_eq!(cfg.tiered_watch.rotating_cold_window_ttl_secs, 180);
+        assert_eq!(cfg.tiered_watch.rotating_cold_window_max_cost_per_root, 64);
+        assert_eq!(cfg.tiered_watch.rotating_cold_window_max_dirs_per_tick, 8);
         assert!(cfg.tiered_watch.l1_l2_fast_scan_enabled);
         assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_target_secs, 5);
         assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_tick_ms, 1_000);
@@ -1126,10 +1187,42 @@ max_watch_dirs = 16
         assert!(toml.contains("ephemeral_watch_ttl_secs"));
         assert!(toml.contains("ephemeral_idle_secs"));
         assert!(toml.contains("ephemeral_max_cost_per_root"));
+        assert!(toml.contains("rotating_cold_window_enabled"));
+        assert!(toml.contains("rotating_cold_window_budget"));
+        assert!(toml.contains("rotating_cold_window_tick_secs"));
+        assert!(toml.contains("rotating_cold_window_ttl_secs"));
+        assert!(toml.contains("rotating_cold_window_max_cost_per_root"));
+        assert!(toml.contains("rotating_cold_window_max_dirs_per_tick"));
         assert!(toml.contains("l1_l2_fast_scan_enabled"));
         assert!(toml.contains("l1_l2_fast_scan_target_secs"));
         assert!(toml.contains("network_fast_scan_mode"));
         assert!(toml.contains("project_markers"));
+    }
+
+    #[test]
+    fn tiered_watch_rotating_cold_window_overrides_parse() {
+        let cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+watch_mode = "tiered"
+
+[tiered_watch]
+rotating_cold_window_enabled = true
+rotating_cold_window_budget = 9
+rotating_cold_window_tick_secs = 2
+rotating_cold_window_ttl_secs = 11
+rotating_cold_window_max_cost_per_root = 7
+rotating_cold_window_max_dirs_per_tick = 3
+"#,
+        )
+        .expect("rotating cold-window config should parse");
+
+        assert!(cfg.tiered_watch.rotating_cold_window_enabled);
+        assert_eq!(cfg.tiered_watch.rotating_cold_window_budget, 9);
+        assert_eq!(cfg.tiered_watch.rotating_cold_window_tick_secs, 2);
+        assert_eq!(cfg.tiered_watch.rotating_cold_window_ttl_secs, 11);
+        assert_eq!(cfg.tiered_watch.rotating_cold_window_max_cost_per_root, 7);
+        assert_eq!(cfg.tiered_watch.rotating_cold_window_max_dirs_per_tick, 3);
     }
 
     #[test]

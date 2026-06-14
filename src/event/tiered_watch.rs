@@ -199,6 +199,7 @@ pub enum FastScanLeaseKind {
     Explicit,
     Query,
     StaleHit,
+    RotatingColdWindow,
     ProjectMarker,
     L0Event,
     ProcSampler,
@@ -212,6 +213,7 @@ impl FastScanLeaseKind {
             Self::ProcSampler => 850,
             Self::L0Event => 700,
             Self::Query => 650,
+            Self::RotatingColdWindow => 625,
             Self::ProjectMarker => 600,
         }
     }
@@ -450,6 +452,61 @@ pub struct EphemeralWatchRemoval {
     pub reason: EphemeralWatchExpiry,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RotatingColdWindowActionKind {
+    EphemeralWatch,
+    FastScanLease,
+    ScanOnly,
+}
+
+impl RotatingColdWindowActionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EphemeralWatch => "ephemeral_watch",
+            Self::FastScanLease => "fast_scan_lease",
+            Self::ScanOnly => "scan_only",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RotatingColdWindowConfig {
+    pub enabled: bool,
+    pub budget: usize,
+    pub ttl_secs: u64,
+    pub max_cost_per_root: usize,
+    pub max_dirs_per_tick: usize,
+}
+
+impl Default for RotatingColdWindowConfig {
+    fn default() -> Self {
+        let defaults = TieredWatchConfig::default();
+        Self {
+            enabled: defaults.rotating_cold_window_enabled,
+            budget: defaults.rotating_cold_window_budget,
+            ttl_secs: defaults.rotating_cold_window_ttl_secs,
+            max_cost_per_root: defaults.rotating_cold_window_max_cost_per_root,
+            max_dirs_per_tick: defaults.rotating_cold_window_max_dirs_per_tick,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RotatingColdWindowAction {
+    pub path: PathBuf,
+    pub action: RotatingColdWindowActionKind,
+    pub watch_cost: u64,
+    pub score: u64,
+    pub expires_unix_secs: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RotatingColdWindowTick {
+    pub cycle_id: u64,
+    pub actions: Vec<RotatingColdWindowAction>,
+    pub budget_blocked: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct EphemeralWatchConfig {
     pub budget: usize,
@@ -514,10 +571,21 @@ struct DirtyScopeObservation {
 }
 
 #[derive(Debug)]
+struct RotatingColdWindowLease {
+    action: RotatingColdWindowActionKind,
+    expires_unix_secs: u64,
+    cycle_id: u64,
+    score: u64,
+    watch_cost: u64,
+}
+
+#[derive(Debug)]
 pub struct TieredWatchRuntime {
     dirs: RwLock<HashMap<PathBuf, Arc<DirState>>>,
     ephemeral: RwLock<HashMap<PathBuf, EphemeralWatchLease>>,
     dirty_observations: RwLock<HashMap<PathBuf, DirtyScopeObservation>>,
+    rotating_cold_window_leases: RwLock<HashMap<PathBuf, RotatingColdWindowLease>>,
+    rotating_cold_window_seen: RwLock<HashSet<PathBuf>>,
     max_watch_dirs: u64,
     l0_max_cost_per_root: u64,
     current_watch_cost: AtomicU64,
@@ -527,6 +595,17 @@ pub struct TieredWatchRuntime {
     ephemeral_watch_expired: AtomicU64,
     ephemeral_watch_evicted: AtomicU64,
     ephemeral_watch_budget_blocked: AtomicU64,
+    rotating_cold_window_enabled: AtomicBool,
+    rotating_cold_window_budget: AtomicUsize,
+    rotating_cold_window_ttl_secs: AtomicU64,
+    rotating_cold_window_max_cost_per_root: AtomicUsize,
+    rotating_cold_window_max_dirs_per_tick: AtomicUsize,
+    rotating_cold_window_cycle_id: AtomicU64,
+    rotating_cold_window_promoted_to_ephemeral: AtomicU64,
+    rotating_cold_window_fast_scan_lease_dirs: AtomicU64,
+    rotating_cold_window_scan_only_dirs: AtomicU64,
+    rotating_cold_window_budget_blocked: AtomicU64,
+    rotating_cold_window_last_tick_unix_secs: AtomicU64,
     scan_items_per_sec: usize,
     scan_ms_per_tick: u64,
     promotions: AtomicU64,
@@ -656,6 +735,8 @@ impl TieredWatchRuntime {
             dirs: RwLock::new(dirs),
             ephemeral: RwLock::new(HashMap::new()),
             dirty_observations: RwLock::new(HashMap::new()),
+            rotating_cold_window_leases: RwLock::new(HashMap::new()),
+            rotating_cold_window_seen: RwLock::new(HashSet::new()),
             max_watch_dirs: max_watch_dirs as u64,
             l0_max_cost_per_root: l0_max_cost_per_root as u64,
             current_watch_cost: AtomicU64::new(current_watch_cost),
@@ -665,6 +746,17 @@ impl TieredWatchRuntime {
             ephemeral_watch_expired: AtomicU64::new(0),
             ephemeral_watch_evicted: AtomicU64::new(0),
             ephemeral_watch_budget_blocked: AtomicU64::new(0),
+            rotating_cold_window_enabled: AtomicBool::new(false),
+            rotating_cold_window_budget: AtomicUsize::new(128),
+            rotating_cold_window_ttl_secs: AtomicU64::new(180),
+            rotating_cold_window_max_cost_per_root: AtomicUsize::new(64),
+            rotating_cold_window_max_dirs_per_tick: AtomicUsize::new(8),
+            rotating_cold_window_cycle_id: AtomicU64::new(0),
+            rotating_cold_window_promoted_to_ephemeral: AtomicU64::new(0),
+            rotating_cold_window_fast_scan_lease_dirs: AtomicU64::new(0),
+            rotating_cold_window_scan_only_dirs: AtomicU64::new(0),
+            rotating_cold_window_budget_blocked: AtomicU64::new(0),
+            rotating_cold_window_last_tick_unix_secs: AtomicU64::new(0),
             scan_items_per_sec,
             scan_ms_per_tick,
             promotions: AtomicU64::new(0),
@@ -778,6 +870,39 @@ impl TieredWatchRuntime {
             network_fast_scan_mode_to_u8(config.network_fast_scan_mode),
             Ordering::Relaxed,
         );
+    }
+
+    pub fn apply_rotating_cold_window_config(&self, config: &TieredWatchConfig) {
+        self.rotating_cold_window_enabled
+            .store(config.rotating_cold_window_enabled, Ordering::Relaxed);
+        self.rotating_cold_window_budget
+            .store(config.rotating_cold_window_budget.max(1), Ordering::Relaxed);
+        self.rotating_cold_window_ttl_secs.store(
+            config.rotating_cold_window_ttl_secs.max(1),
+            Ordering::Relaxed,
+        );
+        self.rotating_cold_window_max_cost_per_root.store(
+            config.rotating_cold_window_max_cost_per_root.max(1),
+            Ordering::Relaxed,
+        );
+        self.rotating_cold_window_max_dirs_per_tick.store(
+            config.rotating_cold_window_max_dirs_per_tick.max(1),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn rotating_cold_window_tick_config(&self) -> RotatingColdWindowConfig {
+        RotatingColdWindowConfig {
+            enabled: self.rotating_cold_window_enabled.load(Ordering::Relaxed),
+            budget: self.rotating_cold_window_budget.load(Ordering::Relaxed),
+            ttl_secs: self.rotating_cold_window_ttl_secs.load(Ordering::Relaxed),
+            max_cost_per_root: self
+                .rotating_cold_window_max_cost_per_root
+                .load(Ordering::Relaxed),
+            max_dirs_per_tick: self
+                .rotating_cold_window_max_dirs_per_tick
+                .load(Ordering::Relaxed),
+        }
     }
 
     pub fn set_proc_sampler_enabled(&self, enabled: bool) {
@@ -2182,6 +2307,196 @@ impl TieredWatchRuntime {
             .collect()
     }
 
+    pub fn rotating_cold_window_tick(
+        &self,
+        config: RotatingColdWindowConfig,
+    ) -> RotatingColdWindowTick {
+        if !config.enabled {
+            return RotatingColdWindowTick::default();
+        }
+
+        let now = unix_secs();
+        let budget = config.budget.max(1);
+        let ttl_secs = config.ttl_secs.max(1);
+        let max_dirs_per_tick = config.max_dirs_per_tick.max(1);
+        let max_ephemeral_cost = config.max_cost_per_root.max(1) as u64;
+        let max_fast_scan_cost = max_ephemeral_cost.saturating_mul(8).max(max_ephemeral_cost);
+
+        {
+            let mut leases = self.rotating_cold_window_leases.write();
+            leases.retain(|_, lease| lease.expires_unix_secs > now);
+        }
+
+        let active_count = self.rotating_cold_window_leases.read().len();
+        if active_count >= budget {
+            self.rotating_cold_window_budget_blocked
+                .fetch_add(1, Ordering::Relaxed);
+            return RotatingColdWindowTick {
+                cycle_id: self.rotating_cold_window_cycle_id.load(Ordering::Relaxed),
+                budget_blocked: true,
+                ..RotatingColdWindowTick::default()
+            };
+        }
+
+        let capacity = budget.saturating_sub(active_count).min(max_dirs_per_tick);
+        let (cold_paths, mut candidates) = {
+            let dirs = self.dirs.read();
+            let active = self.rotating_cold_window_leases.read();
+            let mut cold_paths = HashSet::new();
+            let mut candidates = Vec::new();
+            for (path, state) in dirs.iter() {
+                let tier = state.tier();
+                if !matches!(tier, WatchTier::L2 | WatchTier::L3) {
+                    continue;
+                }
+                cold_paths.insert(path.clone());
+                if active.contains_key(path.as_path())
+                    || state.promotion_pending.load(Ordering::Relaxed)
+                    || state.demotion_pending.load(Ordering::Relaxed)
+                {
+                    continue;
+                }
+                let last_scan = state.last_scan_unix_secs.load(Ordering::Relaxed);
+                let last_event = state.last_event_unix_secs.load(Ordering::Relaxed);
+                let scan_age = if last_scan > 0 {
+                    now.saturating_sub(last_scan)
+                } else {
+                    now.saturating_sub(last_event)
+                };
+                let event_score = state.event_score.load(Ordering::Relaxed);
+                let budget_blocked = u64::from(state.budget_blocked_count.load(Ordering::Relaxed));
+                let dirty_bonus = if state.dirty.load(Ordering::Relaxed) {
+                    128
+                } else {
+                    0
+                };
+                let high_priority_bonus = if state.high_priority_scan.load(Ordering::Relaxed) {
+                    256
+                } else {
+                    0
+                };
+                let freshness_bonus = match state.freshness() {
+                    Freshness::Dirty => 192,
+                    Freshness::Stale | Freshness::Unknown => 96,
+                    Freshness::Fresh => 0,
+                };
+                let tier_bonus = if tier == WatchTier::L3 { 64 } else { 32 };
+                let score = scan_age
+                    .saturating_div(60)
+                    .saturating_add(event_score.saturating_mul(4))
+                    .saturating_add(budget_blocked.saturating_mul(32))
+                    .saturating_add(dirty_bonus)
+                    .saturating_add(high_priority_bonus)
+                    .saturating_add(freshness_bonus)
+                    .saturating_add(tier_bonus);
+                let watch_cost = state.watch_cost.load(Ordering::Relaxed);
+                candidates.push((path.clone(), watch_cost, score, scan_age));
+            }
+            (cold_paths, candidates)
+        };
+
+        if cold_paths.is_empty() || candidates.is_empty() {
+            return RotatingColdWindowTick {
+                cycle_id: self.rotating_cold_window_cycle_id.load(Ordering::Relaxed),
+                ..RotatingColdWindowTick::default()
+            };
+        }
+
+        let mut seen = self.rotating_cold_window_seen.write();
+        seen.retain(|path| cold_paths.contains(path));
+        if seen.len() >= cold_paths.len() {
+            seen.clear();
+            self.rotating_cold_window_cycle_id
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let has_unseen_candidate = candidates
+            .iter()
+            .any(|(path, _, _, _)| !seen.contains(path));
+        if has_unseen_candidate {
+            candidates.retain(|(path, _, _, _)| !seen.contains(path));
+        } else {
+            seen.clear();
+            self.rotating_cold_window_cycle_id
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        candidates.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then_with(|| b.3.cmp(&a.3))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let cycle_id = self.rotating_cold_window_cycle_id.load(Ordering::Relaxed);
+        let expires_unix_secs = now.saturating_add(ttl_secs);
+        let mut actions = Vec::new();
+        let mut leases = self.rotating_cold_window_leases.write();
+        for (path, watch_cost, score, _) in candidates.into_iter().take(capacity) {
+            let action = rotating_cold_window_action_for_cost(
+                watch_cost,
+                max_ephemeral_cost,
+                max_fast_scan_cost,
+            );
+            leases.insert(
+                path.clone(),
+                RotatingColdWindowLease {
+                    action,
+                    expires_unix_secs,
+                    cycle_id,
+                    score,
+                    watch_cost,
+                },
+            );
+            seen.insert(path.clone());
+            match action {
+                RotatingColdWindowActionKind::EphemeralWatch => {
+                    self.rotating_cold_window_promoted_to_ephemeral
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                RotatingColdWindowActionKind::FastScanLease => {
+                    self.rotating_cold_window_fast_scan_lease_dirs
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                RotatingColdWindowActionKind::ScanOnly => {
+                    self.rotating_cold_window_scan_only_dirs
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            actions.push(RotatingColdWindowAction {
+                path,
+                action,
+                watch_cost,
+                score,
+                expires_unix_secs,
+            });
+        }
+        drop(leases);
+        drop(seen);
+
+        if actions.is_empty() {
+            self.rotating_cold_window_budget_blocked
+                .fetch_add(1, Ordering::Relaxed);
+            return RotatingColdWindowTick {
+                cycle_id,
+                budget_blocked: true,
+                actions,
+            };
+        }
+
+        self.rotating_cold_window_last_tick_unix_secs
+            .store(now, Ordering::Relaxed);
+        RotatingColdWindowTick {
+            cycle_id,
+            actions,
+            budget_blocked: false,
+        }
+    }
+
+    pub fn cancel_rotating_cold_window_lease(&self, path: &Path) {
+        self.rotating_cold_window_leases.write().remove(path);
+        self.rotating_cold_window_seen.write().remove(path);
+    }
+
     pub fn l1_batch(&self, limit: usize) -> Vec<PathBuf> {
         self.scan_batch(limit)
     }
@@ -2673,10 +2988,13 @@ impl TieredWatchRuntime {
         let mut warm_memory_dirs = 0usize;
         let mut cold_mmap_dirs = 0usize;
         let mut frozen_manifest_dirs = 0usize;
+        let mut cold_freshness_ages = Vec::new();
 
         for state in dirs.values() {
             let tier = state.tier();
             let cost = state.watch_cost.load(Ordering::Relaxed);
+            let last_scan = state.last_scan_unix_secs.load(Ordering::Relaxed);
+            let last_event = state.last_event_unix_secs.load(Ordering::Relaxed);
             match tier {
                 WatchTier::L0 => {
                     l0_dirs += 1;
@@ -2694,6 +3012,13 @@ impl TieredWatchRuntime {
                     l3_dirs += 1;
                     l3_watch_cost = l3_watch_cost.saturating_add(cost);
                 }
+            }
+            if matches!(tier, WatchTier::L2 | WatchTier::L3) {
+                cold_freshness_ages.push(if last_scan > 0 {
+                    now.saturating_sub(last_scan)
+                } else {
+                    now.saturating_sub(last_event)
+                });
             }
             let freshness = state.freshness();
             if tier == WatchTier::L3 {
@@ -2730,6 +3055,10 @@ impl TieredWatchRuntime {
                 event_score_total.saturating_add(state.event_score.load(Ordering::Relaxed));
         }
         drop(dirs);
+        cold_freshness_ages.sort_unstable();
+        let cold_freshness_age_p50_secs = percentile_ms(&cold_freshness_ages, 50);
+        let cold_freshness_age_p95_secs = percentile_ms(&cold_freshness_ages, 95);
+        let cold_freshness_age_p99_secs = percentile_ms(&cold_freshness_ages, 99);
 
         let ephemeral = self.ephemeral.read();
         let ephemeral_watch_dirs = ephemeral
@@ -2738,6 +3067,22 @@ impl TieredWatchRuntime {
             .count();
         let ephemeral_watch_cost = self.current_ephemeral_watch_cost.load(Ordering::Relaxed);
         drop(ephemeral);
+
+        {
+            let now = unix_secs();
+            let mut leases = self.rotating_cold_window_leases.write();
+            leases.retain(|_, lease| lease.expires_unix_secs > now);
+        }
+        let rotating_cold_window_enabled =
+            self.rotating_cold_window_enabled.load(Ordering::Relaxed);
+        let rotating_cold_window_active_dirs = self.rotating_cold_window_leases.read().len();
+        let rotating_seen = self.rotating_cold_window_seen.read().len();
+        let rotating_total_cold = l2_dirs.saturating_add(l3_dirs);
+        let rotating_cold_window_cycle_progress_pct = if rotating_total_cold == 0 {
+            0
+        } else {
+            ((rotating_seen as u64).saturating_mul(100) / rotating_total_cold as u64).min(100) as u8
+        };
 
         let fast_scan_enabled = self.fast_scan_enabled.load(Ordering::Relaxed);
         let fast_scan_target_secs = self.fast_scan_target_secs.load(Ordering::Relaxed);
@@ -2884,6 +3229,16 @@ impl TieredWatchRuntime {
             ));
             notes.push("fast scan SLA applies to active lease hotset; cold dirs are bounded by cold_sweep_period_estimate and dirty_backlog".to_string());
         }
+        if rotating_cold_window_enabled {
+            notes.push(format!(
+                "rotating cold window active={} budget={} cycle={} progress={}%",
+                rotating_cold_window_active_dirs,
+                self.rotating_cold_window_budget.load(Ordering::Relaxed),
+                self.rotating_cold_window_cycle_id.load(Ordering::Relaxed),
+                rotating_cold_window_cycle_progress_pct
+            ));
+            notes.push("rotating cold window never swaps formal L0/L1/L2/L3 tiers; it issues ephemeral, fast-scan, or scan-only leases".to_string());
+        }
         if fast_scan_budget_degraded && !fast_scan_last_degraded_reason.is_empty() {
             notes.push(format!(
                 "fast scan degraded: {}",
@@ -2982,6 +3337,27 @@ impl TieredWatchRuntime {
             ephemeral_watch_budget_blocked: self
                 .ephemeral_watch_budget_blocked
                 .load(Ordering::Relaxed),
+            rotating_cold_window_enabled,
+            rotating_cold_window_active_dirs,
+            rotating_cold_window_cycle_id: self
+                .rotating_cold_window_cycle_id
+                .load(Ordering::Relaxed),
+            rotating_cold_window_cycle_progress_pct,
+            rotating_cold_window_promoted_to_ephemeral: self
+                .rotating_cold_window_promoted_to_ephemeral
+                .load(Ordering::Relaxed),
+            rotating_cold_window_fast_scan_lease_dirs: self
+                .rotating_cold_window_fast_scan_lease_dirs
+                .load(Ordering::Relaxed),
+            rotating_cold_window_scan_only_dirs: self
+                .rotating_cold_window_scan_only_dirs
+                .load(Ordering::Relaxed),
+            rotating_cold_window_budget_blocked: self
+                .rotating_cold_window_budget_blocked
+                .load(Ordering::Relaxed),
+            cold_freshness_age_p50_secs,
+            cold_freshness_age_p95_secs,
+            cold_freshness_age_p99_secs,
             scan_backlog_by_tier,
             dirty_queue_len: self.dirty_queue_len.load(Ordering::Relaxed),
             cold_validate_count: self.cold_validate_count.load(Ordering::Relaxed),
@@ -3100,6 +3476,23 @@ impl TieredWatchRuntime {
             .filter(|lease| !lease.pending_remove)
             .map(|lease| lease.path.clone())
             .collect::<HashSet<_>>();
+        let rotating_paths = self
+            .rotating_cold_window_leases
+            .read()
+            .iter()
+            .map(|(path, lease)| {
+                (
+                    path.clone(),
+                    (
+                        lease.action.as_str().to_string(),
+                        lease.expires_unix_secs,
+                        lease.cycle_id,
+                        lease.score,
+                        lease.watch_cost,
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
 
         for (path, state) in dirs.iter() {
             if let Some(ref prefix) = filter {
@@ -3121,6 +3514,7 @@ impl TieredWatchRuntime {
                 state.last_budget_blocked_unix_secs.load(Ordering::Relaxed);
             let dirty = state.dirty.load(Ordering::Relaxed);
             let high_priority_scan = state.high_priority_scan.load(Ordering::Relaxed);
+            let rotating = rotating_paths.get(path);
             let nearest_ancestor_root = nearest_ancestor_root(path.as_path(), &dir_paths);
             let descendant_roots = descendant_roots(path.as_path(), &dir_paths);
             let l0_covering_root = nearest_covering_root(path.as_path(), &l0_paths);
@@ -3158,6 +3552,17 @@ impl TieredWatchRuntime {
                 last_budget_blocked_unix_secs,
                 high_priority_scan,
                 ephemeral_watch: ephemeral_paths.contains(path),
+                rotating_cold_window: rotating.is_some(),
+                rotating_cold_window_action: rotating
+                    .map(|(action, _, _, _, _)| action.clone())
+                    .unwrap_or_default(),
+                rotating_cold_window_expires_unix_secs: rotating
+                    .map(|(_, expires, _, _, _)| *expires)
+                    .unwrap_or(0),
+                rotating_cold_window_cycle_id: rotating
+                    .map(|(_, _, cycle_id, _, _)| *cycle_id)
+                    .unwrap_or(0),
+                rotating_cold_window_score: rotating.map(|(_, _, _, score, _)| *score).unwrap_or(0),
                 nearest_ancestor_root,
                 descendant_roots,
                 l0_covering_root,
@@ -3178,6 +3583,13 @@ impl TieredWatchRuntime {
                 ephemeral_watch_dirs: ephemeral_paths.len(),
                 ephemeral_watch_cost: self.current_ephemeral_watch_cost.load(Ordering::Relaxed),
                 ephemeral_watch_budget: self.ephemeral_watch_budget as usize,
+                rotating_cold_window_active_dirs: rotating_paths.len(),
+                rotating_cold_window_cycle_id: self
+                    .rotating_cold_window_cycle_id
+                    .load(Ordering::Relaxed),
+                rotating_cold_window_budget: self
+                    .rotating_cold_window_budget
+                    .load(Ordering::Relaxed),
                 total_event_score,
             },
         }
@@ -3203,6 +3615,11 @@ pub struct TieredWatchDebugDir {
     pub last_budget_blocked_unix_secs: u64,
     pub high_priority_scan: bool,
     pub ephemeral_watch: bool,
+    pub rotating_cold_window: bool,
+    pub rotating_cold_window_action: String,
+    pub rotating_cold_window_expires_unix_secs: u64,
+    pub rotating_cold_window_cycle_id: u64,
+    pub rotating_cold_window_score: u64,
     pub nearest_ancestor_root: Option<String>,
     pub descendant_roots: Vec<String>,
     pub l0_covering_root: Option<String>,
@@ -3219,6 +3636,9 @@ pub struct TieredWatchDebugSummary {
     pub ephemeral_watch_dirs: usize,
     pub ephemeral_watch_cost: u64,
     pub ephemeral_watch_budget: usize,
+    pub rotating_cold_window_active_dirs: usize,
+    pub rotating_cold_window_cycle_id: u64,
+    pub rotating_cold_window_budget: usize,
     pub total_event_score: u64,
 }
 
@@ -3353,6 +3773,20 @@ fn required_fast_scan_budget(known_dirs: usize, target_ms: u64, tick_ms: u64) ->
     let target_ms = target_ms.max(1);
     let numerator = (known_dirs as u128).saturating_mul(u128::from(tick_ms.max(1)));
     numerator.div_ceil(u128::from(target_ms)).max(1) as usize
+}
+
+fn rotating_cold_window_action_for_cost(
+    watch_cost: u64,
+    max_ephemeral_cost: u64,
+    max_fast_scan_cost: u64,
+) -> RotatingColdWindowActionKind {
+    if watch_cost <= max_ephemeral_cost {
+        RotatingColdWindowActionKind::EphemeralWatch
+    } else if watch_cost <= max_fast_scan_cost {
+        RotatingColdWindowActionKind::FastScanLease
+    } else {
+        RotatingColdWindowActionKind::ScanOnly
+    }
 }
 
 fn percentile_ms(values: &[u64], percentile: usize) -> u64 {
@@ -3512,6 +3946,103 @@ mod tests {
             5_000,
             20,
         )
+    }
+
+    #[test]
+    fn rotating_cold_window_selects_cold_dirs_without_tier_swap() {
+        let small = PathBuf::from("/tmp/cold-small");
+        let medium = PathBuf::from("/tmp/cold-medium");
+        let large = PathBuf::from("/tmp/cold-large");
+        let rt = TieredWatchRuntime::new(
+            vec![(PathBuf::from("/tmp/hot"), 2)],
+            vec![
+                (small.clone(), 4),
+                (medium.clone(), 80),
+                (large.clone(), 700),
+            ],
+            16,
+            5_000,
+            20,
+        );
+        for path in [&small, &medium, &large] {
+            let state = rt.state(path).expect("cold dir should exist");
+            state.tier.store(WatchTier::L3.as_u8(), Ordering::Release);
+            state
+                .last_scan_unix_secs
+                .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
+        }
+
+        let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
+            enabled: true,
+            budget: 8,
+            ttl_secs: 60,
+            max_cost_per_root: 64,
+            max_dirs_per_tick: 8,
+        });
+
+        assert_eq!(tick.actions.len(), 3);
+        let action_for = |path: &Path| {
+            tick.actions
+                .iter()
+                .find(|action| action.path == path)
+                .map(|action| action.action)
+                .expect("action exists")
+        };
+        assert_eq!(
+            action_for(&small),
+            RotatingColdWindowActionKind::EphemeralWatch
+        );
+        assert_eq!(
+            action_for(&medium),
+            RotatingColdWindowActionKind::FastScanLease
+        );
+        assert_eq!(action_for(&large), RotatingColdWindowActionKind::ScanOnly);
+
+        for path in [&small, &medium, &large] {
+            assert_eq!(rt.state(path).expect("dir exists").tier(), WatchTier::L3);
+        }
+        let report = rt.report();
+        assert_eq!(report.rotating_cold_window_active_dirs, 3);
+        assert_eq!(report.l0_dirs, 1);
+        assert_eq!(report.l3_dirs, 3);
+    }
+
+    #[test]
+    fn rotating_cold_window_budget_and_ttl_gate_selection() {
+        let first = PathBuf::from("/tmp/cold-first");
+        let second = PathBuf::from("/tmp/cold-second");
+        let rt = TieredWatchRuntime::new(
+            Vec::new(),
+            vec![(first.clone(), 4), (second.clone(), 4)],
+            16,
+            5_000,
+            20,
+        );
+        for path in [&first, &second] {
+            let state = rt.state(path).expect("cold dir should exist");
+            state.tier.store(WatchTier::L2.as_u8(), Ordering::Release);
+            state
+                .last_scan_unix_secs
+                .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
+        }
+
+        let cfg = RotatingColdWindowConfig {
+            enabled: true,
+            budget: 1,
+            ttl_secs: 1,
+            max_cost_per_root: 64,
+            max_dirs_per_tick: 8,
+        };
+        let first_tick = rt.rotating_cold_window_tick(cfg.clone());
+        assert_eq!(first_tick.actions.len(), 1);
+        let blocked_tick = rt.rotating_cold_window_tick(cfg.clone());
+        assert!(blocked_tick.budget_blocked);
+
+        if let Some(lease) = rt.rotating_cold_window_leases.write().values_mut().next() {
+            lease.expires_unix_secs = unix_secs().saturating_sub(1);
+        }
+        let next_tick = rt.rotating_cold_window_tick(cfg);
+        assert_eq!(next_tick.actions.len(), 1);
     }
 
     fn temp_root(tag: &str) -> PathBuf {

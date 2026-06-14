@@ -9,8 +9,8 @@ use fd_rdd::event::proc_sampler::{
 };
 use fd_rdd::event::sync::{DirtyReason, DirtyScope};
 use fd_rdd::event::tiered_watch::{
-    EphemeralWatchConfig, EphemeralWatchDecision, FastScanLeaseKind, TieredWatchDebugDump,
-    TieredWatchDebugSummary, WatchTier,
+    EphemeralWatchConfig, EphemeralWatchDecision, FastScanLeaseKind, RotatingColdWindowActionKind,
+    TieredWatchDebugDump, TieredWatchDebugSummary, WatchTier,
 };
 use fd_rdd::event::watcher::check_inotify_limit;
 use fd_rdd::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
@@ -354,6 +354,7 @@ async fn main() -> anyhow::Result<()> {
     };
     if let Some(runtime) = tiered_runtime.as_ref() {
         runtime.apply_fast_scan_config(&cfg.tiered_watch);
+        runtime.apply_rotating_cold_window_config(&cfg.tiered_watch);
         runtime.set_proc_sampler_enabled(
             cfg.proc_sampler.enabled && watch_enabled && effective_watch_mode == WatchMode::Tiered,
         );
@@ -432,6 +433,17 @@ async fn main() -> anyhow::Result<()> {
         if cfg.tiered_watch.l1_l2_fast_scan_enabled {
             if let Some(runtime) = tiered_runtime.clone() {
                 spawn_tiered_fast_scan_loop(index.clone(), runtime, cfg.tiered_watch.clone());
+            }
+        }
+        if cfg.tiered_watch.rotating_cold_window_enabled {
+            if let Some(runtime) = tiered_runtime.clone() {
+                spawn_rotating_cold_window_loop(
+                    index.clone(),
+                    runtime,
+                    watch_command_tx.clone(),
+                    cfg.tiered_watch.clone(),
+                    exclude_dirs.clone(),
+                );
             }
         }
         if cfg.proc_sampler.enabled {
@@ -626,6 +638,9 @@ async fn main() -> anyhow::Result<()> {
                         ephemeral_watch_dirs: 0,
                         ephemeral_watch_cost: 0,
                         ephemeral_watch_budget: 0,
+                        rotating_cold_window_active_dirs: 0,
+                        rotating_cold_window_cycle_id: 0,
+                        rotating_cold_window_budget: 0,
                         total_event_score: 0,
                     },
                 })
@@ -1534,6 +1549,85 @@ fn spawn_tiered_fast_scan_loop(
             }
             if !result.changed_dirs.is_empty() {
                 index.enqueue_dirty_dirs(result.changed_dirs, DirtyReason::FastScanChangedDir);
+            }
+        }
+    });
+}
+
+fn spawn_rotating_cold_window_loop(
+    index: Arc<TieredIndex>,
+    runtime: Arc<TieredWatchRuntime>,
+    watch_command_tx: tokio::sync::mpsc::Sender<WatchCommand>,
+    tiered: fd_rdd::config::TieredWatchConfig,
+    exclude_dirs: Vec<String>,
+) {
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(tiered.rotating_cold_window_tick_secs.max(1));
+        let ephemeral_config = EphemeralWatchConfig {
+            budget: tiered.ephemeral_watch_budget,
+            ttl_secs: tiered.rotating_cold_window_ttl_secs.max(1),
+            idle_secs: tiered.ephemeral_idle_secs,
+            max_cost_per_root: tiered.rotating_cold_window_max_cost_per_root.max(1),
+            repeat_threshold: 1,
+            ..EphemeralWatchConfig::default()
+        };
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let tick =
+                runtime.rotating_cold_window_tick(runtime.rotating_cold_window_tick_config());
+            if tick.budget_blocked {
+                tracing::debug!(
+                    "rotating cold window budget blocked at cycle {}",
+                    tick.cycle_id
+                );
+                continue;
+            }
+            if tick.actions.is_empty() {
+                continue;
+            }
+
+            let mut scan_only_dirs = Vec::new();
+            for action in tick.actions {
+                match action.action {
+                    RotatingColdWindowActionKind::EphemeralWatch => {
+                        let sent = maybe_send_ephemeral_watch_command(
+                            &runtime,
+                            &watch_command_tx,
+                            action.path.clone(),
+                            1,
+                            &exclude_dirs,
+                            &ephemeral_config,
+                        )
+                        .await;
+                        if sent {
+                            scan_only_dirs.push(action.path);
+                        } else {
+                            runtime.cancel_rotating_cold_window_lease(action.path.as_path());
+                        }
+                    }
+                    RotatingColdWindowActionKind::FastScanLease => {
+                        let granted = runtime.grant_fast_scan_lease(
+                            action.path.clone(),
+                            FastScanLeaseKind::RotatingColdWindow,
+                            Some(tiered.rotating_cold_window_ttl_secs.max(1)),
+                            action.score.max(1),
+                        );
+                        if granted {
+                            scan_only_dirs.push(action.path);
+                        } else {
+                            runtime.cancel_rotating_cold_window_lease(action.path.as_path());
+                        }
+                    }
+                    RotatingColdWindowActionKind::ScanOnly => {
+                        scan_only_dirs.push(action.path);
+                    }
+                }
+            }
+
+            if !scan_only_dirs.is_empty() {
+                index.enqueue_dirty_dirs(scan_only_dirs, DirtyReason::PeriodicColdScan);
             }
         }
     });
