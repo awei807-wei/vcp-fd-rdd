@@ -1604,7 +1604,17 @@ fn spawn_rotating_cold_window_loop(
                         if sent {
                             scan_only_dirs.push(action.path);
                         } else {
-                            runtime.cancel_rotating_cold_window_lease(action.path.as_path());
+                            tracing::debug!(
+                                "rotating cold window ephemeral lease unavailable, falling back to scan-only for {:?}",
+                                action.path
+                            );
+                            if runtime.downgrade_rotating_cold_window_lease_to_scan_only(
+                                action.path.as_path(),
+                            ) {
+                                scan_only_dirs.push(action.path);
+                            } else {
+                                runtime.cancel_rotating_cold_window_lease(action.path.as_path());
+                            }
                         }
                     }
                     RotatingColdWindowActionKind::FastScanLease => {
@@ -1617,7 +1627,17 @@ fn spawn_rotating_cold_window_loop(
                         if granted {
                             scan_only_dirs.push(action.path);
                         } else {
-                            runtime.cancel_rotating_cold_window_lease(action.path.as_path());
+                            tracing::debug!(
+                                "rotating cold window fast-scan lease unavailable, falling back to scan-only for {:?}",
+                                action.path
+                            );
+                            if runtime.downgrade_rotating_cold_window_lease_to_scan_only(
+                                action.path.as_path(),
+                            ) {
+                                scan_only_dirs.push(action.path);
+                            } else {
+                                runtime.cancel_rotating_cold_window_lease(action.path.as_path());
+                            }
                         }
                     }
                     RotatingColdWindowActionKind::ScanOnly => {

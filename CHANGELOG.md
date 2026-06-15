@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 新增 `scripts/m2-cold-window-vm-bench.py` 和 `helloagents/wiki/m2-cold-window-vm-benchmark.md`：在 VM 中隔离启动 fd-rdd、复用内建 metrics JSONL、周期采集端点和进程指标，并提供 M2 冷层轮转 A/B 场景、通过标准与报告模板。
 - `BENCHMARK.md` 与 M2 方案包补充 VM workload driver 计划：driver 独立于 runner / collector，只在 sandbox root 下生成 daily、cold-canary、delete-storm、rename-storm、git-storm、watcher-drop-proxy 压力，并输出 `workload-events.jsonl` 供指标时间线对齐。
 
+### 修复
+
+- M2 冷层轮转在 Ephemeral Watch 或 fast scan lease 发放失败时会降级为 scan-only 并入 `PeriodicColdScan`，不再直接取消轮转租约，避免冷目录已滞后但 `rotating_cold_window_active_dirs` 始终为 0、canary create / rename 无法追平。
+
 ## [7.1.0] - 2026-06-13
 
 ### 质量加固

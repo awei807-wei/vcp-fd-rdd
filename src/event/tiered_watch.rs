@@ -2497,6 +2497,19 @@ impl TieredWatchRuntime {
         self.rotating_cold_window_seen.write().remove(path);
     }
 
+    pub fn downgrade_rotating_cold_window_lease_to_scan_only(&self, path: &Path) -> bool {
+        let mut leases = self.rotating_cold_window_leases.write();
+        let Some(lease) = leases.get_mut(path) else {
+            return false;
+        };
+        if lease.action != RotatingColdWindowActionKind::ScanOnly {
+            lease.action = RotatingColdWindowActionKind::ScanOnly;
+            self.rotating_cold_window_scan_only_dirs
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    }
+
     pub fn l1_batch(&self, limit: usize) -> Vec<PathBuf> {
         self.scan_batch(limit)
     }
@@ -4005,6 +4018,44 @@ mod tests {
         assert_eq!(report.rotating_cold_window_active_dirs, 3);
         assert_eq!(report.l0_dirs, 1);
         assert_eq!(report.l3_dirs, 3);
+    }
+
+    #[test]
+    fn rotating_cold_window_downgrade_keeps_lease_as_scan_only() {
+        let cold = PathBuf::from("/tmp/cold-downgrade");
+        let rt = TieredWatchRuntime::new(Vec::new(), vec![(cold.clone(), 4)], 16, 5_000, 20);
+        let state = rt.state(&cold).expect("cold dir should exist");
+        state.tier.store(WatchTier::L2.as_u8(), Ordering::Release);
+        state
+            .last_scan_unix_secs
+            .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
+
+        let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
+            enabled: true,
+            budget: 8,
+            ttl_secs: 60,
+            max_cost_per_root: 64,
+            max_dirs_per_tick: 8,
+        });
+
+        assert_eq!(tick.actions.len(), 1);
+        assert_eq!(
+            tick.actions[0].action,
+            RotatingColdWindowActionKind::EphemeralWatch
+        );
+        assert_eq!(rt.report().rotating_cold_window_active_dirs, 1);
+
+        assert!(rt.downgrade_rotating_cold_window_lease_to_scan_only(cold.as_path()));
+        assert_eq!(rt.report().rotating_cold_window_active_dirs, 1);
+        assert_eq!(rt.report().rotating_cold_window_scan_only_dirs, 1);
+
+        assert!(rt.downgrade_rotating_cold_window_lease_to_scan_only(cold.as_path()));
+        assert_eq!(rt.report().rotating_cold_window_scan_only_dirs, 1);
+
+        let dump = rt.debug_dump(Some("/tmp/cold-downgrade"));
+        let dir = dump.dirs.first().expect("cold dir should be present");
+        assert!(dir.rotating_cold_window);
+        assert_eq!(dir.rotating_cold_window_action, "scan_only");
     }
 
     #[test]
