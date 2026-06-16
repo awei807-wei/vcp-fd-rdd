@@ -418,7 +418,10 @@ jq '.dirty_queue_len' reports/metrics/metrics_$(date -u +%F_%H).json
 jq 'select(.query_stale_hit_count > 100)' reports/metrics/metrics_*.json
 ```
 
-M2 冷层轮转 VM 压测可用 `scripts/m2-cold-window-vm-bench.py` 启动隔离 daemon，并复用上述内建指标；测试场景、通过标准和报告模板见 `helloagents/wiki/m2-cold-window-vm-benchmark.md`。
+M2 冷层轮转 VM 压测可用 `scripts/m2-cold-window-vm-bench.py` 启动隔离 daemon，并复用上述内建指标；测试场景、通过标准和报告模板见 `helloagents/wiki/m2-cold-window-vm-benchmark.md`。该脚本区分两类 canary：
+
+- active canary：创建后立刻轮询搜索，会测到 query miss / fast scan 触发的补偿路径。
+- passive canary：先创建/rename/delete，等待 `--passive-canary-settle-secs` 后只做首次查询，用来判断后台主动追平，不把查询触发补偿算成 M2 收益。
 
 新增嵌套对象：
 

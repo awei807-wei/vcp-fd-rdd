@@ -192,6 +192,20 @@ def wait_search_state(
     return False, time.monotonic() - start, polls
 
 
+def check_search_state_once(
+    base_url: str,
+    query: str,
+    path: Path,
+    should_exist: bool,
+) -> tuple[bool, bool, float, str]:
+    start = time.monotonic()
+    try:
+        exists = result_has_path(search_results(base_url, query), path)
+        return exists == should_exist, exists, time.monotonic() - start, ""
+    except Exception as exc:  # noqa: BLE001 - benchmark evidence should keep exact error
+        return False, False, time.monotonic() - start, repr(exc)
+
+
 def run_canary_cycle(base_url: str, canary_root: Path, timeout_secs: float) -> list[dict[str, Any]]:
     canary_root.mkdir(parents=True, exist_ok=True)
     marker = f"fd_rdd_m2_canary_{int(time.time() * 1000)}"
@@ -204,6 +218,7 @@ def run_canary_cycle(base_url: str, canary_root: Path, timeout_secs: float) -> l
     records.append(
         {
             "operation": "create_visible",
+            "canary_kind": "active",
             "path": str(created),
             "ok": ok,
             "latency_secs": round(latency, 3),
@@ -221,6 +236,7 @@ def run_canary_cycle(base_url: str, canary_root: Path, timeout_secs: float) -> l
     records.append(
         {
             "operation": "rename_new_visible",
+            "canary_kind": "active",
             "path": str(renamed),
             "ok": ok_new,
             "latency_secs": round(latency_new, 3),
@@ -230,6 +246,7 @@ def run_canary_cycle(base_url: str, canary_root: Path, timeout_secs: float) -> l
     records.append(
         {
             "operation": "rename_old_hidden",
+            "canary_kind": "active",
             "path": str(created),
             "ok": ok_old,
             "latency_secs": round(latency_old, 3),
@@ -242,6 +259,7 @@ def run_canary_cycle(base_url: str, canary_root: Path, timeout_secs: float) -> l
     records.append(
         {
             "operation": "delete_hidden",
+            "canary_kind": "active",
             "path": str(renamed),
             "ok": ok,
             "latency_secs": round(latency, 3),
@@ -249,6 +267,225 @@ def run_canary_cycle(base_url: str, canary_root: Path, timeout_secs: float) -> l
         }
     )
     return records
+
+
+class PassiveCanaryRunner:
+    """Creates canary files first and queries later to avoid measuring query-triggered repair."""
+
+    def __init__(
+        self,
+        base_url: str,
+        root: Path,
+        out_path: Path,
+        started_at: float,
+        interval_secs: float,
+        settle_secs: float,
+        timeout_secs: float,
+        start_delay_secs: float,
+    ) -> None:
+        self.base_url = base_url
+        self.root = root
+        self.out_path = out_path
+        self.started_at = started_at
+        self.interval_secs = max(1.0, interval_secs)
+        self.settle_secs = max(0.0, settle_secs)
+        self.timeout_secs = max(0.0, timeout_secs)
+        self.next_start_at = time.monotonic() + max(0.0, start_delay_secs)
+        self.active: dict[str, Any] | None = None
+        self.cycle = 0
+
+    def tick(self, now: float) -> None:
+        if self.active is None:
+            if now >= self.next_start_at:
+                self.start_cycle(now)
+            return
+        if now < float(self.active["due_at"]):
+            return
+        self.process_due(now)
+
+    def start_cycle(self, now: float) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.cycle += 1
+        marker = f"fd_rdd_m2_passive_{int(time.time() * 1000)}_{self.cycle}"
+        created = self.root / f"{marker}_create.txt"
+        renamed = self.root / f"{marker}_rename.txt"
+        created.write_text(f"{utc_now()} passive create\n", encoding="utf-8")
+        self.active = {
+            "cycle": self.cycle,
+            "stage": "check_create",
+            "created": created,
+            "renamed": renamed,
+            "stage_started_at": now,
+            "due_at": now + self.settle_secs,
+        }
+        self.emit(
+            {
+                "operation": "passive_create_written",
+                "path": str(created),
+                "ok": True,
+                "passive_wait_secs": 0.0,
+            }
+        )
+
+    def process_due(self, now: float) -> None:
+        assert self.active is not None
+        stage = str(self.active["stage"])
+        if stage == "check_create":
+            created = Path(self.active["created"])
+            self.record_first_query(
+                "passive_create_first_query",
+                created.name,
+                created,
+                True,
+                now,
+            )
+            self.record_after_query_if_needed(
+                "passive_create_after_query",
+                created.name,
+                created,
+                True,
+            )
+            renamed = Path(self.active["renamed"])
+            try:
+                created.rename(renamed)
+                self.active["stage"] = "check_rename"
+                self.active["stage_started_at"] = time.monotonic()
+                self.active["due_at"] = time.monotonic() + self.settle_secs
+            except Exception as exc:  # noqa: BLE001 - keep exact failure evidence
+                self.emit(
+                    {
+                        "operation": "passive_rename_prepare",
+                        "path": str(created),
+                        "ok": False,
+                        "error": repr(exc),
+                    }
+                )
+                self.finish_cycle()
+        elif stage == "check_rename":
+            created = Path(self.active["created"])
+            renamed = Path(self.active["renamed"])
+            self.record_first_query(
+                "passive_rename_new_first_query",
+                renamed.name,
+                renamed,
+                True,
+                now,
+            )
+            self.record_after_query_if_needed(
+                "passive_rename_new_after_query",
+                renamed.name,
+                renamed,
+                True,
+            )
+            self.record_first_query(
+                "passive_rename_old_first_query",
+                created.name,
+                created,
+                False,
+                time.monotonic(),
+            )
+            try:
+                renamed.unlink(missing_ok=True)
+                self.active["stage"] = "check_delete"
+                self.active["stage_started_at"] = time.monotonic()
+                self.active["due_at"] = time.monotonic() + self.settle_secs
+            except Exception as exc:  # noqa: BLE001
+                self.emit(
+                    {
+                        "operation": "passive_delete_prepare",
+                        "path": str(renamed),
+                        "ok": False,
+                        "error": repr(exc),
+                    }
+                )
+                self.finish_cycle()
+        elif stage == "check_delete":
+            renamed = Path(self.active["renamed"])
+            self.record_first_query(
+                "passive_delete_first_query",
+                renamed.name,
+                renamed,
+                False,
+                now,
+            )
+            self.record_after_query_if_needed(
+                "passive_delete_after_query",
+                renamed.name,
+                renamed,
+                False,
+            )
+            self.finish_cycle()
+
+    def record_first_query(
+        self,
+        operation: str,
+        query: str,
+        path: Path,
+        should_exist: bool,
+        now: float,
+    ) -> bool:
+        assert self.active is not None
+        ok, exists, latency, error = check_search_state_once(
+            self.base_url,
+            query,
+            path,
+            should_exist,
+        )
+        self.emit(
+            {
+                "operation": operation,
+                "path": str(path),
+                "query": query,
+                "ok": ok,
+                "first_query_exists": exists,
+                "should_exist": should_exist,
+                "latency_secs": round(latency, 3),
+                "passive_wait_secs": round(now - float(self.active["stage_started_at"]), 3),
+                **({"error": error} if error else {}),
+            }
+        )
+        return ok
+
+    def record_after_query_if_needed(
+        self,
+        operation: str,
+        query: str,
+        path: Path,
+        should_exist: bool,
+    ) -> None:
+        if self.timeout_secs <= 0:
+            return
+        ok, latency, polls = wait_search_state(
+            self.base_url,
+            query,
+            path,
+            should_exist,
+            self.timeout_secs,
+        )
+        self.emit(
+            {
+                "operation": operation,
+                "path": str(path),
+                "query": query,
+                "ok": ok,
+                "should_exist": should_exist,
+                "latency_secs": round(latency, 3),
+                "polls": polls,
+            }
+        )
+
+    def emit(self, record: dict[str, Any]) -> None:
+        assert self.active is not None
+        record.setdefault("ok", False)
+        record["canary_kind"] = "passive"
+        record["cycle"] = int(self.active["cycle"])
+        record["ts"] = utc_now()
+        record["elapsed_secs"] = round(time.monotonic() - self.started_at, 3)
+        json_line(self.out_path, record)
+
+    def finish_cycle(self) -> None:
+        self.active = None
+        self.next_start_at = time.monotonic() + self.interval_secs
 
 
 def write_config(args: argparse.Namespace, config_home: Path) -> Path:
@@ -275,6 +512,11 @@ def write_config(args: argparse.Namespace, config_home: Path) -> Path:
         f"rotating_cold_window_max_dirs_per_tick = {args.rotating_max_dirs_per_tick}",
         f"max_watch_dirs = {args.max_watch_dirs}",
         f"l0_max_cost_per_root = {args.l0_max_cost_per_root}",
+        f"l1_scan_interval_secs = {args.l1_scan_interval_secs}",
+        f"l2_scan_interval_secs = {args.l2_scan_interval_secs}",
+        f"l3_scan_interval_secs = {args.l3_scan_interval_secs}",
+        f"l1_empty_scans_to_l2 = {args.l1_empty_scans_to_l2}",
+        f"l2_empty_scans_to_l3 = {args.l2_empty_scans_to_l3}",
         f"l1_l2_fast_scan_enabled = {str(args.fast_scan).lower()}",
         "",
         "[proc_sampler]",
@@ -347,21 +589,85 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
     def nums(samples: list[dict[str, Any]], key: str) -> list[float]:
         return [float(s.get(key, 0) or 0) for s in samples]
 
-    canary_by_op: dict[str, dict[str, Any]] = {}
-    for op in sorted({str(item.get("operation", "")) for item in canary_samples}):
-        if not op:
-            continue
-        rows = [item for item in canary_samples if item.get("operation") == op]
-        latencies = [float(item.get("latency_secs", 0.0)) for item in rows if item.get("ok")]
-        canary_by_op[op] = {
-            "count": len(rows),
-            "ok": sum(1 for item in rows if item.get("ok")),
-            "timeouts": sum(1 for item in rows if not item.get("ok")),
-            "p50_secs": round(percentile(latencies, 50), 3),
-            "p95_secs": round(percentile(latencies, 95), 3),
-            "p99_secs": round(percentile(latencies, 99), 3),
-            "max_secs": round(max(latencies) if latencies else 0.0, 3),
-        }
+    def summarize_canary_group(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        by_op: dict[str, dict[str, Any]] = {}
+        for op in sorted({str(item.get("operation", "")) for item in rows}):
+            if not op:
+                continue
+            op_rows = [item for item in rows if item.get("operation") == op]
+            latencies = [float(item.get("latency_secs", 0.0)) for item in op_rows if item.get("ok")]
+            passive_waits = [
+                float(item.get("passive_wait_secs", 0.0))
+                for item in op_rows
+                if "passive_wait_secs" in item
+            ]
+            summary = {
+                "count": len(op_rows),
+                "ok": sum(1 for item in op_rows if item.get("ok")),
+                "timeouts": sum(1 for item in op_rows if not item.get("ok")),
+                "p50_secs": round(percentile(latencies, 50), 3),
+                "p95_secs": round(percentile(latencies, 95), 3),
+                "p99_secs": round(percentile(latencies, 99), 3),
+                "max_secs": round(max(latencies) if latencies else 0.0, 3),
+            }
+            if passive_waits:
+                summary["passive_wait_p50_secs"] = round(percentile(passive_waits, 50), 3)
+                summary["passive_wait_p95_secs"] = round(percentile(passive_waits, 95), 3)
+                summary["passive_wait_max_secs"] = round(max(passive_waits), 3)
+            by_op[op] = summary
+        return by_op
+
+    canary_by_op = summarize_canary_group(canary_samples)
+    active_canary_by_op = summarize_canary_group(
+        [item for item in canary_samples if item.get("canary_kind") in ("", "active", None)]
+    )
+    passive_canary_by_op = summarize_canary_group(
+        [item for item in canary_samples if item.get("canary_kind") == "passive"]
+    )
+    active_canary_count = sum(
+        1 for item in canary_samples if item.get("canary_kind") in ("", "active", None)
+    )
+    passive_canary_count = sum(
+        1 for item in canary_samples if item.get("canary_kind") == "passive"
+    )
+    passive_first_query_ops = [
+        "passive_create_first_query",
+        "passive_rename_new_first_query",
+        "passive_rename_old_first_query",
+        "passive_delete_first_query",
+    ]
+    passive_positive_first_query_ops = [
+        "passive_create_first_query",
+        "passive_rename_new_first_query",
+    ]
+    passive_first_query = {
+        op: passive_canary_by_op[op]
+        for op in passive_first_query_ops
+        if op in passive_canary_by_op
+    }
+    passive_positive_first_query = {
+        op: passive_canary_by_op[op]
+        for op in passive_positive_first_query_ops
+        if op in passive_canary_by_op
+    }
+    passive_first_query_total = sum(item["count"] for item in passive_first_query.values())
+    passive_first_query_ok = sum(item["ok"] for item in passive_first_query.values())
+    passive_first_query_success_rate = (
+        round(passive_first_query_ok / passive_first_query_total, 4)
+        if passive_first_query_total
+        else 0.0
+    )
+    passive_positive_first_query_total = sum(
+        item["count"] for item in passive_positive_first_query.values()
+    )
+    passive_positive_first_query_ok = sum(
+        item["ok"] for item in passive_positive_first_query.values()
+    )
+    passive_positive_first_query_success_rate = (
+        round(passive_positive_first_query_ok / passive_positive_first_query_total, 4)
+        if passive_positive_first_query_total
+        else 0.0
+    )
 
     summary = {
         "label": label,
@@ -374,6 +680,8 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "memory": len(memory_samples),
             "health": len(health_samples),
             "canary": len(canary_samples),
+            "canary_active": active_canary_count,
+            "canary_passive": passive_canary_count,
         },
         "process": {
             "cpu_pct_p50": round(percentile(cpu, 50), 3),
@@ -404,6 +712,14 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "cold_freshness_age_p99_secs_max": int(
                 max(nums(watch_samples, "cold_freshness_age_p99_secs") or [0])
             ),
+            "cold_freshness_age_p95_secs_delta": int(
+                (
+                    nums(watch_samples[-1:], "cold_freshness_age_p95_secs")[0]
+                    - nums(watch_samples[:1], "cold_freshness_age_p95_secs")[0]
+                )
+                if watch_samples
+                else 0
+            ),
             "rotating_cold_window_budget_blocked_last": int(
                 nums(watch_samples[-1:], "rotating_cold_window_budget_blocked")[0]
                 if watch_samples
@@ -412,8 +728,31 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "rotating_cold_window_active_dirs_max": int(
                 max(nums(watch_samples, "rotating_cold_window_active_dirs") or [0])
             ),
+            "rotating_cold_window_cycle_progress_pct_max": int(
+                max(nums(watch_samples, "rotating_cold_window_cycle_progress_pct") or [0])
+            ),
+            "rotating_cold_window_promoted_to_ephemeral_last": int(
+                nums(watch_samples[-1:], "rotating_cold_window_promoted_to_ephemeral")[0]
+                if watch_samples
+                else 0
+            ),
+            "rotating_cold_window_fast_scan_lease_dirs_last": int(
+                nums(watch_samples[-1:], "rotating_cold_window_fast_scan_lease_dirs")[0]
+                if watch_samples
+                else 0
+            ),
+            "rotating_cold_window_scan_only_dirs_last": int(
+                nums(watch_samples[-1:], "rotating_cold_window_scan_only_dirs")[0]
+                if watch_samples
+                else 0
+            ),
             "ephemeral_watch_budget_blocked_last": int(
                 nums(watch_samples[-1:], "ephemeral_watch_budget_blocked")[0]
+                if watch_samples
+                else 0
+            ),
+            "proc_sampler_triggered_watches_last": int(
+                nums(watch_samples[-1:], "proc_sampler_triggered_watches")[0]
                 if watch_samples
                 else 0
             ),
@@ -432,6 +771,20 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "tiered_degraded_seen": any(bool(item.get("tiered_degraded")) for item in health_samples),
         },
         "canary": canary_by_op,
+        "canary_active": active_canary_by_op,
+        "canary_passive": passive_canary_by_op,
+        "passive_first_query": {
+            "total": passive_first_query_total,
+            "ok": passive_first_query_ok,
+            "success_rate": passive_first_query_success_rate,
+            "operations": passive_first_query,
+        },
+        "passive_positive_first_query": {
+            "total": passive_positive_first_query_total,
+            "ok": passive_positive_first_query_ok,
+            "success_rate": passive_positive_first_query_success_rate,
+            "operations": passive_positive_first_query,
+        },
         "built_in_metrics_dir": str(run_dir / "reports" / "metrics"),
     }
     (run_dir / "summary.json").write_text(
@@ -463,17 +816,44 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | fast scan lag p99 max ms | {summary["watch_state"]["fast_scan_coverage_lag_p99_ms_max"]} |
 | cold freshness age p95 first s | {summary["watch_state"]["cold_freshness_age_p95_secs_first"]} |
 | cold freshness age p95 last s | {summary["watch_state"]["cold_freshness_age_p95_secs_last"]} |
+| cold freshness age p95 delta s | {summary["watch_state"]["cold_freshness_age_p95_secs_delta"]} |
 | cold freshness age p99 max s | {summary["watch_state"]["cold_freshness_age_p99_secs_max"]} |
 | rotating budget blocked last | {summary["watch_state"]["rotating_cold_window_budget_blocked_last"]} |
 | rotating active dirs max | {summary["watch_state"]["rotating_cold_window_active_dirs_max"]} |
+| rotating cycle progress max % | {summary["watch_state"]["rotating_cold_window_cycle_progress_pct_max"]} |
+| rotating scan-only dirs last | {summary["watch_state"]["rotating_cold_window_scan_only_dirs_last"]} |
+| proc sampler triggered watches last | {summary["watch_state"]["proc_sampler_triggered_watches_last"]} |
+| passive first query success rate | {summary["passive_first_query"]["success_rate"]} |
+| passive positive first query success rate | {summary["passive_positive_first_query"]["success_rate"]} |
 | index health last | {summary["health"]["index_health_last"]} |
 
 ## Canary
 
-Use canary numbers only when `--canary-root` was set.
+Active canary numbers include immediate query polling and can measure query-triggered repair.
+Passive canary numbers use create-first/query-later probes and are better for background freshness.
+
+### Active canary
 
 ```json
-{json.dumps(summary["canary"], ensure_ascii=False, indent=2)}
+{json.dumps(summary["canary_active"], ensure_ascii=False, indent=2)}
+```
+
+### Passive first-query canary
+
+```json
+{json.dumps(summary["passive_first_query"], ensure_ascii=False, indent=2)}
+```
+
+### Passive positive first-query canary
+
+```json
+{json.dumps(summary["passive_positive_first_query"], ensure_ascii=False, indent=2)}
+```
+
+### Passive all records
+
+```json
+{json.dumps(summary["canary_passive"], ensure_ascii=False, indent=2)}
 ```
 
 ## Files
@@ -482,7 +862,7 @@ Use canary numbers only when `--canary-root` was set.
 - `fd-rdd.log`: daemon stdout/stderr.
 - `endpoint-samples.jsonl`: periodic `/health`, `/status`, `/metrics`, `/memory`, `/watch-state`.
 - `process-samples.jsonl`: `/proc/<pid>` CPU/RSS/FD/thread samples.
-- `canary-samples.jsonl`: optional create/rename/delete search visibility latency.
+- `canary-samples.jsonl`: optional active and passive create/rename/delete evidence.
 - `reports/metrics/*.json`: fd-rdd built-in JSONL metrics, reusable for jq/offline analysis.
 """
     (run_dir / "REPORT.md").write_text(report, encoding="utf-8")
@@ -513,6 +893,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rotating-max-dirs-per-tick", type=int, default=8)
     parser.add_argument("--max-watch-dirs", type=int, default=131072)
     parser.add_argument("--l0-max-cost-per-root", type=int, default=8192)
+    parser.add_argument("--l1-scan-interval-secs", type=int, default=30)
+    parser.add_argument("--l2-scan-interval-secs", type=int, default=300)
+    parser.add_argument("--l3-scan-interval-secs", type=int, default=21600)
+    parser.add_argument("--l1-empty-scans-to-l2", type=int, default=5)
+    parser.add_argument("--l2-empty-scans-to-l3", type=int, default=3)
     parser.add_argument("--fast-scan", dest="fast_scan", action="store_true", default=True)
     parser.add_argument("--no-fast-scan", dest="fast_scan", action="store_false")
     parser.add_argument("--proc-sampler", dest="proc_sampler", action="store_true", default=True)
@@ -520,6 +905,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--canary-root", default="")
     parser.add_argument("--canary-interval-secs", type=float, default=60.0)
     parser.add_argument("--canary-timeout-secs", type=float, default=30.0)
+    parser.add_argument("--passive-canary-root", default="")
+    parser.add_argument("--passive-canary-interval-secs", type=float, default=180.0)
+    parser.add_argument("--passive-canary-settle-secs", type=float, default=90.0)
+    parser.add_argument("--passive-canary-timeout-secs", type=float, default=0.0)
+    parser.add_argument("--passive-canary-start-delay-secs", type=float, default=60.0)
     parser.add_argument("--startup-timeout-secs", type=float, default=60.0)
     return parser.parse_args()
 
@@ -580,6 +970,13 @@ def main() -> int:
         "command": cmd,
         "roots": [str(Path(root).expanduser().resolve()) for root in args.root],
         "rotating_cold_window": args.rotating_cold_window,
+        "active_canary_root": str(Path(args.canary_root).expanduser().resolve()) if args.canary_root else "",
+        "passive_canary_root": (
+            str(Path(args.passive_canary_root).expanduser().resolve())
+            if args.passive_canary_root
+            else ""
+        ),
+        "passive_canary_settle_secs": args.passive_canary_settle_secs,
     }
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -603,6 +1000,20 @@ def main() -> int:
         next_canary = time.monotonic() + args.canary_interval_secs
         deadline = None if args.duration_secs == 0 else time.monotonic() + args.duration_secs
         canary_root = Path(args.canary_root).expanduser().resolve() if args.canary_root else None
+        passive_canary = (
+            PassiveCanaryRunner(
+                base_url=base_url,
+                root=Path(args.passive_canary_root).expanduser().resolve(),
+                out_path=run_dir / "canary-samples.jsonl",
+                started_at=started_at,
+                interval_secs=args.passive_canary_interval_secs,
+                settle_secs=args.passive_canary_settle_secs,
+                timeout_secs=args.passive_canary_timeout_secs,
+                start_delay_secs=args.passive_canary_start_delay_secs,
+            )
+            if args.passive_canary_root
+            else None
+        )
 
         while True:
             if proc.poll() is not None:
@@ -626,6 +1037,8 @@ def main() -> int:
                     record["elapsed_secs"] = round(time.monotonic() - started_at, 3)
                     json_line(run_dir / "canary-samples.jsonl", record)
                 next_canary = time.monotonic() + args.canary_interval_secs
+            if passive_canary:
+                passive_canary.tick(now)
             time.sleep(0.2)
     except KeyboardInterrupt:
         json_line(run_dir / "events.jsonl", {"ts": utc_now(), "event": "interrupted"})

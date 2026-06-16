@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 新增 M2 Rotating Cold Freshness Window 原型：默认关闭，通过 `tiered_watch.rotating_cold_window_*` 配置在独立窗口预算内轮转 L2/L3 冷目录；小成本目录走 Ephemeral Watch，中等成本目录走 `RotatingColdWindow` fast scan lease，大成本目录只入 `PeriodicColdScan` 分片补扫，正式 L0/L1/L2/L3 tier 不交换、不抢占 hotset。
 - `/watch-state` 与 `/debug/tiered-watch` 新增冷层轮转观测字段，暴露 active dirs、cycle progress、动作计数、budget blocked、cold freshness age p50/p95/p99 和单目录轮转动作/到期/分数，用于判断机制可实施性。
 - 新增 `scripts/m2-cold-window-vm-bench.py` 和 `helloagents/wiki/m2-cold-window-vm-benchmark.md`：在 VM 中隔离启动 fd-rdd、复用内建 metrics JSONL、周期采集端点和进程指标，并提供 M2 冷层轮转 A/B 场景、通过标准与报告模板。
+- `scripts/m2-cold-window-vm-bench.py` 新增 passive canary：先写入文件、等待 settle 后做首次查询，分离后台主动追平与 query miss / fast scan 触发补偿；报告同步输出 active/passive canary、passive first-query 成功率、轮转 action 计数和 scan interval 参数。
 - `BENCHMARK.md` 与 M2 方案包补充 VM workload driver 计划：driver 独立于 runner / collector，只在 sandbox root 下生成 daily、cold-canary、delete-storm、rename-storm、git-storm、watcher-drop-proxy 压力，并输出 `workload-events.jsonl` 供指标时间线对齐。
 
 ### 修复

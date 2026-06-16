@@ -30,7 +30,7 @@
 
 M2 `Rotating Cold Freshness Window` 不能只用“正常情况下能搜到”证明可用。验证目标是：在事件丢失、后台扫描滞后、删除风暴、重命名风暴、冷段 mmap、Tombstone overlay、Lazy Validation、`apply_seq` 竞态同时存在时，系统仍然不爆 RSS、不拖死前台查询、不复活幽灵文件、不用后台旧事实覆盖 watcher 新事实。
 
-现有指标可以复用：daemon 已经每 30 秒写 `reports/metrics/metrics_YYYY-MM-DD_HH.json`，顶层兼容 `/watch-state`，嵌套包含 `runtime`、`memory`、`health`、`diagnostics`。`scripts/m2-cold-window-vm-bench.py` 负责隔离启动 fd-rdd、周期采集 HTTP 端点和 `/proc/<pid>`，并把内建 metrics 一并保存在单次 run 目录。
+现有指标可以复用：daemon 已经每 30 秒写 `reports/metrics/metrics_YYYY-MM-DD_HH.json`，顶层兼容 `/watch-state`，嵌套包含 `runtime`、`memory`、`health`、`diagnostics`。`scripts/m2-cold-window-vm-bench.py` 负责隔离启动 fd-rdd、周期采集 HTTP 端点和 `/proc/<pid>`，并把内建 metrics 一并保存在单次 run 目录。脚本输出同时区分 active canary 与 passive canary：active canary 创建后立刻轮询搜索，可能测到 query miss / fast scan 触发的补偿；passive canary 先写入、等待 settle 后只做首次查询，用来衡量后台主动追平。
 
 ### 总不变量
 
@@ -124,7 +124,7 @@ python3 scripts/m2-cold-window-workload.py \
 | 类别 | 通过条件 |
 |---|---|
 | 正确性 | canary create 可见、rename 新路径可见且旧路径隐藏、delete 隐藏；delete/rename storm 后旧结果不复活。 |
-| 冷层收益 | 冷层 canary p95 比 baseline 下降 ≥ 40%；p99 下降 ≥ 30%；如果 baseline 已很快，实验组 p95/p99 增幅不超过 10%。 |
+| 冷层收益 | passive first-query create / rename 成功率高于 baseline，或冷层 canary p95 比 baseline 下降 ≥ 40%；p99 下降 ≥ 30%；如果 baseline 已很快，实验组 p95/p99 增幅不超过 10%。 |
 | 热层不退 | `fast_scan_coverage_lag_p99_ms <= 5000`，或相对 baseline 增幅不超过 10%。 |
 | 资源成本 | CPU p95 增幅不超过 5–10 个百分点；RSS max 增幅不超过 32 MiB 或 10%；swap 不应持续非 0。 |
 | 队列预算 | `dirty_queue_len` 操作后可回落；`rotating_cold_window_budget_blocked` / `ephemeral_watch_budget_blocked` 不能持续单调增长且无对应回落。 |
