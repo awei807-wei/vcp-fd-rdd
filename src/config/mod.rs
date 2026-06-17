@@ -15,6 +15,27 @@ pub const DEFAULT_L3_SCAN_INTERVAL_SECS: u64 = 21_600;
 pub const DEFAULT_TIERED_MAX_WATCH_DIRS: usize = 131_072;
 pub const DEFAULT_TIERED_L0_MAX_COST_PER_ROOT: usize = 8_192;
 
+/// Default synchronous verification budget per query (QueryConfig).
+const DEFAULT_MAX_VERIFY_PER_QUERY: usize = 150;
+/// Default synchronous verification wall time per query in ms (QueryConfig).
+const DEFAULT_VERIFY_TIMEOUT_MS: u64 = 75;
+/// Default mmap warmup byte ceiling (MmapWarmupConfig).
+const DEFAULT_MMAP_WARMUP_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Default content index max file size (ContentIndexConfig).
+const DEFAULT_CONTENT_INDEX_MAX_FILE_SIZE: u64 = 1024 * 1024;
+/// Default WAL seal threshold for memory_light profile (RuntimeProfileSettings).
+const DEFAULT_WAL_SEAL_BYTES: u64 = 16 * 1024 * 1024;
+/// Memory-light profile auto-flush overlay byte ceiling.
+const MEMORY_LIGHT_AUTO_FLUSH_OVERLAY_BYTES: u64 = 16 * 1024 * 1024;
+/// Default auto-flush overlay byte ceiling (RuntimeProfileSettings).
+const DEFAULT_AUTO_FLUSH_OVERLAY_BYTES: u64 = 64 * 1024 * 1024;
+/// Default auto-flush overlay path count (RuntimeProfileSettings).
+const DEFAULT_AUTO_FLUSH_OVERLAY_PATHS: u64 = 250_000;
+/// Default periodic flush minimum bytes (RuntimeProfileSettings).
+const DEFAULT_PERIODIC_FLUSH_MIN_BYTES: u64 = 4 * 1024 * 1024;
+/// Default network fast scan stat budget per tick (TieredWatchConfig).
+const DEFAULT_NETWORK_FAST_SCAN_STAT_BUDGET_PER_TICK: usize = 128;
+
 /// Returns the platform-appropriate default socket path (user-isolated).
 ///
 /// - Linux: `$XDG_RUNTIME_DIR/fd-rdd/fd-rdd.sock`
@@ -281,8 +302,8 @@ impl QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
-            max_verify_per_query: 150,
-            verify_timeout_ms: 75,
+            max_verify_per_query: DEFAULT_MAX_VERIFY_PER_QUERY,
+            verify_timeout_ms: DEFAULT_VERIFY_TIMEOUT_MS,
         }
     }
 }
@@ -313,7 +334,7 @@ impl Default for MmapWarmupConfig {
     fn default() -> Self {
         Self {
             enable: false,
-            max_bytes: 64 * 1024 * 1024,
+            max_bytes: DEFAULT_MMAP_WARMUP_MAX_BYTES,
         }
     }
 }
@@ -322,7 +343,7 @@ impl Default for ContentIndexConfig {
     fn default() -> Self {
         Self {
             enable: false,
-            max_file_size: 1024 * 1024,
+            max_file_size: DEFAULT_CONTENT_INDEX_MAX_FILE_SIZE,
             include_ext: Vec::new(),
             exclude_ext: Vec::new(),
         }
@@ -461,12 +482,12 @@ impl RuntimeProfile {
             Self::Default => RuntimeProfileSettings::default(),
             Self::MemoryLight => RuntimeProfileSettings {
                 auto_flush_overlay_paths: 50_000,
-                auto_flush_overlay_bytes: 16 * 1024 * 1024,
+                auto_flush_overlay_bytes: MEMORY_LIGHT_AUTO_FLUSH_OVERLAY_BYTES,
                 periodic_flush_min_events: 1_024,
                 periodic_flush_min_bytes: 1024 * 1024,
                 periodic_flush_max_staleness_secs: 30,
                 rebuild_cooldown_secs: 15,
-                wal_seal_bytes: 16 * 1024 * 1024,
+                wal_seal_bytes: DEFAULT_WAL_SEAL_BYTES,
             },
         }
     }
@@ -500,10 +521,10 @@ pub struct RuntimeProfileSettings {
 impl Default for RuntimeProfileSettings {
     fn default() -> Self {
         Self {
-            auto_flush_overlay_paths: 250_000,
-            auto_flush_overlay_bytes: 64 * 1024 * 1024,
+            auto_flush_overlay_paths: DEFAULT_AUTO_FLUSH_OVERLAY_PATHS,
+            auto_flush_overlay_bytes: DEFAULT_AUTO_FLUSH_OVERLAY_BYTES,
             periodic_flush_min_events: 4_096,
-            periodic_flush_min_bytes: 4 * 1024 * 1024,
+            periodic_flush_min_bytes: DEFAULT_PERIODIC_FLUSH_MIN_BYTES,
             periodic_flush_max_staleness_secs: 0,
             rebuild_cooldown_secs: 60,
             wal_seal_bytes: 0,
@@ -573,7 +594,7 @@ impl Default for TieredWatchConfig {
             l1_l2_fast_scan_explicit_lease_ttl_secs: 0,
             l1_l2_fast_scan_sentinel_registry_max_entries: 512,
             network_fast_scan_mode: NetworkFastScanMode::BestEffort,
-            network_fast_scan_stat_budget_per_tick: 128,
+            network_fast_scan_stat_budget_per_tick: DEFAULT_NETWORK_FAST_SCAN_STAT_BUDGET_PER_TICK,
             network_fast_scan_readdir_budget_per_tick: 16,
             l1_empty_scans_to_l2: 5,
             l2_empty_scans_to_l3: 3,
