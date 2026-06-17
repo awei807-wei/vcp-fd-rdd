@@ -204,8 +204,6 @@ impl CompiledExpr {
 }
 
 /// Filter enum for compiled query expressions.
-/// `Content(String)` is intentionally kept as a placeholder for future full-text search integration.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum Filter {
     ExtAny(Vec<Vec<u8>>),
@@ -1253,10 +1251,12 @@ fn parse_local_date_range(s: &str) -> Result<DateRange, String> {
 
 #[cfg(unix)]
 fn local_date_range(year: i32, month: i32, day: i32) -> Result<DateRange, String> {
+    use std::mem::MaybeUninit;
+
     // SAFETY: mktime is a standard POSIX function that converts broken-down local time
     // to calendar time. It modifies the tm struct in-place (normalizing fields) and
     // returns -1 on error. We check the return value. The tm struct is zero-initialized
-    // via std::mem::zeroed() and then populated with valid date fields.
+    // via MaybeUninit::zeroed() and then populated with valid date fields.
     unsafe fn mktime_local(mut tm: libc::tm) -> Result<libc::time_t, String> {
         tm.tm_isdst = -1;
         let t = libc::mktime(&mut tm as *mut libc::tm);
@@ -1267,16 +1267,18 @@ fn local_date_range(year: i32, month: i32, day: i32) -> Result<DateRange, String
         }
     }
 
-    // SAFETY: std::mem::zeroed() produces a valid all-zeros libc::tm struct.
+    // SAFETY: MaybeUninit::zeroed() produces a valid all-zeros libc::tm struct.
     // We then set the date fields to valid values before passing to mktime_local.
     unsafe {
-        let mut tm0: libc::tm = std::mem::zeroed();
-        tm0.tm_year = year - 1900;
-        tm0.tm_mon = month - 1;
-        tm0.tm_mday = day;
-        tm0.tm_hour = 0;
-        tm0.tm_min = 0;
-        tm0.tm_sec = 0;
+        let mut tm0 = MaybeUninit::<libc::tm>::zeroed();
+        let p = tm0.as_mut_ptr();
+        (*p).tm_year = year - 1900;
+        (*p).tm_mon = month - 1;
+        (*p).tm_mday = day;
+        (*p).tm_hour = 0;
+        (*p).tm_min = 0;
+        (*p).tm_sec = 0;
+        let tm0 = tm0.assume_init();
 
         let t0 = mktime_local(tm0)?;
 
