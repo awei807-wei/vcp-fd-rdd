@@ -297,6 +297,11 @@ pub enum QueryCompileError {
     Syntax(String),
     #[error("invalid filter: {0}")]
     Filter(String),
+    #[error("unsupported atom `{atom}`: {reason}")]
+    UnsupportedAtom {
+        atom: &'static str,
+        reason: &'static str,
+    },
 }
 
 fn is_path_initials_query(input: &str) -> bool {
@@ -454,14 +459,48 @@ fn compile_expr(expr: &Expr, case_sensitive: bool) -> Result<CompiledExpr, Query
                 .map(|e| compile_expr(e, case_sensitive))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
-        Expr::And(v) => Ok(CompiledExpr::And(
-            v.iter()
+        Expr::And(v) => {
+            // HardlinkDupe and ContentDupe are meta-filters handled at a higher
+            // level via CompiledQuery::requires_hardlink_dupe() /
+            // requires_content_dupe().  They must not silently compile to
+            // CompiledExpr::True (which would match *every* file), so we strip
+            // them from AND expressions here.  If the AND becomes empty after
+            // stripping, it means the query consisted solely of meta-filters,
+            // which is rejected as too broad.
+            let compiled: Vec<CompiledExpr> = v
+                .iter()
+                .filter(|e| !is_meta_filter_atom(e))
                 .map(|e| compile_expr(e, case_sensitive))
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
+                .collect::<Result<Vec<_>, _>>()?;
+            match compiled.len() {
+                0 => Err(QueryCompileError::UnsupportedAtom {
+                    atom: "dupe",
+                    reason: "dupe filters are meta-filters and must be combined \
+                             with other search criteria",
+                }),
+                1 => Ok(compiled.into_iter().next().unwrap()),
+                _ => Ok(CompiledExpr::And(compiled)),
+            }
+        }
         Expr::True => Ok(CompiledExpr::True),
+        Expr::Atom(Atom::HardlinkDupe) | Expr::Atom(Atom::ContentDupe) => {
+            Err(QueryCompileError::UnsupportedAtom {
+                atom: "dupe",
+                reason: "dupe filters are meta-filters and must be combined with \
+                         other search criteria",
+            })
+        }
         Expr::Atom(a) => compile_atom(a, case_sensitive),
     }
+}
+
+/// Returns true for atoms that are meta-filters (handled outside the compiled
+/// expression tree) and should be stripped before compilation.
+fn is_meta_filter_atom(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Atom(Atom::HardlinkDupe) | Expr::Atom(Atom::ContentDupe)
+    )
 }
 
 fn compile_atom(atom: &Atom, case_sensitive: bool) -> Result<CompiledExpr, QueryCompileError> {
@@ -520,8 +559,13 @@ fn compile_atom(atom: &Atom, case_sensitive: bool) -> Result<CompiledExpr, Query
         Atom::NameLen(op, n) => Ok(CompiledExpr::Filter(Filter::NameLen(*op, *n))),
         Atom::EntryType(k) => Ok(CompiledExpr::Filter(Filter::EntryType(*k))),
         Atom::EmptyDir => Ok(CompiledExpr::Filter(Filter::EmptyDir)),
-        Atom::HardlinkDupe => Ok(CompiledExpr::True),
-        Atom::ContentDupe => Ok(CompiledExpr::True),
+        // HardlinkDupe / ContentDupe are meta-filters handled in compile_expr;
+        // they should never reach compile_atom.  This arm is a safety net.
+        Atom::HardlinkDupe | Atom::ContentDupe => Err(QueryCompileError::UnsupportedAtom {
+            atom: "dupe",
+            reason: "dupe filters are meta-filters and must be combined with \
+                     other search criteria",
+        }),
         Atom::Content(s) => Ok(CompiledExpr::Filter(Filter::Content(s.clone()))),
     }
 }
@@ -1388,9 +1432,10 @@ mod tests {
         assert!(q.matches(&meta("/work/alias-a.txt", 1, None)));
         assert!(!q.matches(&meta("/work/original.txt", 1, None)));
 
-        let all = compile_query("dupe:").unwrap();
-        assert!(all.requires_hardlink_dupe());
-        assert!(all.matches(&meta("/work/original.txt", 1, None)));
+        // Standalone dupe: (no other criteria) should be rejected — it would
+        // silently match every file otherwise.
+        let err = compile_query("dupe:").unwrap_err();
+        assert!(err.to_string().contains("dupe filters are meta-filters"));
     }
 
     #[test]
@@ -1410,10 +1455,9 @@ mod tests {
 
     #[test]
     fn dupe_content_filter_sets_content_dupe_flag() {
-        let q = compile_query("dupe:content").unwrap();
-        assert!(q.requires_content_dupe());
-        assert!(!q.requires_hardlink_dupe());
-        assert!(q.matches(&meta("/work/original.txt", 1, None)));
+        // Standalone dupe:content (no other criteria) should be rejected.
+        let err = compile_query("dupe:content").unwrap_err();
+        assert!(err.to_string().contains("dupe filters are meta-filters"));
 
         let filtered = compile_query("dupe:content alias").unwrap();
         assert!(filtered.requires_content_dupe());
