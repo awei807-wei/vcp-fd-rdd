@@ -70,6 +70,10 @@ M2 `Rotating Cold Freshness Window` 不能只用“正常情况下能搜到”�
 | S6 Rename 风暴 | 10 万级 rename，覆盖 old/new 查询。 | `apply_seq` 单调、旧名不复活、L2 不无限膨胀。 |
 | S7 Git checkout 风暴 | 在临时仓库反复 checkout / clean / reset。 | 最终分支文件正确，删除文件不幽灵复活。 |
 | S8 Watcher 丢事件 | 暂停/降级 watcher 后制造磁盘变化，再恢复对账。 | 最终收敛，前台不等待后台对账。 |
+| S9 子目录重命名雪崩 | 执行 `mv dir_a dir_b`，只触发父目录级 rename 事件。 | 深层子文件新路径能追平，旧路径不复活；验证 DirSentinel / 递归对账。 |
+| S10 挂载点断联海啸 | 扫描或查询过程中让挂载点突然离线。 | 删除熔断器拦截 ENOENT 海啸，不写满无用 Delete Tombstone。 |
+| S11 幽灵文件复活 | 删除文件后立刻创建新文件，尽量诱发 inode 快速复用。 | Generation Number / FileKey 防止旧索引事实复活或覆盖新事实。 |
+| S12 时钟倒挂 | 文件 mtime 或系统时钟向过去跳变。 | 双轨时钟防止 mtime cutoff 剪枝漏扫。 |
 
 ### VM workload driver 设计
 
@@ -78,7 +82,7 @@ M2 `Rotating Cold Freshness Window` 不能只用“正常情况下能搜到”�
 ```bash
 python3 scripts/m2-cold-window-workload.py \
   --root "$HOME/fd-rdd-vm-workload" \
-  --scenario daily,cold-canary,delete-storm,rename-storm,git-storm \
+  --scenario daily,cold-canary,delete-storm,rename-storm,git-storm,subtree-rename,mount-storm,inode-reuse,time-skew \
   --duration-secs 3600 \
   --rate normal \
   --seed 42 \
@@ -118,6 +122,27 @@ python3 scripts/m2-cold-window-workload.py \
 | `rename-storm` | 批量 `file_i -> file_i_new -> file_i`，覆盖 rename 合并与 tombstone。 |
 | `git-storm` | 在临时 git repo 中创建分支、checkout、clean、reset，模拟真实工作区震荡。 |
 | `watcher-drop-proxy` | 不直接控制内核 watcher；通过短时间 `--no-watch` baseline 或暂停 daemon 后磁盘变更，再重启观察 deferred repair。 |
+| `subtree-rename` | 执行 `mv dir_a dir_b`，验证深层子文件的新路径可见、旧路径隐藏。 |
+| `mount-storm` | 在 VM 中用 loop/NFS/U 盘挂载点制造离线；无特权模式可用目录隐藏重命名做代理测试。 |
+| `inode-reuse` | 删除旧文件后快速创建新文件，记录 dev/inode 是否复用，并验证旧路径隐藏、新路径可见。 |
+| `time-skew` | 优先在 VM 中真实回拨系统时间；无特权模式可回拨 fixture mtime，验证 mtime cutoff 不漏扫。 |
+
+轻量一体化 event storm 命令形态：
+
+```bash
+python3 scripts/m2-cold-window-vm-bench.py \
+  --root "$TEST_ROOT/cold-a" \
+  --root "$TEST_ROOT/cold-b" \
+  --root "$TEST_ROOT/hot" \
+  --binary "./target/release/fd-rdd" \
+  --build never \
+  --event-storm \
+  --event-storm-kind rw100,save100,git_clone,npm_install,subtree_rename,mount_storm,inode_reuse,time_skew \
+  --event-storm-target-tier L0,L1,L2,L3 \
+  --event-storm-ops 100 \
+  --event-storm-duration-budget-secs 1 \
+  --event-storm-settle-secs 120
+```
 
 ### A/B 判定标准
 
@@ -129,6 +154,7 @@ python3 scripts/m2-cold-window-workload.py \
 | 资源成本 | CPU p95 增幅不超过 5–10 个百分点；RSS max 增幅不超过 32 MiB 或 10%；swap 不应持续非 0。 |
 | 队列预算 | `dirty_queue_len` 操作后可回落；`rotating_cold_window_budget_blocked` / `ephemeral_watch_budget_blocked` 不能持续单调增长且无对应回落。 |
 | watcher | `watch_failures` 和 `overflow_drops` 不应持续增长，除非测试明确在验证 overflow recovery。 |
+| event storm | `first_query.success_rate` 不低于 baseline，`special.subtree_rename_*`、`mount_storm_old_hidden_ok`、`inode_reuse_*`、`time_skew_backdated_visible_ok` 不能暴露正确性退化；真实挂载断联和系统回拨还需独立 VM driver 验证。 |
 
 ### 推荐指标补齐
 

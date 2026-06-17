@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 新增 `scripts/m2-cold-window-vm-bench.py` 和 `helloagents/wiki/m2-cold-window-vm-benchmark.md`：在 VM 中隔离启动 fd-rdd、复用内建 metrics JSONL、周期采集端点和进程指标，并提供 M2 冷层轮转 A/B 场景、通过标准与报告模板。
 - `scripts/m2-cold-window-vm-bench.py` 新增 passive canary：先写入文件、等待 settle 后做首次查询，分离后台主动追平与 query miss / fast scan 触发补偿；报告同步输出 active/passive canary、passive first-query 成功率、轮转 action 计数和 scan interval 参数。
 - `BENCHMARK.md` 与 M2 方案包补充 VM workload driver 计划：driver 独立于 runner / collector，只在 sandbox root 下生成 daily、cold-canary、delete-storm、rename-storm、git-storm、watcher-drop-proxy 压力，并输出 `workload-events.jsonl` 供指标时间线对齐。
+- `scripts/m2-cold-window-vm-bench.py` 新增一体化 `--event-storm`：支持 `rw100`、`save100`、`git_clone`、`npm_install`、`subtree_rename`、`mount_storm`、`inode_reuse`、`time_skew`，并在 summary/report 中输出 first-query、after-query、workload/tier 维度与特殊正确性计数，用于快速比较 M2 对短窗口事件风暴的投入产出比。
 
 ### 修复
 
