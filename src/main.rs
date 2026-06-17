@@ -34,6 +34,29 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
+// ---------------------------------------------------------------------------
+// Named constants (extracted from magic numbers — M6)
+// ---------------------------------------------------------------------------
+
+/// Default memory-report interval in seconds.
+const DEFAULT_REPORT_INTERVAL_SECS: u64 = 60;
+/// Default watcher event channel capacity.
+const DEFAULT_CHANNEL_SIZE: usize = 65_536;
+/// Default watcher event debounce window in milliseconds.
+const DEFAULT_DEBOUNCE_MS: u64 = 10;
+/// Default metrics-file report interval in seconds.
+const DEFAULT_METRICS_REPORT_INTERVAL_SECS: u64 = 30;
+/// Dirty-queue batch size fetched per iteration.
+const DIRTY_QUEUE_BATCH_SIZE: usize = 16;
+/// Idle poll interval for the dirty-queue loop (milliseconds).
+const DIRTY_QUEUE_IDLE_POLL_MS: u64 = 250;
+/// Minimum content-index worker interval (seconds).
+const CONTENT_INDEX_INTERVAL_MIN_SECS: u64 = 30;
+/// Maximum content-index worker interval (seconds).
+const CONTENT_INDEX_INTERVAL_MAX_SECS: u64 = 300;
+/// Minimum fast-scan bootstrap target interval (seconds).
+const FAST_SCAN_MIN_TARGET_SECS: u64 = 60;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "fd-rdd",
@@ -232,9 +255,11 @@ async fn main() -> anyhow::Result<()> {
         wal_sync_batch_records,
     )?;
     tracing::info!("runtime profile: {}", runtime_profile.as_str());
-    let report_interval_secs = args.report_interval_secs.unwrap_or(60);
-    let event_channel_size = args.event_channel_size.unwrap_or(65_536);
-    let debounce_ms = args.debounce_ms.unwrap_or(10);
+    let report_interval_secs = args
+        .report_interval_secs
+        .unwrap_or(DEFAULT_REPORT_INTERVAL_SECS);
+    let event_channel_size = args.event_channel_size.unwrap_or(DEFAULT_CHANNEL_SIZE);
+    let debounce_ms = args.debounce_ms.unwrap_or(DEFAULT_DEBOUNCE_MS);
     let mut exclude_dirs = cfg.exclude_dirs.clone();
     exclude_dirs.extend(args.exclude_dirs.clone());
     let exclude_dirs = normalize_exclude_dirs(exclude_dirs);
@@ -270,7 +295,9 @@ async fn main() -> anyhow::Result<()> {
     index.spawn_lazy_validation_worker();
     let root_case_policies = index.refresh_root_case_policy_diagnostics();
     index.apply_mmap_warmup_config(cfg.mmap_warmup.clone());
-    let _ = index.attach_wal(store.as_ref());
+    if let Err(e) = index.attach_wal(store.as_ref()) {
+        tracing::warn!("WAL attach failed: {e}");
+    }
     index.set_wal_durability(wal_durability);
     index.set_stable_snapshot_enabled(cfg.stable_snapshot_enabled);
     let loaded_from_empty_snapshot = index.recovery_status().report.snapshot_source == "empty";
@@ -417,8 +444,10 @@ async fn main() -> anyhow::Result<()> {
         cfg.tiered_watch.l3_scan_interval_secs,
     );
     if cfg.content_index.enable {
-        index
-            .spawn_content_index_worker(Duration::from_secs(snapshot_interval_secs.clamp(30, 300)));
+        index.spawn_content_index_worker(Duration::from_secs(snapshot_interval_secs.clamp(
+            CONTENT_INDEX_INTERVAL_MIN_SECS,
+            CONTENT_INDEX_INTERVAL_MAX_SECS,
+        )));
     }
     if effective_watch_mode == WatchMode::Tiered {
         if let Some(runtime) = tiered_runtime.clone() {
@@ -798,7 +827,11 @@ async fn main() -> anyhow::Result<()> {
                 MetricsSnapshot::new(watch, runtime, memory, health)
             })
         };
-        let reporter = MetricsReporter::new(metrics_provider, output_dir, 30);
+        let reporter = MetricsReporter::new(
+            metrics_provider,
+            output_dir,
+            DEFAULT_METRICS_REPORT_INTERVAL_SECS,
+        );
         tokio::spawn(async move {
             reporter.run().await;
         });
@@ -976,7 +1009,7 @@ fn modified_unix_ns(path: &std::path::Path) -> u64 {
     duration
         .as_secs()
         .saturating_mul(1_000_000_000)
-        .saturating_add(duration.subsec_nanos() as u64)
+        .saturating_add(u64::from(duration.subsec_nanos()))
 }
 
 fn startup_reconcile_cutoff_ns_for_source(snapshot_path: &std::path::Path, source: &str) -> u64 {
@@ -1059,14 +1092,15 @@ fn build_tiered_watch_plan(
     let max_watch_dirs = tiered.max_watch_dirs.max(1);
     let l0_max_cost_per_root = effective_l0_max_cost_per_root(tiered);
     let estimate_cap = max_watch_dirs.min(l0_max_cost_per_root);
-    let system_max_user_watches = check_inotify_limit(0).unwrap_or(0) as usize;
+    let system_max_user_watches = usize::try_from(check_inotify_limit(0).unwrap_or(0)).unwrap_or(0);
     let mut strict_uncovered_dirs = Vec::new();
     let mut required_watch_cost = 0u64;
 
     let required_set = required.iter().collect::<std::collections::HashSet<_>>();
     for candidate in required.iter() {
         let estimated = estimate_notify_recursive_watch_count(candidate, estimate_cap);
-        required_watch_cost = required_watch_cost.saturating_add(estimated as u64);
+        required_watch_cost =
+            required_watch_cost.saturating_add(u64::try_from(estimated).unwrap_or(0));
         if estimated <= l0_max_cost_per_root
             && estimated_total.saturating_add(estimated) <= max_watch_dirs
         {
@@ -1111,7 +1145,8 @@ fn build_tiered_watch_plan(
     if admitted.is_empty() {
         notes.push("no L0 directories admitted under current budget".to_string());
     }
-    let watch_budget_shortfall = required_watch_cost.saturating_sub(max_watch_dirs as u64);
+    let watch_budget_shortfall =
+        required_watch_cost.saturating_sub(u64::try_from(max_watch_dirs).unwrap_or(0));
     let strict_coverage_ok = tiered.profile != TieredWatchProfile::Strict
         || (strict_uncovered_dirs.is_empty() && watch_budget_shortfall == 0);
     let strict_coverage_failure =
@@ -1132,9 +1167,9 @@ fn build_tiered_watch_plan(
     let logical_watch_cost = admitted
         .iter()
         .chain(scan_roots.iter())
-        .map(|(_, cost)| *cost as u64)
+        .map(|(_, cost)| u64::try_from(*cost).unwrap_or(0))
         .fold(0u64, u64::saturating_add);
-    let kernel_watch_cost = estimated_total as u64;
+    let kernel_watch_cost = u64::try_from(estimated_total).unwrap_or(0);
     let skipped_watch_cost = logical_watch_cost.saturating_sub(kernel_watch_cost);
 
     let watch_roots = admitted
@@ -1219,11 +1254,11 @@ fn spawn_dirty_queue_loop(
 ) {
     tokio::spawn(async move {
         loop {
-            let batch = index.dirty_queue_ready_batch(16);
+            let batch = index.dirty_queue_ready_batch(DIRTY_QUEUE_BATCH_SIZE);
             if batch.is_empty() {
                 tokio::select! {
                     _ = index.wait_for_dirty_queue() => {}
-                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(DIRTY_QUEUE_IDLE_POLL_MS)) => {}
                 }
                 continue;
             }
@@ -1271,7 +1306,11 @@ fn spawn_dirty_queue_loop(
             let Ok(processed) = processed else {
                 tracing::warn!("dirty queue worker task failed");
                 for entry in batch {
-                    let _ = index.retry_dirty_entry(entry);
+                    if !index.retry_dirty_entry(entry) {
+                        tracing::warn!(
+                            "dirty queue retry failed, entry dropped after worker task failure"
+                        );
+                    }
                 }
                 continue;
             };
@@ -1610,7 +1649,7 @@ fn spawn_proc_sampler_loop(
 fn fast_scan_bootstrap_retry_ms(tiered: &fd_rdd::config::TieredWatchConfig) -> u64 {
     tiered
         .l1_l2_fast_scan_target_secs
-        .max(60)
+        .max(FAST_SCAN_MIN_TARGET_SECS)
         .saturating_mul(1_000)
 }
 
