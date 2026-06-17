@@ -21,6 +21,34 @@ use crate::util::{compose_abs_path_bytes, pathbuf_from_encoded_vec, root_bytes_f
 /// Trigram：3 字节子串，用于倒排索引加速查询
 type Trigram = [u8; 3];
 
+// ── v6 段导出共享常量 ──
+
+/// 能力哨兵：用于 mmap layer 区分"新段（全组件 trigram）"与"旧段（仅 basename trigram）"。
+/// - path 组件不允许包含 NUL，因此 [0,0,0] 不会与真实 trigram 冲突。
+/// - posting 置空即可（只用 key 存在性探测）。
+const TRIGRAM_SENTINEL: [u8; 3] = [0, 0, 0];
+
+/// FileKeyMap header magic.
+const FKM_MAGIC: [u8; 4] = *b"FKM\0";
+/// FileKeyMap header version.
+const FKM_VERSION: u16 = 1;
+#[cfg(not(feature = "rkyv"))]
+const FKM_FLAG_LEGACY: u16 = 0;
+#[cfg(feature = "rkyv")]
+const FKM_FLAG_RKYV: u16 = 1;
+
+/// `build_all_segments` 产出的全部段 bytes，供 `export_segments_v6` 和
+/// `export_segments_v6_to_writer` 共享。
+struct BuiltSegments {
+    roots_bytes: Vec<u8>,
+    path_arena_bytes: Arc<Vec<u8>>,
+    metas_bytes: Vec<u8>,
+    tombstones_bytes: Vec<u8>,
+    trigram_table_bytes: Vec<u8>,
+    postings_blob_bytes: Vec<u8>,
+    filekey_map_bytes: Vec<u8>,
+}
+
 fn normalize_short_hint(hint: &[u8]) -> Option<Vec<u8>> {
     let normalized = folded_lookup_bytes_lossy(hint);
     if (1..=2).contains(&normalized.len()) {
@@ -1325,7 +1353,10 @@ impl PersistentIndex {
         compact.export_segments_v6()
     }
 
-    pub fn export_segments_v6(&self) -> V6Segments {
+    /// 构建 v6 全部段 bytes（roots / path_arena / metas / tombstones / trigram_table /
+    /// postings_blob / filekey_map），供 `export_segments_v6` 和
+    /// `export_segments_v6_to_writer` 共享。
+    fn build_all_segments(&self) -> BuiltSegments {
         // roots 段：u16 count + (u16 len + bytes)...
         let mut roots_bytes = Vec::new();
         let roots_count: u16 = self.roots_bytes.len().try_into().unwrap_or(u16::MAX);
@@ -1367,6 +1398,7 @@ impl PersistentIndex {
         tomb_bitmap
             .serialize_into(&mut tombstones_bytes)
             .expect("write to vec");
+        drop(tombstones);
 
         // TrigramTable + PostingsBlob 段
         //
@@ -1392,10 +1424,7 @@ impl PersistentIndex {
             entries.push((*tri, off, len));
         }
 
-        // 能力哨兵：用于 mmap layer 区分“新段（全组件 trigram）”与“旧段（仅 basename trigram）”。
-        // - path 组件不允许包含 NUL，因此 [0,0,0] 不会与真实 trigram 冲突。
-        // - posting 置空即可（只用 key 存在性探测）。
-        const TRIGRAM_SENTINEL: [u8; 3] = [0, 0, 0];
+        // 能力哨兵：TRIGRAM_SENTINEL（定义于模块级常量）
         if !tri_idx.contains_key(&TRIGRAM_SENTINEL) {
             let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
             roaring::RoaringBitmap::new()
@@ -1408,6 +1437,7 @@ impl PersistentIndex {
                 .unwrap_or(u32::MAX);
             entries.push((TRIGRAM_SENTINEL, off, len));
         }
+        drop(tri_idx);
         entries.sort_by_key(|(tri, _, _)| *tri);
 
         let mut trigram_table_bytes = Vec::with_capacity(entries.len() * 12);
@@ -1437,12 +1467,6 @@ impl PersistentIndex {
             m.iter().map(|(k, v)| (*k, *v)).collect()
         };
         pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino, k.generation));
-        const FKM_MAGIC: [u8; 4] = *b"FKM\0";
-        const FKM_VERSION: u16 = 1;
-        #[cfg(not(feature = "rkyv"))]
-        const FKM_FLAG_LEGACY: u16 = 0;
-        #[cfg(feature = "rkyv")]
-        const FKM_FLAG_RKYV: u16 = 1;
 
         let mut filekey_map_bytes = Vec::new();
         filekey_map_bytes.extend_from_slice(&FKM_MAGIC);
@@ -1473,14 +1497,27 @@ impl PersistentIndex {
             }
         }
 
-        V6Segments {
-            roots_bytes: Arc::new(roots_bytes),
+        BuiltSegments {
+            roots_bytes,
             path_arena_bytes,
-            metas_bytes: Arc::new(metas_bytes),
-            trigram_table_bytes: Arc::new(trigram_table_bytes),
-            postings_blob_bytes: Arc::new(postings_blob_bytes),
-            tombstones_bytes: Arc::new(tombstones_bytes),
-            filekey_map_bytes: Arc::new(filekey_map_bytes),
+            metas_bytes,
+            tombstones_bytes,
+            trigram_table_bytes,
+            postings_blob_bytes,
+            filekey_map_bytes,
+        }
+    }
+
+    pub fn export_segments_v6(&self) -> V6Segments {
+        let s = self.build_all_segments();
+        V6Segments {
+            roots_bytes: Arc::new(s.roots_bytes),
+            path_arena_bytes: s.path_arena_bytes,
+            metas_bytes: Arc::new(s.metas_bytes),
+            trigram_table_bytes: Arc::new(s.trigram_table_bytes),
+            postings_blob_bytes: Arc::new(s.postings_blob_bytes),
+            tombstones_bytes: Arc::new(s.tombstones_bytes),
+            filekey_map_bytes: Arc::new(s.filekey_map_bytes),
         }
     }
 
@@ -1496,129 +1533,14 @@ impl PersistentIndex {
         &self,
         writer: &mut impl std::io::Write,
     ) -> std::io::Result<()> {
-        // roots 段：u16 count + (u16 len + bytes)...
-        let mut roots_bytes = Vec::new();
-        let roots_count: u16 = self.roots_bytes.len().try_into().unwrap_or(u16::MAX);
-        roots_bytes.extend_from_slice(&roots_count.to_le_bytes());
-        for rb in self.roots_bytes.iter().take(roots_count as usize) {
-            let len: u16 = rb.len().try_into().unwrap_or(u16::MAX);
-            roots_bytes.extend_from_slice(&len.to_le_bytes());
-            roots_bytes.extend_from_slice(&rb[..len as usize]);
-        }
-        Self::write_segment(writer, &roots_bytes)?;
-
-        let (arena, metas) = self.build_legacy_metas(false);
-
-        // PathArena 段：raw bytes（root-relative）
-        Self::write_segment(writer, arena.data.as_ref())?;
-
-        // Metas 段：按 DocId 顺序顺排，固定记录大小（little-endian）
-        let mut metas_bytes = Vec::with_capacity(metas.len() * 32);
-        for m in metas.iter() {
-            metas_bytes.extend_from_slice(&m.file_key.dev.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.file_key.ino.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.root_id.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.path_off.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.path_len.to_le_bytes());
-            metas_bytes.extend_from_slice(&m.mtime_ns.to_le_bytes());
-        }
-        Self::write_segment(writer, &metas_bytes)?;
-
-        // Tombstones 段：RoaringBitmap serialized bytes
-        let tombstones = self.tombstones.read();
-        let mut tombstones_bytes = Vec::new();
-        let tomb_bitmap: roaring::RoaringBitmap = tombstones.iter().map(|v| v as u32).collect();
-        tomb_bitmap
-            .serialize_into(&mut tombstones_bytes)
-            .expect("write to vec");
-        drop(tombstones);
-        Self::write_segment(writer, &tombstones_bytes)?;
-
-        // TrigramTable + PostingsBlob 段
-        let tri_idx = self.trigram_index.read();
-        let mut entries: Vec<([u8; 3], u32, u32)> = Vec::with_capacity(tri_idx.len());
-        let mut postings_blob_bytes = Vec::new();
-        for (tri, posting) in tri_idx.iter() {
-            let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
-            let posting_bitmap: roaring::RoaringBitmap = posting.iter().map(|v| v as u32).collect();
-            posting_bitmap
-                .serialize_into(&mut postings_blob_bytes)
-                .expect("write to vec");
-            let len: u32 = postings_blob_bytes
-                .len()
-                .saturating_sub(off as usize)
-                .try_into()
-                .unwrap_or(u32::MAX);
-            entries.push((*tri, off, len));
-        }
-
-        const TRIGRAM_SENTINEL: [u8; 3] = [0, 0, 0];
-        if !tri_idx.contains_key(&TRIGRAM_SENTINEL) {
-            let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
-            roaring::RoaringBitmap::new()
-                .serialize_into(&mut postings_blob_bytes)
-                .expect("write to vec");
-            let len: u32 = postings_blob_bytes
-                .len()
-                .saturating_sub(off as usize)
-                .try_into()
-                .unwrap_or(u32::MAX);
-            entries.push((TRIGRAM_SENTINEL, off, len));
-        }
-        drop(tri_idx);
-        entries.sort_by_key(|(tri, _, _)| *tri);
-
-        let mut trigram_table_bytes = Vec::with_capacity(entries.len() * 12);
-        for (tri, off, len) in entries {
-            trigram_table_bytes.extend_from_slice(&tri);
-            trigram_table_bytes.push(0); // pad
-            trigram_table_bytes.extend_from_slice(&off.to_le_bytes());
-            trigram_table_bytes.extend_from_slice(&len.to_le_bytes());
-        }
-        Self::write_segment(writer, &trigram_table_bytes)?;
-        Self::write_segment(writer, &postings_blob_bytes)?;
-
-        // FileKeyMap 段
-        let mut pairs: Vec<(FileKey, DocId)> = {
-            let m = self.filekey_to_docid.read();
-            m.iter().map(|(k, v)| (*k, *v)).collect()
-        };
-        pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino, k.generation));
-        const FKM_MAGIC: [u8; 4] = *b"FKM\0";
-        const FKM_VERSION: u16 = 1;
-        #[cfg(not(feature = "rkyv"))]
-        const FKM_FLAG_LEGACY: u16 = 0;
-        #[cfg(feature = "rkyv")]
-        const FKM_FLAG_RKYV: u16 = 1;
-
-        let mut filekey_map_bytes = Vec::new();
-        filekey_map_bytes.extend_from_slice(&FKM_MAGIC);
-        filekey_map_bytes.extend_from_slice(&FKM_VERSION.to_le_bytes());
-
-        #[cfg(feature = "rkyv")]
-        {
-            filekey_map_bytes.extend_from_slice(&FKM_FLAG_RKYV.to_le_bytes());
-            let entries: Vec<FileKeyEntry> = pairs
-                .into_iter()
-                .map(|(key, doc_id)| FileKeyEntry { key, doc_id })
-                .collect();
-            let bytes = rkyv::to_bytes::<_, 1024>(&entries).expect("rkyv to_bytes");
-            filekey_map_bytes.extend_from_slice(bytes.as_ref());
-        }
-
-        #[cfg(not(feature = "rkyv"))]
-        {
-            filekey_map_bytes.extend_from_slice(&FKM_FLAG_LEGACY.to_le_bytes());
-            filekey_map_bytes.reserve(pairs.len() * 24);
-            for (k, docid) in pairs {
-                filekey_map_bytes.extend_from_slice(&k.dev.to_le_bytes());
-                filekey_map_bytes.extend_from_slice(&k.ino.to_le_bytes());
-                filekey_map_bytes.extend_from_slice(&k.generation.to_le_bytes());
-                filekey_map_bytes.extend_from_slice(&(docid as u32).to_le_bytes());
-            }
-        }
-        Self::write_segment(writer, &filekey_map_bytes)?;
-
+        let s = self.build_all_segments();
+        Self::write_segment(writer, &s.roots_bytes)?;
+        Self::write_segment(writer, s.path_arena_bytes.as_ref())?;
+        Self::write_segment(writer, &s.metas_bytes)?;
+        Self::write_segment(writer, &s.tombstones_bytes)?;
+        Self::write_segment(writer, &s.trigram_table_bytes)?;
+        Self::write_segment(writer, &s.postings_blob_bytes)?;
+        Self::write_segment(writer, &s.filekey_map_bytes)?;
         Ok(())
     }
 
