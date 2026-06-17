@@ -1434,8 +1434,13 @@ mod tests {
 
         // Standalone dupe: (no other criteria) should be rejected — it would
         // silently match every file otherwise.
-        let err = compile_query("dupe:").unwrap_err();
-        assert!(err.to_string().contains("dupe filters are meta-filters"));
+        let result = compile_query("dupe:");
+        assert!(result.is_err());
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("dupe filters are meta-filters"));
     }
 
     #[test]
@@ -1456,8 +1461,13 @@ mod tests {
     #[test]
     fn dupe_content_filter_sets_content_dupe_flag() {
         // Standalone dupe:content (no other criteria) should be rejected.
-        let err = compile_query("dupe:content").unwrap_err();
-        assert!(err.to_string().contains("dupe filters are meta-filters"));
+        let result = compile_query("dupe:content");
+        assert!(result.is_err());
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("dupe filters are meta-filters"));
 
         let filtered = compile_query("dupe:content alias").unwrap();
         assert!(filtered.requires_content_dupe());

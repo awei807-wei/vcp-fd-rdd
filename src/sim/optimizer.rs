@@ -504,7 +504,7 @@ fn run_evolution_loop(
 
     for step in 1..=config.generations.max(1) {
         let generation = start_generation + step;
-        let generation_population = population;
+        let generation_population = std::mem::take(&mut population);
         let generation_total = generation_population.len();
         let mut generation_runs = Vec::with_capacity(generation_total);
         for (trial_idx, policy) in generation_population.into_iter().enumerate() {
