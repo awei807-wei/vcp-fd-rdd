@@ -27,7 +27,7 @@ use fd_rdd::storage::snapshot::{
     stable_v7_path_for, write_recovery_runtime_state, RecoveryRuntimeState, SnapshotStore,
 };
 use fd_rdd::storage::wal::WalDurability;
-use fd_rdd::util::{estimate_notify_recursive_watch_count, normalize_exclude_dirs};
+use fd_rdd::util::{estimate_notify_recursive_watch_count, normalize_exclude_dirs, unix_secs};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -904,13 +904,6 @@ async fn shutdown_signal() -> anyhow::Result<()> {
         tokio::signal::ctrl_c().await?;
         Ok(())
     }
-}
-
-fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug)]

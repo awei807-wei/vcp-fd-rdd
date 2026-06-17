@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::core::{EventRecord, EventType, FileIdentifier, FileMeta};
 use crate::index::l2_partition::PersistentIndex;
+use crate::util::unix_secs;
 
 use super::TieredIndex;
 
@@ -398,11 +399,4 @@ pub(crate) fn event_record_estimated_bytes(ev: &EventRecord) -> u64 {
         }
     }
     bytes
-}
-
-fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

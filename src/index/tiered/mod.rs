@@ -37,6 +37,7 @@ use crate::storage::quarantine::{FreezeGate, QuarantineState, RootStateRecord};
 use crate::storage::recovery_audit::RecoveryAuditReport;
 use crate::storage::traits::WriteAheadLog;
 use crate::storage::wal::WalDurability;
+use crate::util::unix_secs;
 
 use self::rebuild::RebuildState;
 pub use directory_manifest::DirectoryManifestReport;
@@ -308,13 +309,6 @@ pub struct TieredIndex {
 struct MemoryReportCache {
     report: Option<crate::stats::MemoryReport>,
     sampled_at: Option<Instant>,
-}
-
-fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 impl TieredIndex {

@@ -120,6 +120,14 @@ pub fn path_has_excluded_component(path: &Path, exclude_dirs: &[String]) -> bool
     })
 }
 
+/// Current Unix timestamp in seconds. Returns 0 if the system clock is before the epoch.
+pub fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Estimate how many directory watches `notify::RecursiveMode::Recursive` will register.
 ///
 /// This intentionally does not apply fd-rdd's scan/index `exclude_dirs`: notify still

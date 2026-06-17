@@ -9,6 +9,7 @@ use crate::index::tiered::RecoveryReasonCount;
 use crate::stats::{
     EventPipelineStats, MemoryReport, MemorySampleDepth, StatsReport, WatchStateReport,
 };
+use crate::util::unix_secs;
 
 /// 定期采集统一诊断指标并输出到按小时划分的 JSON Lines 文件。
 pub struct MetricsReporter {
@@ -532,13 +533,6 @@ impl MetricsReporter {
             ))),
         }
     }
-}
-
-fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn format_iso_timestamp(secs: u64) -> String {

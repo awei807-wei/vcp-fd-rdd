@@ -14,6 +14,7 @@ use crate::fs_policy::{is_remote_fstype, MountTable};
 use crate::index::tiered::ScanOutcome;
 use crate::stats::WatchStateReport;
 use crate::storage::snapshot::stable_snapshot_dir_for;
+use crate::util::unix_secs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchTier {
@@ -3484,13 +3485,6 @@ fn choose_ephemeral_victim(
         .collect::<Vec<_>>();
     victims.sort_by_key(|(score, last_event, path)| (*score, *last_event, path.clone()));
     victims.into_iter().next().map(|(_, _, path)| path)
-}
-
-fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn unix_millis() -> u64 {
