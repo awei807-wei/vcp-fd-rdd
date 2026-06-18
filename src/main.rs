@@ -148,6 +148,32 @@ struct Args {
     wal_sync_batch_records: Option<usize>,
 }
 
+// ---------------------------------------------------------------------------
+// EffectiveSettings — resolved CLI + config overrides (H2 refactor)
+// ---------------------------------------------------------------------------
+
+/// All runtime-effective settings after merging CLI args with the config file.
+struct EffectiveSettings {
+    roots: Vec<PathBuf>,
+    ignore_enabled: bool,
+    include_hidden: bool,
+    follow_symlinks: bool,
+    effective_watch_mode: WatchMode,
+    watch_enabled: bool,
+    http_port: u16,
+    snapshot_interval_secs: u64,
+    runtime_profile: RuntimeProfile,
+    wal_durability: WalDurability,
+    report_interval_secs: u64,
+    event_channel_size: usize,
+    debounce_ms: u64,
+    exclude_dirs: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// main() — thin orchestrator (H2 refactor)
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -156,19 +182,145 @@ async fn main() -> anyhow::Result<()> {
     let cli_watch_mode = parse_watch_mode(args.watch_mode.as_deref())?;
     let cli_runtime_profile = parse_runtime_profile(args.runtime_profile.as_deref())?;
 
-    // 检测首次启动：配置文件不存在视为首次启动
+    let cfg = build_config(&args, cli_watch_mode, cli_runtime_profile);
+
+    info!(
+        "Starting fd-rdd v{}: atomic-snapshot file indexer",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let settings = resolve_effective_settings(&args, &cfg, cli_watch_mode, cli_runtime_profile)?;
+
+    // 2) 快照存储
+    let snapshot_path = args
+        .snapshot_path
+        .clone()
+        .unwrap_or_else(default_snapshot_path);
+    let store = Arc::new(SnapshotStore::new(snapshot_path));
+
+    // 3) 从快照加载或空索引启动
+    let (index, root_case_policies) = load_and_init_index(store.as_ref(), &settings, &cfg).await?;
+
+    // 4) 启动修复 + 全量构建
+    run_startup_repair(&index, &cfg, store.as_ref(), &root_case_policies);
+
+    // 5) 忽略过滤器 + 启动对账
+    let (ignore_filter, startup_ignore_paths) =
+        build_ignore_and_reconcile(&args, &index, store.as_ref(), &settings);
+
+    // 6) 观察计划 + 分层运行时
+    let watch_plan = build_watch_plan(
+        settings.effective_watch_mode,
+        &index.roots,
+        &cfg.tiered_watch,
+        &settings.exclude_dirs,
+    );
+    let tiered_runtime = build_tiered_runtime(&settings, &watch_plan, &cfg, store.as_ref(), &index);
+    let watch_state = Arc::new(watch_plan.state.clone());
+
+    // 7) 事件管道
+    let (pipeline, watch_command_tx) = build_event_pipeline(
+        &index,
+        &settings,
+        &ignore_filter,
+        &startup_ignore_paths,
+        &watch_plan,
+        &tiered_runtime,
+    )
+    .await?;
+
+    // 8) 后台工作循环
+    spawn_background_workers(
+        &index,
+        &tiered_runtime,
+        &watch_command_tx,
+        &cfg,
+        &settings,
+        &startup_ignore_paths,
+    );
+
+    // 9) 查询服务提供者
+    let watch_enabled = settings.watch_enabled;
+    let health_provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync> = {
+        let index = index.clone();
+        let pipeline = pipeline.clone();
+        let health_watch_state = watch_state.clone();
+        let health_tiered_runtime = tiered_runtime.clone();
+        Arc::new(move || {
+            build_health_telemetry(
+                &index,
+                &pipeline,
+                &health_watch_state,
+                &health_tiered_runtime,
+                watch_enabled,
+            )
+        })
+    };
+    let stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync> = {
+        let pipeline = pipeline.clone();
+        Arc::new(move || pipeline.stats())
+    };
+    let watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync> = {
+        let index = index.clone();
+        let watch_state = watch_state.clone();
+        let tiered_runtime = tiered_runtime.clone();
+        Arc::new(move || build_watch_state_report(&index, &watch_state, &tiered_runtime))
+    };
+    let tiered_watch_debug_provider: Arc<
+        dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync,
+    > = {
+        let tiered_runtime = tiered_runtime.clone();
+        Arc::new(move |root_filter| build_tiered_watch_debug_dump(&tiered_runtime, root_filter))
+    };
+
+    // 10) 启动 HTTP/UDS 查询服务 + 定期任务
+    serve_queries(
+        &index,
+        &store,
+        &cfg,
+        &args,
+        &health_provider,
+        &stats_provider,
+        &watch_state_provider,
+        tiered_watch_debug_provider,
+        &tiered_runtime,
+        settings.http_port,
+        settings.snapshot_interval_secs,
+        settings.report_interval_secs,
+    );
+
+    info!(
+        "fd-rdd ready. Query via: http://localhost:{}/search?q=keyword",
+        settings.http_port
+    );
+
+    // 11) 优雅退出：SIGINT/SIGTERM → 最终快照
+    shutdown_signal().await?;
+    handle_shutdown(&index, &store, &tiered_runtime, &cfg).await;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Extracted sub-functions (H2 refactor)
+// ---------------------------------------------------------------------------
+
+/// CLI arg parsing + config file loading + first-run creation.
+fn build_config(
+    args: &Args,
+    cli_watch_mode: Option<WatchMode>,
+    cli_runtime_profile: Option<RuntimeProfile>,
+) -> Config {
     let config_path = Config::config_path();
     let is_first_run = config_path.as_ref().map(|p| !p.exists()).unwrap_or(true);
 
-    let cfg = if is_first_run {
-        // 首次启动：必须提供 --root
+    if is_first_run {
         if args.roots.is_empty() {
             eprintln!("错误: 首次启动必须通过 --root <PATH> 指定至少一个索引根目录");
             eprintln!("示例: fd-rdd --root $HOME");
             std::process::exit(1);
         }
 
-        // 用 CLI 参数构建配置，覆盖默认值
         let mut cfg = Config {
             roots: args.roots.clone(),
             http_port: args
@@ -193,7 +345,6 @@ async fn main() -> anyhow::Result<()> {
             cfg.socket_path = Some(socket.clone());
         }
 
-        // 保存默认配置到文件
         if let Err(e) = cfg.save() {
             tracing::warn!("无法保存默认配置文件: {}", e);
         } else {
@@ -202,20 +353,21 @@ async fn main() -> anyhow::Result<()> {
 
         cfg
     } else {
-        // 非首次启动：正常加载配置文件
         Config::load().unwrap_or_else(|e| {
             tracing::warn!("配置文件加载失败，使用默认值: {}", e);
             Config::default()
         })
-    };
+    }
+}
 
-    info!(
-        "Starting fd-rdd v{}: atomic-snapshot file indexer",
-        env!("CARGO_PKG_VERSION")
-    );
-
-    // 1) 确定索引根目录 (CLI > config > 报错退出)
-    let mut roots = args.roots;
+/// Merge CLI overrides with config file values into effective settings.
+fn resolve_effective_settings(
+    args: &Args,
+    cfg: &Config,
+    cli_watch_mode: Option<WatchMode>,
+    cli_runtime_profile: Option<RuntimeProfile>,
+) -> anyhow::Result<EffectiveSettings> {
+    let mut roots = args.roots.clone();
     if roots.is_empty() {
         roots = cfg.roots.clone();
     }
@@ -264,23 +416,45 @@ async fn main() -> anyhow::Result<()> {
     exclude_dirs.extend(args.exclude_dirs.clone());
     let exclude_dirs = normalize_exclude_dirs(exclude_dirs);
 
-    // 2) 快照存储
-    let snapshot_path = args.snapshot_path.unwrap_or_else(default_snapshot_path);
-    let store = Arc::new(SnapshotStore::new(snapshot_path));
-
-    // 3) 从快照加载或空索引启动
-    let index = TieredIndex::load_with_options_follow_excludes_fs_policy_and_io_governor(
-        store.as_ref(),
+    Ok(EffectiveSettings {
         roots,
-        include_hidden,
         ignore_enabled,
+        include_hidden,
         follow_symlinks,
-        exclude_dirs.clone(),
+        effective_watch_mode,
+        watch_enabled,
+        http_port,
+        snapshot_interval_secs,
+        runtime_profile,
+        wal_durability,
+        report_interval_secs,
+        event_channel_size,
+        debounce_ms,
+        exclude_dirs,
+    })
+}
+
+/// Load snapshot + initialize index with all config settings applied.
+async fn load_and_init_index(
+    store: &SnapshotStore,
+    settings: &EffectiveSettings,
+    cfg: &Config,
+) -> anyhow::Result<(
+    Arc<TieredIndex>,
+    Vec<fd_rdd::diagnostics::RootCasePolicyDiagnostics>,
+)> {
+    let index = TieredIndex::load_with_options_follow_excludes_fs_policy_and_io_governor(
+        store,
+        settings.roots.clone(),
+        settings.include_hidden,
+        settings.ignore_enabled,
+        settings.follow_symlinks,
+        settings.exclude_dirs.clone(),
         cfg.fs_policy.clone(),
         cfg.io_governor.clone(),
     )
     .await?;
-    index.apply_runtime_profile_settings(runtime_profile.settings());
+    index.apply_runtime_profile_settings(settings.runtime_profile.settings());
     index.apply_content_index_config(cfg.content_index.clone());
     index.apply_lazy_validation_config(
         cfg.lazy_validation_enabled,
@@ -295,11 +469,21 @@ async fn main() -> anyhow::Result<()> {
     index.spawn_lazy_validation_worker();
     let root_case_policies = index.refresh_root_case_policy_diagnostics();
     index.apply_mmap_warmup_config(cfg.mmap_warmup.clone());
-    if let Err(e) = index.attach_wal(store.as_ref()) {
+    if let Err(e) = index.attach_wal(store) {
         tracing::warn!("WAL attach failed: {e}");
     }
-    index.set_wal_durability(wal_durability);
+    index.set_wal_durability(settings.wal_durability);
     index.set_stable_snapshot_enabled(cfg.stable_snapshot_enabled);
+    Ok((index, root_case_policies))
+}
+
+/// Run startup repair, mark runtime state, and spawn full build if needed.
+fn run_startup_repair(
+    index: &Arc<TieredIndex>,
+    cfg: &Config,
+    store: &SnapshotStore,
+    root_case_policies: &[fd_rdd::diagnostics::RootCasePolicyDiagnostics],
+) {
     let loaded_from_empty_snapshot = index.recovery_status().report.snapshot_source == "empty";
     let repair_stats = index.startup_repair_if_needed(
         cfg.startup_repair_enabled,
@@ -323,18 +507,26 @@ async fn main() -> anyhow::Result<()> {
         false,
         &index.recovery_status().report.snapshot_source,
         "running",
-        root_case_policies,
+        root_case_policies.to_vec(),
     );
     index.spawn_quarantine_verify_worker(quarantine_sidecar_path_for(store.path()));
 
-    // 4) 若没有可信快照，或启动 repair 判断差异过大，后台全量构建。
+    // 若没有可信快照，或启动 repair 判断差异过大，后台全量构建。
     let needs_full_build =
         loaded_from_empty_snapshot || repair_stats.escalated || index.file_count() == 0;
     if needs_full_build && !index.rebuild_in_progress() {
         index.spawn_full_build();
     }
+}
 
-    let ignore_filter = if ignore_enabled {
+/// Build ignore filter, startup ignore paths, and enqueue startup reconcile.
+fn build_ignore_and_reconcile(
+    args: &Args,
+    index: &Arc<TieredIndex>,
+    store: &SnapshotStore,
+    settings: &EffectiveSettings,
+) -> (Option<IgnoreFilter>, Vec<PathBuf>) {
+    let ignore_filter = if settings.ignore_enabled {
         Some(IgnoreFilter::from_roots(&index.roots))
     } else {
         None
@@ -346,7 +538,7 @@ async fn main() -> anyhow::Result<()> {
         store.path(),
         &index.recovery_status().report.snapshot_source,
     );
-    if watch_enabled
+    if settings.watch_enabled
         && index.file_count() > 0
         && startup_reconcile_cutoff_ns > 0
         && index.recovery_status().report.startup_scan_required
@@ -358,13 +550,18 @@ async fn main() -> anyhow::Result<()> {
             DirtyReason::StartupRepair,
         );
     }
-    let watch_plan = build_watch_plan(
-        effective_watch_mode,
-        &index.roots,
-        &cfg.tiered_watch,
-        &exclude_dirs,
-    );
-    let tiered_runtime = if effective_watch_mode == WatchMode::Tiered {
+    (ignore_filter, startup_ignore_paths)
+}
+
+/// Create the tiered watch runtime and restore its fast-scan registry.
+fn build_tiered_runtime(
+    settings: &EffectiveSettings,
+    watch_plan: &WatchPlan,
+    cfg: &Config,
+    store: &SnapshotStore,
+    index: &Arc<TieredIndex>,
+) -> Option<Arc<TieredWatchRuntime>> {
+    let tiered_runtime = if settings.effective_watch_mode == WatchMode::Tiered {
         Some(Arc::new(
             TieredWatchRuntime::new_with_l0_max_cost_and_ephemeral(
                 watch_plan.l0_roots.clone(),
@@ -382,7 +579,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(runtime) = tiered_runtime.as_ref() {
         runtime.apply_fast_scan_config(&cfg.tiered_watch);
         runtime.set_proc_sampler_enabled(
-            cfg.proc_sampler.enabled && watch_enabled && effective_watch_mode == WatchMode::Tiered,
+            cfg.proc_sampler.enabled
+                && settings.watch_enabled
+                && settings.effective_watch_mode == WatchMode::Tiered,
         );
         let restore_report = runtime.restore_fast_scan_registry(
             store.path(),
@@ -404,39 +603,58 @@ async fn main() -> anyhow::Result<()> {
         }
         runtime.seed_fast_scan_explicit_leases(cfg.tiered_watch.hot_dirs.clone());
     }
-    let watch_state = Arc::new(watch_plan.state.clone());
+    tiered_runtime
+}
 
-    // 5) 启动事件管道（bounded + debounce）
-    // 默认忽略索引自身的 snapshot/segment 写入路径，避免 watcher 反馈循环。
-    // 额外忽略项可通过 --ignore-path 传入（例如将日志重定向到了被 watch 的目录下）。
+/// Build and start the event pipeline, returning the pipeline and command sender.
+async fn build_event_pipeline(
+    index: &Arc<TieredIndex>,
+    settings: &EffectiveSettings,
+    ignore_filter: &Option<IgnoreFilter>,
+    startup_ignore_paths: &[PathBuf],
+    watch_plan: &WatchPlan,
+    tiered_runtime: &Option<Arc<TieredWatchRuntime>>,
+) -> anyhow::Result<(Arc<EventPipeline>, tokio::sync::mpsc::Sender<WatchCommand>)> {
     let mut pipeline = EventPipeline::new_with_config_and_ignores(
         index.clone(),
-        debounce_ms,
-        event_channel_size,
-        startup_ignore_paths.clone(),
+        settings.debounce_ms,
+        settings.event_channel_size,
+        startup_ignore_paths.to_vec(),
     )
     .with_ignore_filter(ignore_filter.clone())
-    .with_exclude_dirs(exclude_dirs.clone())
+    .with_exclude_dirs(settings.exclude_dirs.clone())
     .with_tiered_runtime(tiered_runtime.clone());
     if let Some(roots) = watch_plan.watch_roots.clone() {
         pipeline = pipeline.with_watch_roots(roots);
     }
     let pipeline = Arc::new(pipeline);
     let watch_command_tx = pipeline.watch_command_sender();
-    if watch_enabled {
+    if settings.watch_enabled {
         pipeline.start().await?;
     } else {
         tracing::warn!(
             "Filesystem watcher disabled; index updates require manual /scan or rebuild"
         );
     }
+    Ok((pipeline, watch_command_tx))
+}
+
+/// Spawn all background worker loops: dirty queue, tiered scan, fast scan, proc sampler.
+fn spawn_background_workers(
+    index: &Arc<TieredIndex>,
+    tiered_runtime: &Option<Arc<TieredWatchRuntime>>,
+    watch_command_tx: &tokio::sync::mpsc::Sender<WatchCommand>,
+    cfg: &Config,
+    settings: &EffectiveSettings,
+    startup_ignore_paths: &[PathBuf],
+) {
     spawn_dirty_queue_loop(
         index.clone(),
         tiered_runtime.clone(),
         watch_command_tx.clone(),
         cfg.tiered_watch.clone(),
-        exclude_dirs.clone(),
-        startup_ignore_paths.clone(),
+        settings.exclude_dirs.clone(),
+        startup_ignore_paths.to_vec(),
     );
     index.set_cold_sweep_period_estimate_from_tiered_policy(
         cfg.tiered_watch.l2_scan_interval_secs,
@@ -444,12 +662,14 @@ async fn main() -> anyhow::Result<()> {
         cfg.tiered_watch.l3_scan_interval_secs,
     );
     if cfg.content_index.enable {
-        index.spawn_content_index_worker(Duration::from_secs(snapshot_interval_secs.clamp(
-            CONTENT_INDEX_INTERVAL_MIN_SECS,
-            CONTENT_INDEX_INTERVAL_MAX_SECS,
-        )));
+        index.spawn_content_index_worker(Duration::from_secs(
+            settings.snapshot_interval_secs.clamp(
+                CONTENT_INDEX_INTERVAL_MIN_SECS,
+                CONTENT_INDEX_INTERVAL_MAX_SECS,
+            ),
+        ));
     }
-    if effective_watch_mode == WatchMode::Tiered {
+    if settings.effective_watch_mode == WatchMode::Tiered {
         if let Some(runtime) = tiered_runtime.clone() {
             spawn_tiered_scan_loop(
                 index.clone(),
@@ -470,196 +690,218 @@ async fn main() -> anyhow::Result<()> {
                     watch_command_tx.clone(),
                     cfg.proc_sampler.clone(),
                     index.roots.clone(),
-                    startup_ignore_paths.clone(),
-                    exclude_dirs.clone(),
+                    startup_ignore_paths.to_vec(),
+                    settings.exclude_dirs.clone(),
                     cfg.tiered_watch.clone(),
                 );
             }
         }
     }
+}
 
+/// Build a `HealthTelemetry` snapshot from current index/pipeline/watch state.
+///
+/// Extracted from the `health_provider` closure body.
+fn build_health_telemetry(
+    index: &TieredIndex,
+    pipeline: &EventPipeline,
+    plan_watch_state: &WatchStateReport,
+    tiered_runtime: &Option<Arc<TieredWatchRuntime>>,
+    watch_enabled: bool,
+) -> HealthTelemetry {
+    let stats = pipeline.stats();
+    let mut watch_state = tiered_runtime
+        .as_ref()
+        .map(|runtime| runtime.report())
+        .unwrap_or_else(|| plan_watch_state.clone());
+    apply_watch_plan_static_fields(&mut watch_state, plan_watch_state);
+    let recovery = index.recovery_status();
+    let lazy_validation = index.lazy_validation_report();
+    let event_watcher_degraded = stats.watcher_degraded;
+    let event_degraded_roots = stats.degraded_roots;
+    let tiered_unwatched_dirs = watch_state
+        .l1_dirs
+        .saturating_add(watch_state.l2_dirs)
+        .saturating_add(watch_state.l3_dirs);
+    let tiered_degraded = tiered_unwatched_dirs > 0;
+    HealthTelemetry {
+        last_snapshot_time: index.last_snapshot_time(),
+        watch_enabled,
+        watch_failures: stats.watch_failures,
+        watcher_degraded: event_watcher_degraded || tiered_degraded,
+        degraded_roots: event_degraded_roots.saturating_add(tiered_unwatched_dirs),
+        event_watcher_degraded,
+        event_degraded_roots,
+        tiered_degraded,
+        tiered_unwatched_dirs,
+        overflow_drops: stats.overflow_drops,
+        rescan_signals: stats.rescan_signals,
+        snapshot_source: recovery.report.snapshot_source,
+        wal_events_replayed: recovery.report.wal_events_replayed,
+        wal_sealed_used: recovery.report.wal_sealed_used,
+        wal_truncated_tail_records: recovery.report.wal_truncated_tail_records,
+        wal_gap_detected: recovery.report.wal_gap_detected,
+        wal_checkpoint_used: recovery.report.wal_checkpoint_used,
+        wal_durability: index.wal_durability().label().to_string(),
+        wal_sync_interval_ms: index.wal_durability().sync_interval_ms(),
+        wal_sync_batch_records: index.wal_durability().sync_batch_records(),
+        startup_scan_required: recovery.report.startup_scan_required,
+        deferred_repair: recovery.report.deferred_repair,
+        deferred_dirty_dir_count: recovery.report.deferred_dirty_dirs.len(),
+        deferred_unknown_scope: recovery.report.deferred_unknown_scope,
+        wal_tail_dirty_dir_count: recovery.report.deferred_dirty_dirs.len(),
+        deferred_repair_queue_len: index.deferred_repair_queue_len(),
+        cold_sweep_last_completed: index.cold_sweep_last_completed(),
+        cold_sweep_period_estimate: index.cold_sweep_period_estimate(),
+        dirty_backlog: index.dirty_queue_len(),
+        lazy_validation_pending: lazy_validation.pending,
+        lazy_validation_rate_limited: lazy_validation.rate_limited,
+        lazy_validation_cache_hits: lazy_validation.cache_hits,
+        lazy_validation_queue_full: lazy_validation.queue_full,
+        lazy_validation_completed: lazy_validation.completed,
+        lazy_validation_stale_hits: lazy_validation.stale_hits,
+        recovery_requires_repair: recovery.report.requires_repair,
+        recovery_requires_rebuild: recovery.report.requires_rebuild,
+        recovery_soft_repair_needed: recovery.report.soft_repair_needed,
+        recovery_hard_rebuild_needed: recovery.report.hard_rebuild_needed,
+        recovery_reasons: recovery.report.reasons,
+        recovery_soft_reasons: recovery.report.soft_reasons,
+        recovery_hard_reasons: recovery.report.hard_reasons,
+        recovery_reason_counts: recovery.report.repair_reason_counts,
+        recovery_audit: recovery.report.audit,
+        startup_repair_ran: recovery.repair.ran,
+        startup_repair_escalated: recovery.repair.escalated,
+        startup_repair_scanned: recovery.repair.scanned,
+        startup_repair_changed: recovery.repair.changed,
+        startup_repair_budget_ms: recovery.repair.budget_ms,
+        startup_repair_budget_exhausted: recovery.repair.budget_exhausted,
+        startup_repair_escalation_reason: recovery.repair.escalation_reason,
+        last_clean_shutdown: recovery.report.previous_clean_shutdown,
+        l1_dirs: watch_state.l1_dirs,
+        l2_dirs: watch_state.l2_dirs,
+        l3_dirs: watch_state.l3_dirs,
+        max_watch_dirs: watch_state.max_watch_dirs,
+        l0_max_cost_per_root: watch_state.l0_max_cost_per_root,
+        watch_budget_utilization_pct: watch_state.watch_budget_utilization_pct,
+        promotion_budget_blocked: watch_state.promotion_budget_blocked,
+        watch_profile: watch_state.watch_profile,
+        system_max_user_watches: watch_state.system_max_user_watches,
+        required_watch_cost: watch_state.required_watch_cost,
+        watch_budget_shortfall: watch_state.watch_budget_shortfall,
+        strict_coverage_ok: watch_state.strict_coverage_ok,
+        strict_coverage_failure: watch_state.strict_coverage_failure,
+        strict_fail_on_budget_exceeded: watch_state.strict_fail_on_budget_exceeded,
+        strict_uncovered_dirs: watch_state.strict_uncovered_dirs,
+        fast_scan_enabled: watch_state.fast_scan_enabled,
+        fast_scan_sla_ok: watch_state.fast_scan_sla_ok,
+        fast_scan_local_strict_ok: watch_state.fast_scan_local_strict_ok,
+        fast_scan_known_dirs: watch_state.fast_scan_known_dirs,
+        fast_scan_local_trusted_dirs: watch_state.fast_scan_local_trusted_dirs,
+        fast_scan_untrusted_dirs: watch_state.fast_scan_untrusted_dirs,
+        fast_scan_hotset_lease_count: watch_state.fast_scan_hotset_lease_count,
+        fast_scan_hotset_sentinel_count: watch_state.fast_scan_hotset_sentinel_count,
+        fast_scan_explicit_lease_count: watch_state.fast_scan_explicit_lease_count,
+        fast_scan_auto_lease_count: watch_state.fast_scan_auto_lease_count,
+        fast_scan_lease_evictions: watch_state.fast_scan_lease_evictions,
+        fast_scan_lease_renewals: watch_state.fast_scan_lease_renewals,
+        fast_scan_initial_backfill_pending: watch_state.fast_scan_initial_backfill_pending,
+        fast_scan_real_changed_dirs: watch_state.fast_scan_real_changed_dirs,
+        fast_scan_apply_dropped_stale_batches: watch_state.fast_scan_apply_dropped_stale_batches,
+        fast_scan_scan_workers_active: watch_state.fast_scan_scan_workers_active,
+        fast_scan_io_budget_limited_count: watch_state.fast_scan_io_budget_limited_count,
+        fast_scan_coverage_lag_p95_ms: watch_state.fast_scan_coverage_lag_p95_ms,
+        fast_scan_budget_degraded: watch_state.fast_scan_budget_degraded,
+        fast_scan_last_degraded_reason: watch_state.fast_scan_last_degraded_reason,
+        proc_sampler_enabled: watch_state.proc_sampler_enabled,
+        proc_sampler_last_duration_ms: watch_state.proc_sampler_last_duration_ms,
+        proc_sampler_pids_seen: watch_state.proc_sampler_pids_seen,
+        proc_sampler_pids_scanned: watch_state.proc_sampler_pids_scanned,
+        proc_sampler_pids_denied: watch_state.proc_sampler_pids_denied,
+        proc_sampler_fdinfo_read_count: watch_state.proc_sampler_fdinfo_read_count,
+        proc_sampler_readlink_count: watch_state.proc_sampler_readlink_count,
+        proc_sampler_write_fd_count: watch_state.proc_sampler_write_fd_count,
+        proc_sampler_sampled_dirs: watch_state.proc_sampler_sampled_dirs,
+        proc_sampler_triggered_watches: watch_state.proc_sampler_triggered_watches,
+        proc_sampler_budget_exhausted: watch_state.proc_sampler_budget_exhausted,
+        proc_sampler_unavailable: watch_state.proc_sampler_unavailable,
+        diagnostics: fd_rdd::diagnostics::DiagnosticReport::default(),
+    }
+}
+
+/// Build a `WatchStateReport` from current index/tiered-runtime state.
+///
+/// Extracted from the `watch_state_provider` closure body.
+fn build_watch_state_report(
+    index: &TieredIndex,
+    plan_watch_state: &WatchStateReport,
+    tiered_runtime: &Option<Arc<TieredWatchRuntime>>,
+) -> WatchStateReport {
+    if let Some(runtime) = tiered_runtime.as_ref() {
+        runtime.set_dirty_queue_len(index.dirty_queue_len());
+        let stats = index.stats_report();
+        runtime.set_query_stale_hit_count(stats.query_stale_hit_count);
+        runtime.set_query_permission_denied_count(stats.query_permission_denied_count);
+    }
+    let mut report = tiered_runtime
+        .as_ref()
+        .map(|runtime| runtime.report())
+        .unwrap_or_else(|| plan_watch_state.clone());
+    apply_watch_plan_static_fields(&mut report, plan_watch_state);
+    let stats = index.stats_report();
+    report.cold_validate_count = report
+        .cold_validate_count
+        .saturating_add(stats.cold_validate_count);
+    let manifest = index.directory_manifest_report();
+    report.directory_manifest_dirs = manifest.dirs;
+    report.directory_manifest_skipped_scans = manifest.skipped_scans;
+    report.directory_manifest_changed_scans = manifest.changed_scans;
+    report.directory_manifest_untrusted_clock_bypass = manifest.untrusted_clock_bypass;
+    report
+}
+
+/// Build a `TieredWatchDebugDump` from the tiered runtime (or empty if absent).
+///
+/// Extracted from the `tiered_watch_debug_provider` closure body.
+fn build_tiered_watch_debug_dump(
+    tiered_runtime: &Option<Arc<TieredWatchRuntime>>,
+    root_filter: Option<String>,
+) -> TieredWatchDebugDump {
+    tiered_runtime
+        .as_ref()
+        .map(|rt| rt.debug_dump(root_filter.as_deref()))
+        .unwrap_or_else(|| TieredWatchDebugDump {
+            dirs: vec![],
+            summary: TieredWatchDebugSummary {
+                l0_dirs: 0,
+                l1_dirs: 0,
+                l2_dirs: 0,
+                l3_dirs: 0,
+                ephemeral_watch_dirs: 0,
+                ephemeral_watch_cost: 0,
+                ephemeral_watch_budget: 0,
+                total_event_score: 0,
+            },
+        })
+}
+
+/// Start HTTP query server, UDS query server, snapshot loop, memory report loop,
+/// and metrics file report loop.
+#[allow(clippy::too_many_arguments)]
+fn serve_queries(
+    index: &Arc<TieredIndex>,
+    store: &Arc<SnapshotStore>,
+    cfg: &Config,
+    args: &Args,
+    health_provider: &Arc<dyn Fn() -> HealthTelemetry + Send + Sync>,
+    stats_provider: &Arc<dyn Fn() -> EventPipelineStats + Send + Sync>,
+    watch_state_provider: &Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
+    tiered_watch_debug_provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync>,
+    tiered_runtime: &Option<Arc<TieredWatchRuntime>>,
+    http_port: u16,
+    snapshot_interval_secs: u64,
+    report_interval_secs: u64,
+) {
     // 6) 启动 HTTP 查询服务
-    let health_provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync> = {
-        let index = index.clone();
-        let pipeline = pipeline.clone();
-        let health_watch_state = watch_state.clone();
-        let health_tiered_runtime = tiered_runtime.clone();
-        Arc::new(move || {
-            let stats = pipeline.stats();
-            let mut watch_state = health_tiered_runtime
-                .as_ref()
-                .map(|runtime| runtime.report())
-                .unwrap_or_else(|| health_watch_state.as_ref().clone());
-            apply_watch_plan_static_fields(&mut watch_state, health_watch_state.as_ref());
-            let recovery = index.recovery_status();
-            let lazy_validation = index.lazy_validation_report();
-            let event_watcher_degraded = stats.watcher_degraded;
-            let event_degraded_roots = stats.degraded_roots;
-            let tiered_unwatched_dirs = watch_state
-                .l1_dirs
-                .saturating_add(watch_state.l2_dirs)
-                .saturating_add(watch_state.l3_dirs);
-            let tiered_degraded = tiered_unwatched_dirs > 0;
-            HealthTelemetry {
-                last_snapshot_time: index.last_snapshot_time(),
-                watch_enabled,
-                watch_failures: stats.watch_failures,
-                watcher_degraded: event_watcher_degraded || tiered_degraded,
-                degraded_roots: event_degraded_roots.saturating_add(tiered_unwatched_dirs),
-                event_watcher_degraded,
-                event_degraded_roots,
-                tiered_degraded,
-                tiered_unwatched_dirs,
-                overflow_drops: stats.overflow_drops,
-                rescan_signals: stats.rescan_signals,
-                snapshot_source: recovery.report.snapshot_source,
-                wal_events_replayed: recovery.report.wal_events_replayed,
-                wal_sealed_used: recovery.report.wal_sealed_used,
-                wal_truncated_tail_records: recovery.report.wal_truncated_tail_records,
-                wal_gap_detected: recovery.report.wal_gap_detected,
-                wal_checkpoint_used: recovery.report.wal_checkpoint_used,
-                wal_durability: index.wal_durability().label().to_string(),
-                wal_sync_interval_ms: index.wal_durability().sync_interval_ms(),
-                wal_sync_batch_records: index.wal_durability().sync_batch_records(),
-                startup_scan_required: recovery.report.startup_scan_required,
-                deferred_repair: recovery.report.deferred_repair,
-                deferred_dirty_dir_count: recovery.report.deferred_dirty_dirs.len(),
-                deferred_unknown_scope: recovery.report.deferred_unknown_scope,
-                wal_tail_dirty_dir_count: recovery.report.deferred_dirty_dirs.len(),
-                deferred_repair_queue_len: index.deferred_repair_queue_len(),
-                cold_sweep_last_completed: index.cold_sweep_last_completed(),
-                cold_sweep_period_estimate: index.cold_sweep_period_estimate(),
-                dirty_backlog: index.dirty_queue_len(),
-                lazy_validation_pending: lazy_validation.pending,
-                lazy_validation_rate_limited: lazy_validation.rate_limited,
-                lazy_validation_cache_hits: lazy_validation.cache_hits,
-                lazy_validation_queue_full: lazy_validation.queue_full,
-                lazy_validation_completed: lazy_validation.completed,
-                lazy_validation_stale_hits: lazy_validation.stale_hits,
-                recovery_requires_repair: recovery.report.requires_repair,
-                recovery_requires_rebuild: recovery.report.requires_rebuild,
-                recovery_soft_repair_needed: recovery.report.soft_repair_needed,
-                recovery_hard_rebuild_needed: recovery.report.hard_rebuild_needed,
-                recovery_reasons: recovery.report.reasons,
-                recovery_soft_reasons: recovery.report.soft_reasons,
-                recovery_hard_reasons: recovery.report.hard_reasons,
-                recovery_reason_counts: recovery.report.repair_reason_counts,
-                recovery_audit: recovery.report.audit,
-                startup_repair_ran: recovery.repair.ran,
-                startup_repair_escalated: recovery.repair.escalated,
-                startup_repair_scanned: recovery.repair.scanned,
-                startup_repair_changed: recovery.repair.changed,
-                startup_repair_budget_ms: recovery.repair.budget_ms,
-                startup_repair_budget_exhausted: recovery.repair.budget_exhausted,
-                startup_repair_escalation_reason: recovery.repair.escalation_reason,
-                last_clean_shutdown: recovery.report.previous_clean_shutdown,
-                l1_dirs: watch_state.l1_dirs,
-                l2_dirs: watch_state.l2_dirs,
-                l3_dirs: watch_state.l3_dirs,
-                max_watch_dirs: watch_state.max_watch_dirs,
-                l0_max_cost_per_root: watch_state.l0_max_cost_per_root,
-                watch_budget_utilization_pct: watch_state.watch_budget_utilization_pct,
-                promotion_budget_blocked: watch_state.promotion_budget_blocked,
-                watch_profile: watch_state.watch_profile,
-                system_max_user_watches: watch_state.system_max_user_watches,
-                required_watch_cost: watch_state.required_watch_cost,
-                watch_budget_shortfall: watch_state.watch_budget_shortfall,
-                strict_coverage_ok: watch_state.strict_coverage_ok,
-                strict_coverage_failure: watch_state.strict_coverage_failure,
-                strict_fail_on_budget_exceeded: watch_state.strict_fail_on_budget_exceeded,
-                strict_uncovered_dirs: watch_state.strict_uncovered_dirs,
-                fast_scan_enabled: watch_state.fast_scan_enabled,
-                fast_scan_sla_ok: watch_state.fast_scan_sla_ok,
-                fast_scan_local_strict_ok: watch_state.fast_scan_local_strict_ok,
-                fast_scan_known_dirs: watch_state.fast_scan_known_dirs,
-                fast_scan_local_trusted_dirs: watch_state.fast_scan_local_trusted_dirs,
-                fast_scan_untrusted_dirs: watch_state.fast_scan_untrusted_dirs,
-                fast_scan_hotset_lease_count: watch_state.fast_scan_hotset_lease_count,
-                fast_scan_hotset_sentinel_count: watch_state.fast_scan_hotset_sentinel_count,
-                fast_scan_explicit_lease_count: watch_state.fast_scan_explicit_lease_count,
-                fast_scan_auto_lease_count: watch_state.fast_scan_auto_lease_count,
-                fast_scan_lease_evictions: watch_state.fast_scan_lease_evictions,
-                fast_scan_lease_renewals: watch_state.fast_scan_lease_renewals,
-                fast_scan_initial_backfill_pending: watch_state.fast_scan_initial_backfill_pending,
-                fast_scan_real_changed_dirs: watch_state.fast_scan_real_changed_dirs,
-                fast_scan_apply_dropped_stale_batches: watch_state
-                    .fast_scan_apply_dropped_stale_batches,
-                fast_scan_scan_workers_active: watch_state.fast_scan_scan_workers_active,
-                fast_scan_io_budget_limited_count: watch_state.fast_scan_io_budget_limited_count,
-                fast_scan_coverage_lag_p95_ms: watch_state.fast_scan_coverage_lag_p95_ms,
-                fast_scan_budget_degraded: watch_state.fast_scan_budget_degraded,
-                fast_scan_last_degraded_reason: watch_state.fast_scan_last_degraded_reason,
-                proc_sampler_enabled: watch_state.proc_sampler_enabled,
-                proc_sampler_last_duration_ms: watch_state.proc_sampler_last_duration_ms,
-                proc_sampler_pids_seen: watch_state.proc_sampler_pids_seen,
-                proc_sampler_pids_scanned: watch_state.proc_sampler_pids_scanned,
-                proc_sampler_pids_denied: watch_state.proc_sampler_pids_denied,
-                proc_sampler_fdinfo_read_count: watch_state.proc_sampler_fdinfo_read_count,
-                proc_sampler_readlink_count: watch_state.proc_sampler_readlink_count,
-                proc_sampler_write_fd_count: watch_state.proc_sampler_write_fd_count,
-                proc_sampler_sampled_dirs: watch_state.proc_sampler_sampled_dirs,
-                proc_sampler_triggered_watches: watch_state.proc_sampler_triggered_watches,
-                proc_sampler_budget_exhausted: watch_state.proc_sampler_budget_exhausted,
-                proc_sampler_unavailable: watch_state.proc_sampler_unavailable,
-                diagnostics: fd_rdd::diagnostics::DiagnosticReport::default(),
-            }
-        })
-    };
-    let stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync> = {
-        let pipeline = pipeline.clone();
-        Arc::new(move || pipeline.stats())
-    };
-    let watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync> = {
-        let index = index.clone();
-        let watch_state = watch_state.clone();
-        let tiered_runtime = tiered_runtime.clone();
-        Arc::new(move || {
-            if let Some(runtime) = tiered_runtime.as_ref() {
-                runtime.set_dirty_queue_len(index.dirty_queue_len());
-                let stats = index.stats_report();
-                runtime.set_query_stale_hit_count(stats.query_stale_hit_count);
-                runtime.set_query_permission_denied_count(stats.query_permission_denied_count);
-            }
-            let mut report = tiered_runtime
-                .as_ref()
-                .map(|runtime| runtime.report())
-                .unwrap_or_else(|| watch_state.as_ref().clone());
-            apply_watch_plan_static_fields(&mut report, watch_state.as_ref());
-            let stats = index.stats_report();
-            report.cold_validate_count = report
-                .cold_validate_count
-                .saturating_add(stats.cold_validate_count);
-            let manifest = index.directory_manifest_report();
-            report.directory_manifest_dirs = manifest.dirs;
-            report.directory_manifest_skipped_scans = manifest.skipped_scans;
-            report.directory_manifest_changed_scans = manifest.changed_scans;
-            report.directory_manifest_untrusted_clock_bypass = manifest.untrusted_clock_bypass;
-            report
-        })
-    };
-    let tiered_watch_debug_provider: Arc<
-        dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync,
-    > = {
-        let tiered_runtime = tiered_runtime.clone();
-        Arc::new(move |root_filter| {
-            tiered_runtime
-                .as_ref()
-                .map(|rt| rt.debug_dump(root_filter.as_deref()))
-                .unwrap_or_else(|| TieredWatchDebugDump {
-                    dirs: vec![],
-                    summary: TieredWatchDebugSummary {
-                        l0_dirs: 0,
-                        l1_dirs: 0,
-                        l2_dirs: 0,
-                        l3_dirs: 0,
-                        ephemeral_watch_dirs: 0,
-                        ephemeral_watch_cost: 0,
-                        ephemeral_watch_budget: 0,
-                        total_event_score: 0,
-                    },
-                })
-        })
-    };
     let query_server = QueryServer::new(index.clone())
         .with_health_provider(health_provider.clone())
         .with_stats_provider(stats_provider.clone())
@@ -682,11 +924,12 @@ async fn main() -> anyhow::Result<()> {
     // 6.5) 启动 UDS 查询服务（CLI > config > default_socket_path()）
     let uds_path = args
         .uds_socket
-        .or(cfg.socket_path)
+        .clone()
+        .or(cfg.socket_path.clone())
         .unwrap_or_else(default_socket_path);
     {
         let socket_server = SocketServer::new(index.clone());
-        let path = uds_path.clone();
+        let path = uds_path;
         tokio::spawn(async move {
             if let Err(e) = socket_server.run(&path).await {
                 tracing::error!("UDS query server error: {}", e);
@@ -694,7 +937,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 7) 启动定期快照循环（每 300 秒）
+    // 7) 启动定期快照循环（每 snapshot_interval_secs 秒）
     let snap_index = index.clone();
     let snap_store = store.clone();
     tokio::spawn(async move {
@@ -703,7 +946,7 @@ async fn main() -> anyhow::Result<()> {
             .await;
     });
 
-    // 8) 启动内存报告循环（每 60 秒）
+    // 8) 启动内存报告循环（每 report_interval_secs 秒）
     {
         let report_index = index.clone();
         let report_stats_provider = stats_provider.clone();
@@ -744,14 +987,15 @@ async fn main() -> anyhow::Result<()> {
             reporter.run().await;
         });
     }
+}
 
-    info!(
-        "fd-rdd ready. Query via: http://localhost:{}/search?q=keyword",
-        http_port
-    );
-
-    // 9) 优雅退出：SIGINT/SIGTERM → 最终快照
-    shutdown_signal().await?;
+/// Write final snapshot, persist fast-scan registry, and mark clean shutdown.
+async fn handle_shutdown(
+    index: &Arc<TieredIndex>,
+    store: &Arc<SnapshotStore>,
+    tiered_runtime: &Option<Arc<TieredWatchRuntime>>,
+    cfg: &Config,
+) {
     info!("Shutting down, writing final snapshot...");
     if let Err(e) = index.snapshot_now(store.clone()).await {
         tracing::error!("Final snapshot failed: {}", e);
@@ -785,10 +1029,7 @@ async fn main() -> anyhow::Result<()> {
         index.root_case_policy_diagnostics(),
     );
     info!("Goodbye.");
-
-    Ok(())
 }
-
 fn mark_runtime_state(
     snapshot_path: &std::path::Path,
     clean_shutdown: bool,
