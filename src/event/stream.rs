@@ -349,322 +349,23 @@ impl EventPipeline {
                 let (first_ev, is_priority) = tokio::select! {
                     biased;
                     cmd = watch_command_rx.recv() => {
-                        match cmd {
-                            Some(WatchCommand::Add(path)) => {
-                                if !mount_policy_allows_dynamic_watch(
-                                    fs_policy.as_ref(),
-                                    mount_policy_counters.as_ref(),
-                                    &configured_roots,
-                                    path.as_path(),
-                                ) {
-                                    note_watch_mount_policy_rejected(&tiered_runtime);
-                                    if let Some(runtime) = tiered_runtime.as_ref() {
-                                        runtime.rollback_promote(path.as_path());
-                                    }
-                                    tracing::warn!("tiered watcher add denied by mount policy for {:?}", path);
-                                    continue;
-                                }
-                                match watcher.watch(path.as_path(), notify::RecursiveMode::Recursive) {
-                                    Ok(()) => {
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.confirm_promoted(path.as_path());
-                                        }
-                                        dynamic_watches.insert(path.clone());
-                                        let scan_index = index.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let _ = scan_index.scan_dirs_immediate_deep(&[path]);
-                                        });
-                                    }
-                                    Err(e) => {
-                                        watch_failures.fetch_add(1, Ordering::Relaxed);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.rollback_promote(path.as_path());
-                                        }
-                                        tracing::warn!("tiered watcher add failed for {:?}: {}", path, e);
-                                    }
-                                }
-                            }
-                            Some(WatchCommand::AddEphemeral(path)) => {
-                                if !mount_policy_allows_dynamic_watch(
-                                    fs_policy.as_ref(),
-                                    mount_policy_counters.as_ref(),
-                                    &configured_roots,
-                                    path.as_path(),
-                                ) {
-                                    note_watch_mount_policy_rejected(&tiered_runtime);
-                                    if let Some(runtime) = tiered_runtime.as_ref() {
-                                        runtime.rollback_ephemeral_add(path.as_path());
-                                    }
-                                    tracing::warn!("tiered ephemeral watcher add denied by mount policy for {:?}", path);
-                                    continue;
-                                }
-                                match watcher.watch(path.as_path(), notify::RecursiveMode::Recursive) {
-                                    Ok(()) => {
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.confirm_ephemeral_added(path.as_path());
-                                        }
-                                        ephemeral_watches.insert(path.clone());
-                                        let scan_index = index.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let _ = scan_index.scan_dirs_immediate_deep(&[path]);
-                                        });
-                                    }
-                                    Err(e) => {
-                                        watch_failures.fetch_add(1, Ordering::Relaxed);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.rollback_ephemeral_add(path.as_path());
-                                        }
-                                        tracing::warn!("tiered ephemeral watcher add failed for {:?}: {}", path, e);
-                                    }
-                                }
-                            }
-                            Some(WatchCommand::Remove(path)) => {
-                                let child_watches = dynamic_watches
-                                    .iter()
-                                    .filter(|child| child.as_path() != path.as_path() && child.starts_with(&path))
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                for child in child_watches {
-                                    if let Err(e) = watcher.unwatch(child.as_path()) {
-                                        tracing::debug!(
-                                            "tiered watcher child remove failed for {:?}: {}",
-                                            child,
-                                            e
-                                        );
-                                    }
-                                    dynamic_watches.remove(&child);
-                                    if let Some(runtime) = tiered_runtime.as_ref() {
-                                        runtime.confirm_demoted(child.as_path());
-                                    }
-                                }
-                                let ephemeral_children = ephemeral_watches
-                                    .iter()
-                                    .filter(|child| child.as_path() != path.as_path() && child.starts_with(&path))
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                for child in ephemeral_children {
-                                    if let Err(e) = watcher.unwatch(child.as_path()) {
-                                        tracing::debug!(
-                                            "tiered ephemeral child remove failed for {:?}: {}",
-                                            child,
-                                            e
-                                        );
-                                    }
-                                    ephemeral_watches.remove(&child);
-                                    if let Some(runtime) = tiered_runtime.as_ref() {
-                                        runtime.confirm_ephemeral_removed(child.as_path());
-                                    }
-                                }
-                                match watcher.unwatch(path.as_path()) {
-                                    Ok(()) => {
-                                        dynamic_watches.remove(&path);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.confirm_demoted(path.as_path());
-                                        }
-                                    }
-                                    Err(e) => {
-                                        watch_failures.fetch_add(1, Ordering::Relaxed);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.rollback_demote(path.as_path());
-                                        }
-                                        tracing::warn!("tiered watcher remove failed for {:?}: {}", path, e);
-                                    }
-                                }
-                            }
-                            Some(WatchCommand::RemoveEphemeral(path)) => {
-                                match watcher.unwatch(path.as_path()) {
-                                    Ok(()) => {
-                                        ephemeral_watches.remove(&path);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.confirm_ephemeral_removed(path.as_path());
-                                        }
-                                    }
-                                    Err(e) => {
-                                        watch_failures.fetch_add(1, Ordering::Relaxed);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.rollback_ephemeral_remove(path.as_path());
-                                        }
-                                        tracing::warn!("tiered ephemeral watcher remove failed for {:?}: {}", path, e);
-                                    }
-                                }
-                            }
-                            Some(WatchCommand::Replace { demote, promote }) => {
-                                if !mount_policy_allows_dynamic_watch(
-                                    fs_policy.as_ref(),
-                                    mount_policy_counters.as_ref(),
-                                    &configured_roots,
-                                    promote.as_path(),
-                                ) {
-                                    note_watch_mount_policy_rejected(&tiered_runtime);
-                                    if let Some(runtime) = tiered_runtime.as_ref() {
-                                        runtime.rollback_replacement(
-                                            demote.as_path(),
-                                            promote.as_path(),
-                                        );
-                                    }
-                                    tracing::warn!("tiered watcher replacement add denied by mount policy for {:?}", promote);
-                                    continue;
-                                }
-                                let child_watches = dynamic_watches
-                                    .iter()
-                                    .filter(|child| child.as_path() != demote.as_path() && child.starts_with(&demote))
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                for child in child_watches {
-                                    if let Err(e) = watcher.unwatch(child.as_path()) {
-                                        tracing::debug!(
-                                            "tiered watcher replacement child remove failed for {:?}: {}",
-                                            child,
-                                            e
-                                        );
-                                    }
-                                    dynamic_watches.remove(&child);
-                                    if let Some(runtime) = tiered_runtime.as_ref() {
-                                        runtime.confirm_demoted(child.as_path());
-                                    }
-                                }
-                                let ephemeral_children = ephemeral_watches
-                                    .iter()
-                                    .filter(|child| child.as_path() != demote.as_path() && child.starts_with(&demote))
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                for child in ephemeral_children {
-                                    if let Err(e) = watcher.unwatch(child.as_path()) {
-                                        tracing::debug!(
-                                            "tiered ephemeral replacement child remove failed for {:?}: {}",
-                                            child,
-                                            e
-                                        );
-                                    }
-                                    ephemeral_watches.remove(&child);
-                                    if let Some(runtime) = tiered_runtime.as_ref() {
-                                        runtime.confirm_ephemeral_removed(child.as_path());
-                                    }
-                                }
-
-                                match watcher.unwatch(demote.as_path()) {
-                                    Ok(()) => {
-                                        dynamic_watches.remove(&demote);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.confirm_demoted(demote.as_path());
-                                            if !runtime.reserve_pending_promotion(promote.as_path()) {
-                                                runtime.cancel_pending_promotion(promote.as_path());
-                                                tracing::warn!(
-                                                    "tiered watcher replacement could not reserve promoted budget for {:?}",
-                                                    promote
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        watch_failures.fetch_add(1, Ordering::Relaxed);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.rollback_replacement(
-                                                demote.as_path(),
-                                                promote.as_path(),
-                                            );
-                                        }
-                                        tracing::warn!(
-                                            "tiered watcher replacement remove failed for {:?}: {}",
-                                            demote,
-                                            e
-                                        );
-                                        continue;
-                                    }
-                                }
-
-                                match watcher.watch(promote.as_path(), notify::RecursiveMode::Recursive) {
-                                    Ok(()) => {
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.confirm_promoted(promote.as_path());
-                                        }
-                                        dynamic_watches.insert(promote.clone());
-                                        let scan_index = index.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let _ = scan_index.scan_dirs_immediate_deep(&[promote]);
-                                        });
-                                    }
-                                    Err(e) => {
-                                        watch_failures.fetch_add(1, Ordering::Relaxed);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.rollback_promote(promote.as_path());
-                                        }
-                                        tracing::warn!(
-                                            "tiered watcher replacement add failed for {:?}: {}",
-                                            promote,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            Some(WatchCommand::ReplaceEphemeral { remove, add }) => {
-                                if !mount_policy_allows_dynamic_watch(
-                                    fs_policy.as_ref(),
-                                    mount_policy_counters.as_ref(),
-                                    &configured_roots,
-                                    add.as_path(),
-                                ) {
-                                    note_watch_mount_policy_rejected(&tiered_runtime);
-                                    if let Some(runtime) = tiered_runtime.as_ref() {
-                                        runtime.rollback_ephemeral_replace(
-                                            remove.as_path(),
-                                            add.as_path(),
-                                        );
-                                    }
-                                    tracing::warn!("tiered ephemeral replacement add denied by mount policy for {:?}", add);
-                                    continue;
-                                }
-                                match watcher.unwatch(remove.as_path()) {
-                                    Ok(()) => {
-                                        ephemeral_watches.remove(&remove);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.confirm_ephemeral_evicted(remove.as_path());
-                                        }
-                                    }
-                                    Err(e) => {
-                                        watch_failures.fetch_add(1, Ordering::Relaxed);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.rollback_ephemeral_replace(
-                                                remove.as_path(),
-                                                add.as_path(),
-                                            );
-                                        }
-                                        tracing::warn!(
-                                            "tiered ephemeral replacement remove failed for {:?}: {}",
-                                            remove,
-                                            e
-                                        );
-                                        continue;
-                                    }
-                                }
-
-                                match watcher.watch(add.as_path(), notify::RecursiveMode::Recursive) {
-                                    Ok(()) => {
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.confirm_ephemeral_added(add.as_path());
-                                        }
-                                        ephemeral_watches.insert(add.clone());
-                                        let scan_index = index.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let _ = scan_index.scan_dirs_immediate_deep(&[add]);
-                                        });
-                                    }
-                                    Err(e) => {
-                                        watch_failures.fetch_add(1, Ordering::Relaxed);
-                                        if let Some(runtime) = tiered_runtime.as_ref() {
-                                            runtime.rollback_ephemeral_add(add.as_path());
-                                        }
-                                        tracing::warn!(
-                                            "tiered ephemeral replacement add failed for {:?}: {}",
-                                            add,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            None => {}
-                        }
+                        handle_watch_command(
+                            cmd,
+                            &mut WatchCtx {
+                                watcher: &mut watcher,
+                                dynamic_watches: &mut dynamic_watches,
+                                ephemeral_watches: &mut ephemeral_watches,
+                                index: &index,
+                                tiered_runtime: &tiered_runtime,
+                                fs_policy: &fs_policy,
+                                mount_policy_counters: mount_policy_counters.as_ref(),
+                                configured_roots: &configured_roots,
+                                watch_failures: &watch_failures,
+                                ignore_paths: &ignore_paths,
+                                exclude_dirs: &exclude_dirs,
+                                ignore_filter: &ignore_filter,
+                            },
+                        );
                         continue;
                     },
                     ev = priority_rx.recv() => match ev {
@@ -679,25 +380,17 @@ impl EventPipeline {
                     },
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                         // idle maintenance：每 5s 最多触发一次 shrink+trim，避免频繁抖动。
-                        if last_idle_trim.elapsed() >= std::time::Duration::from_secs(5) {
-                            let current_total = total_events.load(Ordering::Relaxed);
-                            let mut shrunk = false;
-                            shrunk |= shrink_if_large_vec(&mut raw_events, keep_cap);
-                            shrunk |= shrink_if_large_map(&mut merge_scratch.merged, keep_cap);
-                            shrunk |= shrink_if_large_vec(&mut merge_scratch.records, keep_cap);
-                            if shrunk {
-                                // 同步更新观测值，便于 fs-churn 归因。
-                                raw_events_capacity.store(raw_events.capacity() as u64, Ordering::Relaxed);
-                                merged_map_capacity.store(merge_scratch.merged.capacity() as u64, Ordering::Relaxed);
-                                records_capacity.store(merge_scratch.records.capacity() as u64, Ordering::Relaxed);
-
-                            }
-                            if current_total != last_idle_trim_total_events {
-                                maybe_trim_rss();
-                                last_idle_trim_total_events = current_total;
-                            }
-                            last_idle_trim = tokio::time::Instant::now();
-                        }
+                        idle_maintenance(
+                            &mut last_idle_trim,
+                            &mut last_idle_trim_total_events,
+                            &mut raw_events,
+                            &mut merge_scratch,
+                            keep_cap,
+                            &total_events,
+                            &raw_events_capacity,
+                            &merged_map_capacity,
+                            &records_capacity,
+                        );
                         continue;
                     }
                 };
@@ -735,28 +428,14 @@ impl EventPipeline {
                 }
 
                 // 过滤：全局目录排除和索引自身写入路径，必须在动态 watch / fast path 前执行。
-                raw_events.retain(|ev| {
-                    let excluded = ev
-                        .paths
-                        .iter()
-                        .any(|p| path_has_excluded_component(p, &exclude_dirs));
-                    if excluded {
-                        note_watch_exclude_rejected(&tiered_runtime);
-                    }
-                    !should_ignore_event(ev, &ignore_paths) && !excluded
-                });
-                if let Some(ref gi) = ignore_filter {
-                    raw_events.retain(|ev| !ev.paths.iter().any(|p| gi.is_ignored(p)));
-                }
-                if raw_events.iter().any(|ev| ev.need_rescan()) {
-                    index.enqueue_dirty(
-                        DirtyScope::All {
-                            cutoff_ns: now_ns(),
-                        },
-                        DirtyReason::OverflowRecovery,
-                    );
-                    raw_events.retain(|ev| !ev.need_rescan());
-                }
+                filter_raw_events(
+                    &mut raw_events,
+                    &ignore_paths,
+                    &exclude_dirs,
+                    &ignore_filter,
+                    &tiered_runtime,
+                    &index,
+                );
                 if raw_events.is_empty() {
                     continue;
                 }
@@ -773,172 +452,23 @@ impl EventPipeline {
                 // 因此需要在检测到 Create(Folder) 事件时手动调用 watcher.watch()。
                 // 同时扫描新目录中的已有文件，生成合成 Create 事件，弥补 watch 注册
                 // 时间窗口内丢失的 inotify 事件（目录创建与 watch 生效之间存在竞态）。
-                let mut changed_dirs: Vec<PathBuf> = Vec::new();
-                for ev in &raw_events {
-                    let dir_paths = match ev.kind {
-                        notify::EventKind::Create(notify::event::CreateKind::Folder) => {
-                            ev.paths.as_slice()
-                        }
-                        notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
-                            ev.paths.last().map(std::slice::from_ref).unwrap_or(&[])
-                        }
-                        _ => &[],
-                    };
-                    for path in dir_paths {
-                        if ignore_paths
-                            .iter()
-                            .any(|ig| !ig.as_os_str().is_empty() && path.starts_with(ig))
-                        {
-                            continue;
-                        }
-                        if path_has_excluded_component(path, &exclude_dirs) {
-                            note_watch_exclude_rejected(&tiered_runtime);
-                            continue;
-                        }
-                        if ignore_filter
-                            .as_ref()
-                            .is_some_and(|filter| filter.is_ignored(path))
-                        {
-                            continue;
-                        }
-                        if !std::fs::symlink_metadata(path)
-                            .map(|m| m.is_dir())
-                            .unwrap_or(false)
-                        {
-                            continue;
-                        }
-                        if !mount_policy_allows_dynamic_watch(
-                            fs_policy.as_ref(),
-                            mount_policy_counters.as_ref(),
-                            &configured_roots,
-                            path.as_path(),
-                        ) {
-                            note_watch_mount_policy_rejected(&tiered_runtime);
-                            tracing::warn!(
-                                "dynamic watcher add denied by mount policy for {:?}",
-                                path
-                            );
-                            continue;
-                        }
-                        if let Some(runtime) = tiered_runtime.as_ref() {
-                            if matches!(
-                                runtime.covering_tier(path.as_path()),
-                                Some(WatchTier::L2 | WatchTier::L3)
-                            ) {
-                                index.enqueue_dirty_dirs(
-                                    vec![path.clone()],
-                                    DirtyReason::InotifyEvent,
-                                );
-                                continue;
-                            }
-                            let watch_cost = estimate_notify_recursive_watch_count(
-                                path,
-                                runtime.l0_max_cost_per_root().max(1),
-                            );
-                            match runtime.register_dynamic_candidate(path.clone(), watch_cost) {
-                                crate::event::tiered_watch::PromotionDecision::SendAdd => {
-                                    match watcher.watch(path, notify::RecursiveMode::Recursive) {
-                                        Ok(()) => {
-                                            runtime.confirm_promoted(path.as_path());
-                                            dynamic_watches.insert(path.clone());
-                                        }
-                                        Err(e) => {
-                                            watch_failures.fetch_add(1, Ordering::Relaxed);
-                                            runtime.rollback_promote(path.as_path());
-                                            tracing::warn!(
-                                                "tiered dynamic watcher add failed for {:?}: {}",
-                                                path,
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                                crate::event::tiered_watch::PromotionDecision::Replace {
-                                    demote,
-                                    promote,
-                                } => {
-                                    let child_watches = dynamic_watches
-                                        .iter()
-                                        .filter(|child| {
-                                            child.as_path() != demote.as_path()
-                                                && child.starts_with(&demote)
-                                        })
-                                        .cloned()
-                                        .collect::<Vec<_>>();
-                                    for child in child_watches {
-                                        if let Err(e) = watcher.unwatch(child.as_path()) {
-                                            tracing::debug!(
-                                                "tiered dynamic replacement child remove failed for {:?}: {}",
-                                                child,
-                                                e
-                                            );
-                                        }
-                                        dynamic_watches.remove(&child);
-                                        runtime.confirm_demoted(child.as_path());
-                                    }
-                                    match watcher.unwatch(demote.as_path()) {
-                                        Ok(()) => {
-                                            dynamic_watches.remove(&demote);
-                                            runtime.confirm_demoted(demote.as_path());
-                                            if !runtime.reserve_pending_promotion(promote.as_path())
-                                            {
-                                                runtime.cancel_pending_promotion(promote.as_path());
-                                                tracing::warn!(
-                                                    "tiered dynamic replacement could not reserve promoted budget for {:?}",
-                                                    promote
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            runtime.rollback_replacement(
-                                                demote.as_path(),
-                                                promote.as_path(),
-                                            );
-                                            tracing::warn!(
-                                                "tiered dynamic replacement remove failed for {:?}: {}",
-                                                demote,
-                                                e
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                    match watcher
-                                        .watch(promote.as_path(), notify::RecursiveMode::Recursive)
-                                    {
-                                        Ok(()) => {
-                                            runtime.confirm_promoted(promote.as_path());
-                                            dynamic_watches.insert(promote.clone());
-                                        }
-                                        Err(e) => {
-                                            watch_failures.fetch_add(1, Ordering::Relaxed);
-                                            runtime.rollback_promote(promote.as_path());
-                                            tracing::warn!(
-                                                "tiered dynamic replacement add failed for {:?}: {}",
-                                                promote,
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                                crate::event::tiered_watch::PromotionDecision::BudgetBlocked => {
-                                    tracing::debug!(
-                                        "tiered dynamic watcher budget blocked for {:?} (cost={})",
-                                        path,
-                                        watch_cost
-                                    );
-                                }
-                                crate::event::tiered_watch::PromotionDecision::NotEligible => {}
-                            }
-                        } else if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive)
-                        {
-                            tracing::debug!("Failed to add dynamic watch for {:?}: {}", path, e);
-                        } else {
-                            dynamic_watches.insert(path.clone());
-                        }
-                        changed_dirs.push(path.clone());
-                    }
-                }
+                let mut changed_dirs = register_dynamic_watches(
+                    &raw_events,
+                    &mut WatchCtx {
+                        watcher: &mut watcher,
+                        dynamic_watches: &mut dynamic_watches,
+                        ephemeral_watches: &mut ephemeral_watches,
+                        index: &index,
+                        tiered_runtime: &tiered_runtime,
+                        fs_policy: &fs_policy,
+                        mount_policy_counters: mount_policy_counters.as_ref(),
+                        configured_roots: &configured_roots,
+                        watch_failures: &watch_failures,
+                        ignore_paths: &ignore_paths,
+                        exclude_dirs: &exclude_dirs,
+                        ignore_filter: &ignore_filter,
+                    },
+                );
                 changed_dirs.sort();
                 changed_dirs.dedup();
                 if !changed_dirs.is_empty() {
@@ -952,28 +482,13 @@ impl EventPipeline {
                 }
 
                 // Fast path: if all events are Create for distinct paths, apply immediately.
-                let all_create = raw_events
-                    .iter()
-                    .all(|ev| matches!(ev.kind, notify::EventKind::Create(_)));
-                if all_create && raw_events.len() <= 10 {
-                    let mut fast_records: Vec<EventRecord> = Vec::with_capacity(raw_events.len());
-                    for ev in raw_events.drain(..) {
-                        if let Some(path) = ev.paths.into_iter().next() {
-                            seq = seq.wrapping_add(1);
-                            fast_records.push(EventRecord {
-                                seq,
-                                timestamp: std::time::SystemTime::now(),
-                                event_type: EventType::Create,
-                                id: FileIdentifier::Path(path),
-                                path_hint: None,
-                            });
-                        }
-                    }
-                    if !fast_records.is_empty() {
-                        index.apply_events(&fast_records);
-                        total_events.fetch_add(fast_records.len() as u64, Ordering::Relaxed);
-                        last_batch_size.store(fast_records.len() as u64, Ordering::Relaxed);
-                    }
+                if try_fast_path(
+                    &mut raw_events,
+                    &mut seq,
+                    &index,
+                    &total_events,
+                    &last_batch_size,
+                ) {
                     continue;
                 }
 
@@ -981,59 +496,7 @@ impl EventPipeline {
 
                 // 合并去重
                 // 跨批次 Rename 配对：将 inotify 拆分的 From/To 事件合并为完整 Rename
-                {
-                    let mut pm = pending_moves.lock().await;
-                    let mut paired = Vec::new();
-                    let mut to_remove = Vec::new();
-
-                    for (idx, ev) in raw_events.iter().enumerate() {
-                        if let notify::EventKind::Modify(notify::event::ModifyKind::Name(mode)) =
-                            ev.kind
-                        {
-                            if let Some(tracker) = ev.tracker() {
-                                match mode {
-                                    notify::event::RenameMode::From => {
-                                        pm.insert(tracker, (Instant::now(), ev.clone()));
-                                        to_remove.push(idx);
-                                    }
-                                    notify::event::RenameMode::To => {
-                                        if let Some((_, from_ev)) = pm.remove(&tracker) {
-                                            if let (Some(from), Some(to)) =
-                                                (from_ev.paths.first(), ev.paths.first())
-                                            {
-                                                let mut combined = notify::Event {
-                                                    kind: notify::EventKind::Modify(
-                                                        notify::event::ModifyKind::Name(
-                                                            notify::event::RenameMode::Any,
-                                                        ),
-                                                    ),
-                                                    paths: vec![from.clone(), to.clone()],
-                                                    attrs: Default::default(),
-                                                };
-                                                combined.attrs.set_tracker(tracker);
-                                                paired.push((idx, combined));
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-
-                    // 替换已配对的 To 事件，并移除已存储的 From 事件
-                    for (idx, ev) in paired {
-                        if idx < raw_events.len() {
-                            raw_events[idx] = ev;
-                        }
-                    }
-                    for idx in to_remove.into_iter().rev() {
-                        if idx < raw_events.len() {
-                            raw_events.swap_remove(idx);
-                        }
-                    }
-                }
-
+                pair_pending_moves(&mut raw_events, &pending_moves).await;
                 merge_events_in_place(&mut seq, &mut raw_events, &mut merge_scratch);
                 raw_events_capacity.store(raw_events.capacity() as u64, Ordering::Relaxed);
                 merged_map_capacity
@@ -1058,6 +521,724 @@ impl EventPipeline {
         });
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Watch command handler infrastructure (extracted from start() — H3 refactor)
+// ---------------------------------------------------------------------------
+
+/// Borrowed context shared by all `WatchCommand` handlers and the dynamic
+/// watch-registration logic.  All fields are references into local variables
+/// owned by the event-loop task in `EventPipeline::start`.
+struct WatchCtx<'a> {
+    watcher: &'a mut notify::RecommendedWatcher,
+    dynamic_watches: &'a mut HashSet<PathBuf>,
+    ephemeral_watches: &'a mut HashSet<PathBuf>,
+    index: &'a Arc<TieredIndex>,
+    tiered_runtime: &'a Option<Arc<TieredWatchRuntime>>,
+    fs_policy: &'a Option<FsPolicy>,
+    mount_policy_counters: &'a SharedMountPolicyCounters,
+    configured_roots: &'a [PathBuf],
+    watch_failures: &'a Arc<AtomicU64>,
+    ignore_paths: &'a [PathBuf],
+    exclude_dirs: &'a [String],
+    ignore_filter: &'a Option<IgnoreFilter>,
+}
+
+/// Dispatch a `WatchCommand` (or `None`) to the appropriate handler.
+fn handle_watch_command(cmd: Option<WatchCommand>, ctx: &mut WatchCtx<'_>) {
+    match cmd {
+        Some(WatchCommand::Add(path)) => handle_add_watch(ctx, path),
+        Some(WatchCommand::AddEphemeral(path)) => handle_add_ephemeral_watch(ctx, path),
+        Some(WatchCommand::Remove(path)) => handle_remove_watch(ctx, path),
+        Some(WatchCommand::RemoveEphemeral(path)) => handle_remove_ephemeral_watch(ctx, path),
+        Some(WatchCommand::Replace { demote, promote }) => {
+            handle_replace_watch(ctx, demote, promote)
+        }
+        Some(WatchCommand::ReplaceEphemeral { remove, add }) => {
+            handle_replace_ephemeral_watch(ctx, remove, add)
+        }
+        None => {}
+    }
+}
+
+/// `WatchCommand::Add` — promote a path to a recursive inotify watch.
+fn handle_add_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
+    if !mount_policy_allows_dynamic_watch(
+        ctx.fs_policy.as_ref(),
+        ctx.mount_policy_counters,
+        ctx.configured_roots,
+        path.as_path(),
+    ) {
+        note_watch_mount_policy_rejected(ctx.tiered_runtime);
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.rollback_promote(path.as_path());
+        }
+        tracing::warn!("tiered watcher add denied by mount policy for {:?}", path);
+        return;
+    }
+    match ctx
+        .watcher
+        .watch(path.as_path(), notify::RecursiveMode::Recursive)
+    {
+        Ok(()) => {
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.confirm_promoted(path.as_path());
+            }
+            ctx.dynamic_watches.insert(path.clone());
+            let scan_index = ctx.index.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = scan_index.scan_dirs_immediate_deep(&[path]);
+            });
+        }
+        Err(e) => {
+            ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.rollback_promote(path.as_path());
+            }
+            tracing::warn!("tiered watcher add failed for {:?}: {}", path, e);
+        }
+    }
+}
+
+/// `WatchCommand::AddEphemeral` — add an ephemeral (evictable) recursive watch.
+fn handle_add_ephemeral_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
+    if !mount_policy_allows_dynamic_watch(
+        ctx.fs_policy.as_ref(),
+        ctx.mount_policy_counters,
+        ctx.configured_roots,
+        path.as_path(),
+    ) {
+        note_watch_mount_policy_rejected(ctx.tiered_runtime);
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.rollback_ephemeral_add(path.as_path());
+        }
+        tracing::warn!(
+            "tiered ephemeral watcher add denied by mount policy for {:?}",
+            path
+        );
+        return;
+    }
+    match ctx
+        .watcher
+        .watch(path.as_path(), notify::RecursiveMode::Recursive)
+    {
+        Ok(()) => {
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.confirm_ephemeral_added(path.as_path());
+            }
+            ctx.ephemeral_watches.insert(path.clone());
+            let scan_index = ctx.index.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = scan_index.scan_dirs_immediate_deep(&[path]);
+            });
+        }
+        Err(e) => {
+            ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.rollback_ephemeral_add(path.as_path());
+            }
+            tracing::warn!("tiered ephemeral watcher add failed for {:?}: {}", path, e);
+        }
+    }
+}
+
+/// `WatchCommand::Remove` — demote a path: unwatch it and all child watches.
+fn handle_remove_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
+    // Remove child dynamic watches under this path.
+    let child_watches = ctx
+        .dynamic_watches
+        .iter()
+        .filter(|child| child.as_path() != path.as_path() && child.starts_with(&path))
+        .cloned()
+        .collect::<Vec<_>>();
+    for child in child_watches {
+        if let Err(e) = ctx.watcher.unwatch(child.as_path()) {
+            tracing::debug!("tiered watcher child remove failed for {:?}: {}", child, e);
+        }
+        ctx.dynamic_watches.remove(&child);
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.confirm_demoted(child.as_path());
+        }
+    }
+    // Remove child ephemeral watches under this path.
+    let ephemeral_children = ctx
+        .ephemeral_watches
+        .iter()
+        .filter(|child| child.as_path() != path.as_path() && child.starts_with(&path))
+        .cloned()
+        .collect::<Vec<_>>();
+    for child in ephemeral_children {
+        if let Err(e) = ctx.watcher.unwatch(child.as_path()) {
+            tracing::debug!(
+                "tiered ephemeral child remove failed for {:?}: {}",
+                child,
+                e
+            );
+        }
+        ctx.ephemeral_watches.remove(&child);
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.confirm_ephemeral_removed(child.as_path());
+        }
+    }
+    // Unwatch the path itself.
+    match ctx.watcher.unwatch(path.as_path()) {
+        Ok(()) => {
+            ctx.dynamic_watches.remove(&path);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.confirm_demoted(path.as_path());
+            }
+        }
+        Err(e) => {
+            ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.rollback_demote(path.as_path());
+            }
+            tracing::warn!("tiered watcher remove failed for {:?}: {}", path, e);
+        }
+    }
+}
+
+/// `WatchCommand::RemoveEphemeral` — remove an ephemeral watch.
+fn handle_remove_ephemeral_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
+    match ctx.watcher.unwatch(path.as_path()) {
+        Ok(()) => {
+            ctx.ephemeral_watches.remove(&path);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.confirm_ephemeral_removed(path.as_path());
+            }
+        }
+        Err(e) => {
+            ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.rollback_ephemeral_remove(path.as_path());
+            }
+            tracing::warn!(
+                "tiered ephemeral watcher remove failed for {:?}: {}",
+                path,
+                e
+            );
+        }
+    }
+}
+
+/// `WatchCommand::Replace` — demote `demote` and promote `promote`.
+fn handle_replace_watch(ctx: &mut WatchCtx<'_>, demote: PathBuf, promote: PathBuf) {
+    if !mount_policy_allows_dynamic_watch(
+        ctx.fs_policy.as_ref(),
+        ctx.mount_policy_counters,
+        ctx.configured_roots,
+        promote.as_path(),
+    ) {
+        note_watch_mount_policy_rejected(ctx.tiered_runtime);
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.rollback_replacement(demote.as_path(), promote.as_path());
+        }
+        tracing::warn!(
+            "tiered watcher replacement add denied by mount policy for {:?}",
+            promote
+        );
+        return;
+    }
+    // Remove child dynamic watches under the demoted path.
+    let child_watches = ctx
+        .dynamic_watches
+        .iter()
+        .filter(|child| child.as_path() != demote.as_path() && child.starts_with(&demote))
+        .cloned()
+        .collect::<Vec<_>>();
+    for child in child_watches {
+        if let Err(e) = ctx.watcher.unwatch(child.as_path()) {
+            tracing::debug!(
+                "tiered watcher replacement child remove failed for {:?}: {}",
+                child,
+                e
+            );
+        }
+        ctx.dynamic_watches.remove(&child);
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.confirm_demoted(child.as_path());
+        }
+    }
+    // Remove child ephemeral watches under the demoted path.
+    let ephemeral_children = ctx
+        .ephemeral_watches
+        .iter()
+        .filter(|child| child.as_path() != demote.as_path() && child.starts_with(&demote))
+        .cloned()
+        .collect::<Vec<_>>();
+    for child in ephemeral_children {
+        if let Err(e) = ctx.watcher.unwatch(child.as_path()) {
+            tracing::debug!(
+                "tiered ephemeral replacement child remove failed for {:?}: {}",
+                child,
+                e
+            );
+        }
+        ctx.ephemeral_watches.remove(&child);
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.confirm_ephemeral_removed(child.as_path());
+        }
+    }
+
+    // Unwatch the demoted path.
+    match ctx.watcher.unwatch(demote.as_path()) {
+        Ok(()) => {
+            ctx.dynamic_watches.remove(&demote);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.confirm_demoted(demote.as_path());
+                if !runtime.reserve_pending_promotion(promote.as_path()) {
+                    runtime.cancel_pending_promotion(promote.as_path());
+                    tracing::warn!(
+                        "tiered watcher replacement could not reserve promoted budget for {:?}",
+                        promote
+                    );
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.rollback_replacement(demote.as_path(), promote.as_path());
+            }
+            tracing::warn!(
+                "tiered watcher replacement remove failed for {:?}: {}",
+                demote,
+                e
+            );
+            return;
+        }
+    }
+
+    // Watch the promoted path.
+    match ctx
+        .watcher
+        .watch(promote.as_path(), notify::RecursiveMode::Recursive)
+    {
+        Ok(()) => {
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.confirm_promoted(promote.as_path());
+            }
+            ctx.dynamic_watches.insert(promote.clone());
+            let scan_index = ctx.index.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = scan_index.scan_dirs_immediate_deep(&[promote]);
+            });
+        }
+        Err(e) => {
+            ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.rollback_promote(promote.as_path());
+            }
+            tracing::warn!(
+                "tiered watcher replacement add failed for {:?}: {}",
+                promote,
+                e
+            );
+        }
+    }
+}
+
+/// `WatchCommand::ReplaceEphemeral` — remove `remove` and add `add` as ephemeral.
+fn handle_replace_ephemeral_watch(ctx: &mut WatchCtx<'_>, remove: PathBuf, add: PathBuf) {
+    if !mount_policy_allows_dynamic_watch(
+        ctx.fs_policy.as_ref(),
+        ctx.mount_policy_counters,
+        ctx.configured_roots,
+        add.as_path(),
+    ) {
+        note_watch_mount_policy_rejected(ctx.tiered_runtime);
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.rollback_ephemeral_replace(remove.as_path(), add.as_path());
+        }
+        tracing::warn!(
+            "tiered ephemeral replacement add denied by mount policy for {:?}",
+            add
+        );
+        return;
+    }
+    // Unwatch the removed ephemeral path.
+    match ctx.watcher.unwatch(remove.as_path()) {
+        Ok(()) => {
+            ctx.ephemeral_watches.remove(&remove);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.confirm_ephemeral_evicted(remove.as_path());
+            }
+        }
+        Err(e) => {
+            ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.rollback_ephemeral_replace(remove.as_path(), add.as_path());
+            }
+            tracing::warn!(
+                "tiered ephemeral replacement remove failed for {:?}: {}",
+                remove,
+                e
+            );
+            return;
+        }
+    }
+
+    // Watch the new ephemeral path.
+    match ctx
+        .watcher
+        .watch(add.as_path(), notify::RecursiveMode::Recursive)
+    {
+        Ok(()) => {
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.confirm_ephemeral_added(add.as_path());
+            }
+            ctx.ephemeral_watches.insert(add.clone());
+            let scan_index = ctx.index.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = scan_index.scan_dirs_immediate_deep(&[add]);
+            });
+        }
+        Err(e) => {
+            ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.rollback_ephemeral_add(add.as_path());
+            }
+            tracing::warn!(
+                "tiered ephemeral replacement add failed for {:?}: {}",
+                add,
+                e
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event processing helpers (extracted from start() — H3 refactor)
+// ---------------------------------------------------------------------------
+
+/// Filter raw events: exclude dirs, ignore paths, ignore filter, rescan.
+/// Also enqueues dirty scope for rescan events.
+fn filter_raw_events(
+    raw_events: &mut Vec<notify::Event>,
+    ignore_paths: &[PathBuf],
+    exclude_dirs: &[String],
+    ignore_filter: &Option<IgnoreFilter>,
+    tiered_runtime: &Option<Arc<TieredWatchRuntime>>,
+    index: &Arc<TieredIndex>,
+) {
+    raw_events.retain(|ev| {
+        let excluded = ev
+            .paths
+            .iter()
+            .any(|p| path_has_excluded_component(p, exclude_dirs));
+        if excluded {
+            note_watch_exclude_rejected(tiered_runtime);
+        }
+        !should_ignore_event(ev, ignore_paths) && !excluded
+    });
+    if let Some(ref gi) = ignore_filter {
+        raw_events.retain(|ev| !ev.paths.iter().any(|p| gi.is_ignored(p)));
+    }
+    if raw_events.iter().any(|ev| ev.need_rescan()) {
+        index.enqueue_dirty(
+            DirtyScope::All {
+                cutoff_ns: now_ns(),
+            },
+            DirtyReason::OverflowRecovery,
+        );
+        raw_events.retain(|ev| !ev.need_rescan());
+    }
+}
+
+/// Register dynamic recursive watches for newly created directories.
+///
+/// Returns the list of changed directories that need deep scanning.
+fn register_dynamic_watches(raw_events: &[notify::Event], ctx: &mut WatchCtx<'_>) -> Vec<PathBuf> {
+    // Destructure to get independent borrows (avoids field-level borrow conflicts).
+    let watcher = &mut *ctx.watcher;
+    let dynamic_watches = &mut *ctx.dynamic_watches;
+    let index = ctx.index;
+    let tiered_runtime = ctx.tiered_runtime;
+    let fs_policy = ctx.fs_policy;
+    let mount_policy_counters = ctx.mount_policy_counters;
+    let configured_roots = ctx.configured_roots;
+    let watch_failures = ctx.watch_failures;
+    let ignore_paths = ctx.ignore_paths;
+    let exclude_dirs = ctx.exclude_dirs;
+    let ignore_filter = ctx.ignore_filter;
+
+    let mut changed_dirs: Vec<PathBuf> = Vec::new();
+    for ev in raw_events {
+        let dir_paths = match ev.kind {
+            notify::EventKind::Create(notify::event::CreateKind::Folder) => ev.paths.as_slice(),
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
+                ev.paths.last().map(std::slice::from_ref).unwrap_or(&[])
+            }
+            _ => &[],
+        };
+        for path in dir_paths {
+            if ignore_paths
+                .iter()
+                .any(|ig| !ig.as_os_str().is_empty() && path.starts_with(ig))
+            {
+                continue;
+            }
+            if path_has_excluded_component(path, exclude_dirs) {
+                note_watch_exclude_rejected(tiered_runtime);
+                continue;
+            }
+            if ignore_filter
+                .as_ref()
+                .is_some_and(|filter| filter.is_ignored(path))
+            {
+                continue;
+            }
+            if !std::fs::symlink_metadata(path)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if !mount_policy_allows_dynamic_watch(
+                fs_policy.as_ref(),
+                mount_policy_counters,
+                configured_roots,
+                path.as_path(),
+            ) {
+                note_watch_mount_policy_rejected(tiered_runtime);
+                tracing::warn!("dynamic watcher add denied by mount policy for {:?}", path);
+                continue;
+            }
+            if let Some(runtime) = tiered_runtime.as_ref() {
+                if matches!(
+                    runtime.covering_tier(path.as_path()),
+                    Some(WatchTier::L2 | WatchTier::L3)
+                ) {
+                    index.enqueue_dirty_dirs(vec![path.clone()], DirtyReason::InotifyEvent);
+                    continue;
+                }
+                let watch_cost = estimate_notify_recursive_watch_count(
+                    path,
+                    runtime.l0_max_cost_per_root().max(1),
+                );
+                match runtime.register_dynamic_candidate(path.clone(), watch_cost) {
+                    crate::event::tiered_watch::PromotionDecision::SendAdd => {
+                        match watcher.watch(path, notify::RecursiveMode::Recursive) {
+                            Ok(()) => {
+                                runtime.confirm_promoted(path.as_path());
+                                dynamic_watches.insert(path.clone());
+                            }
+                            Err(e) => {
+                                watch_failures.fetch_add(1, Ordering::Relaxed);
+                                runtime.rollback_promote(path.as_path());
+                                tracing::warn!(
+                                    "tiered dynamic watcher add failed for {:?}: {}",
+                                    path,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    crate::event::tiered_watch::PromotionDecision::Replace { demote, promote } => {
+                        let child_watches = dynamic_watches
+                            .iter()
+                            .filter(|child| {
+                                child.as_path() != demote.as_path() && child.starts_with(&demote)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for child in child_watches {
+                            if let Err(e) = watcher.unwatch(child.as_path()) {
+                                tracing::debug!(
+                                    "tiered dynamic replacement child remove failed for {:?}: {}",
+                                    child,
+                                    e
+                                );
+                            }
+                            dynamic_watches.remove(&child);
+                            runtime.confirm_demoted(child.as_path());
+                        }
+                        match watcher.unwatch(demote.as_path()) {
+                            Ok(()) => {
+                                dynamic_watches.remove(&demote);
+                                runtime.confirm_demoted(demote.as_path());
+                                if !runtime.reserve_pending_promotion(promote.as_path()) {
+                                    runtime.cancel_pending_promotion(promote.as_path());
+                                    tracing::warn!(
+                                        "tiered dynamic replacement could not reserve promoted budget for {:?}",
+                                        promote
+                                    );
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                runtime.rollback_replacement(demote.as_path(), promote.as_path());
+                                tracing::warn!(
+                                    "tiered dynamic replacement remove failed for {:?}: {}",
+                                    demote,
+                                    e
+                                );
+                                continue;
+                            }
+                        }
+                        match watcher.watch(promote.as_path(), notify::RecursiveMode::Recursive) {
+                            Ok(()) => {
+                                runtime.confirm_promoted(promote.as_path());
+                                dynamic_watches.insert(promote.clone());
+                            }
+                            Err(e) => {
+                                watch_failures.fetch_add(1, Ordering::Relaxed);
+                                runtime.rollback_promote(promote.as_path());
+                                tracing::warn!(
+                                    "tiered dynamic replacement add failed for {:?}: {}",
+                                    promote,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    crate::event::tiered_watch::PromotionDecision::BudgetBlocked => {
+                        tracing::debug!(
+                            "tiered dynamic watcher budget blocked for {:?} (cost={})",
+                            path,
+                            watch_cost
+                        );
+                    }
+                    crate::event::tiered_watch::PromotionDecision::NotEligible => {}
+                }
+            } else if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
+                tracing::debug!("Failed to add dynamic watch for {:?}: {}", path, e);
+            } else {
+                dynamic_watches.insert(path.clone());
+            }
+            changed_dirs.push(path.clone());
+        }
+    }
+    changed_dirs
+}
+
+/// Fast path: if all events are Create for distinct paths (≤ 10), apply
+/// immediately without debounce merge.  Returns `true` if the fast path was
+/// taken (caller should `continue`).
+fn try_fast_path(
+    raw_events: &mut Vec<notify::Event>,
+    seq: &mut u64,
+    index: &Arc<TieredIndex>,
+    total_events: &Arc<AtomicU64>,
+    last_batch_size: &Arc<AtomicU64>,
+) -> bool {
+    let all_create = raw_events
+        .iter()
+        .all(|ev| matches!(ev.kind, notify::EventKind::Create(_)));
+    if !all_create || raw_events.len() > 10 {
+        return false;
+    }
+    let mut fast_records: Vec<EventRecord> = Vec::with_capacity(raw_events.len());
+    for ev in raw_events.drain(..) {
+        if let Some(path) = ev.paths.into_iter().next() {
+            *seq = seq.wrapping_add(1);
+            fast_records.push(EventRecord {
+                seq: *seq,
+                timestamp: std::time::SystemTime::now(),
+                event_type: EventType::Create,
+                id: FileIdentifier::Path(path),
+                path_hint: None,
+            });
+        }
+    }
+    if !fast_records.is_empty() {
+        index.apply_events(&fast_records);
+        total_events.fetch_add(fast_records.len() as u64, Ordering::Relaxed);
+        last_batch_size.store(fast_records.len() as u64, Ordering::Relaxed);
+    }
+    true
+}
+
+/// Cross-batch Rename pairing: merge inotify-split From/To events into
+/// complete Rename events using the pending-moves tracker.
+async fn pair_pending_moves(
+    raw_events: &mut Vec<notify::Event>,
+    pending_moves: &Arc<tokio::sync::Mutex<PendingMoveMap>>,
+) {
+    let mut pm = pending_moves.lock().await;
+    let mut paired = Vec::new();
+    let mut to_remove = Vec::new();
+
+    for (idx, ev) in raw_events.iter().enumerate() {
+        if let notify::EventKind::Modify(notify::event::ModifyKind::Name(mode)) = ev.kind {
+            if let Some(tracker) = ev.tracker() {
+                match mode {
+                    notify::event::RenameMode::From => {
+                        pm.insert(tracker, (Instant::now(), ev.clone()));
+                        to_remove.push(idx);
+                    }
+                    notify::event::RenameMode::To => {
+                        if let Some((_, from_ev)) = pm.remove(&tracker) {
+                            if let (Some(from), Some(to)) =
+                                (from_ev.paths.first(), ev.paths.first())
+                            {
+                                let mut combined = notify::Event {
+                                    kind: notify::EventKind::Modify(
+                                        notify::event::ModifyKind::Name(
+                                            notify::event::RenameMode::Any,
+                                        ),
+                                    ),
+                                    paths: vec![from.clone(), to.clone()],
+                                    attrs: Default::default(),
+                                };
+                                combined.attrs.set_tracker(tracker);
+                                paired.push((idx, combined));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 替换已配对的 To 事件，并移除已存储的 From 事件
+    for (idx, ev) in paired {
+        if idx < raw_events.len() {
+            raw_events[idx] = ev;
+        }
+    }
+    for idx in to_remove.into_iter().rev() {
+        if idx < raw_events.len() {
+            raw_events.swap_remove(idx);
+        }
+    }
+}
+
+/// Idle maintenance: shrink over-allocated buffers and trim RSS at most once
+/// every 5 seconds.
+#[allow(clippy::too_many_arguments)]
+fn idle_maintenance(
+    last_idle_trim: &mut tokio::time::Instant,
+    last_idle_trim_total_events: &mut u64,
+    raw_events: &mut Vec<notify::Event>,
+    merge_scratch: &mut MergeScratch,
+    keep_cap: usize,
+    total_events: &Arc<AtomicU64>,
+    raw_events_capacity: &Arc<AtomicU64>,
+    merged_map_capacity: &Arc<AtomicU64>,
+    records_capacity: &Arc<AtomicU64>,
+) {
+    if last_idle_trim.elapsed() >= std::time::Duration::from_secs(5) {
+        let current_total = total_events.load(Ordering::Relaxed);
+        let mut shrunk = false;
+        shrunk |= shrink_if_large_vec(raw_events, keep_cap);
+        shrunk |= shrink_if_large_map(&mut merge_scratch.merged, keep_cap);
+        shrunk |= shrink_if_large_vec(&mut merge_scratch.records, keep_cap);
+        if shrunk {
+            // 同步更新观测值，便于 fs-churn 归因。
+            raw_events_capacity.store(raw_events.capacity() as u64, Ordering::Relaxed);
+            merged_map_capacity.store(merge_scratch.merged.capacity() as u64, Ordering::Relaxed);
+            records_capacity.store(merge_scratch.records.capacity() as u64, Ordering::Relaxed);
+        }
+        if current_total != *last_idle_trim_total_events {
+            maybe_trim_rss();
+            *last_idle_trim_total_events = current_total;
+        }
+        *last_idle_trim = tokio::time::Instant::now();
     }
 }
 
@@ -1490,7 +1671,9 @@ mod tests {
         assert!(results.iter().any(|meta| meta.path == to));
         assert!(!results.iter().any(|meta| meta.path == from_path));
 
-        let _ = std::fs::remove_dir_all(&root);
+        if let Err(e) = std::fs::remove_dir_all(&root) {
+            tracing::warn!("Failed to clean up test temp dir {:?}: {}", root, e);
+        }
     }
 
     #[test]
