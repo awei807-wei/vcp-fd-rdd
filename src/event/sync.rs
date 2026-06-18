@@ -1,6 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::stats::DirtyQueueStats;
@@ -418,11 +418,6 @@ impl DirtyScopeKey {
                 .unwrap_or_default(),
         }
     }
-}
-
-#[allow(dead_code)]
-fn _path_parent(path: &Path) -> Option<PathBuf> {
-    path.parent().map(Path::to_path_buf)
 }
 
 #[cfg(test)]
