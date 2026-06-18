@@ -128,6 +128,33 @@ pub fn unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Atomically write serializable data as pretty-printed JSON to `path`.
+///
+/// Creates the parent directory, writes to a `.tmp` sidecar, fsyncs, renames
+/// into place, and fsyncs the parent dir. The write closure receives a
+/// `&mut std::fs::File` so callers can use `serde_json::to_writer_pretty` or
+/// any other serialization method.
+pub fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {path:?}"))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        serde_json::to_writer_pretty(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Ok(dir_file) = std::fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
 /// Estimate how many directory watches `notify::RecursiveMode::Recursive` will register.
 ///
 /// This intentionally does not apply fd-rdd's scan/index `exclude_dirs`: notify still

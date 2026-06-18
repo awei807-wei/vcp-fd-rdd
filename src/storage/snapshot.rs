@@ -119,21 +119,8 @@ pub fn write_recovery_runtime_state(
     snapshot_path: &Path,
     state: &RecoveryRuntimeState,
 ) -> anyhow::Result<()> {
-    let dir = stable_snapshot_dir_for(snapshot_path);
-    std::fs::create_dir_all(&dir)?;
     let path = runtime_state_path_for(snapshot_path);
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        serde_json::to_writer_pretty(&mut file, state)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    if let Ok(dir_file) = std::fs::File::open(&dir) {
-        let _ = dir_file.sync_all();
-    }
-    Ok(())
+    crate::util::atomic_write_json(&path, state)
 }
 
 pub fn write_stable_v7_atomic(snapshot_path: &Path, base: &BaseIndexData) -> anyhow::Result<()> {

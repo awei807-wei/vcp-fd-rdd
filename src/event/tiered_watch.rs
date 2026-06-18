@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -3395,21 +3394,8 @@ fn write_fast_scan_registry_atomic(
     snapshot_path: &Path,
     registry: &FastScanPersistedRegistry,
 ) -> anyhow::Result<()> {
-    let dir = stable_snapshot_dir_for(snapshot_path);
-    std::fs::create_dir_all(&dir)?;
     let path = fast_scan_registry_path_for(snapshot_path);
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        serde_json::to_writer_pretty(&mut file, registry)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    if let Ok(dir_file) = std::fs::File::open(&dir) {
-        let _ = dir_file.sync_all();
-    }
-    Ok(())
+    crate::util::atomic_write_json(&path, registry)
 }
 
 fn fast_scan_config_fingerprint(config: &TieredWatchConfig) -> u64 {

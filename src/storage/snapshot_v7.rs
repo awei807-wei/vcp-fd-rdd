@@ -1629,10 +1629,7 @@ fn write_v7_segments_atomic_with_version(
     Ok(())
 }
 
-/// 从 v6 segments + delta 构建 v7 快照（排序归并后写入）。
-///
-/// 当前为框架实现：将 base（若提供）与 delta 直接拼接，未做真正归并。
-/// 后续完善为"base + delta → 去重排序 → v7"。
+/// 从 v6 segments + delta 构建 v7 快照（按 filekey 归并去重后写入）。
 pub fn snapshot_now_v7(
     path: &Path,
     base: Option<&BaseIndexData>,
@@ -1653,13 +1650,29 @@ pub fn snapshot_now_v7(
         merged.tombstones = b.tombstones.clone();
     }
 
-    // 再灌入 delta（简单追加；TODO: 真正归并去重）
-    for i in 0..delta.entries_by_key.len() {
-        if let Some(e) = delta.entries_by_key.get(i) {
-            merged.entries_by_key.push(*e);
+    // 灌入 delta，按 filekey 归并去重：delta 中的条目覆盖 base 中同 key 条目
+    // （delta 代表更新的状态）。使用 HashMap 做最终去重。
+
+    // 收集 base + delta 的所有条目，delta 在后覆盖 base
+    let mut latest_by_key: HashMap<FileKey, FileEntry> = HashMap::new();
+    for i in 0..merged.entries_by_key.len() {
+        if let Some(e) = merged.entries_by_key.get(i) {
+            latest_by_key.insert(e.file_key(), *e);
         }
     }
-    // trigram / parent / tombstones：简单合并（TODO: 真正归并）
+    for i in 0..delta.entries_by_key.len() {
+        if let Some(e) = delta.entries_by_key.get(i) {
+            latest_by_key.insert(e.file_key(), *e);
+        }
+    }
+
+    // 重建 entries_by_key
+    merged.entries_by_key = FileEntryIndex::new();
+    for (_, e) in latest_by_key {
+        merged.entries_by_key.push(e);
+    }
+
+    // trigram / parent / tombstones：合并时对 parent_index 做归并去重
     for (tri, bm) in &delta.trigram_index.inner {
         merged.trigram_index.insert(*tri, bm.clone());
     }
