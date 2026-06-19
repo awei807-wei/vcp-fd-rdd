@@ -14,7 +14,7 @@ use crate::index::parent_index::ParentIndex;
 use crate::index::path_table_v2::{PathTableBuilder, PathTableV2};
 use crate::query::Matcher;
 use crate::storage::checksum::{crc32c_checksum, Crc32c};
-use crate::util::pathbuf_from_encoded_vec;
+use crate::util::{align_up, read_u32};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // v7 单文件 mmap 格式常量
@@ -521,12 +521,6 @@ fn lookup_raw_path(bytes: &[u8], layout: RawPathTableLayout, target: &[u8]) -> O
     None
 }
 
-fn read_u32(bytes: &[u8], off: &mut usize) -> Option<u32> {
-    let value = u32::from_le_bytes(bytes.get(*off..*off + 4)?.try_into().ok()?);
-    *off += 4;
-    Some(value)
-}
-
 fn file_entry_rec_size(snapshot_version: u32) -> anyhow::Result<usize> {
     match snapshot_version {
         V7_VERSION => Ok(FILE_ENTRY_REC_SIZE),
@@ -561,19 +555,7 @@ fn file_entry_at(bytes: &[u8], snapshot_version: u32, docid: u32) -> Option<File
 }
 
 fn entry_to_meta(entry: FileEntry, path_bytes: Vec<u8>) -> FileMeta {
-    FileMeta {
-        file_key: entry.file_key(),
-        path: pathbuf_from_encoded_vec(path_bytes),
-        size: 0,
-        mtime: if entry.mtime_ns >= 0 {
-            Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(entry.mtime_ns as u64))
-        } else {
-            None
-        },
-        ctime: None,
-        atime: None,
-        kind: entry.kind(),
-    }
+    crate::util::entry_to_meta(&entry, &path_bytes)
 }
 
 fn posting_for_trigram(bytes: &[u8], tri: [u8; 3]) -> anyhow::Result<Option<RoaringBitmap>> {
@@ -1439,10 +1421,6 @@ pub fn shallow_validate_v7(path: &Path) -> anyhow::Result<bool> {
 // v7 写入：base + delta → 排序 → 归并 → atomic write v7 单文件
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn align_up(v: usize, a: usize) -> usize {
-    (v + (a - 1)) & !(a - 1)
-}
-
 /// 将 BaseIndexData 原子写入 v7 单文件（tmp + rename）。
 ///
 /// 写入流程：
@@ -1575,10 +1553,7 @@ fn write_v7_segments_atomic_with_version(
     let trailer_bytes = trailer.encode();
 
     // 组装文件
-    let tmp_path = path.with_extension("v7.tmp");
-    {
-        let mut file = std::fs::File::create(&tmp_path)?;
-
+    crate::storage::atomic_write(path, "v7.tmp", |file| {
         // Header（先占位，crc 后填）
         let mut header_buf = encode_header_with_version(num_segments, 0, version);
         file.write_all(&header_buf)?;
@@ -1609,16 +1584,8 @@ fn write_v7_segments_atomic_with_version(
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&header_buf)?;
 
-        file.sync_all()?;
-    }
-
-    // 原子替换
-    std::fs::rename(&tmp_path, path)?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+        Ok(())
+    })?;
 
     tracing::info!(
         "v7 snapshot written: {} segments, {} bytes",

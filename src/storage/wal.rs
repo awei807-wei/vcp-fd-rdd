@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::storage::checksum::crc32c_checksum;
+use crate::storage::fsync_dir;
 use crate::storage::quarantine::{MountIdentity, RootStateKind, RootStateRecord};
 
 pub(crate) const WAL_MAGIC: u32 = 0x314C_4157; // "WAL1"
@@ -437,9 +438,7 @@ impl WalStore {
         }
 
         // fsync(dir) after rename to ensure the directory entry is persisted.
-        if let Ok(dir) = std::fs::File::open(&self.dir) {
-            let _ = dir.sync_all();
-        }
+        fsync_dir(&self.dir);
 
         let newf = open_or_init(&self.current)?;
         *self.file.lock().unwrap_or_else(|e| e.into_inner()) = newf;
@@ -647,9 +646,7 @@ fn open_or_init(path: &Path) -> anyhow::Result<File> {
 
         // fsync(dir) after rename to ensure the directory entry is persisted.
         if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+            fsync_dir(parent);
         }
 
         let mut nf = OpenOptions::new()

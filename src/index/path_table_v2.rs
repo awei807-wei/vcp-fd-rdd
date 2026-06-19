@@ -6,6 +6,8 @@
 
 use std::cmp::Ordering;
 
+use crate::util::read_u32;
+
 /// Index into the path table.
 pub type PathIdx = u32;
 
@@ -179,11 +181,6 @@ impl PathTableV2 {
             return None;
         }
         let mut off = 8usize;
-        let read_u32 = |bytes: &[u8], off: &mut usize| -> Option<u32> {
-            let v = u32::from_le_bytes(bytes.get(*off..*off + 4)?.try_into().ok()?);
-            *off += 4;
-            Some(v)
-        };
         let slots_len = read_u32(bytes, &mut off)? as usize;
         let suffix_len = read_u32(bytes, &mut off)? as usize;
         let idx_len = read_u32(bytes, &mut off)? as usize;
