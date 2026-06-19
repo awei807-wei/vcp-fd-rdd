@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 去重 `l2_partition/export.rs` 段导出逻辑：抽取 `build_v6_segments()` 和 `write_v6_segments_to_writer()` 公共函数，`export_segments_v6` / `export_segments_v6_to_writer` 改为调用公共函数（完成方案包 `code-debt-cleanup-phase1` 最后一个未落实项）。
 - 修复 daemon 集成测试的并发串扰：`FdRddProcess` 现在默认为每个子进程隔离 `XDG_CONFIG_HOME` 与 `XDG_RUNTIME_DIR`，避免 `--no-watch` 测试持久化的配置影响 crash recovery/watcher 测试。
 
+### 代码审查修复（2026-06-19）
+
+- 修复 `util.rs` 分层违规：`entry_to_meta` 从底层 `util.rs` 移至 `index/mod.rs`，消除底层工具模块对领域类型的向上依赖。
+- 修复 `query/dsl.rs` 2 处 `unwrap_or(CompiledExpr::True)` / `unwrap_or(Expr::True)` 改为 `unwrap()`，消除不可达分支在重构后静默匹配所有文件的风险。
+- 修复 `storage/mod.rs` `fsync_dir` 静默吞掉目录打开失败：为 `File::open` 失败添加 `tracing::debug!` 日志。
+- 简化 `storage/snapshot.rs` `lsm_read_manifest` 的 `Ok(...?)` 模式为 `.map_err(Into::into)`。
+- `storage/error.rs` 添加 `StorageError` 迁移状态说明，明确标注已完成和待完成的迁移范围。
+- `storage/snapshot.rs` 为 `LoadedSnapshot` re-export 添加注释，说明与 `snapshot_legacy.rs` 的双向依赖是刻意设计。
+- 新增 `export_segments_v6` 和 `export_segments_v6_to_writer` 单元测试，验证 7 段输出完整性与顺序。
+
 ## [0.7.1] - 2026-06-13
 
 ### 质量加固
