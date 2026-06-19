@@ -2974,3 +2974,126 @@ fn periodic_cold_scan_bypasses_manifest_when_clock_cutoff_untrusted() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn materialize_self_heals_when_cold_base_resolves_nothing() {
+    use crate::index::base_index::BaseIndexData;
+    use crate::index::file_entry_v2::{FileEntry, FileEntryIndex};
+    use crate::index::path_table_v2::PathTableBuilder;
+
+    let root = unique_tmp_dir("materialize-selfheal");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // A base reporting many entries whose path_idx resolves to nothing: the
+    // exact shape of a misread cold base (file_count large, for_each ~0).
+    let mut entries = FileEntryIndex::new();
+    for ino in 0..20_000u64 {
+        entries.push(FileEntry::from_file_key(
+            FileKey {
+                dev: 1,
+                ino,
+                generation: 0,
+            },
+            999_999, // outside the (empty) path table
+            100,
+        ));
+    }
+    let corrupt_base = BaseIndexData {
+        path_table: PathTableBuilder::new().build(),
+        entries_by_key: entries.build(),
+        ..BaseIndexData::default()
+    };
+    assert_eq!(corrupt_base.file_count(), 20_000);
+
+    let l1 = L1Cache::with_capacity(16);
+    let l2 = Arc::new(PersistentIndex::new_with_roots(vec![root.clone()]));
+    let l3 = IndexBuilder::new(vec![root.clone()]);
+    let governor = Arc::new(IoGovernor::new(false, 1_000_000));
+    let idx = Arc::new(TieredIndex::new_with_base_and_io_governor(
+        l1,
+        l2,
+        l3,
+        vec![root.clone()],
+        false,
+        true,
+        false,
+        Vec::new(),
+        Some(corrupt_base),
+        governor,
+    ));
+
+    // Materialize must refuse to collapse the base into the tiny resolvable set,
+    // instead reporting corruption (which also triggers a full rebuild).
+    let err = idx
+        .materialize_snapshot_base()
+        .expect_err("corrupt cold base must abort materialization");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("corruption suspected"),
+        "unexpected error: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn snapshot_marks_clean_shutdown_only_after_begin_shutdown() -> anyhow::Result<()> {
+    use crate::storage::snapshot::read_recovery_runtime_state;
+
+    let root = unique_tmp_dir("clean-shutdown-marker");
+    let state = unique_tmp_dir("clean-shutdown-marker-state");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&state)?;
+    std::fs::write(root.join("a.txt"), b"hello")?;
+
+    let store = Arc::new(SnapshotStore::new(state.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, root.join("a.txt"))]);
+    idx.refresh_base();
+
+    // While running, a snapshot must leave the marker false so a real crash is
+    // detected on the next start.
+    idx.snapshot_now(store.clone()).await?;
+    let running = read_recovery_runtime_state(store.path())?;
+    assert!(
+        !running.last_clean_shutdown,
+        "running snapshot must keep last_clean_shutdown=false"
+    );
+
+    // After begin_shutdown the (final) snapshot must mark the shutdown clean.
+    idx.apply_events(&[mk_event(2, EventType::Create, root.join("a.txt"))]);
+    idx.refresh_base();
+    idx.begin_shutdown();
+    assert!(idx.is_shutting_down());
+    idx.snapshot_now(store.clone()).await?;
+    let shutting = read_recovery_runtime_state(store.path())?;
+    assert!(
+        shutting.last_clean_shutdown,
+        "snapshot during shutdown must set last_clean_shutdown=true"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_loop_exits_promptly_on_begin_shutdown() {
+    let root = unique_tmp_dir("loop-exits-shutdown");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = Arc::new(SnapshotStore::new(root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+
+    // Long interval: the loop would otherwise sleep for an hour. begin_shutdown
+    // must wake it and make it return.
+    let handle = tokio::spawn(idx.clone().snapshot_loop(store.clone(), 3600));
+    idx.begin_shutdown();
+
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    assert!(
+        joined.is_ok(),
+        "snapshot loop did not exit after begin_shutdown"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

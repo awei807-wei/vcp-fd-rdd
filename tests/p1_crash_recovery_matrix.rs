@@ -4,7 +4,8 @@
 mod common;
 
 use common::{
-    unique_port, unique_tmp_dir, wait_for_file_visible, wait_for_indexed_count, FdRddProcess,
+    unique_port, unique_tmp_dir, wait_for_file_visible, wait_for_indexed_count,
+    wait_for_watch_coverage, FdRddProcess,
 };
 use fd_rdd::storage::snapshot::{
     stable_v7_path_for, write_recovery_runtime_state, RecoveryRuntimeState,
@@ -27,6 +28,13 @@ fn abrupt_kill_restart_recovers_visible_incremental_file() {
         &["--snapshot-interval-secs", "3600", "--debounce-ms", "20"],
     );
     wait_for_indexed_count(port, 1, 15).unwrap();
+    // The startup scan finding the initial probe does not mean the live watcher
+    // is armed yet. Wait for watch coverage before creating the late file, or
+    // its CREATE event can be missed and it never becomes visible (CI flake).
+    assert!(
+        wait_for_watch_coverage(port, 15),
+        "watcher should cover the root before creating the late file"
+    );
 
     let late = root.join("crash_late_probe.txt");
     std::fs::write(&late, b"late").unwrap();

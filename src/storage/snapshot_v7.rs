@@ -47,7 +47,10 @@ const V7_HEADER_SIZE: usize = 64;
 const V7_TRAILER_FIXED_SIZE: usize = 4 + 4 + 4 + 4 + 8 + 8;
 const FILE_ENTRY_REC_SIZE: usize = 8 + 8 + 4 + 4 + 8;
 const LEGACY_FILE_ENTRY_REC_SIZE: usize = 8 + 8 + 4 + 4 + 8 + 8;
-const RAW_PATH_TABLE_MAGIC: &[u8; 8] = b"PTV2raw\0";
+/// Only the current path-table layout is read through the zero-copy mmap fast
+/// path. Snapshots carrying the legacy magic fall back to a full `decode_raw`
+/// (see `path_resolver`), which understands both legacy on-disk layouts.
+const RAW_PATH_TABLE_MAGIC: &[u8; 8] = b"PTV2rw2\0";
 const RAW_PATH_TABLE_HEADER_SIZE: usize = 8 + 4 * 4;
 const RAW_PATH_TABLE_SLOT_SIZE: usize = 12;
 const RAW_PATH_TABLE_ANCHOR_INTERVAL: usize = 256;
@@ -881,6 +884,62 @@ impl V7Snapshot {
         Ok(V7PathResolver::Decoded(decode_path_table(bytes)?))
     }
 
+    /// Load-time guard against silently misread path tables.
+    ///
+    /// The original defect: a legacy on-disk path table was decoded with the
+    /// wrong layout, so `file_count()` (from EntriesByKey) stayed large while
+    /// path resolution produced garbage and `for_each_live_meta` yielded ~0.
+    /// CRC checks pass in that case because the bytes are intact — only the
+    /// interpretation is wrong. Here we confirm the path table decodes and that
+    /// a live sample of entries actually resolves to non-empty paths; if not,
+    /// the snapshot is rejected so the caller can rebuild cleanly.
+    fn path_table_resolves_entries(&self) -> bool {
+        let resolver = match self.path_resolver() {
+            Ok(resolver) => resolver,
+            Err(e) => {
+                tracing::warn!("v7 path table failed to decode: {}", e);
+                return false;
+            }
+        };
+        let Some(entries) = self.segment(V7SegKind::EntriesByKey) else {
+            return true;
+        };
+        let Some(count) = entry_count_from_segment(entries, self.version) else {
+            return false;
+        };
+        if count == 0 {
+            return true;
+        }
+        let tombstones = self.tombstones().unwrap_or_default();
+
+        // Sample evenly across the table; checking ~256 live entries is enough
+        // to catch a wholesale misread without a full O(n) sweep at load.
+        let step = (count / 256).max(1);
+        let mut path_bytes = Vec::new();
+        let mut docid = 0usize;
+        while docid < count {
+            let id = docid as u32;
+            if !tombstones.contains(id) {
+                if let Some(entry) = file_entry_at(entries, self.version, id) {
+                    if resolver
+                        .resolve_into(entry.path_index(), &mut path_bytes)
+                        .is_none()
+                        || path_bytes.is_empty()
+                    {
+                        tracing::warn!(
+                            "v7 path table inconsistent: entry {} (path_idx={}) did not resolve",
+                            id,
+                            entry.path_index()
+                        );
+                        return false;
+                    }
+                }
+            }
+            docid += step;
+        }
+        true
+    }
+
     fn tombstones(&self) -> anyhow::Result<RoaringBitmap> {
         Ok(self
             .segment(V7SegKind::Tombstones)
@@ -1393,11 +1452,22 @@ pub fn load_v7_from_path(path: &Path) -> anyhow::Result<Option<V7Snapshot>> {
         }
     }
 
-    Ok(Some(V7Snapshot {
+    let snapshot = V7Snapshot {
         mmap: Arc::new(mmap),
         segments,
         version,
-    }))
+    };
+
+    // Structural CRCs are intact at this point, but that does not prove the
+    // path table is interpretable. Reject snapshots whose path table cannot be
+    // decoded or whose entries do not resolve, so a corrupt cold base triggers
+    // a clean rebuild instead of being silently misread.
+    if !snapshot.path_table_resolves_entries() {
+        tracing::warn!("v7 snapshot rejected: path table did not resolve entries, forcing rebuild");
+        return Ok(None);
+    }
+
+    Ok(Some(snapshot))
 }
 
 /// Lightweight v7 audit used during recovery routing.
@@ -1828,6 +1898,11 @@ mod tests {
     fn v7_roundtrip_base_index() {
         let path = tmp_v7_path("roundtrip");
         let mut data = BaseIndexData::default();
+        // Give the entry a resolvable path so the snapshot mirrors real bases
+        // (every file entry has a path-table entry) and passes load validation.
+        let mut paths = PathTableBuilder::new();
+        paths.push(0, b"/tmp/roundtrip/file.bin");
+        data.path_table = paths.build();
         data.entries_by_key.push(FileEntry::from_file_key(
             FileKey {
                 dev: 1,
@@ -1845,6 +1920,57 @@ mod tests {
 
         assert_eq!(decoded.entries_by_key.len(), 1);
         assert!(decoded.tombstones.contains(42));
+    }
+
+    #[test]
+    fn v7_rejects_snapshot_whose_entries_do_not_resolve() {
+        // A structurally valid, CRC-correct snapshot whose live entries point at
+        // path indices the path table cannot resolve. This is exactly the shape
+        // a misread cold base takes: file_count > 0 but resolution yields ~0.
+        // It must be rejected at load (Ok(None)) rather than silently accepted.
+        let path = tmp_v7_path("reject-unresolvable");
+        let mut paths = PathTableBuilder::new();
+        paths.push(0, b"/tmp/only/one.txt");
+        let mut entries = FileEntryIndex::new();
+        for ino in 0..2_000u64 {
+            // path_idx 999_999 is far outside the single-entry path table.
+            entries.push(FileEntry::from_file_key(
+                FileKey {
+                    dev: 9,
+                    ino,
+                    generation: 0,
+                },
+                999_999,
+                100,
+            ));
+        }
+        let data = BaseIndexData {
+            path_table: paths.build(),
+            entries_by_key: entries.build(),
+            ..BaseIndexData::default()
+        };
+
+        write_v7_snapshot_atomic(&path, &data).unwrap();
+        // CRC validation alone would accept it; the path-table guard must not.
+        assert!(
+            load_v7_from_path(&path).unwrap().is_none(),
+            "snapshot with unresolvable entries must be rejected"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v7_accepts_healthy_snapshot_with_extra_path_table_entries() {
+        // Path tables legitimately hold more entries than EntriesByKey (parent
+        // directories), so the guard must not key off an exact count match.
+        let path = tmp_v7_path("accept-extra-paths");
+        let (data, _) = sample_query_data();
+        write_v7_snapshot_atomic(&path, &data).unwrap();
+        assert!(
+            load_v7_from_path(&path).unwrap().is_some(),
+            "healthy snapshot with extra path-table entries must load"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

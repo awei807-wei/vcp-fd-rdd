@@ -279,6 +279,11 @@ pub struct TieredIndex {
     pub base: ArcSwap<crate::index::base_index::BaseIndexData>,
     pub(self) flush_requested: AtomicBool,
     pub(self) flush_notify: Notify,
+    /// Set once a termination signal has been received. From this point the
+    /// periodic snapshot loop exits and any snapshot writes the clean-shutdown
+    /// marker as `true`, so a late background snapshot cannot race the final
+    /// shutdown marker back to `false`.
+    pub(self) shutting_down: AtomicBool,
     pub(self) auto_flush_overlay_paths: AtomicU64,
     pub(self) auto_flush_overlay_bytes: AtomicU64,
     pub(self) periodic_flush_min_events: AtomicU64,
@@ -325,6 +330,20 @@ struct MemoryReportCache {
 impl TieredIndex {
     pub fn rebuild_in_progress(&self) -> bool {
         self.rebuild_state.lock().in_progress
+    }
+
+    /// Mark the index as shutting down. Call this once on a termination signal,
+    /// before the final snapshot, so the periodic snapshot loop stops and the
+    /// clean-shutdown marker can no longer be raced back to `false`.
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        // Wake the snapshot loop so it observes the flag and exits promptly
+        // instead of sleeping out the rest of its interval.
+        self.flush_notify.notify_one();
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
     }
 
     pub fn recovery_status(&self) -> RecoveryStatus {
