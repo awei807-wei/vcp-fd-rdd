@@ -13,6 +13,8 @@ __pycache__/
 /helloagents/
 /.helloagents/
 .snow/
+/AGENTS.md
+/scripts/setup-helloagents-snow.sh
 opus4.7-codex-suggestions/
 logs/*
 

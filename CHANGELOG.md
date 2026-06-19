@@ -48,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - 修复 `storage/snapshot_v7.rs` `snapshot_now_v7` 冗余双重排序：确定性修复已在重建 `entries_by_key` 时按 `FileKey` 排序，函数末尾的 `sort_by_key()` 为冗余二次排序，删除以消除每次快照写入的无谓 O(n log n) 开销。
 
+### CI 与快照合并修复（2026-06-19）
+
+- 修复 `storage/snapshot_v7.rs` `snapshot_now_v7` DocId 错位 bug：排序重建 `entries_by_key` 改变了 DocId（= 插入索引），但 `trigram_index`、`parent_index.dir_to_files`、`tombstones` 仍引用 base/delta 旧 DocId，导致 posting 与 tombstone 解析到错误路径。改为先确定最终条目顺序、分配新 DocId 并构建 old→new 映射，再对三个 DocId 索引逐一重映射后并集。
+- 修复 `storage/snapshot_v7.rs` `snapshot_now_v7` 硬链接别名丢失 bug：`HashMap<FileKey, FileEntry>` 按 FileKey 单键去重会折叠同 inode 不同路径的硬链接别名，合并后静默丢弃多余路径。去重键改为 `(FileKey, path_index())`，delta 仅覆盖完全相同键的条目，别名全部保留。
+- 新增两个单元测试：`snapshot_now_v7_remaps_docids_when_base_unsorted`（验证 base 未按 FileKey 排序时位图仍解析到正确路径）、`snapshot_now_v7_preserves_hardlink_aliases`（验证同 FileKey 不同 path_idx 的别名合并后均存活）。
+- CI 新增快速门禁 job `gate`（`cargo check --locked --all-targets`），所有需要编译的 job 声明 `needs: [gate]`，编译错误时 fail-fast 只挂 1 个 job，不再浪费 15 份并行 runner 时间。
+
 ## [0.7.1] - 2026-06-13
 
 ### 质量加固
