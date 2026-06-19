@@ -5,6 +5,24 @@
 //! domain-specific variants. Public APIs that are part of trait signatures
 //! or heavily used by external callers remain on `anyhow::Result` for
 //! compatibility; internal helpers are migrated to [`StorageResult`].
+//!
+//! ## Migration Status
+//!
+//! The migration from `anyhow::Result` to `StorageResult` is **incomplete**.
+//! Internal helper functions that decode binary segments have been migrated
+//! (`decode_path_table`, `decode_tombstones`, `lsm_decode_manifest_body`, etc.).
+//! The following categories remain on `anyhow::Result` by design:
+//!
+//! - **Public trait methods** (`WriteAheadLog`, `StorageBackend`) — trait
+//!   signatures use `anyhow::Result` for ecosystem compatibility.
+//! - **Top-level entry points** (`SnapshotStore::load_if_valid`,
+//!   `lsm_read_manifest`) — they aggregate multiple internal calls and
+//!   convert `StorageError` via `?` at the boundary.
+//! - **Async writers** (`write_atomic_v5_bincode`, `write_atomic_v6`) —
+//!   bincode serialization errors are not yet mapped to `StorageError`.
+//!
+//! TODO: complete the migration in a future pass, starting with the async
+//! writers and then the trait methods.
 
 use thiserror::Error;
 
