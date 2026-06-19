@@ -476,7 +476,10 @@ fn compile_expr(expr: &Expr, case_sensitive: bool) -> Result<CompiledExpr, Query
                     reason: "dupe filters are meta-filters and must be combined \
                              with other search criteria",
                 }),
-                1 => Ok(compiled.into_iter().next().unwrap()),
+                1 => Ok(compiled
+                    .into_iter()
+                    .next()
+                    .expect("compiled.len()==1 guarantees exactly one element")),
                 _ => Ok(CompiledExpr::And(compiled)),
             }
         }
@@ -988,7 +991,12 @@ fn build_or_and(
             continue;
         }
         if factors.len() == 1 {
-            built.push(factors.into_iter().next().unwrap());
+            built.push(
+                factors
+                    .into_iter()
+                    .next()
+                    .expect("factors.len()==1 guarantees exactly one element"),
+            );
         } else {
             built.push(Expr::And(factors));
         }

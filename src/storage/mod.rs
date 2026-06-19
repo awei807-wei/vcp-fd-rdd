@@ -28,7 +28,7 @@ pub(crate) fn fsync_dir(dir: &Path) {
             }
         }
         Err(e) => {
-            tracing::debug!("fsync_dir: could not open directory {:?}: {}", dir, e);
+            tracing::warn!("fsync_dir: could not open directory {:?}: {}", dir, e);
         }
     }
 }

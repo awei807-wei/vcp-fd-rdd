@@ -1253,8 +1253,7 @@ fn build_tiered_watch_plan(
     let required_set = required.iter().collect::<std::collections::HashSet<_>>();
     for candidate in required.iter() {
         let estimated = estimate_notify_recursive_watch_count(candidate, estimate_cap);
-        required_watch_cost =
-            required_watch_cost.saturating_add(u64::try_from(estimated).unwrap_or(0));
+        required_watch_cost = required_watch_cost.saturating_add(estimated as u64);
         if estimated <= l0_max_cost_per_root
             && estimated_total.saturating_add(estimated) <= max_watch_dirs
         {
@@ -1299,8 +1298,7 @@ fn build_tiered_watch_plan(
     if admitted.is_empty() {
         notes.push("no L0 directories admitted under current budget".to_string());
     }
-    let watch_budget_shortfall =
-        required_watch_cost.saturating_sub(u64::try_from(max_watch_dirs).unwrap_or(0));
+    let watch_budget_shortfall = required_watch_cost.saturating_sub(max_watch_dirs as u64);
     let strict_coverage_ok = tiered.profile != TieredWatchProfile::Strict
         || (strict_uncovered_dirs.is_empty() && watch_budget_shortfall == 0);
     let strict_coverage_failure =
@@ -1321,9 +1319,9 @@ fn build_tiered_watch_plan(
     let logical_watch_cost = admitted
         .iter()
         .chain(scan_roots.iter())
-        .map(|(_, cost)| u64::try_from(*cost).unwrap_or(0))
+        .map(|(_, cost)| *cost as u64)
         .fold(0u64, u64::saturating_add);
-    let kernel_watch_cost = u64::try_from(estimated_total).unwrap_or(0);
+    let kernel_watch_cost = estimated_total as u64;
     let skipped_watch_cost = logical_watch_cost.saturating_sub(kernel_watch_cost);
 
     let watch_roots = admitted
