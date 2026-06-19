@@ -470,14 +470,6 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
-/// Read a little-endian u32 at `*off`, advancing `*off`. Returns `None` on
-/// out-of-bounds rather than panicking.
-fn read_u32(bytes: &[u8], off: &mut usize) -> Option<u32> {
-    let v = u32::from_le_bytes(bytes.get(*off..*off + 4)?.try_into().ok()?);
-    *off += 4;
-    Some(v)
-}
-
 /// Encoded byte total implied by the current-layout header, or `None` on
 /// overflow / too-short input.
 fn raw_v2_total(bytes: &[u8]) -> Option<usize> {
