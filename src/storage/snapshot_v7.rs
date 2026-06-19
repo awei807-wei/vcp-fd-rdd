@@ -1689,9 +1689,6 @@ pub fn snapshot_now_v7(
     }
     merged.tombstones |= delta.tombstones.clone();
 
-    // 排序（key）
-    merged.entries_by_key.sort_by_key();
-
     write_v7_snapshot_atomic(path, &merged)
 }
 

@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 修复 `storage/mod.rs` `fsync_dir` 目录打开失败日志级别从 `debug!` 提升至 `warn!`，便于生产环境排查。
 - 新建 `storage/snapshot_common.rs`：提取 `MAGIC`/`STATE_COMMITTED`/`STATE_INCOMPLETE`/`HEADER_SIZE` 共享常量，消除 `snapshot.rs` 与 `snapshot_legacy.rs` 之间的双向模块依赖。
 
+### 代码审查修复第三轮（2026-06-19）
+
+- 修复 `storage/snapshot_v7.rs` `snapshot_now_v7` 冗余双重排序：确定性修复已在重建 `entries_by_key` 时按 `FileKey` 排序，函数末尾的 `sort_by_key()` 为冗余二次排序，删除以消除每次快照写入的无谓 O(n log n) 开销。
+
 ## [0.7.1] - 2026-06-13
 
 ### 质量加固
