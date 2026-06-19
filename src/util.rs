@@ -1,5 +1,8 @@
 use std::path::{Component, Path, PathBuf};
 
+use crate::core::FileMeta;
+use crate::index::file_entry_v2::FileEntry;
+
 // ── RSS trim：主动向 OS 归还空闲堆内存 ──
 
 #[cfg(feature = "mimalloc")]
@@ -186,6 +189,44 @@ pub fn estimate_notify_recursive_watch_count(root: &Path, cap: usize) -> usize {
     let limit = cap.max(1).saturating_add(1);
     walk(root, limit, &mut count);
     count.max(1)
+}
+
+// ── 数值/字节工具 ──
+
+/// Round `v` up to the next multiple of `a`. `a` must be a power of two.
+pub fn align_up(v: usize, a: usize) -> usize {
+    (v + (a - 1)) & !(a - 1)
+}
+
+/// Read a little-endian `u32` at `*off`, advancing `*off` by 4.
+/// Returns `None` if fewer than 4 bytes remain.
+pub fn read_u32(bytes: &[u8], off: &mut usize) -> Option<u32> {
+    let value = u32::from_le_bytes(bytes.get(*off..*off + 4)?.try_into().ok()?);
+    *off += 4;
+    Some(value)
+}
+
+// ── 索引元数据工具 ──
+
+/// Build a `FileMeta` from a `FileEntry` and its raw encoded path bytes.
+///
+/// `size`/`ctime`/`atime` are left as zero/`None` — the on-disk entry only
+/// carries `mtime`, matching the historical behaviour of the snapshot and
+/// base-index decoders.
+pub fn entry_to_meta(entry: &FileEntry, path_bytes: &[u8]) -> FileMeta {
+    FileMeta {
+        file_key: entry.file_key(),
+        path: pathbuf_from_encoded_vec(path_bytes.to_vec()),
+        size: 0,
+        mtime: if entry.mtime_ns >= 0 {
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(entry.mtime_ns as u64))
+        } else {
+            None
+        },
+        ctime: None,
+        atime: None,
+        kind: entry.kind(),
+    }
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ use crate::index::PathFreshness;
 use crate::query::Matcher;
 use crate::stats::BaseStats;
 use crate::storage::snapshot_v7::V7Snapshot;
-use crate::util::pathbuf_from_encoded_vec;
+use crate::util::{entry_to_meta, pathbuf_from_encoded_vec};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MmapWarmupReport {
@@ -840,22 +840,6 @@ fn cold_segment_id(path: &Path, generation: u64) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h ^ generation
-}
-
-fn entry_to_meta(entry: &FileEntry, path_bytes: &[u8]) -> FileMeta {
-    FileMeta {
-        file_key: entry.file_key(),
-        path: pathbuf_from_encoded_vec(path_bytes.to_vec()),
-        size: 0,
-        mtime: if entry.mtime_ns >= 0 {
-            Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(entry.mtime_ns as u64))
-        } else {
-            None
-        },
-        ctime: None,
-        atime: None,
-        kind: entry.kind(),
-    }
 }
 
 impl crate::index::IndexLayer for BaseIndexData {
