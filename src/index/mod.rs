@@ -9,7 +9,6 @@ pub mod l3_cold;
 pub mod mmap_index;
 pub mod parent_index;
 pub mod path_table_v2;
-pub mod pathtable;
 pub mod tiered;
 
 use crate::core::{FileKey, FileMeta};

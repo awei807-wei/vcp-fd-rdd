@@ -476,7 +476,7 @@ fn compile_expr(expr: &Expr, case_sensitive: bool) -> Result<CompiledExpr, Query
                     reason: "dupe filters are meta-filters and must be combined \
                              with other search criteria",
                 }),
-                1 => Ok(compiled.into_iter().next().unwrap()),
+                1 => Ok(compiled.into_iter().next().unwrap_or(CompiledExpr::True)),
                 _ => Ok(CompiledExpr::And(compiled)),
             }
         }
@@ -769,7 +769,9 @@ impl Parser {
                     };
                     let e = parse_atom_expr(&word, case_sensitive)?;
                     if !matches!(e, Expr::True) {
-                        branches.last_mut().expect("branches non-empty").push(e);
+                        if let Some(last) = branches.last_mut() {
+                            last.push(e);
+                        }
                     }
                 }
             }
@@ -986,7 +988,7 @@ fn build_or_and(
             continue;
         }
         if factors.len() == 1 {
-            built.push(factors.into_iter().next().unwrap());
+            built.push(factors.into_iter().next().unwrap_or(Expr::True));
         } else {
             built.push(Expr::And(factors));
         }
