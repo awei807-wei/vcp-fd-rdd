@@ -1,14 +1,55 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta};
 use crate::event::sync::{now_ns, DirtyReason};
 use crate::index::l2_partition::mtime_to_ns;
 
 use super::TieredIndex;
+
+/// 懒校验运行时状态子结构（外层容器）。
+///
+/// 注意：内部队列/缓存状态仍由 [`LazyValidationState`] 管理，
+/// 此处仅持有计数器、开关与同步原语。
+pub(super) struct LazyValidationRuntime {
+    pub enabled: AtomicBool,
+    pub cache_entries: AtomicU64,
+    pub ttl_ns: AtomicU64,
+    pub stat_per_sec: AtomicU64,
+    pub state: Mutex<LazyValidationState>,
+    pub notify: Notify,
+    pub enqueued: AtomicU64,
+    pub completed: AtomicU64,
+    pub stale_hits: AtomicU64,
+    pub cache_hits: AtomicU64,
+    pub rate_limited: AtomicU64,
+    pub queue_full: AtomicU64,
+}
+
+impl Default for LazyValidationRuntime {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            cache_entries: AtomicU64::new(4096),
+            ttl_ns: AtomicU64::new(10_000_000_000),
+            stat_per_sec: AtomicU64::new(50),
+            state: Mutex::new(LazyValidationState::default()),
+            notify: Notify::new(),
+            enqueued: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            stale_hits: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
+            queue_full: AtomicU64::new(0),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct LazyValidationState {
@@ -93,68 +134,77 @@ impl TieredIndex {
         ttl_secs: u64,
         stat_per_sec: u64,
     ) {
-        self.lazy_validation_enabled
+        self.lazy_validation
+            .enabled
             .store(enabled, Ordering::Relaxed);
-        self.lazy_validation_cache_entries
+        self.lazy_validation
+            .cache_entries
             .store(cache_entries.max(1) as u64, Ordering::Relaxed);
-        self.lazy_validation_ttl_ns.store(
+        self.lazy_validation.ttl_ns.store(
             Duration::from_secs(ttl_secs.max(1))
                 .as_nanos()
                 .min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
         );
-        self.lazy_validation_stat_per_sec
+        self.lazy_validation
+            .stat_per_sec
             .store(stat_per_sec.max(1), Ordering::Relaxed);
         if enabled {
-            self.lazy_validation_notify.notify_one();
+            self.lazy_validation.notify.notify_one();
         }
     }
 
     pub fn lazy_validation_report(&self) -> LazyValidationReport {
         LazyValidationReport {
-            enabled: self.lazy_validation_enabled.load(Ordering::Relaxed),
+            enabled: self.lazy_validation.enabled.load(Ordering::Relaxed),
             pending: self
-                .lazy_validation_state
+                .lazy_validation
+                .state
                 .try_lock()
                 .map(|state| state.len())
                 .unwrap_or(0),
-            enqueued: self.lazy_validation_enqueued.load(Ordering::Relaxed),
-            completed: self.lazy_validation_completed.load(Ordering::Relaxed),
-            stale_hits: self.lazy_validation_stale_hits.load(Ordering::Relaxed),
-            cache_hits: self.lazy_validation_cache_hits.load(Ordering::Relaxed),
-            rate_limited: self.lazy_validation_rate_limited.load(Ordering::Relaxed),
-            queue_full: self.lazy_validation_queue_full.load(Ordering::Relaxed),
+            enqueued: self.lazy_validation.enqueued.load(Ordering::Relaxed),
+            completed: self.lazy_validation.completed.load(Ordering::Relaxed),
+            stale_hits: self.lazy_validation.stale_hits.load(Ordering::Relaxed),
+            cache_hits: self.lazy_validation.cache_hits.load(Ordering::Relaxed),
+            rate_limited: self.lazy_validation.rate_limited.load(Ordering::Relaxed),
+            queue_full: self.lazy_validation.queue_full.load(Ordering::Relaxed),
         }
     }
 
     pub(super) fn lazy_validation_is_enabled(&self) -> bool {
-        self.lazy_validation_enabled.load(Ordering::Relaxed)
+        self.lazy_validation.enabled.load(Ordering::Relaxed)
     }
 
     pub(super) fn try_enqueue_lazy_validation(&self, meta: FileMeta) {
         let now = now_ns();
-        let ttl_ns = self.lazy_validation_ttl_ns.load(Ordering::Relaxed);
+        let ttl_ns = self.lazy_validation.ttl_ns.load(Ordering::Relaxed);
         let cache_entries = self
-            .lazy_validation_cache_entries
+            .lazy_validation
+            .cache_entries
             .load(Ordering::Relaxed)
             .max(1) as usize;
-        let Some(mut state) = self.lazy_validation_state.try_lock() else {
-            self.lazy_validation_rate_limited
+        let Some(mut state) = self.lazy_validation.state.try_lock() else {
+            self.lazy_validation
+                .rate_limited
                 .fetch_add(1, Ordering::Relaxed);
             return;
         };
         match state.try_enqueue(meta, now, ttl_ns, cache_entries) {
             LazyValidationEnqueue::Enqueued => {
-                self.lazy_validation_enqueued
+                self.lazy_validation
+                    .enqueued
                     .fetch_add(1, Ordering::Relaxed);
-                self.lazy_validation_notify.notify_one();
+                self.lazy_validation.notify.notify_one();
             }
             LazyValidationEnqueue::CacheHit => {
-                self.lazy_validation_cache_hits
+                self.lazy_validation
+                    .cache_hits
                     .fetch_add(1, Ordering::Relaxed);
             }
             LazyValidationEnqueue::QueueFull => {
-                self.lazy_validation_queue_full
+                self.lazy_validation
+                    .queue_full
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -165,19 +215,20 @@ impl TieredIndex {
         tokio::spawn(async move {
             let mut last_stat_ns = 0u64;
             loop {
-                if !index.lazy_validation_enabled.load(Ordering::Relaxed) {
-                    index.lazy_validation_notify.notified().await;
+                if !index.lazy_validation.enabled.load(Ordering::Relaxed) {
+                    index.lazy_validation.notify.notified().await;
                     continue;
                 }
 
-                let job = { index.lazy_validation_state.lock().pop() };
+                let job = { index.lazy_validation.state.lock().pop() };
                 let Some(job) = job else {
-                    index.lazy_validation_notify.notified().await;
+                    index.lazy_validation.notify.notified().await;
                     continue;
                 };
 
                 let stat_per_sec = index
-                    .lazy_validation_stat_per_sec
+                    .lazy_validation
+                    .stat_per_sec
                     .load(Ordering::Relaxed)
                     .max(1);
                 let min_interval_ns = 1_000_000_000u64 / stat_per_sec;
@@ -200,7 +251,8 @@ impl TieredIndex {
     fn validate_lazy_job(&self, job: LazyValidationJob) {
         let meta = job.meta;
         if self.path_is_frozen(meta.path.as_path()) || meta.mtime.is_none() {
-            self.lazy_validation_completed
+            self.lazy_validation
+                .completed
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -211,13 +263,15 @@ impl TieredIndex {
             Ok(m) if m.is_file() || m.is_dir() => m,
             Ok(_) => {
                 self.apply_lazy_delete(meta.path);
-                self.lazy_validation_completed
+                self.lazy_validation
+                    .completed
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.apply_lazy_delete(meta.path);
-                self.lazy_validation_completed
+                self.lazy_validation
+                    .completed
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -227,7 +281,8 @@ impl TieredIndex {
                     meta.path.display(),
                     e
                 );
-                self.lazy_validation_completed
+                self.lazy_validation
+                    .completed
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -242,7 +297,8 @@ impl TieredIndex {
 
         if changed {
             self.stats.record_query_stale_hits(1);
-            self.lazy_validation_stale_hits
+            self.lazy_validation
+                .stale_hits
                 .fetch_add(1, Ordering::Relaxed);
             self.enqueue_lazy_dirty_parent(meta.path.as_path());
             let event = EventRecord {
@@ -264,13 +320,15 @@ impl TieredIndex {
             self.apply_upserted_metas_inner(std::slice::from_ref(&event), &mut metas, true);
         }
 
-        self.lazy_validation_completed
+        self.lazy_validation
+            .completed
             .fetch_add(1, Ordering::Relaxed);
     }
 
     fn apply_lazy_delete(&self, path: PathBuf) {
         self.stats.record_query_stale_hits(1);
-        self.lazy_validation_stale_hits
+        self.lazy_validation
+            .stale_hits
             .fetch_add(1, Ordering::Relaxed);
         self.enqueue_lazy_dirty_parent(path.as_path());
         let event = EventRecord {

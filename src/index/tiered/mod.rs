@@ -24,7 +24,7 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use crate::config::{ContentIndexConfig, MmapWarmupConfig, QueryConfig, RuntimeProfileSettings};
+use crate::config::{MmapWarmupConfig, QueryConfig, RuntimeProfileSettings};
 use crate::core::AdaptiveScheduler;
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource, RootCasePolicyDiagnostics};
 use crate::event::sync::DirtyQueue;
@@ -270,31 +270,9 @@ pub struct TieredIndex {
     pub(self) mount_policy_counters: Arc<SharedMountPolicyCounters>,
     pub(self) io_governor: Arc<crate::io_governor::IoGovernor>,
     pub(self) stats: Arc<StatsCollector>,
-    pub(self) content_index_enabled: AtomicBool,
-    pub(self) content_index_config: Mutex<ContentIndexConfig>,
-    pub(self) content_index_docs: Mutex<std::collections::HashMap<PathBuf, String>>,
-    pub(self) content_indexed_paths: AtomicU64,
-    pub(self) content_indexed_bytes: AtomicU64,
-    pub(self) content_index_last_elapsed_ms: AtomicU64,
-    pub(self) content_hash_queue_pending: AtomicU64,
-    pub(self) content_hash_candidate_count: AtomicU64,
-    pub(self) content_hash_confirmed_groups: AtomicU64,
-    pub(self) content_hash_skipped_count: AtomicU64,
-    pub(self) content_hash_last_elapsed_ms: AtomicU64,
-    pub(self) content_hash_last_skip_reason: Mutex<String>,
+    pub(self) content: content::ContentIndexState,
     pub(self) directory_manifests: DirectoryManifestStore,
-    pub(self) lazy_validation_enabled: AtomicBool,
-    pub(self) lazy_validation_cache_entries: AtomicU64,
-    pub(self) lazy_validation_ttl_ns: AtomicU64,
-    pub(self) lazy_validation_stat_per_sec: AtomicU64,
-    pub(self) lazy_validation_state: Mutex<lazy_validation::LazyValidationState>,
-    pub(self) lazy_validation_notify: Notify,
-    pub(self) lazy_validation_enqueued: AtomicU64,
-    pub(self) lazy_validation_completed: AtomicU64,
-    pub(self) lazy_validation_stale_hits: AtomicU64,
-    pub(self) lazy_validation_cache_hits: AtomicU64,
-    pub(self) lazy_validation_rate_limited: AtomicU64,
-    pub(self) lazy_validation_queue_full: AtomicU64,
+    pub(self) lazy_validation: lazy_validation::LazyValidationRuntime,
     pub(self) query_max_verify_per_query: AtomicU64,
     pub(self) query_verify_timeout_ms: AtomicU64,
     pub(self) runtime_subtree_tombstone_ttl_secs: AtomicU64,
@@ -780,24 +758,24 @@ impl DiagnosticSource for TieredIndex {
         let l2_physical = self.l2.load().physical_dedupe_stats();
         report.storage.hardlink_group_count = l2_physical.hardlink_group_count;
         report.storage.hardlink_max_group_size = l2_physical.max_group_size;
-        report.storage.content_index_enabled = self.content_index_enabled.load(Ordering::Relaxed);
+        report.storage.content_index_enabled = self.content.enabled.load(Ordering::Relaxed);
         report.storage.content_indexed_paths =
-            self.content_indexed_paths.load(Ordering::Relaxed) as usize;
-        report.storage.content_indexed_bytes = self.content_indexed_bytes.load(Ordering::Relaxed);
+            self.content.indexed_paths.load(Ordering::Relaxed) as usize;
+        report.storage.content_indexed_bytes = self.content.indexed_bytes.load(Ordering::Relaxed);
         report.storage.content_index_last_elapsed_ms =
-            self.content_index_last_elapsed_ms.load(Ordering::Relaxed);
+            self.content.last_elapsed_ms.load(Ordering::Relaxed);
         report.storage.content_hash_queue_pending =
-            self.content_hash_queue_pending.load(Ordering::Relaxed) as usize;
+            self.content.hash_queue_pending.load(Ordering::Relaxed) as usize;
         report.storage.content_hash_candidate_count =
-            self.content_hash_candidate_count.load(Ordering::Relaxed) as usize;
+            self.content.hash_candidate_count.load(Ordering::Relaxed) as usize;
         report.storage.content_hash_confirmed_groups =
-            self.content_hash_confirmed_groups.load(Ordering::Relaxed) as usize;
+            self.content.hash_confirmed_groups.load(Ordering::Relaxed) as usize;
         report.storage.content_hash_skipped_count =
-            self.content_hash_skipped_count.load(Ordering::Relaxed) as usize;
+            self.content.hash_skipped_count.load(Ordering::Relaxed) as usize;
         report.storage.content_hash_last_elapsed_ms =
-            self.content_hash_last_elapsed_ms.load(Ordering::Relaxed);
+            self.content.hash_last_elapsed_ms.load(Ordering::Relaxed);
         report.storage.content_hash_last_skip_reason =
-            self.content_hash_last_skip_reason.lock().clone();
+            self.content.hash_last_skip_reason.lock().clone();
         report.storage.case_policy_roots = self.root_case_policy_diagnostics();
         report.storage.case_policy_conflict_count = report
             .storage

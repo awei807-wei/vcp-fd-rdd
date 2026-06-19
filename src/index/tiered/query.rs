@@ -996,16 +996,20 @@ impl TieredIndex {
     }
 
     fn record_content_dupe_outcome(&self, outcome: &ContentDupeOutcome) {
-        self.content_hash_queue_pending.store(0, Ordering::Relaxed);
-        self.content_hash_candidate_count
+        self.content.hash_queue_pending.store(0, Ordering::Relaxed);
+        self.content
+            .hash_candidate_count
             .store(outcome.candidate_count as u64, Ordering::Relaxed);
-        self.content_hash_confirmed_groups
+        self.content
+            .hash_confirmed_groups
             .store(outcome.confirmed_groups as u64, Ordering::Relaxed);
-        self.content_hash_skipped_count
+        self.content
+            .hash_skipped_count
             .store(outcome.skipped_count as u64, Ordering::Relaxed);
-        self.content_hash_last_elapsed_ms
+        self.content
+            .hash_last_elapsed_ms
             .store(outcome.elapsed_ms, Ordering::Relaxed);
-        *self.content_hash_last_skip_reason.lock() = outcome.last_skip_reason.clone();
+        *self.content.hash_last_skip_reason.lock() = outcome.last_skip_reason.clone();
     }
 }
 
@@ -1138,7 +1142,7 @@ fn content_duplicate_paths(
     let started = Instant::now();
     let mut outcome = ContentDupeOutcome::default();
     let mut by_size: HashMap<u64, Vec<ContentDupeCandidate>> = HashMap::new();
-    let config = index.content_index_config.lock().clone();
+    let config = index.content.config.lock().clone();
     let fs_policy = FsPolicy::current_with_config(index.fs_policy_config());
 
     for meta in metas {
