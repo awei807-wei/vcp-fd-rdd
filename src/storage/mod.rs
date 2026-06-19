@@ -5,6 +5,7 @@ pub mod quarantine;
 pub mod recovery_audit;
 pub mod serde;
 pub mod snapshot;
+pub mod snapshot_common;
 pub mod snapshot_legacy;
 pub mod snapshot_v7;
 pub mod traits;
