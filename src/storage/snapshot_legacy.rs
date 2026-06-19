@@ -11,9 +11,8 @@ use crate::index::l2_partition::{
     IndexSnapshotV2, IndexSnapshotV3, IndexSnapshotV4, IndexSnapshotV5, PersistentIndex,
 };
 use crate::storage::checksum::Crc32c;
-use crate::storage::snapshot::{
-    SnapshotStore, HEADER_SIZE, MAGIC, STATE_COMMITTED, STATE_INCOMPLETE,
-};
+use crate::storage::snapshot::SnapshotStore;
+use crate::storage::snapshot_common::{HEADER_SIZE, MAGIC, STATE_COMMITTED, STATE_INCOMPLETE};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Legacy version constants

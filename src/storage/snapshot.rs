@@ -12,23 +12,17 @@ use tokio::fs;
 
 // LoadedSnapshot is defined in snapshot_legacy.rs but re-exported here so
 // existing callers that reference `snapshot::LoadedSnapshot` continue to work.
-// snapshot_legacy.rs imports constants (MAGIC, HEADER_SIZE, etc.) from this
-// module — this bidirectional dependency is intentional: the legacy code is
-// an extension of the main snapshot module, not an independent component.
-// If this becomes a maintenance burden, extract shared constants to a
-// `snapshot_common` module.
+// Shared constants (MAGIC, HEADER_SIZE, etc.) now live in `snapshot_common`
+// to avoid a bidirectional dependency between this module and
+// `snapshot_legacy`.
+use crate::storage::snapshot_common::{HEADER_SIZE, MAGIC, STATE_COMMITTED, STATE_INCOMPLETE};
 use crate::storage::snapshot_legacy;
 pub use crate::storage::snapshot_legacy::LoadedSnapshot;
 
-/// 索引文件 Header
-pub(crate) const MAGIC: u32 = 0xFDDD_0002;
 const VERSION_V6: u32 = 6; // legacy: SimpleChecksum
+
 const VERSION_V7: u32 = 7; // CRC32C (Castagnoli)
 const VERSION_CURRENT: u32 = VERSION_V7;
-pub(crate) const STATE_COMMITTED: u32 = 0x0000_0001;
-pub(crate) const STATE_INCOMPLETE: u32 = 0xFFFF_FFFF;
-pub(crate) const HEADER_SIZE: usize = 4 + 4 + 4 + 4 + 4; // magic + version + state + data_len + checksum
-
 // Safety guards: prevent memory DoS via corrupted headers/segments.
 const MAX_V6_MANIFEST_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 const MAX_V6_ROOTS_SEGMENT_BYTES: u64 = 1024 * 1024; // 1 MiB
