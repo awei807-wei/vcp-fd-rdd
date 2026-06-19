@@ -324,6 +324,17 @@ pub struct WatchStateReport {
     pub proc_sampler_triggered_watches: u64,
     pub proc_sampler_budget_exhausted: bool,
     pub proc_sampler_unavailable: bool,
+    // ── Waterline alarm (adaptive L3 scan degradation) ──────────────────────
+    /// True when soft degradation is active (rotating budget reduced).
+    pub waterline_soft_degraded: bool,
+    /// True when hard degradation is active (L3 interval overridden to 1 day).
+    pub waterline_hard_degraded: bool,
+    /// The L3 scan interval actually in effect (may differ from configured
+    /// when hard degradation is active).
+    pub waterline_effective_l3_scan_interval_secs: u64,
+    /// The rotating cold-window budget actually in effect (may differ from
+    /// configured when soft degradation is active).
+    pub waterline_effective_rotating_budget: usize,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]

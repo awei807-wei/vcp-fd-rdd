@@ -422,6 +422,24 @@ pub struct TieredWatchConfig {
     pub strict_required_hot_dirs: Vec<PathBuf>,
     /// Treat strict required coverage shortfall as degraded health instead of warning.
     pub strict_fail_on_budget_exceeded: bool,
+    // ── Waterline alarm (adaptive L3 scan degradation) ──────────────────────
+    /// Master switch for the waterline alarm backpressure mechanism.
+    pub waterline_alarm_enabled: bool,
+    /// Fast-scan SLA in milliseconds used as the soft-degradation baseline.
+    pub waterline_sla_ms: u64,
+    /// Soft trigger threshold as a fraction of the SLA (default 0.8 = 80%).
+    pub waterline_soft_trigger_pct: f64,
+    /// Soft recovery threshold as a fraction of the SLA (default 0.4 = 40%).
+    pub waterline_soft_recover_pct: f64,
+    /// Hard trigger threshold as a fraction of the L2 scan interval (default 0.8).
+    pub waterline_hard_trigger_pct: f64,
+    /// Hard recovery threshold as a fraction of the L2 scan interval (default 0.4).
+    pub waterline_hard_recover_pct: f64,
+    /// L3 scan interval (seconds) forced when hard degradation is active.
+    pub waterline_hard_degraded_l3_interval_secs: u64,
+    /// Fraction by which the rotating cold-window budget is reduced during soft
+    /// degradation (default 0.5 = reduce to 50% of configured budget).
+    pub waterline_soft_budget_reduction_pct: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -573,6 +591,41 @@ impl TieredWatchConfig {
                 return Err("rotating_cold_window_max_dirs_per_tick must be >= 1".to_string());
             }
         }
+        // Waterline alarm validation.
+        if self.waterline_alarm_enabled {
+            if self.waterline_sla_ms == 0 {
+                return Err("waterline_sla_ms must be > 0".to_string());
+            }
+            if self.waterline_hard_degraded_l3_interval_secs == 0 {
+                return Err("waterline_hard_degraded_l3_interval_secs must be > 0".to_string());
+            }
+            for (name, val) in [
+                (
+                    "waterline_soft_trigger_pct",
+                    self.waterline_soft_trigger_pct,
+                ),
+                (
+                    "waterline_soft_recover_pct",
+                    self.waterline_soft_recover_pct,
+                ),
+                (
+                    "waterline_hard_trigger_pct",
+                    self.waterline_hard_trigger_pct,
+                ),
+                (
+                    "waterline_hard_recover_pct",
+                    self.waterline_hard_recover_pct,
+                ),
+                (
+                    "waterline_soft_budget_reduction_pct",
+                    self.waterline_soft_budget_reduction_pct,
+                ),
+            ] {
+                if !(0.0..=1.0).contains(&val) {
+                    return Err(format!("{name} must be in [0.0, 1.0], got {val}"));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -621,6 +674,14 @@ impl Default for TieredWatchConfig {
             hot_dirs: default_hot_dirs(),
             strict_required_hot_dirs: default_hot_dirs(),
             strict_fail_on_budget_exceeded: true,
+            waterline_alarm_enabled: true,
+            waterline_sla_ms: 5_000,
+            waterline_soft_trigger_pct: 0.8,
+            waterline_soft_recover_pct: 0.4,
+            waterline_hard_trigger_pct: 0.8,
+            waterline_hard_recover_pct: 0.4,
+            waterline_hard_degraded_l3_interval_secs: 86_400,
+            waterline_soft_budget_reduction_pct: 0.5,
         }
     }
 }
@@ -674,6 +735,14 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             hot_dirs: Vec<PathBuf>,
             strict_required_hot_dirs: Vec<PathBuf>,
             strict_fail_on_budget_exceeded: bool,
+            waterline_alarm_enabled: bool,
+            waterline_sla_ms: u64,
+            waterline_soft_trigger_pct: f64,
+            waterline_soft_recover_pct: f64,
+            waterline_hard_trigger_pct: f64,
+            waterline_hard_recover_pct: f64,
+            waterline_hard_degraded_l3_interval_secs: u64,
+            waterline_soft_budget_reduction_pct: f64,
         }
 
         impl Default for RawTieredWatchConfig {
@@ -730,6 +799,16 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
                     hot_dirs: defaults.hot_dirs,
                     strict_required_hot_dirs: defaults.strict_required_hot_dirs,
                     strict_fail_on_budget_exceeded: defaults.strict_fail_on_budget_exceeded,
+                    waterline_alarm_enabled: defaults.waterline_alarm_enabled,
+                    waterline_sla_ms: defaults.waterline_sla_ms,
+                    waterline_soft_trigger_pct: defaults.waterline_soft_trigger_pct,
+                    waterline_soft_recover_pct: defaults.waterline_soft_recover_pct,
+                    waterline_hard_trigger_pct: defaults.waterline_hard_trigger_pct,
+                    waterline_hard_recover_pct: defaults.waterline_hard_recover_pct,
+                    waterline_hard_degraded_l3_interval_secs: defaults
+                        .waterline_hard_degraded_l3_interval_secs,
+                    waterline_soft_budget_reduction_pct: defaults
+                        .waterline_soft_budget_reduction_pct,
                 }
             }
         }
@@ -798,6 +877,14 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             hot_dirs: raw.hot_dirs,
             strict_required_hot_dirs: raw.strict_required_hot_dirs,
             strict_fail_on_budget_exceeded: raw.strict_fail_on_budget_exceeded,
+            waterline_alarm_enabled: raw.waterline_alarm_enabled,
+            waterline_sla_ms: raw.waterline_sla_ms,
+            waterline_soft_trigger_pct: raw.waterline_soft_trigger_pct,
+            waterline_soft_recover_pct: raw.waterline_soft_recover_pct,
+            waterline_hard_trigger_pct: raw.waterline_hard_trigger_pct,
+            waterline_hard_recover_pct: raw.waterline_hard_recover_pct,
+            waterline_hard_degraded_l3_interval_secs: raw.waterline_hard_degraded_l3_interval_secs,
+            waterline_soft_budget_reduction_pct: raw.waterline_soft_budget_reduction_pct,
         })
     }
 }
@@ -1223,6 +1310,66 @@ rotating_cold_window_max_dirs_per_tick = 3
         assert_eq!(cfg.tiered_watch.rotating_cold_window_ttl_secs, 11);
         assert_eq!(cfg.tiered_watch.rotating_cold_window_max_cost_per_root, 7);
         assert_eq!(cfg.tiered_watch.rotating_cold_window_max_dirs_per_tick, 3);
+    }
+
+    #[test]
+    fn tiered_watch_waterline_alarm_defaults() {
+        let cfg = Config::default();
+        assert!(cfg.tiered_watch.waterline_alarm_enabled);
+        assert_eq!(cfg.tiered_watch.waterline_sla_ms, 5_000);
+        assert_eq!(cfg.tiered_watch.waterline_soft_trigger_pct, 0.8);
+        assert_eq!(cfg.tiered_watch.waterline_soft_recover_pct, 0.4);
+        assert_eq!(cfg.tiered_watch.waterline_hard_trigger_pct, 0.8);
+        assert_eq!(cfg.tiered_watch.waterline_hard_recover_pct, 0.4);
+        assert_eq!(
+            cfg.tiered_watch.waterline_hard_degraded_l3_interval_secs,
+            86_400
+        );
+        assert_eq!(cfg.tiered_watch.waterline_soft_budget_reduction_pct, 0.5);
+    }
+
+    #[test]
+    fn tiered_watch_waterline_alarm_overrides_parse() {
+        let cfg: Config = toml::from_str(
+            r#"
+roots = ["~"]
+watch_mode = "tiered"
+
+[tiered_watch]
+waterline_alarm_enabled = false
+waterline_sla_ms = 3000
+waterline_soft_trigger_pct = 0.9
+waterline_soft_recover_pct = 0.3
+waterline_hard_trigger_pct = 0.7
+waterline_hard_recover_pct = 0.2
+waterline_hard_degraded_l3_interval_secs = 43200
+waterline_soft_budget_reduction_pct = 0.25
+"#,
+        )
+        .expect("waterline alarm config should parse");
+
+        assert!(!cfg.tiered_watch.waterline_alarm_enabled);
+        assert_eq!(cfg.tiered_watch.waterline_sla_ms, 3000);
+        assert_eq!(cfg.tiered_watch.waterline_soft_trigger_pct, 0.9);
+        assert_eq!(cfg.tiered_watch.waterline_soft_recover_pct, 0.3);
+        assert_eq!(cfg.tiered_watch.waterline_hard_trigger_pct, 0.7);
+        assert_eq!(cfg.tiered_watch.waterline_hard_recover_pct, 0.2);
+        assert_eq!(
+            cfg.tiered_watch.waterline_hard_degraded_l3_interval_secs,
+            43200
+        );
+        assert_eq!(cfg.tiered_watch.waterline_soft_budget_reduction_pct, 0.25);
+    }
+
+    #[test]
+    fn tiered_watch_waterline_alarm_validation_rejects_invalid_pct() {
+        let mut cfg = Config::default();
+        cfg.tiered_watch.waterline_soft_trigger_pct = 1.5;
+        assert!(cfg.tiered_watch.validate().is_err());
+
+        cfg.tiered_watch.waterline_soft_trigger_pct = 0.8;
+        cfg.tiered_watch.waterline_sla_ms = 0;
+        assert!(cfg.tiered_watch.validate().is_err());
     }
 
     #[test]

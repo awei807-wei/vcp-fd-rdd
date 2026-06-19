@@ -159,6 +159,10 @@ pub struct WatcherDiagnostics {
     pub proc_sampler_triggered_watches: u64,
     pub proc_sampler_budget_exhausted: bool,
     pub proc_sampler_unavailable: bool,
+    pub waterline_soft_degraded: bool,
+    pub waterline_hard_degraded: bool,
+    pub waterline_effective_l3_scan_interval_secs: u64,
+    pub waterline_effective_rotating_budget: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

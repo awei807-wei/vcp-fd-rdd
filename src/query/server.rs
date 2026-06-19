@@ -128,6 +128,10 @@ pub struct HealthTelemetry {
     pub proc_sampler_triggered_watches: u64,
     pub proc_sampler_budget_exhausted: bool,
     pub proc_sampler_unavailable: bool,
+    pub waterline_soft_degraded: bool,
+    pub waterline_hard_degraded: bool,
+    pub waterline_effective_l3_scan_interval_secs: u64,
+    pub waterline_effective_rotating_budget: usize,
     pub diagnostics: DiagnosticReport,
 }
 
@@ -278,6 +282,10 @@ pub struct HealthResponse {
     pub proc_sampler_triggered_watches: u64,
     pub proc_sampler_budget_exhausted: bool,
     pub proc_sampler_unavailable: bool,
+    pub waterline_soft_degraded: bool,
+    pub waterline_hard_degraded: bool,
+    pub waterline_effective_l3_scan_interval_secs: u64,
+    pub waterline_effective_rotating_budget: usize,
     pub diagnostics: DiagnosticReport,
     pub issues: Vec<String>,
 }
@@ -738,6 +746,14 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     diagnostics.watchers.proc_sampler_triggered_watches = health.proc_sampler_triggered_watches;
     diagnostics.watchers.proc_sampler_budget_exhausted = health.proc_sampler_budget_exhausted;
     diagnostics.watchers.proc_sampler_unavailable = health.proc_sampler_unavailable;
+    diagnostics.watchers.waterline_soft_degraded = health.waterline_soft_degraded;
+    diagnostics.watchers.waterline_hard_degraded = health.waterline_hard_degraded;
+    diagnostics
+        .watchers
+        .waterline_effective_l3_scan_interval_secs =
+        health.waterline_effective_l3_scan_interval_secs;
+    diagnostics.watchers.waterline_effective_rotating_budget =
+        health.waterline_effective_rotating_budget;
 
     Json(HealthResponse {
         status: "ok",
@@ -844,6 +860,10 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         proc_sampler_triggered_watches: health.proc_sampler_triggered_watches,
         proc_sampler_budget_exhausted: health.proc_sampler_budget_exhausted,
         proc_sampler_unavailable: health.proc_sampler_unavailable,
+        waterline_soft_degraded: health.waterline_soft_degraded,
+        waterline_hard_degraded: health.waterline_hard_degraded,
+        waterline_effective_l3_scan_interval_secs: health.waterline_effective_l3_scan_interval_secs,
+        waterline_effective_rotating_budget: health.waterline_effective_rotating_budget,
         diagnostics,
         issues,
     })
@@ -1151,6 +1171,10 @@ mod tests {
             proc_sampler_triggered_watches: 10,
             proc_sampler_budget_exhausted: false,
             proc_sampler_unavailable: false,
+            waterline_soft_degraded: false,
+            waterline_hard_degraded: false,
+            waterline_effective_l3_scan_interval_secs: 21600,
+            waterline_effective_rotating_budget: 128,
             diagnostics: DiagnosticReport::default(),
             issues: Vec::new(),
         })

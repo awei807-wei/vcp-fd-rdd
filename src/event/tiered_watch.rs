@@ -579,7 +579,269 @@ struct RotatingColdWindowLease {
     watch_cost: u64,
 }
 
-#[derive(Debug)]
+// ════════════════════════════════════════════════════════════════════════════
+// Waterline alarm — adaptive L3 scan degradation
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Number of consecutive below-recovery-threshold checks required to clear
+/// soft degradation.
+const WATERLINE_SOFT_RECOVERY_CHECKS: u32 = 3;
+/// Number of consecutive below-recovery-threshold checks required to clear
+/// hard degradation.
+const WATERLINE_HARD_RECOVERY_CHECKS: u32 = 5;
+
+/// Immutable configuration snapshot for the waterline alarm.
+///
+/// All thresholds are expressed as fractions so the alarm can compare the
+/// observed `fast_scan_coverage_lag_p99_ms` against two independent baselines:
+///
+/// * **Soft** — compared against the fast-scan SLA (`sla_ms`). When the p99
+///   lag exceeds `soft_trigger_pct` of the SLA the rotating cold-window budget
+///   is reduced. Recovery happens once lag drops below
+///   `soft_recover_pct` for `WATERLINE_SOFT_RECOVERY_CHECKS` checks.
+///
+/// * **Hard** — compared against the L2 scan interval (converted to ms).
+///   When the p99 lag exceeds `hard_trigger_pct` of the L2 interval the L3
+///   scan interval is overridden to `hard_degraded_l3_interval_secs`.
+///   Recovery requires `hard_recover_pct` for
+///   `WATERLINE_HARD_RECOVERY_CHECKS` checks.
+///
+/// Hysteresis (trigger at a higher fraction, recover at a lower one) prevents
+/// oscillation around the threshold.
+#[derive(Debug, Clone)]
+struct WaterlineAlarmConfig {
+    enabled: bool,
+    sla_ms: u64,
+    soft_trigger_pct: f64,
+    soft_recover_pct: f64,
+    hard_trigger_pct: f64,
+    hard_recover_pct: f64,
+    hard_degraded_l3_interval_secs: u64,
+    soft_budget_reduction_pct: f64,
+}
+
+impl Default for WaterlineAlarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sla_ms: 5_000,
+            soft_trigger_pct: 0.8,
+            soft_recover_pct: 0.4,
+            hard_trigger_pct: 0.8,
+            hard_recover_pct: 0.4,
+            hard_degraded_l3_interval_secs: 86_400,
+            soft_budget_reduction_pct: 0.5,
+        }
+    }
+}
+
+/// Adaptive backpressure mechanism that degrades L3 scanning and the rotating
+/// cold-window when the fast-scan lane falls behind.
+///
+/// The alarm is checked once per metrics sample (inside `TieredWatchRuntime::report`)
+/// using the freshly-computed `fast_scan_coverage_lag_p99_ms`. All mutable state
+/// is stored in atomics so `check()` can run from the shared `&self` reference
+/// that `report()` borrows.
+///
+/// # Two-level degradation
+///
+/// **Soft** (early warning) — reduces the effective rotating cold-window budget
+/// so fewer directories are promoted per tick, giving the fast-scan lane room
+/// to catch up.
+///
+/// **Hard** (catastrophic backstop) — overrides the L3 scan interval to a much
+/// longer value (default 1 day) so the cold sweeper stops competing for I/O.
+struct WaterlineAlarm {
+    // ── Configuration (set once at startup, read-only afterwards) ──────────
+    config: RwLock<WaterlineAlarmConfig>,
+    /// L2 scan interval in milliseconds — the hard-degradation baseline.
+    l2_scan_interval_ms: AtomicU64,
+    /// The configured (non-degraded) L3 scan interval in seconds.
+    configured_l3_scan_interval_secs: AtomicU64,
+    /// The configured (non-degraded) rotating cold-window budget.
+    configured_rotating_budget: AtomicUsize,
+    // ── Live state ─────────────────────────────────────────────────────────
+    soft_degraded: AtomicBool,
+    hard_degraded: AtomicBool,
+    /// Consecutive checks where lag stayed below the soft recovery threshold.
+    soft_recovery_streak: AtomicU32,
+    /// Consecutive checks where lag stayed below the hard recovery threshold.
+    hard_recovery_streak: AtomicU32,
+}
+
+impl WaterlineAlarm {
+    fn new() -> Self {
+        Self {
+            config: RwLock::new(WaterlineAlarmConfig::default()),
+            l2_scan_interval_ms: AtomicU64::new(300_000),
+            configured_l3_scan_interval_secs: AtomicU64::new(21_600),
+            configured_rotating_budget: AtomicUsize::new(128),
+            soft_degraded: AtomicBool::new(false),
+            hard_degraded: AtomicBool::new(false),
+            soft_recovery_streak: AtomicU32::new(0),
+            hard_recovery_streak: AtomicU32::new(0),
+        }
+    }
+
+    /// Update alarm configuration and baselines from the tiered-watch config.
+    fn apply_config(&self, config: &TieredWatchConfig) {
+        let wc = WaterlineAlarmConfig {
+            enabled: config.waterline_alarm_enabled,
+            sla_ms: config.waterline_sla_ms,
+            soft_trigger_pct: config.waterline_soft_trigger_pct,
+            soft_recover_pct: config.waterline_soft_recover_pct,
+            hard_trigger_pct: config.waterline_hard_trigger_pct,
+            hard_recover_pct: config.waterline_hard_recover_pct,
+            hard_degraded_l3_interval_secs: config.waterline_hard_degraded_l3_interval_secs,
+            soft_budget_reduction_pct: config.waterline_soft_budget_reduction_pct,
+        };
+        *self.config.write() = wc;
+        self.l2_scan_interval_ms.store(
+            config.l2_scan_interval_secs.saturating_mul(1_000),
+            Ordering::Relaxed,
+        );
+        self.configured_l3_scan_interval_secs
+            .store(config.l3_scan_interval_secs, Ordering::Relaxed);
+        self.configured_rotating_budget
+            .store(config.rotating_cold_window_budget.max(1), Ordering::Relaxed);
+    }
+
+    /// Returns `true` if soft degradation is currently active.
+    fn is_soft_degraded(&self) -> bool {
+        self.soft_degraded.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` if hard degradation is currently active.
+    fn is_hard_degraded(&self) -> bool {
+        self.hard_degraded.load(Ordering::Relaxed)
+    }
+
+    /// The L3 scan interval that should actually be used right now.
+    ///
+    /// When hard degradation is active this returns the overridden (longer)
+    /// interval; otherwise it returns the configured interval.
+    fn effective_l3_scan_interval_secs(&self) -> u64 {
+        if self.is_hard_degraded() {
+            let cfg = self.config.read();
+            cfg.hard_degraded_l3_interval_secs
+        } else {
+            self.configured_l3_scan_interval_secs
+                .load(Ordering::Relaxed)
+        }
+    }
+
+    /// The rotating cold-window budget that should actually be used right now.
+    ///
+    /// When soft degradation is active the budget is reduced by
+    /// `soft_budget_reduction_pct` (e.g. 50% reduction → budget halved).
+    fn effective_rotating_budget(&self) -> usize {
+        let configured = self.configured_rotating_budget.load(Ordering::Relaxed);
+        if self.is_soft_degraded() {
+            let cfg = self.config.read();
+            let reduction = cfg.soft_budget_reduction_pct.clamp(0.0, 1.0);
+            let effective = (configured as f64) * (1.0 - reduction);
+            (effective.round() as usize).max(1)
+        } else {
+            configured
+        }
+    }
+
+    /// Evaluate the alarm against the latest p99 coverage lag.
+    ///
+    /// This updates the internal degradation state using hysteresis: trigger at
+    /// the higher `trigger_pct`, recover at the lower `recover_pct` after a
+    /// streak of consecutive below-recovery checks. State transitions are
+    /// logged via `tracing`.
+    ///
+    /// Returns the lag value that was evaluated (useful for reporting).
+    fn check(&self, lag_p99_ms: u64) -> u64 {
+        let cfg = self.config.read();
+        if !cfg.enabled {
+            return lag_p99_ms;
+        }
+
+        let sla_ms = cfg.sla_ms.max(1);
+        let l2_ms = self.l2_scan_interval_ms.load(Ordering::Relaxed).max(1);
+
+        // ── Soft level ──────────────────────────────────────────────────────
+        let soft_trigger_ms = (sla_ms as f64 * cfg.soft_trigger_pct) as u64;
+        let soft_recover_ms = (sla_ms as f64 * cfg.soft_recover_pct) as u64;
+
+        let was_soft = self.is_soft_degraded();
+        if !was_soft && lag_p99_ms > soft_trigger_ms {
+            self.soft_degraded.store(true, Ordering::Relaxed);
+            self.soft_recovery_streak.store(0, Ordering::Relaxed);
+            tracing::warn!(
+                lag_p99_ms,
+                soft_trigger_ms,
+                sla_ms,
+                "waterline alarm: soft degradation triggered — \
+                 reducing rotating cold-window budget"
+            );
+        } else if was_soft {
+            if lag_p99_ms < soft_recover_ms {
+                let streak = self
+                    .soft_recovery_streak
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                if streak >= WATERLINE_SOFT_RECOVERY_CHECKS {
+                    self.soft_degraded.store(false, Ordering::Relaxed);
+                    self.soft_recovery_streak.store(0, Ordering::Relaxed);
+                    tracing::info!(
+                        lag_p99_ms,
+                        soft_recover_ms,
+                        streak,
+                        "waterline alarm: soft degradation recovered — \
+                         rotating budget restored"
+                    );
+                }
+            } else {
+                self.soft_recovery_streak.store(0, Ordering::Relaxed);
+            }
+        }
+
+        // ── Hard level ──────────────────────────────────────────────────────
+        let hard_trigger_ms = (l2_ms as f64 * cfg.hard_trigger_pct) as u64;
+        let hard_recover_ms = (l2_ms as f64 * cfg.hard_recover_pct) as u64;
+
+        let was_hard = self.is_hard_degraded();
+        if !was_hard && lag_p99_ms > hard_trigger_ms {
+            self.hard_degraded.store(true, Ordering::Relaxed);
+            self.hard_recovery_streak.store(0, Ordering::Relaxed);
+            tracing::error!(
+                lag_p99_ms,
+                hard_trigger_ms,
+                l2_interval_ms = l2_ms,
+                "waterline alarm: hard degradation triggered — \
+                 L3 scan interval overridden to {}s",
+                cfg.hard_degraded_l3_interval_secs
+            );
+        } else if was_hard {
+            if lag_p99_ms < hard_recover_ms {
+                let streak = self
+                    .hard_recovery_streak
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                if streak >= WATERLINE_HARD_RECOVERY_CHECKS {
+                    self.hard_degraded.store(false, Ordering::Relaxed);
+                    self.hard_recovery_streak.store(0, Ordering::Relaxed);
+                    tracing::info!(
+                        lag_p99_ms,
+                        hard_recover_ms,
+                        streak,
+                        "waterline alarm: hard degradation recovered — \
+                         L3 scan interval restored"
+                    );
+                }
+            } else {
+                self.hard_recovery_streak.store(0, Ordering::Relaxed);
+            }
+        }
+
+        lag_p99_ms
+    }
+}
+
 pub struct TieredWatchRuntime {
     dirs: RwLock<HashMap<PathBuf, Arc<DirState>>>,
     ephemeral: RwLock<HashMap<PathBuf, EphemeralWatchLease>>,
@@ -663,6 +925,8 @@ pub struct TieredWatchRuntime {
     proc_sampler_budget_exhausted: AtomicBool,
     proc_sampler_unavailable: AtomicBool,
     last_adjustment_unix_secs: AtomicU64,
+    /// Waterline alarm — adaptive L3 scan degradation state.
+    waterline_alarm: WaterlineAlarm,
 }
 
 impl TieredWatchRuntime {
@@ -816,6 +1080,7 @@ impl TieredWatchRuntime {
             proc_sampler_budget_exhausted: AtomicBool::new(false),
             proc_sampler_unavailable: AtomicBool::new(false),
             last_adjustment_unix_secs: AtomicU64::new(now),
+            waterline_alarm: WaterlineAlarm::new(),
         }
     }
 
@@ -892,17 +1157,74 @@ impl TieredWatchRuntime {
     }
 
     pub fn rotating_cold_window_tick_config(&self) -> RotatingColdWindowConfig {
+        // When the waterline alarm has triggered soft degradation, reduce the
+        // effective budget so fewer directories are promoted per tick.
+        let effective_budget = self.waterline_alarm.effective_rotating_budget();
+        let configured_budget = self.rotating_cold_window_budget.load(Ordering::Relaxed);
+        let budget = if self.waterline_alarm.is_soft_degraded() {
+            effective_budget.min(configured_budget).max(1)
+        } else {
+            configured_budget
+        };
+        // Also cap max_dirs_per_tick proportionally when soft degraded so the
+        // per-tick promotion count stays consistent with the reduced budget.
+        let configured_max_dirs = self
+            .rotating_cold_window_max_dirs_per_tick
+            .load(Ordering::Relaxed);
+        let max_dirs_per_tick = if self.waterline_alarm.is_soft_degraded() && configured_budget > 0
+        {
+            let ratio = budget as f64 / configured_budget as f64;
+            (((configured_max_dirs as f64) * ratio).round() as usize)
+                .max(1)
+                .min(configured_max_dirs)
+        } else {
+            configured_max_dirs
+        };
         RotatingColdWindowConfig {
             enabled: self.rotating_cold_window_enabled.load(Ordering::Relaxed),
-            budget: self.rotating_cold_window_budget.load(Ordering::Relaxed),
+            budget,
             ttl_secs: self.rotating_cold_window_ttl_secs.load(Ordering::Relaxed),
             max_cost_per_root: self
                 .rotating_cold_window_max_cost_per_root
                 .load(Ordering::Relaxed),
-            max_dirs_per_tick: self
-                .rotating_cold_window_max_dirs_per_tick
-                .load(Ordering::Relaxed),
+            max_dirs_per_tick,
         }
+    }
+
+    /// Push waterline alarm configuration and baselines from the tiered-watch
+    /// config into the runtime. Must be called at startup (and on config
+    /// reload) before the scan loops begin using the effective intervals.
+    pub fn apply_waterline_config(&self, config: &TieredWatchConfig) {
+        self.waterline_alarm.apply_config(config);
+    }
+
+    /// The L3 scan interval currently in effect. When hard degradation is
+    /// active this returns the overridden (longer) interval; otherwise the
+    /// configured interval.
+    pub fn effective_l3_scan_interval_secs(&self) -> u64 {
+        self.waterline_alarm.effective_l3_scan_interval_secs()
+    }
+
+    /// Whether the waterline alarm has triggered soft degradation.
+    pub fn waterline_soft_degraded(&self) -> bool {
+        self.waterline_alarm.is_soft_degraded()
+    }
+
+    /// Whether the waterline alarm has triggered hard degradation.
+    pub fn waterline_hard_degraded(&self) -> bool {
+        self.waterline_alarm.is_hard_degraded()
+    }
+
+    /// The effective rotating cold-window budget (after soft-degradation
+    /// reduction, if active).
+    pub fn waterline_effective_rotating_budget(&self) -> usize {
+        self.waterline_alarm.effective_rotating_budget()
+    }
+
+    /// Evaluate the waterline alarm against the latest p99 coverage lag.
+    /// Called from `report()` at each metrics sample. Returns the lag value.
+    fn check_waterline_alarm(&self, lag_p99_ms: u64) -> u64 {
+        self.waterline_alarm.check(lag_p99_ms)
     }
 
     pub fn set_proc_sampler_enabled(&self, enabled: bool) {
@@ -3160,6 +3482,12 @@ impl TieredWatchRuntime {
         let fast_scan_last_degraded_reason = fast_state.last_degraded_reason.clone();
         drop(fast_state);
 
+        // Evaluate the waterline alarm against the freshly-computed p99 lag.
+        // This may transition the soft/hard degradation state, which in turn
+        // affects the effective L3 scan interval and rotating budget reported
+        // below and consumed by the scan loops.
+        self.check_waterline_alarm(fast_scan_coverage_lag_p99_ms);
+
         let fast_scan_budget_degraded = self.fast_scan_budget_degraded.load(Ordering::Relaxed);
         let fast_scan_backfill_pending =
             fast_scan_initial_backfill_pending > 0 || fast_scan_uncovered_lease_count > 0;
@@ -3442,6 +3770,12 @@ impl TieredWatchRuntime {
                 .proc_sampler_budget_exhausted
                 .load(Ordering::Relaxed),
             proc_sampler_unavailable: self.proc_sampler_unavailable.load(Ordering::Relaxed),
+            waterline_soft_degraded: self.waterline_alarm.is_soft_degraded(),
+            waterline_hard_degraded: self.waterline_alarm.is_hard_degraded(),
+            waterline_effective_l3_scan_interval_secs: self
+                .waterline_alarm
+                .effective_l3_scan_interval_secs(),
+            waterline_effective_rotating_budget: self.waterline_alarm.effective_rotating_budget(),
         }
     }
 
@@ -5818,5 +6152,159 @@ mod tests {
         let rolled_back = rt.report();
         assert_eq!(rolled_back.ephemeral_watch_cost, 2);
         assert_eq!(rolled_back.ephemeral_watch_dirs, 1);
+    }
+
+    // ── Waterline alarm tests ───────────────────────────────────────────────
+
+    fn waterline_config() -> TieredWatchConfig {
+        let mut cfg = TieredWatchConfig::default();
+        cfg.waterline_alarm_enabled = true;
+        cfg.waterline_sla_ms = 5_000;
+        cfg.waterline_soft_trigger_pct = 0.8;
+        cfg.waterline_soft_recover_pct = 0.4;
+        cfg.waterline_hard_trigger_pct = 0.8;
+        cfg.waterline_hard_recover_pct = 0.4;
+        cfg.waterline_hard_degraded_l3_interval_secs = 86_400;
+        cfg.waterline_soft_budget_reduction_pct = 0.5;
+        cfg.l2_scan_interval_secs = 300;
+        cfg.l3_scan_interval_secs = 21_600;
+        cfg.rotating_cold_window_budget = 128;
+        cfg
+    }
+
+    #[test]
+    fn waterline_alarm_soft_triggers_and_recovers_with_hysteresis() {
+        let rt = runtime();
+        let cfg = waterline_config();
+        rt.apply_waterline_config(&cfg);
+
+        // Below trigger threshold (80% of 5000ms = 4000ms) — no degradation.
+        rt.check_waterline_alarm(3_000);
+        assert!(!rt.waterline_soft_degraded());
+
+        // Above trigger — soft degradation activates.
+        rt.check_waterline_alarm(4_001);
+        assert!(rt.waterline_soft_degraded());
+
+        // Between recover (2000ms) and trigger (4000ms) — stays degraded
+        // (hysteresis: no recovery yet).
+        rt.check_waterline_alarm(3_000);
+        assert!(rt.waterline_soft_degraded());
+
+        // Below recover threshold — first check, not enough (need 3).
+        rt.check_waterline_alarm(1_500);
+        assert!(rt.waterline_soft_degraded());
+
+        // Second consecutive below-recover check — still not enough.
+        rt.check_waterline_alarm(1_500);
+        assert!(rt.waterline_soft_degraded());
+
+        // Third consecutive below-recover check — recovery!
+        rt.check_waterline_alarm(1_500);
+        assert!(!rt.waterline_soft_degraded());
+    }
+
+    #[test]
+    fn waterline_alarm_hard_triggers_and_overrides_l3_interval() {
+        let rt = runtime();
+        let cfg = waterline_config();
+        rt.apply_waterline_config(&cfg);
+
+        // Default: effective L3 interval = configured (21600s).
+        assert_eq!(rt.effective_l3_scan_interval_secs(), 21_600);
+
+        // Hard trigger: 80% of L2 interval (300s * 1000ms = 300000ms * 0.8 = 240000ms).
+        rt.check_waterline_alarm(240_001);
+        assert!(rt.waterline_hard_degraded());
+
+        // Effective L3 interval is now overridden to 86400s.
+        assert_eq!(rt.effective_l3_scan_interval_secs(), 86_400);
+
+        // Hard recovery: need 5 consecutive checks below 40% (120000ms).
+        for _ in 0..4 {
+            rt.check_waterline_alarm(100_000);
+            assert!(rt.waterline_hard_degraded());
+        }
+        // 5th check — recovery!
+        rt.check_waterline_alarm(100_000);
+        assert!(!rt.waterline_hard_degraded());
+        assert_eq!(rt.effective_l3_scan_interval_secs(), 21_600);
+    }
+
+    #[test]
+    fn waterline_alarm_soft_reduces_effective_rotating_budget() {
+        let rt = runtime();
+        let cfg = waterline_config();
+        rt.apply_waterline_config(&cfg);
+
+        // Default: budget = configured (128).
+        assert_eq!(rt.waterline_effective_rotating_budget(), 128);
+
+        // Trigger soft degradation.
+        rt.check_waterline_alarm(4_500);
+        assert!(rt.waterline_soft_degraded());
+
+        // Budget reduced by 50% → 64.
+        assert_eq!(rt.waterline_effective_rotating_budget(), 64);
+
+        // The tick config should reflect the reduced budget.
+        let tick_cfg = rt.rotating_cold_window_tick_config();
+        assert_eq!(tick_cfg.budget, 64);
+    }
+
+    #[test]
+    fn waterline_alarm_disabled_does_not_degrade() {
+        let rt = runtime();
+        let mut cfg = waterline_config();
+        cfg.waterline_alarm_enabled = false;
+        rt.apply_waterline_config(&cfg);
+
+        // Even with extreme lag, no degradation when disabled.
+        rt.check_waterline_alarm(u64::MAX / 2);
+        assert!(!rt.waterline_soft_degraded());
+        assert!(!rt.waterline_hard_degraded());
+        assert_eq!(rt.effective_l3_scan_interval_secs(), 21_600);
+    }
+
+    #[test]
+    fn waterline_alarm_recovery_streak_resets_on_spike() {
+        let rt = runtime();
+        let cfg = waterline_config();
+        rt.apply_waterline_config(&cfg);
+
+        // Trigger soft.
+        rt.check_waterline_alarm(4_500);
+        assert!(rt.waterline_soft_degraded());
+
+        // Two below-recover checks (streak = 2).
+        rt.check_waterline_alarm(1_000);
+        rt.check_waterline_alarm(1_000);
+        assert!(rt.waterline_soft_degraded());
+
+        // Spike above recover threshold resets streak.
+        rt.check_waterline_alarm(3_500);
+        assert!(rt.waterline_soft_degraded());
+
+        // Two more below-recover checks — streak should have reset, need 3 again.
+        rt.check_waterline_alarm(1_000);
+        rt.check_waterline_alarm(1_000);
+        assert!(rt.waterline_soft_degraded());
+
+        // Third check — recovery.
+        rt.check_waterline_alarm(1_000);
+        assert!(!rt.waterline_soft_degraded());
+    }
+
+    #[test]
+    fn waterline_alarm_metrics_exposed_in_watch_state_report() {
+        let rt = runtime();
+        let cfg = waterline_config();
+        rt.apply_waterline_config(&cfg);
+
+        let report = rt.report();
+        assert!(!report.waterline_soft_degraded);
+        assert!(!report.waterline_hard_degraded);
+        assert_eq!(report.waterline_effective_l3_scan_interval_secs, 21_600);
+        assert_eq!(report.waterline_effective_rotating_budget, 128);
     }
 }

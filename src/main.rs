@@ -355,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(runtime) = tiered_runtime.as_ref() {
         runtime.apply_fast_scan_config(&cfg.tiered_watch);
         runtime.apply_rotating_cold_window_config(&cfg.tiered_watch);
+        runtime.apply_waterline_config(&cfg.tiered_watch);
         runtime.set_proc_sampler_enabled(
             cfg.proc_sampler.enabled && watch_enabled && effective_watch_mode == WatchMode::Tiered,
         );
@@ -584,6 +585,12 @@ async fn main() -> anyhow::Result<()> {
                 proc_sampler_triggered_watches: watch_state.proc_sampler_triggered_watches,
                 proc_sampler_budget_exhausted: watch_state.proc_sampler_budget_exhausted,
                 proc_sampler_unavailable: watch_state.proc_sampler_unavailable,
+                waterline_soft_degraded: watch_state.waterline_soft_degraded,
+                waterline_hard_degraded: watch_state.waterline_hard_degraded,
+                waterline_effective_l3_scan_interval_secs: watch_state
+                    .waterline_effective_l3_scan_interval_secs,
+                waterline_effective_rotating_budget: watch_state
+                    .waterline_effective_rotating_budget,
                 diagnostics: fd_rdd::diagnostics::DiagnosticReport::default(),
             }
         })
@@ -768,6 +775,11 @@ async fn main() -> anyhow::Result<()> {
                     proc_sampler_triggered_watches: health.proc_sampler_triggered_watches,
                     proc_sampler_budget_exhausted: health.proc_sampler_budget_exhausted,
                     proc_sampler_unavailable: health.proc_sampler_unavailable,
+                    waterline_soft_degraded: health.waterline_soft_degraded,
+                    waterline_hard_degraded: health.waterline_hard_degraded,
+                    waterline_effective_l3_scan_interval_secs: health
+                        .waterline_effective_l3_scan_interval_secs,
+                    waterline_effective_rotating_budget: health.waterline_effective_rotating_budget,
                     watch_failures: health.watch_failures,
                     overflow_drops: health.overflow_drops,
                     rescan_signals: health.rescan_signals,
@@ -1355,7 +1367,9 @@ fn spawn_dirty_queue_loop(
                             tiered.l1_scan_interval_secs,
                             tiered.l2_scan_interval_secs,
                             tiered.l3_scan_policy,
-                            tiered.l3_scan_interval_secs,
+                            // Use the waterline-alarm-adjusted L3 interval so
+                            // that hard degradation lengthens the L3 scan cycle.
+                            runtime.effective_l3_scan_interval_secs(),
                             tiered.l1_empty_scans_to_l2,
                             tiered.l2_empty_scans_to_l3,
                         );
