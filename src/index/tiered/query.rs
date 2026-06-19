@@ -947,7 +947,7 @@ impl TieredIndex {
     }
 
     fn record_recent_stale_hit_dir(&self, dir: PathBuf) {
-        let mut dirs = self.recent_stale_hit_dirs.lock();
+        let mut dirs = self.tombstones.recent_stale_hit_dirs.lock();
         if !dirs.iter().any(|existing| existing == &dir) {
             dirs.push(dir);
         }
@@ -958,7 +958,7 @@ impl TieredIndex {
     }
 
     pub fn drain_recent_stale_hit_dirs(&self) -> Vec<PathBuf> {
-        let mut dirs = self.recent_stale_hit_dirs.lock();
+        let mut dirs = self.tombstones.recent_stale_hit_dirs.lock();
         let mut out = std::mem::take(&mut *dirs);
         out.sort();
         out.dedup();

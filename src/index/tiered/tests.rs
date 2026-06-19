@@ -379,7 +379,10 @@ fn freeze_gate_blocks_destructive_events_before_delta_buffer() {
     ]);
 
     assert_eq!(idx.delta_buffer.lock().len(), 0);
-    assert_eq!(idx.freeze_gate.lock().blocked_events(), 3);
+    assert_eq!(
+        idx.recovery_quarantine.freeze_gate.lock().blocked_events(),
+        3
+    );
 }
 
 #[test]
@@ -420,7 +423,13 @@ fn online_root_record_unfreezes_and_queues_prefix_reconciliation() {
         vec![prefix],
     ));
 
-    assert_eq!(idx.freeze_gate.lock().frozen_root_count(), 0);
+    assert_eq!(
+        idx.recovery_quarantine
+            .freeze_gate
+            .lock()
+            .frozen_root_count(),
+        0
+    );
     assert_eq!(idx.dirty_queue_len(), 1);
 }
 
@@ -535,12 +544,20 @@ async fn quarantine_sidecar_restore_installs_freeze_gate_before_events() -> anyh
     let idx = TieredIndex::load_or_empty(&store, vec![content_root.clone()]).await?;
 
     assert!(idx.path_is_frozen(&prefix));
-    assert_eq!(idx.quarantine_verify_pending.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        idx.recovery_quarantine
+            .verify_pending
+            .load(Ordering::Relaxed),
+        1
+    );
 
     let deleted = prefix.join("blocked_delete.txt");
     idx.apply_events(&[mk_event(1, EventType::Delete, deleted)]);
     assert_eq!(idx.delta_buffer.lock().len(), 0);
-    assert_eq!(idx.freeze_gate.lock().blocked_events(), 1);
+    assert_eq!(
+        idx.recovery_quarantine.freeze_gate.lock().blocked_events(),
+        1
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -572,8 +589,18 @@ fn quarantine_verify_online_appends_wal_unfreezes_and_queues_scan() -> anyhow::R
 
     assert!(!idx.path_is_frozen(&prefix));
     assert_eq!(idx.dirty_queue_len(), 1);
-    assert_eq!(idx.quarantine_verify_pending.load(Ordering::Relaxed), 0);
-    assert_eq!(idx.quarantine_verified_roots.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        idx.recovery_quarantine
+            .verify_pending
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        idx.recovery_quarantine
+            .verified_roots
+            .load(Ordering::Relaxed),
+        1
+    );
 
     let dirty_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
     let report = idx.process_dirty_entry(dirty_entry, &[]);
@@ -616,8 +643,18 @@ fn quarantine_verify_identity_mismatch_keeps_freeze() -> anyhow::Result<()> {
 
     assert!(idx.path_is_frozen(&prefix));
     assert_eq!(idx.dirty_queue_len(), 0);
-    assert_eq!(idx.quarantine_verify_pending.load(Ordering::Relaxed), 1);
-    assert_eq!(idx.quarantine_verified_roots.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        idx.recovery_quarantine
+            .verify_pending
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        idx.recovery_quarantine
+            .verified_roots
+            .load(Ordering::Relaxed),
+        0
+    );
     assert_eq!(
         QuarantineSidecar::read_from(&sidecar_path)?
             .active_roots()
@@ -664,7 +701,10 @@ async fn wal_online_root_replay_unfreezes_before_following_file_events() -> anyh
 
     assert!(!idx.path_is_frozen(&prefix));
     assert_eq!(idx.query("wal_restored_after_online").len(), 1);
-    assert_eq!(idx.freeze_gate.lock().blocked_events(), 0);
+    assert_eq!(
+        idx.recovery_quarantine.freeze_gate.lock().blocked_events(),
+        0
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())

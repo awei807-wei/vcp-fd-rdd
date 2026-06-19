@@ -84,7 +84,11 @@ impl TieredIndex {
             remount_path = Some(v7_path.clone());
         }
 
-        if self.stable_snapshot_enabled.load(Ordering::Relaxed) {
+        if self
+            .io_tuning
+            .stable_snapshot_enabled
+            .load(Ordering::Relaxed)
+        {
             if let Err(e) = write_stable_v7_atomic(store.path(), &base) {
                 tracing::warn!("stable v7 snapshot write failed: {}", e);
             } else {
