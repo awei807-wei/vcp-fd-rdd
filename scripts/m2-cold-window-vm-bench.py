@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -245,6 +246,8 @@ EVENT_STORM_KIND_ALIASES = {
     "inode_reuse": "inode_reuse",
     "ghost_inode_reuse": "inode_reuse",
     "ghost_reuse": "inode_reuse",
+    "inode_reuse_stress": "inode_reuse_stress",
+    "inode_stress": "inode_reuse_stress",
     "time_skew": "time_skew",
     "clock_skew": "time_skew",
 }
@@ -564,6 +567,10 @@ class EventStormRunner:
         time_skew_secs: float,
         kinds: list[str],
         target_tiers: list[str],
+        file_count: int = 0,
+        subtree_depth: int = 2,
+        inode_stress_iterations: int = 0,
+        inode_stress_tmpfs_inodes: int = 200,
     ) -> None:
         self.base_url = base_url
         self.roots = roots
@@ -576,11 +583,22 @@ class EventStormRunner:
         self.ops_per_burst = max(1, ops_per_burst)
         self.duration_budget_secs = max(0.1, duration_budget_secs)
         self.time_skew_secs = max(1.0, time_skew_secs)
+        # Task 5: explicit file-count and tree-depth knobs. file_count<=0 means
+        # "use each workload's existing ops-based default" (preserves old behavior).
+        self.file_count = max(0, file_count)
+        self.subtree_depth = max(1, subtree_depth)
+        # Task 2: inode_reuse_stress tmpfs tuning.
+        self.inode_stress_iterations = max(0, inode_stress_iterations)
+        self.inode_stress_tmpfs_inodes = max(16, inode_stress_tmpfs_inodes)
         self.kinds = normalize_event_storm_kinds(kinds)
         self.target_tiers = [tier.upper() for tier in target_tiers]
         tiers = self.target_tiers or [""]
         workloads = self.kinds or ["rw100"]
         self.work_items = [(tier, kind) for tier in tiers for kind in workloads]
+        # Run-unique id (timestamp + pid) folded into burst paths so concurrent or
+        # repeated runs (A vs B legs, re-runs on shared storm roots) never collide
+        # on fixture directories -- the root cause of OSError(39, 'Directory not empty').
+        self.run_id = f"{time.time_ns()}-{os.getpid()}"
         self.next_start_at = time.monotonic() + self.start_delay_secs
         self.active: dict[str, Any] | None = None
         self.current_burst_started_at = 0.0
@@ -606,32 +624,54 @@ class EventStormRunner:
         events: list[dict[str, Any]] = []
         cycle_started = time.monotonic()
         self.current_burst_started_at = cycle_started
-        if selected_kind == "rw100":
-            events.extend(self.write_rw100(root, tier_before))
-        elif selected_kind == "save100":
-            events.extend(self.write_save100(root, tier_before))
-        elif selected_kind == "git_clone":
-            events.extend(self.write_git_clone_fixture(root, tier_before))
-        elif selected_kind == "npm_install":
-            events.extend(self.write_npm_install_fixture(root, tier_before))
-        elif selected_kind == "subtree_rename":
-            events.extend(self.write_subtree_rename_avalanche(root, tier_before))
-        elif selected_kind == "mount_storm":
-            events.extend(self.write_mount_storm_fixture(root, tier_before))
-        elif selected_kind == "inode_reuse":
-            events.extend(self.write_inode_reuse_fixture(root, tier_before))
-        elif selected_kind == "time_skew":
-            events.extend(self.write_time_skew_fixture(root, tier_before))
-        else:
+        try:
+            if selected_kind == "rw100":
+                events.extend(self.write_rw100(root, tier_before))
+            elif selected_kind == "save100":
+                events.extend(self.write_save100(root, tier_before))
+            elif selected_kind == "git_clone":
+                events.extend(self.write_git_clone_fixture(root, tier_before))
+            elif selected_kind == "npm_install":
+                events.extend(self.write_npm_install_fixture(root, tier_before))
+            elif selected_kind == "subtree_rename":
+                events.extend(self.write_subtree_rename_avalanche(root, tier_before))
+            elif selected_kind == "mount_storm":
+                events.extend(self.write_mount_storm_fixture(root, tier_before))
+            elif selected_kind == "inode_reuse":
+                events.extend(self.write_inode_reuse_fixture(root, tier_before))
+            elif selected_kind == "inode_reuse_stress":
+                events.extend(self.write_inode_reuse_stress(root, tier_before))
+            elif selected_kind == "time_skew":
+                events.extend(self.write_time_skew_fixture(root, tier_before))
+            else:
+                self.emit(
+                    {
+                        "event_kind": "unsupported_workload",
+                        "operation": "unsupported_workload",
+                        "selected_kind": selected_kind,
+                        "supported_kinds": supported_event_storm_kinds(),
+                        "ok": False,
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 - keep going; record evidence
+            # Fix C: isolate each workload so one fixture failure (e.g. a stray
+            # ENOTEMPTY) cannot kill the entire run. Skip the settle/check phase
+            # for this cycle and schedule the next burst.
             self.emit(
                 {
-                    "event_kind": "unsupported_workload",
-                    "operation": "unsupported_workload",
+                    "event_kind": "burst_write_failed",
+                    "operation": "burst_write_failed",
+                    "root": str(root),
+                    "requested_tier": requested_tier,
                     "selected_kind": selected_kind,
-                    "supported_kinds": supported_event_storm_kinds(),
+                    "tier_before": tier_before,
                     "ok": False,
+                    "error": repr(exc),
                 }
             )
+            self.active = None
+            self.next_start_at = time.monotonic() + self.interval_secs
+            return
         generation_secs = time.monotonic() - cycle_started
         due_at = time.monotonic() + self.settle_secs
         self.active = {
@@ -667,7 +707,8 @@ class EventStormRunner:
         burst_root.mkdir(parents=True, exist_ok=True)
         records: list[dict[str, Any]] = []
         deadline = time.monotonic() + self.duration_budget_secs
-        for i in range(self.ops_per_burst):
+        count = self.file_count if self.file_count > 0 else self.ops_per_burst
+        for i in range(count):
             path = burst_root / f"rw_{i:04d}.txt"
             marker = f"fd_rdd_m2_storm_rw_{self.cycle}_{i:04d}"
             path.write_text(f"{utc_now()} {marker}\n", encoding="utf-8")
@@ -684,7 +725,8 @@ class EventStormRunner:
         burst_root.mkdir(parents=True, exist_ok=True)
         records: list[dict[str, Any]] = []
         deadline = time.monotonic() + self.duration_budget_secs
-        for i in range(self.ops_per_burst):
+        count = self.file_count if self.file_count > 0 else self.ops_per_burst
+        for i in range(count):
             final = burst_root / f"save_{i:04d}.txt"
             tmp = burst_root / f".save_{i:04d}.tmp"
             marker = f"fd_rdd_m2_storm_save_{self.cycle}_{i:04d}"
@@ -729,7 +771,7 @@ class EventStormRunner:
         pkg_root = self.burst_root(root, "npm-install") / "app"
         node_modules = pkg_root / "node_modules"
         records: list[dict[str, Any]] = []
-        packages = max(1, self.ops_per_burst // 10)
+        packages = max(1, (self.file_count if self.file_count > 0 else self.ops_per_burst) // 10)
         for i in range(packages):
             pkg = node_modules / f"pkg_{i:03d}"
             pkg.mkdir(parents=True, exist_ok=True)
@@ -754,9 +796,14 @@ class EventStormRunner:
         records: list[dict[str, Any]] = []
         created: list[tuple[Path, Path]] = []
         deadline = time.monotonic() + self.duration_budget_secs
-        width = max(1, min(self.ops_per_burst, 200))
+        # Task 5: --event-storm-file-count overrides the ops-based width; depth
+        # comes from --event-storm-depth (default 2, preserving the old layout).
+        width = self.file_count if self.file_count > 0 else max(1, min(self.ops_per_burst, 200))
+        depth = self.subtree_depth
         for i in range(width):
-            parent = source / f"level1_{i % 10:02d}" / f"level2_{i % 25:02d}"
+            parent = source
+            for level in range(depth):
+                parent = parent / f"level{level + 1}_{(i // (10 ** level)) % 10:02d}"
             parent.mkdir(parents=True, exist_ok=True)
             old_path = parent / f"deep_{self.cycle:03d}_{i:04d}.txt"
             old_path.write_text(
@@ -768,6 +815,9 @@ class EventStormRunner:
             if time.monotonic() > deadline:
                 break
         destination.parent.mkdir(parents=True, exist_ok=True)
+        # Fix D: clear any stale destination before the directory rename so
+        # rename(2) can never hit ENOTEMPTY on a leftover populated dir_b.
+        shutil.rmtree(destination, ignore_errors=True)
         source.rename(destination)
         for old_path, new_path in created:
             records.append(
@@ -809,7 +859,7 @@ class EventStormRunner:
         records: list[dict[str, Any]] = []
         created: list[Path] = []
         deadline = time.monotonic() + self.duration_budget_secs
-        width = max(1, min(self.ops_per_burst, 200))
+        width = self.file_count if self.file_count > 0 else max(1, min(self.ops_per_burst, 200))
         for i in range(width):
             parent = mount_point / f"tree_{i % 20:02d}"
             parent.mkdir(parents=True, exist_ok=True)
@@ -821,6 +871,9 @@ class EventStormRunner:
             created.append(path)
             if time.monotonic() > deadline:
                 break
+        # Fix D: clear any stale detached dir before the directory rename so
+        # rename(2) can never hit ENOTEMPTY on a leftover .detached_mountpoint.
+        shutil.rmtree(detached, ignore_errors=True)
         mount_point.rename(detached)
         sample_limit = min(len(created), max(1, min(32, self.ops_per_burst)))
         for old_path in created[:sample_limit]:
@@ -847,7 +900,7 @@ class EventStormRunner:
         burst_root.mkdir(parents=True, exist_ok=True)
         records: list[dict[str, Any]] = []
         deadline = time.monotonic() + self.duration_budget_secs
-        width = max(1, min(self.ops_per_burst, 200))
+        width = self.file_count if self.file_count > 0 else max(1, min(self.ops_per_burst, 200))
         for i in range(width):
             old_path = burst_root / f"ghost_old_{self.cycle:03d}_{i:04d}.txt"
             new_path = burst_root / f"ghost_new_{self.cycle:03d}_{i:04d}.txt"
@@ -898,12 +951,149 @@ class EventStormRunner:
                 break
         return records
 
+    def write_inode_reuse_stress(self, root: Path, tier_before: str) -> list[dict[str, Any]]:
+        """Task 2: dedicated inode-reuse stress test on a small tmpfs.
+
+        Creates a tmpfs with a limited inode pool so delete+recreate in a tight
+        loop is very likely to recycle the just-freed inode. When reuse is
+        observed we emit expected_records (old path hidden / new path visible)
+        carrying old/new dev+inode metadata so the deferred search check verifies
+        the generation/filekey ghost-revival defense. Falls back to a plain
+        directory (with a warning) when mounting is not permitted.
+        """
+        burst_root = self.burst_root(root, "inode-reuse-stress")
+        burst_root.mkdir(parents=True, exist_ok=True)
+        mount_point = burst_root / "stress-tmpfs"
+        mount_point.mkdir(parents=True, exist_ok=True)
+        records: list[dict[str, Any]] = []
+        iterations = self.inode_stress_iterations if self.inode_stress_iterations > 0 else 100
+        nr_inodes = self.inode_stress_tmpfs_inodes
+
+        mounted = False
+        try:
+            subprocess.run(
+                ["mount", "-t", "tmpfs", "-o", f"nr_inodes={nr_inodes},size=10m", "tmpfs", str(mount_point)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            mounted = True
+        except Exception:
+            # No privileges (or no mount binary): fall back to a regular dir.
+            # Inode reuse is less likely here, but the workload still exercises
+            # the create/delete/recreate event path and remains correct.
+            mounted = False
+        work_dir = mount_point
+        self.emit(
+            {
+                "event_kind": "inode_reuse_stress_setup",
+                "operation": "inode_reuse_stress_setup",
+                "workload": "inode_reuse_stress",
+                "root": str(root),
+                "mount_point": str(mount_point),
+                "tmpfs_mounted": mounted,
+                "tmpfs_nr_inodes": nr_inodes if mounted else 0,
+                "iterations": iterations,
+                "ok": True,
+            }
+        )
+
+        attempts = 0
+        observed = 0
+        deadline = time.monotonic() + max(self.duration_budget_secs, 5.0)
+        for i in range(iterations):
+            old_path = work_dir / f"old_{self.cycle:03d}_{i:05d}.txt"
+            new_path = work_dir / f"new_{self.cycle:03d}_{i:05d}.txt"
+            try:
+                old_path.write_text(
+                    f"{utc_now()} fd_rdd_m2_storm_inode_stress_old_{self.cycle}_{i:05d}\n",
+                    encoding="utf-8",
+                )
+                old_stat = old_path.stat()
+                old_path.unlink()
+                # Tight loop: immediately create a new file in the same directory
+                # to maximize the chance the freed inode is recycled.
+                new_path.write_text(
+                    f"{utc_now()} fd_rdd_m2_storm_inode_stress_new_{self.cycle}_{i:05d}\n",
+                    encoding="utf-8",
+                )
+                new_stat = new_path.stat()
+            except OSError:
+                # tmpfs inode exhaustion or other FS error: stop early.
+                break
+            attempts += 1
+            reused = old_stat.st_dev == new_stat.st_dev and old_stat.st_ino == new_stat.st_ino
+            if not reused:
+                if time.monotonic() > deadline:
+                    break
+                continue
+            observed += 1
+            metadata = {
+                "old_dev": old_stat.st_dev,
+                "old_inode": old_stat.st_ino,
+                "new_dev": new_stat.st_dev,
+                "new_inode": new_stat.st_ino,
+                "inode_reused": True,
+                "ghost_revival_defense": "old_hidden+new_visible search checks verify generation/filekey defense",
+            }
+            records.append(
+                self.expected_record(
+                    "inode_reuse",
+                    "inode_reuse_old_hidden",
+                    old_path,
+                    old_path.name,
+                    False,
+                    tier_before,
+                    metadata,
+                )
+            )
+            records.append(
+                self.expected_record(
+                    "inode_reuse",
+                    "inode_reuse_new_visible",
+                    new_path,
+                    new_path.name,
+                    True,
+                    tier_before,
+                    metadata,
+                )
+            )
+            if time.monotonic() > deadline:
+                break
+
+        # Cleanup: unmount tmpfs if we mounted it, then remove the mountpoint.
+        if mounted:
+            try:
+                subprocess.run(
+                    ["umount", str(mount_point)],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+        shutil.rmtree(mount_point, ignore_errors=True)
+
+        self.emit(
+            {
+                "event_kind": "inode_reuse_stress_summary",
+                "operation": "inode_reuse_stress_summary",
+                "workload": "inode_reuse_stress",
+                "root": str(root),
+                "inode_reuse_attempts": attempts,
+                "inode_reuse_observed": observed,
+                "tmpfs_mounted": mounted,
+                "ok": True,
+            }
+        )
+        return records
+
     def write_time_skew_fixture(self, root: Path, tier_before: str) -> list[dict[str, Any]]:
         burst_root = self.burst_root(root, "time-skew")
         burst_root.mkdir(parents=True, exist_ok=True)
         records: list[dict[str, Any]] = []
         deadline = time.monotonic() + self.duration_budget_secs
-        width = max(1, min(self.ops_per_burst, 200))
+        width = self.file_count if self.file_count > 0 else max(1, min(self.ops_per_burst, 200))
         skewed_mtime = max(0.0, time.time() - self.time_skew_secs)
         for i in range(width):
             path = burst_root / f"time_skew_{self.cycle:03d}_{i:04d}.txt"
@@ -930,7 +1120,7 @@ class EventStormRunner:
         return records
 
     def burst_root(self, root: Path, kind: str) -> Path:
-        return root / f"fd-rdd-m2-event-storm-{safe_name(kind)}-{self.cycle:03d}"
+        return root / f"fd-rdd-m2-event-storm-{safe_name(kind)}-{self.run_id}-{self.cycle:03d}"
 
     def select_root(self, requested_tier: str) -> Path:
         if requested_tier:
@@ -1099,6 +1289,16 @@ class EventStormRunner:
                 "tier_after": tier_after,
             }
         )
+        # Fix E: best-effort teardown of the just-checked storm fixtures so the
+        # storm root does not grow unbounded and cannot poison a later re-run.
+        # Only removes per-burst subdirs (prefixed fd-rdd-m2-event-storm-),
+        # never the indexed root itself. ignore_errors so cleanup never crashes.
+        try:
+            for child in list(root.iterdir()):
+                if child.name.startswith("fd-rdd-m2-event-storm-"):
+                    shutil.rmtree(child, ignore_errors=True)
+        except Exception:
+            pass
         self.active = None
         self.next_start_at = time.monotonic() + self.interval_secs
 
@@ -1386,6 +1586,48 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         for item in event_first_queries
         if item.get("operation") == "inode_reuse_new_visible_first_query"
     ]
+
+    # Task 3: cold-freshness spike metrics, computed from the /watch-state
+    # sample series (paired with their endpoint elapsed_secs for time-aware
+    # rates). spike_count = samples whose p95 exceeds 2x the running median;
+    # slope_max = max |dp95/dt| between consecutive samples (secs per second).
+    watch_p95_series: list[tuple[float, float]] = []
+    for item in endpoint_samples:
+        if (
+            item.get("ok")
+            and item.get("endpoint") == "/watch-state"
+            and isinstance(item.get("data"), dict)
+        ):
+            try:
+                p95 = float(item["data"].get("cold_freshness_age_p95_secs") or 0)
+                elapsed = float(item.get("elapsed_secs", 0.0) or 0.0)
+                watch_p95_series.append((elapsed, p95))
+            except (TypeError, ValueError):
+                continue
+    cold_freshness_spike_count = 0
+    cold_freshness_slope_max = 0.0
+    if len(watch_p95_series) >= 2:
+        running_values: list[float] = []
+        for _elapsed, p95 in watch_p95_series:
+            running_values.append(p95)
+            if len(running_values) >= 3:
+                median = percentile(running_values, 50)
+                if median > 0 and p95 > 2.0 * median:
+                    cold_freshness_spike_count += 1
+        for (t0, v0), (t1, v1) in zip(watch_p95_series, watch_p95_series[1:]):
+            dt = t1 - t0
+            if dt > 0:
+                cold_freshness_slope_max = max(cold_freshness_slope_max, abs(v1 - v0) / dt)
+
+    # Task 2: if an inode_reuse_stress run emitted a stress summary, use its
+    # attempt/observed counters (which reflect the full tight-loop iteration
+    # count) instead of the first-query-derived counts that undercount attempts.
+    inode_reuse_stress_rows = [
+        item
+        for item in event_storm_samples
+        if item.get("event_kind") == "inode_reuse_stress_summary"
+    ]
+
     event_special = {
         "subtree_rename_pairs_checked": count_event_op(
             "subtree_rename_new_visible_first_query"
@@ -1417,6 +1659,17 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "backdated_file_visible_first_query"
         ),
     }
+    if inode_reuse_stress_rows:
+        # Stress test reports the true iteration count; aggregate across cycles.
+        event_special["inode_reuse_attempts"] = sum(
+            int(item.get("inode_reuse_attempts", 0) or 0) for item in inode_reuse_stress_rows
+        )
+        event_special["inode_reuse_observed"] = sum(
+            int(item.get("inode_reuse_observed", 0) or 0) for item in inode_reuse_stress_rows
+        )
+        event_special["inode_reuse_stress_tmpfs_mounted"] = any(
+            bool(item.get("tmpfs_mounted")) for item in inode_reuse_stress_rows
+        )
 
     summary = {
         "label": label,
@@ -1463,6 +1716,8 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "cold_freshness_age_p99_secs_max": int(
                 max(nums(watch_samples, "cold_freshness_age_p99_secs") or [0])
             ),
+            "cold_freshness_age_spike_count": cold_freshness_spike_count,
+            "cold_freshness_age_slope_max": round(cold_freshness_slope_max, 3),
             "cold_freshness_age_p95_secs_delta": int(
                 (
                     nums(watch_samples[-1:], "cold_freshness_age_p95_secs")[0]
@@ -1601,8 +1856,10 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | fast scan lag p99 max ms | {summary["watch_state"]["fast_scan_coverage_lag_p99_ms_max"]} |
 | cold freshness age p95 first s | {summary["watch_state"]["cold_freshness_age_p95_secs_first"]} |
 | cold freshness age p95 last s | {summary["watch_state"]["cold_freshness_age_p95_secs_last"]} |
-| cold freshness age p95 delta s | {summary["watch_state"]["cold_freshness_age_p95_secs_delta"]} |
 | cold freshness age p99 max s | {summary["watch_state"]["cold_freshness_age_p99_secs_max"]} |
+| cold freshness age spike count | {summary["watch_state"]["cold_freshness_age_spike_count"]} |
+| cold freshness age slope max s/s | {summary["watch_state"]["cold_freshness_age_slope_max"]} |
+| cold freshness age p95 delta s | {summary["watch_state"]["cold_freshness_age_p95_secs_delta"]} |
 | rotating budget blocked last | {summary["watch_state"]["rotating_cold_window_budget_blocked_last"]} |
 | rotating active dirs max | {summary["watch_state"]["rotating_cold_window_active_dirs_max"]} |
 | rotating cycle progress max % | {summary["watch_state"]["rotating_cold_window_cycle_progress_pct_max"]} |
@@ -1751,7 +2008,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event-storm-interval-secs", type=float, default=300.0)
     parser.add_argument("--event-storm-settle-secs", type=float, default=120.0)
     parser.add_argument("--event-storm-timeout-secs", type=float, default=0.0)
-    parser.add_argument("--event-storm-ops", type=int, default=100)
+    parser.add_argument("--event-storm-ops", type=int, default=100,
+                        help="ops per burst. Default 100; 500-1000 recommended for stress testing.")
     parser.add_argument("--event-storm-duration-budget-secs", type=float, default=1.0)
     parser.add_argument(
         "--event-storm-time-skew-secs",
@@ -1764,12 +2022,44 @@ def parse_args() -> argparse.Namespace:
         default="L0,L1,L2,L3",
         help="comma-separated preferred tiers for successive bursts; falls back to roots",
     )
+    parser.add_argument(
+        "--event-storm-file-count",
+        type=int,
+        default=0,
+        help="explicit number of files each file-producing workload creates. "
+             "0 (default) keeps the per-workload ops-based defaults (backwards compatible).",
+    )
+    parser.add_argument(
+        "--event-storm-depth",
+        type=int,
+        default=2,
+        help="directory tree depth for the subtree_rename avalanche workload (default 2).",
+    )
+    parser.add_argument(
+        "--event-storm-inode-stress-iterations",
+        type=int,
+        default=0,
+        help="iterations for the inode_reuse_stress workload (default 0 => 100).",
+    )
+    parser.add_argument(
+        "--event-storm-inode-stress-tmpfs-inodes",
+        type=int,
+        default=200,
+        help="nr_inodes for the inode_reuse_stress tmpfs mount (default 200).",
+    )
+    parser.add_argument(
+        "--sweep-config",
+        default="",
+        help="path to a JSON sweep config file. When set, runs one benchmark per "
+             "variant (overriding base args) and prints a comparison table. "
+             "Format: {\"base_args\": {...}, \"variants\": [{\"label\": ..., ...}]}.",
+    )
     parser.add_argument("--startup-timeout-secs", type=float, default=60.0)
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
+def run_single(args: argparse.Namespace) -> dict[str, Any]:
+    """Run a single benchmark and return its summary dict."""
     repo = Path(args.repo).resolve()
     binary = Path(args.binary)
     if not binary.is_absolute():
@@ -1839,6 +2129,10 @@ def main() -> int:
         "event_storm_kind": normalize_event_storm_kinds(split_csv(args.event_storm_kind)),
         "event_storm_target_tier": split_csv(args.event_storm_target_tier),
         "event_storm_time_skew_secs": args.event_storm_time_skew_secs,
+        "event_storm_file_count": args.event_storm_file_count,
+        "event_storm_depth": args.event_storm_depth,
+        "event_storm_inode_stress_iterations": args.event_storm_inode_stress_iterations,
+        "event_storm_inode_stress_tmpfs_inodes": args.event_storm_inode_stress_tmpfs_inodes,
     }
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -1894,6 +2188,10 @@ def main() -> int:
                 time_skew_secs=args.event_storm_time_skew_secs,
                 kinds=normalize_event_storm_kinds(split_csv(args.event_storm_kind)),
                 target_tiers=split_csv(args.event_storm_target_tier),
+                file_count=args.event_storm_file_count,
+                subtree_depth=args.event_storm_depth,
+                inode_stress_iterations=args.event_storm_inode_stress_iterations,
+                inode_stress_tmpfs_inodes=args.event_storm_inode_stress_tmpfs_inodes,
             )
             if args.event_storm
             else None
@@ -1953,7 +2251,134 @@ def main() -> int:
         )
     write_report(run_dir, summary)
     print(json.dumps({"run_dir": str(run_dir), "summary": summary}, ensure_ascii=False, indent=2))
-    return 0 if not fatal_error and exit_code in (0, -signal.SIGTERM) else 1
+    return summary
+
+
+def _apply_overrides(args: argparse.Namespace, overrides: dict[str, Any]) -> argparse.Namespace:
+    """Return a copy of `args` with the given CLI-style overrides applied.
+
+    Keys use the CLI flag names with dashes (e.g. "rotating-budget"); values are
+    coerced to the type of the existing attribute when possible.
+    """
+    import copy as _copy
+
+    new_args = _copy.copy(args)
+    attr_map = {
+        key.replace("-", "_"): key for key in [
+            "rotating-budget", "rotating-tick-secs", "rotating-ttl-secs",
+            "rotating-max-cost-per-root", "rotating-max-dirs-per-tick",
+            "rotating-cold-window", "no-rotating-cold-window",
+            "duration-secs", "sample-interval-secs", "snapshot-interval-secs",
+            "tiered-profile", "watch-mode", "max-watch-dirs",
+            "l0-max-cost-per-root", "l1-scan-interval-secs", "l2-scan-interval-secs",
+            "l3-scan-interval-secs", "l1-empty-scans-to-l2", "l2-empty-scans-to-l3",
+            "fast-scan", "no-fast-scan", "event-storm-ops", "event-storm-file-count",
+            "event-storm-depth", "event-storm-interval-secs", "event-storm-settle-secs",
+        ]
+    }
+    for raw_key, value in overrides.items():
+        attr = raw_key.replace("-", "_")
+        if attr == "label":
+            new_args.run_label = str(value)
+            continue
+        if attr == "no_rotating_cold_window" and value:
+            new_args.rotating_cold_window = False
+            continue
+        if attr == "rotating_cold_window":
+            new_args.rotating_cold_window = bool(value)
+            continue
+        current = getattr(new_args, attr, None)
+        if isinstance(current, bool):
+            setattr(new_args, attr, bool(value))
+        elif isinstance(current, int) and not isinstance(current, bool):
+            setattr(new_args, attr, int(value))
+        elif isinstance(current, float):
+            setattr(new_args, attr, float(value))
+        else:
+            setattr(new_args, attr, value)
+    return new_args
+
+
+def run_sweep(args: argparse.Namespace) -> int:
+    """Task 4: run one benchmark per sweep variant and print a comparison table."""
+    import copy as _copy
+
+    sweep_path = Path(args.sweep_config).expanduser().resolve()
+    if not sweep_path.exists():
+        raise SystemExit(f"sweep config not found: {sweep_path}")
+    config = json.loads(sweep_path.read_text(encoding="utf-8"))
+    base_overrides = config.get("base_args", {}) or {}
+    variants = config.get("variants", []) or []
+    if not variants:
+        raise SystemExit("sweep config has no variants")
+
+    results: list[dict[str, Any]] = []
+    base_port = args.port
+    for idx, variant in enumerate(variants):
+        label = str(variant.get("label", f"variant-{idx:02d}"))
+        variant_args = _copy.copy(args)
+        variant_args.sweep_config = ""  # avoid recursion
+        variant_args = _apply_overrides(variant_args, base_overrides)
+        variant_args = _apply_overrides(variant_args, {k: v for k, v in variant.items() if k != "label"})
+        variant_args.run_label = label
+        variant_args.run_dir = ""  # auto-generate per variant
+        variant_args.port = base_port + idx  # unique port per variant
+        print(f"\n=== sweep [{idx + 1}/{len(variants)}] {label} ===", flush=True)
+        try:
+            summary = run_single(variant_args)
+        except Exception as exc:  # noqa: BLE001 - keep sweep going
+            print(f"sweep variant {label} failed: {repr(exc)}", flush=True)
+            summary = {"label": label, "fatal_error": repr(exc)}
+        summary["sweep_label"] = label
+        results.append(summary)
+
+    # Comparison table
+    cols = [
+        ("label", lambda s: s.get("label", s.get("sweep_label", ""))),
+        ("bursts", lambda s: s.get("event_storm", {}).get("bursts", "")),
+        ("es_success", lambda s: s.get("event_storm", {}).get("success_rate", "")),
+        ("cf_p95_max", lambda s: s.get("watch_state", {}).get("cold_freshness_age_p95_secs_max", "")),
+        ("cf_spike", lambda s: s.get("watch_state", {}).get("cold_freshness_age_spike_count", "")),
+        ("cf_slope", lambda s: s.get("watch_state", {}).get("cold_freshness_age_slope_max", "")),
+        ("dirty_q_max", lambda s: s.get("watch_state", {}).get("dirty_queue_len_max", "")),
+        ("rss_max", lambda s: s.get("process", {}).get("rss_bytes_max", "")),
+        ("passive_sr", lambda s: s.get("passive_first_query", {}).get("success_rate", "")),
+        ("inode_reuse_obs", lambda s: s.get("event_storm", {}).get("special", {}).get("inode_reuse_observed", "")),
+        ("fatal", lambda s: s.get("fatal_error", "")),
+    ]
+    header = " | ".join(name for name, _ in cols)
+    sep = "-+-".join("-" * len(name) for name, _ in cols)
+    print("\n=== sweep comparison ===")
+    print(header)
+    print(sep)
+    for s in results:
+        row = []
+        for _, getter in cols:
+            val = getter(s)
+            row.append(str(val) if val != "" else "-")
+        print(" | ".join(row))
+
+    sweep_report = {
+        "generated_at": utc_now(),
+        "sweep_config": str(sweep_path),
+        "variants": results,
+    }
+    repo = Path(args.repo).resolve()
+    out_path = repo / "reports" / "m2-cold-window-vm" / f"{utc_stamp()}_sweep_comparison.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(sweep_report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"\nsweep comparison written to: {out_path}")
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    if args.sweep_config:
+        return run_sweep(args)
+    summary = run_single(args)
+    exit_code = summary.get("fd_rdd_exit_code")
+    fatal = summary.get("fatal_error", "")
+    return 0 if not fatal and exit_code in (0, -signal.SIGTERM) else 1
 
 
 if __name__ == "__main__":
