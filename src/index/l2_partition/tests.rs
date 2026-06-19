@@ -1,5 +1,8 @@
 use super::*;
+use crate::core::{FileKey, FileMeta};
+use crate::index::IndexLayer;
 use crate::query::matcher::create_matcher;
+use std::path::PathBuf;
 
 #[test]
 fn roaring_posting_basic_query() {
