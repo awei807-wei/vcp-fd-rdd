@@ -3,17 +3,17 @@
 //! 本模块原为单一 2200+ 行的"上帝模块"，已按职责拆分为若干子模块：
 //!
 //! - [`path_arena`]: 路径压缩 arena（`PathArena`）
-//! - [`snapshot_format`]: 快照/段格式定义（`IndexSnapshotV2`–`V5`、`V6Segments`、常量）
+//! - [`snapshot_format`][]: 快照/段格式定义（`IndexSnapshotV2`–`V5`、`V6Segments`、常量）
 //! - [`dedupe`]: hardlink 去重统计（`HardlinkGroup`、`PhysicalDedupeStats`）
 //! - [`helpers`]: trigram / mtime / 路径哈希等自由函数与小型辅助类型
-//! - [`types`]: `OneOrManyDocId`、`RebuildPathTable`
+//! - [`types`][]: `OneOrManyDocId`、`RebuildPathTable`
 //! - [`construct`]: `PersistentIndex` 的构造与快照加载
 //! - [`upsert`]: upsert / mark_deleted / path_freshness 等写入路径
 //! - [`query`]: 查询、`IndexLayer` 实现、`to_base_index_data`
 //! - [`parent`]: hardlink 分组、`ParentIndex` 重建与目录候选
 //! - [`events`]: 事件应用（`apply_events` / `handle_*`）
-//! - [`export`]: 快照/段导出（`export_snapshot_v5`、`export_segments_v6*`）
-//! - [`stats`]: 内存统计、compaction、reset
+//! - [`export`][]: 快照/段导出（`export_snapshot_v5`、`export_segments_v6*`）
+//! - [`stats`][]: 内存统计、compaction、reset
 //! - [`internal`]: trigram / path_hash 增删、docid 查找等内部方法
 //!
 //! `PersistentIndex` 的私有字段定义在本文件中，所有子模块作为其后代模块均可直接访问。
