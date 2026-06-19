@@ -200,7 +200,12 @@ impl PersistentIndex {
         }
     }
 
-    pub fn export_segments_v6(&self) -> V6Segments {
+    /// 构建完整的 v6 段集合（roots / path_arena / metas / tombstones /
+    /// trigram_table / postings_blob / filekey_map），返回已 Arc 包装的 V6Segments。
+    ///
+    /// 供 `export_segments_v6` 与 `export_segments_v6_to_writer` 共享同一份构建产物，
+    /// 避免两者各自重复调用 `build_all_segments` + Arc 包装逻辑。
+    fn build_v6_segments(&self) -> V6Segments {
         let s = self.build_all_segments();
         V6Segments {
             roots_bytes: Arc::new(s.roots_bytes),
@@ -213,9 +218,31 @@ impl PersistentIndex {
         }
     }
 
+    pub fn export_segments_v6(&self) -> V6Segments {
+        self.build_v6_segments()
+    }
+
     fn write_segment(writer: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
         writer.write_all(&(bytes.len() as u64).to_le_bytes())?;
         writer.write_all(bytes)?;
+        Ok(())
+    }
+
+    /// 将 V6Segments 按固定顺序流式写入 writer，每段带 u64 LE 长度前缀。
+    /// 顺序：roots → path_arena → metas → tombstones → trigram_table → postings_blob → filekey_map。
+    ///
+    /// 供 `export_segments_v6_to_writer` 及 compacted 变体共享写入逻辑。
+    fn write_v6_segments_to_writer(
+        writer: &mut impl std::io::Write,
+        segments: &V6Segments,
+    ) -> std::io::Result<()> {
+        Self::write_segment(writer, &segments.roots_bytes)?;
+        Self::write_segment(writer, segments.path_arena_bytes.as_ref())?;
+        Self::write_segment(writer, &segments.metas_bytes)?;
+        Self::write_segment(writer, &segments.tombstones_bytes)?;
+        Self::write_segment(writer, &segments.trigram_table_bytes)?;
+        Self::write_segment(writer, &segments.postings_blob_bytes)?;
+        Self::write_segment(writer, &segments.filekey_map_bytes)?;
         Ok(())
     }
 
@@ -225,15 +252,8 @@ impl PersistentIndex {
         &self,
         writer: &mut impl std::io::Write,
     ) -> std::io::Result<()> {
-        let s = self.build_all_segments();
-        Self::write_segment(writer, &s.roots_bytes)?;
-        Self::write_segment(writer, s.path_arena_bytes.as_ref())?;
-        Self::write_segment(writer, &s.metas_bytes)?;
-        Self::write_segment(writer, &s.tombstones_bytes)?;
-        Self::write_segment(writer, &s.trigram_table_bytes)?;
-        Self::write_segment(writer, &s.postings_blob_bytes)?;
-        Self::write_segment(writer, &s.filekey_map_bytes)?;
-        Ok(())
+        let segments = self.build_v6_segments();
+        Self::write_v6_segments_to_writer(writer, &segments)
     }
 
     /// 导出 v6 段（物理 compaction 版）并流式写入 writer。
