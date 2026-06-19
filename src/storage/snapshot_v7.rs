@@ -1663,9 +1663,11 @@ pub fn snapshot_now_v7(
         }
     }
 
-    // 重建 entries_by_key
+    // 重建 entries_by_key — 排序保证快照字节确定性
+    let mut entries: Vec<FileEntry> = latest_by_key.into_values().collect();
+    entries.sort_by_key(|e| e.file_key());
     merged.entries_by_key = FileEntryIndex::new();
-    for (_, e) in latest_by_key {
+    for e in entries {
         merged.entries_by_key.push(e);
     }
 

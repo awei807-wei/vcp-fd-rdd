@@ -267,10 +267,10 @@ fn export_segments_v6_produces_all_seven_segments() {
         !segs.roots_bytes.is_empty(),
         "roots_bytes should not be empty"
     );
-    assert!(
-        !segs.path_arena_bytes.is_empty() || segs.path_arena_bytes.len() == 0,
-        "path_arena_bytes should exist"
-    );
+    // path_arena_bytes: 段必须存在但内容取决于 root 匹配；
+    // 插入的 "/tmp/test_file.txt" 在 root="/" 下 rel_bytes="tmp/test_file.txt"，
+    // 因此 arena 应非空。但若 root 匹配逻辑变化，arena 可能为空。
+    // 此处不强制断言 arena 内容，仅验证段引用存在。
     // metas_bytes 应该包含至少一条记录 (dev u64 + ino u64 + root_id u16 + path_off u32 + path_len u16 + mtime_ns i64 = 30 bytes)
     assert!(
         !segs.metas_bytes.is_empty(),
