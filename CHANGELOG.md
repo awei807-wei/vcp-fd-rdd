@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `storage/snapshot.rs` 为 `LoadedSnapshot` re-export 添加注释，说明与 `snapshot_legacy.rs` 的双向依赖是刻意设计。
 - 新增 `export_segments_v6` 和 `export_segments_v6_to_writer` 单元测试，验证 7 段输出完整性与顺序。
 
+### 代码审查修复第二轮（2026-06-19）
+
+- 修复 `storage/snapshot_v7.rs` `snapshot_now_v7` 快照输出非确定性：HashMap 遍历顺序随机化导致相同数据产生不同快照字节，改为收集到 Vec 后按 FileKey 排序再重建索引。
+- 修复 `index/l2_partition/tests.rs` 恒真断言：`!is_empty() || len() == 0` 永远为真，删除该无意义 assert。
+- 修复 `query/dsl.rs` 2 处 `unwrap()` 改为 `expect()` 带诊断信息，避免不变量被破坏时守护进程无信息 panic。
+- 修复 `runtime.rs` 多处 `u64::try_from(usize).unwrap_or(0)` 改为 `as u64` 直接转换，消除不可能溢出场景下的静默归零风险。
+- 修复 `storage/mod.rs` `fsync_dir` 目录打开失败日志级别从 `debug!` 提升至 `warn!`，便于生产环境排查。
+- 新建 `storage/snapshot_common.rs`：提取 `MAGIC`/`STATE_COMMITTED`/`STATE_INCOMPLETE`/`HEADER_SIZE` 共享常量，消除 `snapshot.rs` 与 `snapshot_legacy.rs` 之间的双向模块依赖。
+
 ## [0.7.1] - 2026-06-13
 
 ### 质量加固
