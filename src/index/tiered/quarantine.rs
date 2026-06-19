@@ -1,13 +1,36 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::fs_policy::MountTable;
 use crate::storage::quarantine::{
-    MountIdentity, QuarantineSidecar, QuarantineState, RootStateRecord,
+    FreezeGate, MountIdentity, QuarantineSidecar, QuarantineState, RootStateRecord,
 };
 
-use super::TieredIndex;
+use super::{RecoveryStatus, TieredIndex};
+
+/// Recovery & quarantine state extracted from `TieredIndex`.
+pub struct RecoveryQuarantine {
+    pub status: Mutex<RecoveryStatus>,
+    pub quarantine_state: Mutex<QuarantineState>,
+    pub freeze_gate: Mutex<FreezeGate>,
+    pub verify_pending: AtomicU64,
+    pub verified_roots: AtomicU64,
+}
+
+impl Default for RecoveryQuarantine {
+    fn default() -> Self {
+        Self {
+            status: Mutex::new(RecoveryStatus::default()),
+            quarantine_state: Mutex::new(QuarantineState::default()),
+            freeze_gate: Mutex::new(FreezeGate::default()),
+            verify_pending: AtomicU64::new(0),
+            verified_roots: AtomicU64::new(0),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct VerifiedRoot {
@@ -30,9 +53,10 @@ impl TieredIndex {
         let state = QuarantineState::from_sidecar(sidecar);
         let pending = state.active_root_count() as u64;
         let gate = state.freeze_gate();
-        *self.quarantine_state.lock() = state;
+        *self.recovery_quarantine.quarantine_state.lock() = state;
         self.install_freeze_gate(gate);
-        self.quarantine_verify_pending
+        self.recovery_quarantine
+            .verify_pending
             .store(pending, Ordering::Relaxed);
     }
 
@@ -45,7 +69,9 @@ impl TieredIndex {
 
     pub(crate) fn verify_quarantine_sidecar_once(&self, sidecar_path: PathBuf) {
         if !sidecar_path.exists() {
-            self.quarantine_verify_pending.store(0, Ordering::Relaxed);
+            self.recovery_quarantine
+                .verify_pending
+                .store(0, Ordering::Relaxed);
             return;
         }
 
@@ -103,10 +129,12 @@ impl TieredIndex {
                     e
                 );
             }
-            self.quarantine_verified_roots
+            self.recovery_quarantine
+                .verified_roots
                 .fetch_add(completed, Ordering::Relaxed);
         }
-        self.quarantine_verify_pending
+        self.recovery_quarantine
+            .verify_pending
             .store(sidecar.active_roots().count() as u64, Ordering::Relaxed);
     }
 }
