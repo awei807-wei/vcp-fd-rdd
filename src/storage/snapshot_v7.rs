@@ -14,6 +14,7 @@ use crate::index::parent_index::ParentIndex;
 use crate::index::path_table_v2::{PathTableBuilder, PathTableV2};
 use crate::query::Matcher;
 use crate::storage::checksum::{crc32c_checksum, Crc32c};
+use crate::storage::error::{StorageError, StorageResult};
 use crate::util::{align_up, read_u32};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,24 +83,24 @@ fn encode_path_table(pt: &PathTableV2) -> Vec<u8> {
     pt.encode_raw()
 }
 
-fn decode_path_table(bytes: &[u8]) -> anyhow::Result<PathTableV2> {
+fn decode_path_table(bytes: &[u8]) -> StorageResult<PathTableV2> {
     if let Some(table) = PathTableV2::decode_raw(bytes) {
         return Ok(table);
     }
     if bytes.len() < 4 {
-        anyhow::bail!("path table too small");
+        return Err(StorageError::Corruption("path table too small".into()));
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
     let mut builder = PathTableBuilder::with_capacity(count);
     let mut off = 4usize;
     for i in 0..count {
         if off + 2 > bytes.len() {
-            anyhow::bail!("path table truncated");
+            return Err(StorageError::Corruption("path table truncated".into()));
         }
         let len = u16::from_le_bytes(bytes[off..off + 2].try_into()?) as usize;
         off += 2;
         if off + len > bytes.len() {
-            anyhow::bail!("path table truncated");
+            return Err(StorageError::Corruption("path table truncated".into()));
         }
         let path_bytes = bytes[off..off + len].to_vec();
         off += len;
@@ -146,15 +147,19 @@ fn encode_file_entry_index_legacy_40b(fei: &FileEntryIndex) -> Vec<u8> {
     out
 }
 
-fn decode_file_entry_index(bytes: &[u8], snapshot_version: u32) -> anyhow::Result<FileEntryIndex> {
+fn decode_file_entry_index(bytes: &[u8], snapshot_version: u32) -> StorageResult<FileEntryIndex> {
     if bytes.len() < 4 {
-        anyhow::bail!("file entry index too small");
+        return Err(StorageError::Corruption(
+            "file entry index too small".into(),
+        ));
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
     let rec_size = file_entry_rec_size(snapshot_version)?;
     let expected = 4 + count * rec_size;
     if bytes.len() < expected {
-        anyhow::bail!("file entry index truncated");
+        return Err(StorageError::Corruption(
+            "file entry index truncated".into(),
+        ));
     }
     let mut fei = FileEntryIndex::with_capacity(count);
     let mut off = 4usize;
@@ -248,26 +253,28 @@ fn encode_trigram_map(index: &HashMap<[u8; 3], RoaringBitmap>) -> Vec<u8> {
     out
 }
 
-fn decode_trigram_index(bytes: &[u8]) -> anyhow::Result<TrigramIndex> {
+fn decode_trigram_index(bytes: &[u8]) -> StorageResult<TrigramIndex> {
     if bytes.len() < 4 {
-        anyhow::bail!("trigram index too small");
+        return Err(StorageError::Corruption("trigram index too small".into()));
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
     let mut ti = TrigramIndex::new();
     let mut off = 4usize;
     for _ in 0..count {
         if off + 8 > bytes.len() {
-            anyhow::bail!("trigram index truncated");
+            return Err(StorageError::Corruption("trigram index truncated".into()));
         }
         let tri = [bytes[off], bytes[off + 1], bytes[off + 2]];
         // skip pad at off+3
         let posting_len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into()?) as usize;
         off += 8;
         if off + posting_len > bytes.len() {
-            anyhow::bail!("trigram index posting truncated");
+            return Err(StorageError::Corruption(
+                "trigram index posting truncated".into(),
+            ));
         }
         let bitmap = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
-            .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
+            .map_err(|e| StorageError::Deserialize(format!("roaring deserialize failed: {}", e)))?;
         off += posting_len;
         ti.insert(tri, bitmap);
     }
@@ -299,9 +306,9 @@ fn encode_parent_index(pi: &ParentIndex) -> Vec<u8> {
     out
 }
 
-fn decode_parent_index(bytes: &[u8]) -> anyhow::Result<ParentIndex> {
+fn decode_parent_index(bytes: &[u8]) -> StorageResult<ParentIndex> {
     if bytes.len() < 4 {
-        anyhow::bail!("parent index too small");
+        return Err(StorageError::Corruption("parent index too small".into()));
     }
     let mut off = 0usize;
     // Decode dir_to_files
@@ -310,42 +317,56 @@ fn decode_parent_index(bytes: &[u8]) -> anyhow::Result<ParentIndex> {
     let mut dir_to_files: HashMap<u32, Vec<u32>> = HashMap::with_capacity(count);
     for _ in 0..count {
         if off + 4 > bytes.len() {
-            anyhow::bail!("parent index dir_idx truncated");
+            return Err(StorageError::Corruption(
+                "parent index dir_idx truncated".into(),
+            ));
         }
         let dir_idx = u32::from_le_bytes(bytes[off..off + 4].try_into()?);
         off += 4;
         if off + 4 > bytes.len() {
-            anyhow::bail!("parent index posting len truncated");
+            return Err(StorageError::Corruption(
+                "parent index posting len truncated".into(),
+            ));
         }
         let posting_len = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
         off += 4;
         if off + posting_len > bytes.len() {
-            anyhow::bail!("parent index posting truncated");
+            return Err(StorageError::Corruption(
+                "parent index posting truncated".into(),
+            ));
         }
         let rb = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
-            .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
+            .map_err(|e| StorageError::Deserialize(format!("roaring deserialize failed: {}", e)))?;
         off += posting_len;
         dir_to_files.insert(dir_idx, rb.iter().collect());
     }
     // Decode and discard legacy dir_to_subdirs.
     if off + 4 > bytes.len() {
-        anyhow::bail!("parent index subdir count truncated");
+        return Err(StorageError::Corruption(
+            "parent index subdir count truncated".into(),
+        ));
     }
     let subdir_count = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
     off += 4;
     for _ in 0..subdir_count {
         if off + 4 > bytes.len() {
-            anyhow::bail!("parent index subdir dir_idx truncated");
+            return Err(StorageError::Corruption(
+                "parent index subdir dir_idx truncated".into(),
+            ));
         }
         off += 4;
         if off + 4 > bytes.len() {
-            anyhow::bail!("parent index subdir list count truncated");
+            return Err(StorageError::Corruption(
+                "parent index subdir list count truncated".into(),
+            ));
         }
         let list_count = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
         off += 4;
         for _ in 0..list_count {
             if off + 4 > bytes.len() {
-                anyhow::bail!("parent index subdir entry truncated");
+                return Err(StorageError::Corruption(
+                    "parent index subdir entry truncated".into(),
+                ));
             }
             off += 4;
         }
@@ -362,10 +383,9 @@ fn encode_tombstones(t: &RoaringBitmap) -> Vec<u8> {
     t.serialize_into(&mut out).expect("roaring serialize");
     out
 }
-
-fn decode_tombstones(bytes: &[u8]) -> anyhow::Result<RoaringBitmap> {
+fn decode_tombstones(bytes: &[u8]) -> StorageResult<RoaringBitmap> {
     RoaringBitmap::deserialize_from(bytes)
-        .map_err(|e| anyhow::anyhow!("tombstones deserialize failed: {}", e))
+        .map_err(|e| StorageError::Deserialize(format!("tombstones deserialize failed: {}", e)))
 }
 
 #[derive(Clone, Copy)]
@@ -521,11 +541,11 @@ fn lookup_raw_path(bytes: &[u8], layout: RawPathTableLayout, target: &[u8]) -> O
     None
 }
 
-fn file_entry_rec_size(snapshot_version: u32) -> anyhow::Result<usize> {
+fn file_entry_rec_size(snapshot_version: u32) -> StorageResult<usize> {
     match snapshot_version {
         V7_VERSION => Ok(FILE_ENTRY_REC_SIZE),
         V7_VERSION_LEGACY_40B_ENTRY => Ok(LEGACY_FILE_ENTRY_REC_SIZE),
-        version => anyhow::bail!("unsupported v7 snapshot version {}", version),
+        version => Err(StorageError::UnsupportedVersion(version)),
     }
 }
 
@@ -558,56 +578,65 @@ fn entry_to_meta(entry: FileEntry, path_bytes: Vec<u8>) -> FileMeta {
     crate::util::entry_to_meta(&entry, &path_bytes)
 }
 
-fn posting_for_trigram(bytes: &[u8], tri: [u8; 3]) -> anyhow::Result<Option<RoaringBitmap>> {
+fn posting_for_trigram(bytes: &[u8], tri: [u8; 3]) -> StorageResult<Option<RoaringBitmap>> {
     if bytes.len() < 4 {
-        anyhow::bail!("trigram index too small");
+        return Err(StorageError::Corruption("trigram index too small".into()));
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
     let mut off = 4usize;
     for _ in 0..count {
         if off + 8 > bytes.len() {
-            anyhow::bail!("trigram index truncated");
+            return Err(StorageError::Corruption("trigram index truncated".into()));
         }
         let key = [bytes[off], bytes[off + 1], bytes[off + 2]];
         let posting_len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into()?) as usize;
         off += 8;
         if off + posting_len > bytes.len() {
-            anyhow::bail!("trigram index posting truncated");
+            return Err(StorageError::Corruption(
+                "trigram index posting truncated".into(),
+            ));
         }
         if key == tri {
-            let bitmap = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
-                .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
+            let bitmap =
+                RoaringBitmap::deserialize_from(&bytes[off..off + posting_len]).map_err(|e| {
+                    StorageError::Deserialize(format!("roaring deserialize failed: {}", e))
+                })?;
             return Ok(Some(bitmap));
         }
         off += posting_len;
     }
     Ok(None)
 }
-
-fn trigram_index_has_sentinel(bytes: &[u8]) -> anyhow::Result<bool> {
+fn trigram_index_has_sentinel(bytes: &[u8]) -> StorageResult<bool> {
     posting_for_trigram(bytes, TRIGRAM_SENTINEL).map(|posting| posting.is_some())
 }
 
-fn parent_posting(bytes: &[u8], parent_idx: u32) -> anyhow::Result<Option<RoaringBitmap>> {
+fn parent_posting(bytes: &[u8], parent_idx: u32) -> StorageResult<Option<RoaringBitmap>> {
     if bytes.len() < 4 {
-        anyhow::bail!("parent index too small");
+        return Err(StorageError::Corruption("parent index too small".into()));
     }
     let mut off = 0usize;
     let count = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
     off += 4;
     for _ in 0..count {
         if off + 8 > bytes.len() {
-            anyhow::bail!("parent index dir entry truncated");
+            return Err(StorageError::Corruption(
+                "parent index dir entry truncated".into(),
+            ));
         }
         let dir_idx = u32::from_le_bytes(bytes[off..off + 4].try_into()?);
         let posting_len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into()?) as usize;
         off += 8;
         if off + posting_len > bytes.len() {
-            anyhow::bail!("parent index posting truncated");
+            return Err(StorageError::Corruption(
+                "parent index posting truncated".into(),
+            ));
         }
         if dir_idx == parent_idx {
-            let bitmap = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
-                .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
+            let bitmap =
+                RoaringBitmap::deserialize_from(&bytes[off..off + posting_len]).map_err(|e| {
+                    StorageError::Deserialize(format!("roaring deserialize failed: {}", e))
+                })?;
             return Ok(Some(bitmap));
         }
         off += posting_len;
@@ -853,10 +882,11 @@ impl V7Snapshot {
     }
 
     fn tombstones(&self) -> anyhow::Result<RoaringBitmap> {
-        self.segment(V7SegKind::Tombstones)
+        Ok(self
+            .segment(V7SegKind::Tombstones)
             .map(decode_tombstones)
-            .transpose()
-            .map(|t| t.unwrap_or_default())
+            .transpose()?
+            .unwrap_or_default())
     }
 
     fn trigram_candidates(&self, matcher: &dyn Matcher) -> anyhow::Result<Option<RoaringBitmap>> {
