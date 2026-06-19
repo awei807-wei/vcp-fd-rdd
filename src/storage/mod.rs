@@ -21,9 +21,14 @@ use std::path::Path;
 /// are logged rather than propagated because, on most filesystems, a failed
 /// directory fsync does not indicate data loss for the rename itself.
 pub(crate) fn fsync_dir(dir: &Path) {
-    if let Ok(d) = std::fs::File::open(dir) {
-        if let Err(e) = d.sync_all() {
-            tracing::warn!("fsync directory failed: {e}");
+    match std::fs::File::open(dir) {
+        Ok(d) => {
+            if let Err(e) = d.sync_all() {
+                tracing::warn!("fsync directory failed: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::debug!("fsync_dir: could not open directory {:?}: {}", dir, e);
         }
     }
 }

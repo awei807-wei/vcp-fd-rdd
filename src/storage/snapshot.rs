@@ -10,9 +10,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-// Re-export LoadedSnapshot so existing callers that reference
-// `snapshot::LoadedSnapshot` continue to work after the legacy code was
-// moved to `snapshot_legacy`.
+// LoadedSnapshot is defined in snapshot_legacy.rs but re-exported here so
+// existing callers that reference `snapshot::LoadedSnapshot` continue to work.
+// snapshot_legacy.rs imports constants (MAGIC, HEADER_SIZE, etc.) from this
+// module — this bidirectional dependency is intentional: the legacy code is
+// an extension of the main snapshot module, not an independent component.
+// If this becomes a maintenance burden, extract shared constants to a
+// `snapshot_common` module.
 use crate::storage::snapshot_legacy;
 pub use crate::storage::snapshot_legacy::LoadedSnapshot;
 
@@ -1040,7 +1044,7 @@ pub(crate) fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
     if !checksum_ok {
         anyhow::bail!("LSM manifest checksum mismatch");
     }
-    Ok(lsm_decode_manifest_body(&body)?)
+    lsm_decode_manifest_body(&body).map_err(Into::into)
 }
 
 fn now_unix_nanos() -> u64 {
