@@ -13,6 +13,30 @@ pub mod tiered;
 
 use crate::core::{FileKey, FileMeta};
 use crate::query::Matcher;
+use crate::util::pathbuf_from_encoded_vec;
+
+use file_entry_v2::FileEntry;
+
+/// Build a `FileMeta` from a `FileEntry` and its raw encoded path bytes.
+///
+/// `size`/`ctime`/`atime` are left as zero/`None` — the on-disk entry only
+/// carries `mtime`, matching the historical behaviour of the snapshot and
+/// base-index decoders.
+pub(crate) fn entry_to_meta(entry: &FileEntry, path_bytes: &[u8]) -> FileMeta {
+    FileMeta {
+        file_key: entry.file_key(),
+        path: pathbuf_from_encoded_vec(path_bytes.to_vec()),
+        size: 0,
+        mtime: if entry.mtime_ns >= 0 {
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(entry.mtime_ns as u64))
+        } else {
+            None
+        },
+        ctime: None,
+        atime: None,
+        kind: entry.kind(),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathFreshness {

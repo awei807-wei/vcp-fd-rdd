@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::entry_to_meta;
 use crate::core::{FileKey, FileMeta};
 use crate::index::case_policy::unicode_case_fold_lookup;
 pub use crate::index::file_entry_v2::{FileEntry, FileEntryIndex};
@@ -13,7 +14,7 @@ use crate::index::PathFreshness;
 use crate::query::Matcher;
 use crate::stats::BaseStats;
 use crate::storage::snapshot_v7::V7Snapshot;
-use crate::util::{entry_to_meta, pathbuf_from_encoded_vec};
+use crate::util::pathbuf_from_encoded_vec;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MmapWarmupReport {

@@ -575,7 +575,7 @@ fn file_entry_at(bytes: &[u8], snapshot_version: u32, docid: u32) -> Option<File
 }
 
 fn entry_to_meta(entry: FileEntry, path_bytes: Vec<u8>) -> FileMeta {
-    crate::util::entry_to_meta(&entry, &path_bytes)
+    crate::index::entry_to_meta(&entry, &path_bytes)
 }
 
 fn posting_for_trigram(bytes: &[u8], tri: [u8; 3]) -> StorageResult<Option<RoaringBitmap>> {

@@ -1,8 +1,5 @@
 use std::path::{Component, Path, PathBuf};
 
-use crate::core::FileMeta;
-use crate::index::file_entry_v2::FileEntry;
-
 // ── RSS trim：主动向 OS 归还空闲堆内存 ──
 
 #[cfg(feature = "mimalloc")]
@@ -204,29 +201,6 @@ pub fn read_u32(bytes: &[u8], off: &mut usize) -> Option<u32> {
     let value = u32::from_le_bytes(bytes.get(*off..*off + 4)?.try_into().ok()?);
     *off += 4;
     Some(value)
-}
-
-// ── 索引元数据工具 ──
-
-/// Build a `FileMeta` from a `FileEntry` and its raw encoded path bytes.
-///
-/// `size`/`ctime`/`atime` are left as zero/`None` — the on-disk entry only
-/// carries `mtime`, matching the historical behaviour of the snapshot and
-/// base-index decoders.
-pub fn entry_to_meta(entry: &FileEntry, path_bytes: &[u8]) -> FileMeta {
-    FileMeta {
-        file_key: entry.file_key(),
-        path: pathbuf_from_encoded_vec(path_bytes.to_vec()),
-        size: 0,
-        mtime: if entry.mtime_ns >= 0 {
-            Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(entry.mtime_ns as u64))
-        } else {
-            None
-        },
-        ctime: None,
-        atime: None,
-        kind: entry.kind(),
-    }
 }
 
 #[cfg(test)]
