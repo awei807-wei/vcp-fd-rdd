@@ -475,29 +475,6 @@ fn log_metadata_error(path: &std::path::Path, err: &ignore::Error) {
     tracing::warn!("scan metadata failed for {}: {}", path.display(), err);
 }
 
-/// BuildLineage：仅记录构建流水线的阶段性记录，有硬上限（环形缓冲区）
-#[derive(Clone, Debug)]
-pub struct BuildLineage {
-    pub max_records: usize,
-    pub records: std::collections::VecDeque<String>,
-}
-
-impl BuildLineage {
-    pub fn new(max_records: usize) -> Self {
-        Self {
-            max_records,
-            records: std::collections::VecDeque::with_capacity(max_records),
-        }
-    }
-
-    pub fn push(&mut self, record: String) {
-        if self.records.len() >= self.max_records {
-            self.records.pop_front();
-        }
-        self.records.push_back(record);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
