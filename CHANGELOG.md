@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 代码审查与质量加固（2026-06-19）
+
+- 删除 `src/index/pathtable.rs`（Phase 4 未完成半成品，已被 `PathTableV2` 取代，零引用）。
+- 修复 `query/dsl.rs` 查询编译路径 3 处 `unwrap()`/`expect()`，改为安全 fallback，避免异常输入导致进程崩溃。
+- 修复 `index/l1_cache.rs` 4 处 TOCTOU 竞态：insert/remove/remove_by_path 改为同时持有 inner + path_index 写锁保证双向映射原子一致，建立统一锁序 inner → path_index → lru。
+- 分析 `index/tiered/sync.rs` `finish_rebuild` 双锁路径，确认全项目锁序一致无死锁风险，补充文档注释。
+- 提取 5 处重复代码为共享 helper：`entry_to_meta()`、`align_up()`、`read_u32()`（→ `util.rs`）；`atomic_write()`、`fsync_dir()`（→ `storage/mod.rs`）；消除 `snapshot.rs` 4 处内联 CRC32 改调已有 `checksum::crc32c_checksum()`。
+- `TieredIndex` 上帝对象拆分（阶段 1）：82 个平铺字段提取为 5 个子 struct（`ContentIndexState`、`LazyValidationRuntime`、`RecoveryQuarantine`、`IoTuning`、`TombstoneTracker`），struct 定义从 82 行降至 41 字段。
+- 拆分 `index/l2_partition/mod.rs` 上帝模块：2210 行 → 106 行 + 13 个子模块（每个 <400 行），外部 pub API 通过 re-export 完全保持不变。
+- `main.rs` 瘦身：2154 行 → 9 行薄入口，全部守护进程编排逻辑下沉到新 `src/runtime.rs`。
+- `storage/snapshot.rs` legacy 隔离：V2-V5 兼容加载代码移至新 `src/storage/snapshot_legacy.rs`（兼容代码保留，仅文件隔离）。
+- storage 层引入 `StorageError`（thiserror），内部函数从 anyhow 改为精确错误类型。
+- 删除 `src/core/dag.rs`（278 行，连编译都不参与的孤儿文件）。
+- 删除 `src/core/rdd.rs` 中从未被调用的 `BuildLineage` 壳子。
+- `src/core/lineage.rs` 改名为 `event_types.rs`（内容实为事件类型定义，与 RDD lineage 无关）。
+- 去重 `l2_partition/export.rs` 段导出逻辑：抽取 `build_v6_segments()` 和 `write_v6_segments_to_writer()` 公共函数，`export_segments_v6` / `export_segments_v6_to_writer` 改为调用公共函数（完成方案包 `code-debt-cleanup-phase1` 最后一个未落实项）。
 - 修复 daemon 集成测试的并发串扰：`FdRddProcess` 现在默认为每个子进程隔离 `XDG_CONFIG_HOME` 与 `XDG_RUNTIME_DIR`，避免 `--no-watch` 测试持久化的配置影响 crash recovery/watcher 测试。
 
 ## [0.7.1] - 2026-06-13
