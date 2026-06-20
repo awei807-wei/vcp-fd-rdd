@@ -11,7 +11,7 @@ use super::metrics::{RunMetrics, RunReport};
 use super::policy::PolicyParams;
 use super::rng::Rng64;
 use super::simulator::run_simulation;
-use super::world::{generate_world, WorkloadConfig, WorkloadProfile, WorldSummary};
+use super::world::{generate_world, WorkloadConfig, WorkloadProfile, World, WorldSummary};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -393,6 +393,18 @@ pub fn evolve_report(config: OptimizerConfig) -> BenchmarkReport {
 
 pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkReport> {
     let summary_world = generate_world(config.workload.clone());
+    let resumed = load_checkpoint_or_init(&config, &summary_world)?;
+    let baseline = evaluate_baseline(&config, resumed.as_ref());
+    let state = run_evolution_loop(&config, &summary_world, &baseline, resumed.as_ref())?;
+    Ok(assemble_report(&config, &summary_world, baseline, state))
+}
+
+/// Reads a checkpoint from `resume_path` (if set) and writes an initial
+/// baseline-started checkpoint when no resume data is found.
+fn load_checkpoint_or_init(
+    config: &OptimizerConfig,
+    world: &World,
+) -> anyhow::Result<Option<BenchmarkReport>> {
     let resumed = match &config.resume_path {
         Some(path) => Some(read_checkpoint(path)?),
         None => None,
@@ -400,8 +412,8 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
     if resumed.is_none() {
         if let Some(path) = &config.checkpoint_path {
             let report = build_optimize_report(BuildOptimizeReport {
-                config: &config,
-                world: summary_world.summary(),
+                config,
+                world: world.summary(),
                 baseline: None,
                 trace: Vec::new(),
                 converged: false,
@@ -417,19 +429,47 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
             write_checkpoint(path, &report)?;
         }
     }
-    let baseline = resumed
+    Ok(resumed)
+}
+
+/// Returns the baseline `RunReport` from a resumed checkpoint or evaluates
+/// a fresh one from the default policy.
+fn evaluate_baseline(config: &OptimizerConfig, resumed: Option<&BenchmarkReport>) -> RunReport {
+    resumed
         .as_ref()
         .and_then(|report| report.baseline.clone())
         .unwrap_or_else(|| {
             let baseline_policy = config.policy.clone().sanitize();
-            let baseline_metrics = evaluate_policy(&config, &baseline_policy);
+            let baseline_metrics = evaluate_policy(config, &baseline_policy);
             RunReport {
                 rank: 0,
                 policy: baseline_policy,
                 metrics: baseline_metrics,
             }
-        });
+        })
+}
 
+/// Mutable state carried through the evolution loop.
+struct EvolutionState {
+    best_seen: Vec<RunReport>,
+    trace: Vec<GenerationTrace>,
+    best_score: f64,
+    best_generation: usize,
+    stale_generations: usize,
+    trials: usize,
+    converged: bool,
+    start_generation: usize,
+    #[allow(dead_code)]
+    population: Vec<PolicyParams>,
+}
+
+/// Runs the main evolutionary optimization loop, returning the final state.
+fn run_evolution_loop(
+    config: &OptimizerConfig,
+    world: &World,
+    baseline: &RunReport,
+    resumed: Option<&BenchmarkReport>,
+) -> anyhow::Result<EvolutionState> {
     let mut rng = Rng64::new(config.workload.seed ^ 0x0f7d_5eed_c0de);
     let mut best_seen = resumed
         .as_ref()
@@ -460,18 +500,18 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
         .unwrap_or(0);
     let mut converged = false;
     let start_generation = trace.len();
-    let mut population = resume_population(&config, &baseline.policy, &best_seen, &mut rng);
+    let mut population = resume_population(config, &baseline.policy, &best_seen, &mut rng);
 
     for step in 1..=config.generations.max(1) {
         let generation = start_generation + step;
-        let generation_population = population;
+        let generation_population = std::mem::take(&mut population);
         let generation_total = generation_population.len();
         let mut generation_runs = Vec::with_capacity(generation_total);
         for (trial_idx, policy) in generation_population.into_iter().enumerate() {
             if let Some(path) = &config.checkpoint_path {
                 let report = build_optimize_report(BuildOptimizeReport {
-                    config: &config,
-                    world: summary_world.summary(),
+                    config,
+                    world: world.summary(),
                     baseline: Some(baseline.clone()),
                     trace: trace.clone(),
                     converged: false,
@@ -486,7 +526,7 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
                 });
                 write_checkpoint(path, &report)?;
             }
-            let metrics = evaluate_policy(&config, &policy);
+            let metrics = evaluate_policy(config, &policy);
             trials += 1;
             generation_runs.push(RunReport {
                 rank: 0,
@@ -500,8 +540,8 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
             rank_and_truncate(&mut partial_best, config.top_n.max(8));
             if let Some(path) = &config.checkpoint_path {
                 let report = build_optimize_report(BuildOptimizeReport {
-                    config: &config,
-                    world: summary_world.summary(),
+                    config,
+                    world: world.summary(),
                     baseline: Some(baseline.clone()),
                     trace: trace.clone(),
                     converged: false,
@@ -546,8 +586,8 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
 
         if let Some(path) = &config.checkpoint_path {
             let report = build_optimize_report(BuildOptimizeReport {
-                config: &config,
-                world: summary_world.summary(),
+                config,
+                world: world.summary(),
                 baseline: Some(baseline.clone()),
                 trace: trace.clone(),
                 converged,
@@ -578,7 +618,7 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
             );
         }
 
-        if stale_generations >= config.patience.max(1) {
+        if check_convergence(config, stale_generations) {
             converged = true;
             break;
         }
@@ -597,10 +637,46 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
         }
     }
 
+    Ok(EvolutionState {
+        best_seen,
+        trace,
+        best_score,
+        best_generation,
+        stale_generations,
+        trials,
+        converged,
+        start_generation,
+        population,
+    })
+}
+
+/// Returns `true` when the evolution loop should stop due to convergence.
+fn check_convergence(config: &OptimizerConfig, stale_generations: usize) -> bool {
+    stale_generations >= config.patience.max(1)
+}
+
+/// Assembles the final `BenchmarkReport` from the evolution state.
+fn assemble_report(
+    config: &OptimizerConfig,
+    world: &World,
+    baseline: RunReport,
+    state: EvolutionState,
+) -> BenchmarkReport {
+    let EvolutionState {
+        mut best_seen,
+        trace,
+        converged,
+        stale_generations,
+        best_generation,
+        best_score,
+        trials,
+        start_generation,
+        ..
+    } = state;
     rank_and_truncate(&mut best_seen, config.top_n);
-    Ok(build_optimize_report(BuildOptimizeReport {
-        config: &config,
-        world: summary_world.summary(),
+    build_optimize_report(BuildOptimizeReport {
+        config,
+        world: world.summary(),
         baseline: Some(baseline),
         trace,
         converged,
@@ -612,7 +688,7 @@ pub fn optimize_report(config: OptimizerConfig) -> anyhow::Result<BenchmarkRepor
         current_generation_trials: 0,
         phase: "finished".to_string(),
         best_seen,
-    }))
+    })
 }
 
 struct BuildOptimizeReport<'a> {

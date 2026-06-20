@@ -217,10 +217,10 @@ jobs:
                 echo "❌ FAIL: Query $i returned empty results (persisted through retries)"
                 exit 1
               fi
+
             fi
           done
           echo "✅ PASS: All 10 queries completed, max latency ${MAX_LATENCY}ms"
-
       - name: "Test C: Deep file query"
         run: |
           set -e

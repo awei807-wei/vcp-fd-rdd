@@ -14,7 +14,8 @@ use crate::index::parent_index::ParentIndex;
 use crate::index::path_table_v2::{PathTableBuilder, PathTableV2};
 use crate::query::Matcher;
 use crate::storage::checksum::{crc32c_checksum, Crc32c};
-use crate::util::pathbuf_from_encoded_vec;
+use crate::storage::error::{StorageError, StorageResult};
+use crate::util::{align_up, read_u32};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // v7 单文件 mmap 格式常量
@@ -85,24 +86,24 @@ fn encode_path_table(pt: &PathTableV2) -> Vec<u8> {
     pt.encode_raw()
 }
 
-fn decode_path_table(bytes: &[u8]) -> anyhow::Result<PathTableV2> {
+fn decode_path_table(bytes: &[u8]) -> StorageResult<PathTableV2> {
     if let Some(table) = PathTableV2::decode_raw(bytes) {
         return Ok(table);
     }
     if bytes.len() < 4 {
-        anyhow::bail!("path table too small");
+        return Err(StorageError::Corruption("path table too small".into()));
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
     let mut builder = PathTableBuilder::with_capacity(count);
     let mut off = 4usize;
     for i in 0..count {
         if off + 2 > bytes.len() {
-            anyhow::bail!("path table truncated");
+            return Err(StorageError::Corruption("path table truncated".into()));
         }
         let len = u16::from_le_bytes(bytes[off..off + 2].try_into()?) as usize;
         off += 2;
         if off + len > bytes.len() {
-            anyhow::bail!("path table truncated");
+            return Err(StorageError::Corruption("path table truncated".into()));
         }
         let path_bytes = bytes[off..off + len].to_vec();
         off += len;
@@ -149,15 +150,19 @@ fn encode_file_entry_index_legacy_40b(fei: &FileEntryIndex) -> Vec<u8> {
     out
 }
 
-fn decode_file_entry_index(bytes: &[u8], snapshot_version: u32) -> anyhow::Result<FileEntryIndex> {
+fn decode_file_entry_index(bytes: &[u8], snapshot_version: u32) -> StorageResult<FileEntryIndex> {
     if bytes.len() < 4 {
-        anyhow::bail!("file entry index too small");
+        return Err(StorageError::Corruption(
+            "file entry index too small".into(),
+        ));
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
     let rec_size = file_entry_rec_size(snapshot_version)?;
     let expected = 4 + count * rec_size;
     if bytes.len() < expected {
-        anyhow::bail!("file entry index truncated");
+        return Err(StorageError::Corruption(
+            "file entry index truncated".into(),
+        ));
     }
     let mut fei = FileEntryIndex::with_capacity(count);
     let mut off = 4usize;
@@ -251,26 +256,28 @@ fn encode_trigram_map(index: &HashMap<[u8; 3], RoaringBitmap>) -> Vec<u8> {
     out
 }
 
-fn decode_trigram_index(bytes: &[u8]) -> anyhow::Result<TrigramIndex> {
+fn decode_trigram_index(bytes: &[u8]) -> StorageResult<TrigramIndex> {
     if bytes.len() < 4 {
-        anyhow::bail!("trigram index too small");
+        return Err(StorageError::Corruption("trigram index too small".into()));
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
     let mut ti = TrigramIndex::new();
     let mut off = 4usize;
     for _ in 0..count {
         if off + 8 > bytes.len() {
-            anyhow::bail!("trigram index truncated");
+            return Err(StorageError::Corruption("trigram index truncated".into()));
         }
         let tri = [bytes[off], bytes[off + 1], bytes[off + 2]];
         // skip pad at off+3
         let posting_len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into()?) as usize;
         off += 8;
         if off + posting_len > bytes.len() {
-            anyhow::bail!("trigram index posting truncated");
+            return Err(StorageError::Corruption(
+                "trigram index posting truncated".into(),
+            ));
         }
         let bitmap = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
-            .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
+            .map_err(|e| StorageError::Deserialize(format!("roaring deserialize failed: {}", e)))?;
         off += posting_len;
         ti.insert(tri, bitmap);
     }
@@ -302,9 +309,9 @@ fn encode_parent_index(pi: &ParentIndex) -> Vec<u8> {
     out
 }
 
-fn decode_parent_index(bytes: &[u8]) -> anyhow::Result<ParentIndex> {
+fn decode_parent_index(bytes: &[u8]) -> StorageResult<ParentIndex> {
     if bytes.len() < 4 {
-        anyhow::bail!("parent index too small");
+        return Err(StorageError::Corruption("parent index too small".into()));
     }
     let mut off = 0usize;
     // Decode dir_to_files
@@ -313,42 +320,56 @@ fn decode_parent_index(bytes: &[u8]) -> anyhow::Result<ParentIndex> {
     let mut dir_to_files: HashMap<u32, Vec<u32>> = HashMap::with_capacity(count);
     for _ in 0..count {
         if off + 4 > bytes.len() {
-            anyhow::bail!("parent index dir_idx truncated");
+            return Err(StorageError::Corruption(
+                "parent index dir_idx truncated".into(),
+            ));
         }
         let dir_idx = u32::from_le_bytes(bytes[off..off + 4].try_into()?);
         off += 4;
         if off + 4 > bytes.len() {
-            anyhow::bail!("parent index posting len truncated");
+            return Err(StorageError::Corruption(
+                "parent index posting len truncated".into(),
+            ));
         }
         let posting_len = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
         off += 4;
         if off + posting_len > bytes.len() {
-            anyhow::bail!("parent index posting truncated");
+            return Err(StorageError::Corruption(
+                "parent index posting truncated".into(),
+            ));
         }
         let rb = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
-            .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
+            .map_err(|e| StorageError::Deserialize(format!("roaring deserialize failed: {}", e)))?;
         off += posting_len;
         dir_to_files.insert(dir_idx, rb.iter().collect());
     }
     // Decode and discard legacy dir_to_subdirs.
     if off + 4 > bytes.len() {
-        anyhow::bail!("parent index subdir count truncated");
+        return Err(StorageError::Corruption(
+            "parent index subdir count truncated".into(),
+        ));
     }
     let subdir_count = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
     off += 4;
     for _ in 0..subdir_count {
         if off + 4 > bytes.len() {
-            anyhow::bail!("parent index subdir dir_idx truncated");
+            return Err(StorageError::Corruption(
+                "parent index subdir dir_idx truncated".into(),
+            ));
         }
         off += 4;
         if off + 4 > bytes.len() {
-            anyhow::bail!("parent index subdir list count truncated");
+            return Err(StorageError::Corruption(
+                "parent index subdir list count truncated".into(),
+            ));
         }
         let list_count = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
         off += 4;
         for _ in 0..list_count {
             if off + 4 > bytes.len() {
-                anyhow::bail!("parent index subdir entry truncated");
+                return Err(StorageError::Corruption(
+                    "parent index subdir entry truncated".into(),
+                ));
             }
             off += 4;
         }
@@ -365,10 +386,9 @@ fn encode_tombstones(t: &RoaringBitmap) -> Vec<u8> {
     t.serialize_into(&mut out).expect("roaring serialize");
     out
 }
-
-fn decode_tombstones(bytes: &[u8]) -> anyhow::Result<RoaringBitmap> {
+fn decode_tombstones(bytes: &[u8]) -> StorageResult<RoaringBitmap> {
     RoaringBitmap::deserialize_from(bytes)
-        .map_err(|e| anyhow::anyhow!("tombstones deserialize failed: {}", e))
+        .map_err(|e| StorageError::Deserialize(format!("tombstones deserialize failed: {}", e)))
 }
 
 #[derive(Clone, Copy)]
@@ -524,17 +544,11 @@ fn lookup_raw_path(bytes: &[u8], layout: RawPathTableLayout, target: &[u8]) -> O
     None
 }
 
-fn read_u32(bytes: &[u8], off: &mut usize) -> Option<u32> {
-    let value = u32::from_le_bytes(bytes.get(*off..*off + 4)?.try_into().ok()?);
-    *off += 4;
-    Some(value)
-}
-
-fn file_entry_rec_size(snapshot_version: u32) -> anyhow::Result<usize> {
+fn file_entry_rec_size(snapshot_version: u32) -> StorageResult<usize> {
     match snapshot_version {
         V7_VERSION => Ok(FILE_ENTRY_REC_SIZE),
         V7_VERSION_LEGACY_40B_ENTRY => Ok(LEGACY_FILE_ENTRY_REC_SIZE),
-        version => anyhow::bail!("unsupported v7 snapshot version {}", version),
+        version => Err(StorageError::UnsupportedVersion(version)),
     }
 }
 
@@ -564,71 +578,68 @@ fn file_entry_at(bytes: &[u8], snapshot_version: u32, docid: u32) -> Option<File
 }
 
 fn entry_to_meta(entry: FileEntry, path_bytes: Vec<u8>) -> FileMeta {
-    FileMeta {
-        file_key: entry.file_key(),
-        path: pathbuf_from_encoded_vec(path_bytes),
-        size: 0,
-        mtime: if entry.mtime_ns >= 0 {
-            Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(entry.mtime_ns as u64))
-        } else {
-            None
-        },
-        ctime: None,
-        atime: None,
-        kind: entry.kind(),
-    }
+    crate::index::entry_to_meta(&entry, &path_bytes)
 }
 
-fn posting_for_trigram(bytes: &[u8], tri: [u8; 3]) -> anyhow::Result<Option<RoaringBitmap>> {
+fn posting_for_trigram(bytes: &[u8], tri: [u8; 3]) -> StorageResult<Option<RoaringBitmap>> {
     if bytes.len() < 4 {
-        anyhow::bail!("trigram index too small");
+        return Err(StorageError::Corruption("trigram index too small".into()));
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
     let mut off = 4usize;
     for _ in 0..count {
         if off + 8 > bytes.len() {
-            anyhow::bail!("trigram index truncated");
+            return Err(StorageError::Corruption("trigram index truncated".into()));
         }
         let key = [bytes[off], bytes[off + 1], bytes[off + 2]];
         let posting_len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into()?) as usize;
         off += 8;
         if off + posting_len > bytes.len() {
-            anyhow::bail!("trigram index posting truncated");
+            return Err(StorageError::Corruption(
+                "trigram index posting truncated".into(),
+            ));
         }
         if key == tri {
-            let bitmap = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
-                .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
+            let bitmap =
+                RoaringBitmap::deserialize_from(&bytes[off..off + posting_len]).map_err(|e| {
+                    StorageError::Deserialize(format!("roaring deserialize failed: {}", e))
+                })?;
             return Ok(Some(bitmap));
         }
         off += posting_len;
     }
     Ok(None)
 }
-
-fn trigram_index_has_sentinel(bytes: &[u8]) -> anyhow::Result<bool> {
+fn trigram_index_has_sentinel(bytes: &[u8]) -> StorageResult<bool> {
     posting_for_trigram(bytes, TRIGRAM_SENTINEL).map(|posting| posting.is_some())
 }
 
-fn parent_posting(bytes: &[u8], parent_idx: u32) -> anyhow::Result<Option<RoaringBitmap>> {
+fn parent_posting(bytes: &[u8], parent_idx: u32) -> StorageResult<Option<RoaringBitmap>> {
     if bytes.len() < 4 {
-        anyhow::bail!("parent index too small");
+        return Err(StorageError::Corruption("parent index too small".into()));
     }
     let mut off = 0usize;
     let count = u32::from_le_bytes(bytes[off..off + 4].try_into()?) as usize;
     off += 4;
     for _ in 0..count {
         if off + 8 > bytes.len() {
-            anyhow::bail!("parent index dir entry truncated");
+            return Err(StorageError::Corruption(
+                "parent index dir entry truncated".into(),
+            ));
         }
         let dir_idx = u32::from_le_bytes(bytes[off..off + 4].try_into()?);
         let posting_len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into()?) as usize;
         off += 8;
         if off + posting_len > bytes.len() {
-            anyhow::bail!("parent index posting truncated");
+            return Err(StorageError::Corruption(
+                "parent index posting truncated".into(),
+            ));
         }
         if dir_idx == parent_idx {
-            let bitmap = RoaringBitmap::deserialize_from(&bytes[off..off + posting_len])
-                .map_err(|e| anyhow::anyhow!("roaring deserialize failed: {}", e))?;
+            let bitmap =
+                RoaringBitmap::deserialize_from(&bytes[off..off + posting_len]).map_err(|e| {
+                    StorageError::Deserialize(format!("roaring deserialize failed: {}", e))
+                })?;
             return Ok(Some(bitmap));
         }
         off += posting_len;
@@ -930,10 +941,11 @@ impl V7Snapshot {
     }
 
     fn tombstones(&self) -> anyhow::Result<RoaringBitmap> {
-        self.segment(V7SegKind::Tombstones)
+        Ok(self
+            .segment(V7SegKind::Tombstones)
             .map(decode_tombstones)
-            .transpose()
-            .map(|t| t.unwrap_or_default())
+            .transpose()?
+            .unwrap_or_default())
     }
 
     fn trigram_candidates(&self, matcher: &dyn Matcher) -> anyhow::Result<Option<RoaringBitmap>> {
@@ -1509,10 +1521,6 @@ pub fn shallow_validate_v7(path: &Path) -> anyhow::Result<bool> {
 // v7 写入：base + delta → 排序 → 归并 → atomic write v7 单文件
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn align_up(v: usize, a: usize) -> usize {
-    (v + (a - 1)) & !(a - 1)
-}
-
 /// 将 BaseIndexData 原子写入 v7 单文件（tmp + rename）。
 ///
 /// 写入流程：
@@ -1645,10 +1653,7 @@ fn write_v7_segments_atomic_with_version(
     let trailer_bytes = trailer.encode();
 
     // 组装文件
-    let tmp_path = path.with_extension("v7.tmp");
-    {
-        let mut file = std::fs::File::create(&tmp_path)?;
-
+    crate::storage::atomic_write(path, "v7.tmp", |file| {
         // Header（先占位，crc 后填）
         let mut header_buf = encode_header_with_version(num_segments, 0, version);
         file.write_all(&header_buf)?;
@@ -1679,16 +1684,8 @@ fn write_v7_segments_atomic_with_version(
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&header_buf)?;
 
-        file.sync_all()?;
-    }
-
-    // 原子替换
-    std::fs::rename(&tmp_path, path)?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+        Ok(())
+    })?;
 
     tracing::info!(
         "v7 snapshot written: {} segments, {} bytes",
@@ -1699,56 +1696,171 @@ fn write_v7_segments_atomic_with_version(
     Ok(())
 }
 
-/// 从 v6 segments + delta 构建 v7 快照（排序归并后写入）。
+/// Remap a RoaringBitmap of DocIds through `old → new` mapping.
 ///
-/// 当前为框架实现：将 base（若提供）与 delta 直接拼接，未做真正归并。
-/// 后续完善为"base + delta → 去重排序 → v7"。
+/// DocIds absent from `map` (entries overridden/removed) are dropped.
+fn remap_bitmap(bm: &RoaringBitmap, map: &HashMap<u32, u32>) -> RoaringBitmap {
+    let mut out = RoaringBitmap::new();
+    for d in bm.iter() {
+        if let Some(&n) = map.get(&d) {
+            out.insert(n);
+        }
+    }
+    out
+}
+
+/// One surviving entry after base+delta dedup, carrying its origin old-DocId for remap.
+struct SurvivedEntry {
+    entry: FileEntry,
+    /// Old DocId in `base`, if the survivor came from base (None if overridden by delta).
+    base_old: Option<u32>,
+    /// Old DocId in `delta`, if the survivor came from delta.
+    delta_old: Option<u32>,
+}
+
+/// 从 v6 segments + delta 构建 v7 快照（按 (filekey, path_idx) 归并去重后写入）。
+///
+/// 修复两个 bug：
+/// 1. 排序重建 `entries_by_key` 会改变 DocId，必须把 trigram / parent / tombstones
+///    中所有旧 DocId 引用重映射到新 DocId，否则 posting/tombstone 解析到错误路径。
+/// 2. 以 `FileKey` 单独去重会丢弃同 inode 不同路径的硬链接别名，改为
+///    `(FileKey, path_idx)` 去重，delta 仅覆盖完全相同键的条目，别名全部保留。
 pub fn snapshot_now_v7(
     path: &Path,
     base: Option<&BaseIndexData>,
     delta: &BaseIndexData,
 ) -> anyhow::Result<()> {
-    let mut merged = BaseIndexData::default();
-
-    // 先灌入 base
+    // 1. 收集最终条目，按 (FileKey, path_index) 去重；delta 覆盖 base 同键条目。
+    //    记录每个存活条目的来源旧 DocId（base 或 delta），用于后续重映射。
+    //    delta 覆盖 base 时，base 那条被丢弃，其旧 DocId 不进入 base_map。
+    let mut dedup: HashMap<(FileKey, u32), SurvivedEntry> = HashMap::new();
     if let Some(b) = base {
-        merged.path_table = b.path_table.clone();
         for i in 0..b.entries_by_key.len() {
             if let Some(e) = b.entries_by_key.get(i) {
-                merged.entries_by_key.push(*e);
+                let k = (e.file_key(), e.path_index());
+                dedup.insert(
+                    k,
+                    SurvivedEntry {
+                        entry: *e,
+                        base_old: Some(i as u32),
+                        delta_old: None,
+                    },
+                );
             }
         }
-        merged.trigram_index = b.trigram_index.clone();
-        merged.parent_index = b.parent_index.clone();
-        merged.tombstones = b.tombstones.clone();
     }
-
-    // 再灌入 delta（简单追加；TODO: 真正归并去重）
     for i in 0..delta.entries_by_key.len() {
         if let Some(e) = delta.entries_by_key.get(i) {
-            merged.entries_by_key.push(*e);
+            let k = (e.file_key(), e.path_index());
+            // delta 覆盖 base：base 同键条目被丢弃，故 base 来源清空为 None。
+            dedup.insert(
+                k,
+                SurvivedEntry {
+                    entry: *e,
+                    base_old: None,
+                    delta_old: Some(i as u32),
+                },
+            );
         }
     }
-    // trigram / parent / tombstones：简单合并（TODO: 真正归并）
-    for (tri, bm) in &delta.trigram_index.inner {
-        merged.trigram_index.insert(*tri, bm.clone());
+
+    // 2. 确定最终顺序（按 (dev, ino, generation, path_index) 排序，保证字节确定性）。
+    let mut final_entries: Vec<SurvivedEntry> = dedup.into_values().collect();
+    final_entries.sort_by_key(|s| {
+        (
+            s.entry.dev,
+            s.entry.ino,
+            s.entry.generation,
+            s.entry.path_index(),
+        )
+    });
+
+    // 3. 分配新 DocId = 最终位置；构建 old→new 映射。
+    let mut base_map: HashMap<u32, u32> = HashMap::new();
+    let mut delta_map: HashMap<u32, u32> = HashMap::new();
+    let mut entries_idx = FileEntryIndex::new();
+    for (new_docid, s) in final_entries.iter().enumerate() {
+        let new = new_docid as u32;
+        entries_idx.push(s.entry);
+        if let Some(b) = s.base_old {
+            base_map.insert(b, new);
+        }
+        if let Some(d) = s.delta_old {
+            delta_map.insert(d, new);
+        }
     }
-    for (dir, bm) in &delta.parent_index.dir_to_files {
+
+    // 4. 组装 merged。path_table 沿用 base（不合并 delta 的 path_table，超出范围）。
+    let mut merged = BaseIndexData::default();
+    if let Some(b) = base {
+        merged.path_table = b.path_table.clone();
+    }
+    merged.entries_by_key = entries_idx.build();
+
+    // 5. 重映射 + 合并三个基于 DocId 的索引。
+    //    trigram_index：对每个 trigram，base 位图经 base_map、delta 位图经 delta_map
+    //    重映射后并集（跳过无映射的 DocId）。
+    merged.trigram_index = TrigramIndex::new();
+    if let Some(b) = base {
+        for (tri, bm) in &b.trigram_index.inner {
+            let remapped = remap_bitmap(bm, &base_map);
+            merged.trigram_index.inner.insert(*tri, remapped);
+        }
+    }
+    for (tri, bm) in &delta.trigram_index.inner {
+        let remapped = remap_bitmap(bm, &delta_map);
+        *merged.trigram_index.inner.entry(*tri).or_default() |= remapped;
+    }
+
+    //    parent_index：每个 dir 的 DocId 列表分别经 base_map / delta_map 重映射后并集，
+    //    排序去重。
+    merged.parent_index = ParentIndex::default();
+    if let Some(b) = base {
+        for (dir, docids) in &b.parent_index.dir_to_files {
+            let remapped: Vec<u32> = docids
+                .iter()
+                .filter_map(|d| base_map.get(d).copied())
+                .collect();
+            merged
+                .parent_index
+                .dir_to_files
+                .entry(*dir)
+                .or_default()
+                .extend(remapped);
+        }
+    }
+    for (dir, docids) in &delta.parent_index.dir_to_files {
+        let remapped: Vec<u32> = docids
+            .iter()
+            .filter_map(|d| delta_map.get(d).copied())
+            .collect();
         merged
             .parent_index
             .dir_to_files
             .entry(*dir)
-            .and_modify(|existing| {
-                existing.extend_from_slice(bm);
-                existing.sort_unstable();
-                existing.dedup();
-            })
-            .or_insert_with(|| bm.clone());
+            .or_default()
+            .extend(remapped);
     }
-    merged.tombstones |= delta.tombstones.clone();
+    for docids in merged.parent_index.dir_to_files.values_mut() {
+        docids.sort_unstable();
+        docids.dedup();
+    }
 
-    // 排序（key）
-    merged.entries_by_key.sort_by_key();
+    //    tombstones：base 与 delta 的 tombstones 分别经各自映射重映射后并集。
+    let mut tombstones = RoaringBitmap::new();
+    if let Some(b) = base {
+        for d in b.tombstones.iter() {
+            if let Some(&n) = base_map.get(&d) {
+                tombstones.insert(n);
+            }
+        }
+    }
+    for d in delta.tombstones.iter() {
+        if let Some(&n) = delta_map.get(&d) {
+            tombstones.insert(n);
+        }
+    }
+    merged.tombstones = tombstones;
 
     write_v7_snapshot_atomic(path, &merged)
 }
@@ -2318,5 +2430,169 @@ mod tests {
         let path = tmp_v7_path("corrupt");
         std::fs::write(&path, b"not a v7 file").unwrap();
         assert!(load_v7_from_path(&path).unwrap().is_none());
+    }
+
+    // ── snapshot_now_v7 bug-fix tests ────────────────────────────────────────
+
+    #[test]
+    fn snapshot_now_v7_remaps_docids_when_base_unsorted() {
+        // base entries inserted in REVERSE FileKey-sorted order, so sorting changes DocIds.
+        //   old docid 0 -> FileKey ino:30 -> "/tmp/cold/aaa.txt"
+        //   old docid 1 -> FileKey ino:20 -> "/tmp/cold/bbb.txt"
+        //   old docid 2 -> FileKey ino:10 -> "/tmp/cold/ccc.txt"
+        // sorted order => new docids: new0=old2(ccc), new1=old1(bbb), new2=old0(aaa)
+        // base_map: {0->2, 1->1, 2->0}
+        let path = tmp_v7_path("snap-remap");
+
+        let key_aaa = FileKey {
+            dev: 7,
+            ino: 30,
+            generation: 0,
+        };
+        let key_bbb = FileKey {
+            dev: 7,
+            ino: 20,
+            generation: 0,
+        };
+        let key_ccc = FileKey {
+            dev: 7,
+            ino: 10,
+            generation: 0,
+        };
+
+        let mut paths = PathTableBuilder::new();
+        paths.push(0, b"/tmp/cold/aaa.txt");
+        paths.push(1, b"/tmp/cold/bbb.txt");
+        paths.push(2, b"/tmp/cold/ccc.txt");
+        paths.push(3, b"/tmp/cold");
+        let path_table = paths.build();
+
+        let mut entries = FileEntryIndex::new();
+        entries.push(FileEntry::from_file_key(key_aaa, 0, 100));
+        entries.push(FileEntry::from_file_key(key_bbb, 1, 200));
+        entries.push(FileEntry::from_file_key(key_ccc, 2, 300));
+
+        let mut base = BaseIndexData {
+            path_table: path_table.clone(),
+            entries_by_key: entries.build(),
+            ..BaseIndexData::default()
+        };
+        add_path_trigrams(&mut base.trigram_index, "/tmp/cold/aaa.txt", 0);
+        add_path_trigrams(&mut base.trigram_index, "/tmp/cold/bbb.txt", 1);
+        add_path_trigrams(&mut base.trigram_index, "/tmp/cold/ccc.txt", 2);
+        add_trigram_sentinel(&mut base.trigram_index);
+        base.parent_index.dir_to_files.insert(3, vec![0]); // dir /tmp/cold -> aaa (old docid 0)
+        base.tombstones.insert(2); // tombstone ccc (old docid 2)
+
+        let delta = BaseIndexData::default();
+        snapshot_now_v7(&path, Some(&base), &delta).unwrap();
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+        let decoded = loaded.to_base_index_data().unwrap();
+
+        assert_eq!(decoded.entries_by_key.len(), 3);
+        // 1 tombstone -> 2 live
+        assert_eq!(decoded.file_count(), 2);
+
+        // parent_index remap: dir /tmp/cold should resolve to aaa.txt (new docid 2),
+        // NOT ccc.txt (new docid 0).
+        let parent_metas = loaded.parent_metas("/tmp/cold").unwrap();
+        assert_eq!(parent_metas.len(), 1);
+        assert_eq!(parent_metas[0].path, PathBuf::from("/tmp/cold/aaa.txt"));
+
+        // tombstones remap: aaa (old docid 0 -> new docid 2) must be LIVE,
+        // ccc (old docid 2 -> new docid 0) must be TOMBSTONED.
+        assert!(loaded.get_meta(key_aaa).unwrap().is_some());
+        assert!(loaded.get_meta(key_ccc).unwrap().is_none());
+
+        // regenerated trigram respects remapped tombstone: "aaa" live, "ccc" dead.
+        assert_eq!(
+            loaded.query_keys(&ExactMatcher::new("aaa", false)).unwrap(),
+            vec![key_aaa]
+        );
+        assert!(loaded
+            .query_keys(&ExactMatcher::new("ccc", false))
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn snapshot_now_v7_preserves_hardlink_aliases() {
+        // base has ONE entry (FileKey K, path P1). delta shares the SAME path_table
+        // and has TWO entries both with FileKey K but different path_idx
+        // (P1 updated + P2 new alias) -> hardlink alias must survive.
+        let path = tmp_v7_path("snap-hardlink");
+
+        let key = FileKey {
+            dev: 5,
+            ino: 99,
+            generation: 0,
+        };
+
+        let mut paths = PathTableBuilder::new();
+        paths.push(0, b"/tmp/hl/p1.txt");
+        paths.push(1, b"/tmp/hl/p2.txt");
+        paths.push(2, b"/tmp/hl");
+        let path_table = paths.build();
+
+        // base: single alias at P1.
+        let mut base_entries = FileEntryIndex::new();
+        base_entries.push(FileEntry::from_file_key(key, 0, 100));
+        let mut base = BaseIndexData {
+            path_table: path_table.clone(),
+            entries_by_key: base_entries.build(),
+            ..BaseIndexData::default()
+        };
+        add_path_trigrams(&mut base.trigram_index, "/tmp/hl/p1.txt", 0);
+        add_trigram_sentinel(&mut base.trigram_index);
+        base.parent_index.dir_to_files.insert(2, vec![0]);
+
+        // delta: P1 updated (mtime 200) + P2 new alias (mtime 300), same FileKey K.
+        let mut delta_entries = FileEntryIndex::new();
+        delta_entries.push(FileEntry::from_file_key(key, 0, 200));
+        delta_entries.push(FileEntry::from_file_key(key, 1, 300));
+        let mut delta = BaseIndexData {
+            path_table: path_table.clone(),
+            entries_by_key: delta_entries.build(),
+            ..BaseIndexData::default()
+        };
+        add_path_trigrams(&mut delta.trigram_index, "/tmp/hl/p1.txt", 0);
+        add_path_trigrams(&mut delta.trigram_index, "/tmp/hl/p2.txt", 1);
+        add_trigram_sentinel(&mut delta.trigram_index);
+        delta.parent_index.dir_to_files.insert(2, vec![0, 1]);
+
+        snapshot_now_v7(&path, Some(&base), &delta).unwrap();
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+        let decoded = loaded.to_base_index_data().unwrap();
+
+        // Both aliases survive (hardlink aliases share FileKey but differ in path_idx).
+        assert_eq!(decoded.entries_by_key.len(), 2);
+        assert_eq!(decoded.file_count(), 2);
+
+        // Both paths queryable.
+        assert_eq!(
+            loaded.query_keys(&ExactMatcher::new("p1", false)).unwrap(),
+            vec![key]
+        );
+        assert_eq!(
+            loaded.query_keys(&ExactMatcher::new("p2", false)).unwrap(),
+            vec![key]
+        );
+
+        // parent index covers both aliases.
+        let parent_metas = loaded.parent_metas("/tmp/hl").unwrap();
+        assert_eq!(parent_metas.len(), 2);
+        let mut parent_paths: Vec<PathBuf> = parent_metas.iter().map(|m| m.path.clone()).collect();
+        parent_paths.sort();
+        assert_eq!(
+            parent_paths,
+            vec![
+                PathBuf::from("/tmp/hl/p1.txt"),
+                PathBuf::from("/tmp/hl/p2.txt")
+            ]
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }

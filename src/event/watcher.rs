@@ -180,46 +180,6 @@ pub fn watch_roots(
     failed
 }
 
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-/// Roughly estimate the number of inotify watches a root will need.
-/// Capped at `max_depth` to avoid expensive traversal on huge trees.
-fn estimate_watch_count(path: &std::path::Path, max_depth: usize) -> u64 {
-    if max_depth == 0 {
-        return 1;
-    }
-    let mut count = 1u64; // the root itself
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_dir() {
-                    count += 1;
-                    if count >= 10_000 {
-                        return count;
-                    }
-                    count += estimate_watch_count(&entry.path(), max_depth.saturating_sub(1));
-                }
-            }
-        }
-    }
-    count
-}
-
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-fn read_inotify_limit() -> Option<u64> {
-    std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-}
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-fn read_inotify_limit() -> Option<u64> {
-    None
-}
-
 /// Enhanced version that also returns degraded roots and marks dirty on limit pressure.
 pub fn watch_roots_enhanced(
     watcher: &mut notify::RecommendedWatcher,

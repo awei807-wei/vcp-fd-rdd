@@ -1,10 +1,6 @@
 use crate::index::base_index::BaseIndexData;
-use crate::index::l2_partition::IndexSnapshotV2;
-use crate::index::l2_partition::IndexSnapshotV3;
-use crate::index::l2_partition::IndexSnapshotV4;
-use crate::index::l2_partition::IndexSnapshotV5;
-use crate::index::l2_partition::PersistentIndex;
 use crate::index::l2_partition::V6Segments;
+use crate::util::align_up;
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -14,19 +10,19 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-/// 索引文件 Header
-const MAGIC: u32 = 0xFDDD_0002;
+// LoadedSnapshot is defined in snapshot_legacy.rs but re-exported here so
+// existing callers that reference `snapshot::LoadedSnapshot` continue to work.
+// Shared constants (MAGIC, HEADER_SIZE, etc.) now live in `snapshot_common`
+// to avoid a bidirectional dependency between this module and
+// `snapshot_legacy`.
+use crate::storage::snapshot_common::{HEADER_SIZE, MAGIC, STATE_COMMITTED, STATE_INCOMPLETE};
+use crate::storage::snapshot_legacy;
+pub use crate::storage::snapshot_legacy::LoadedSnapshot;
+
 const VERSION_V6: u32 = 6; // legacy: SimpleChecksum
+
 const VERSION_V7: u32 = 7; // CRC32C (Castagnoli)
 const VERSION_CURRENT: u32 = VERSION_V7;
-const VERSION_COMPAT_V5: u32 = 5;
-const VERSION_COMPAT_V4: u32 = 4;
-const VERSION_COMPAT_V3: u32 = 3;
-const VERSION_COMPAT_V2: u32 = 2;
-const STATE_COMMITTED: u32 = 0x0000_0001;
-const STATE_INCOMPLETE: u32 = 0xFFFF_FFFF;
-const HEADER_SIZE: usize = 4 + 4 + 4 + 4 + 4; // magic + version + state + data_len + checksum
-
 // Safety guards: prevent memory DoS via corrupted headers/segments.
 const MAX_V6_MANIFEST_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 const MAX_V6_ROOTS_SEGMENT_BYTES: u64 = 1024 * 1024; // 1 MiB
@@ -119,21 +115,8 @@ pub fn write_recovery_runtime_state(
     snapshot_path: &Path,
     state: &RecoveryRuntimeState,
 ) -> anyhow::Result<()> {
-    let dir = stable_snapshot_dir_for(snapshot_path);
-    std::fs::create_dir_all(&dir)?;
     let path = runtime_state_path_for(snapshot_path);
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        serde_json::to_writer_pretty(&mut file, state)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    if let Ok(dir_file) = std::fs::File::open(&dir) {
-        let _ = dir_file.sync_all();
-    }
-    Ok(())
+    crate::util::atomic_write_json(&path, state)
 }
 
 pub fn write_stable_v7_atomic(snapshot_path: &Path, base: &BaseIndexData) -> anyhow::Result<()> {
@@ -159,95 +142,6 @@ pub fn write_stable_v7_atomic(snapshot_path: &Path, base: &BaseIndexData) -> any
         let _ = dir_file.sync_all();
     }
     Ok(())
-}
-
-#[derive(Clone, Debug)]
-pub enum LoadedSnapshot {
-    V5(IndexSnapshotV5),
-    V4(IndexSnapshotV4),
-    V3(IndexSnapshotV3),
-    V2(IndexSnapshotV2),
-}
-
-/// 统一的老版本快照反序列化 trait：用于消除 v2-v5 的复制粘贴式分发。
-pub trait LegacySnapshot: Sized {
-    const VERSION_NAME: &'static str;
-    fn deserialize_bincode(body: &[u8]) -> anyhow::Result<Self>;
-    fn into_loaded(self) -> LoadedSnapshot;
-}
-
-macro_rules! impl_legacy_snapshot {
-    ($ty:ty, $name:expr) => {
-        impl LegacySnapshot for $ty {
-            const VERSION_NAME: &'static str = $name;
-            fn deserialize_bincode(body: &[u8]) -> anyhow::Result<Self> {
-                Ok(bincode::deserialize::<$ty>(body)?)
-            }
-            fn into_loaded(self) -> LoadedSnapshot {
-                LoadedSnapshot::from(self)
-            }
-        }
-    };
-}
-
-impl_legacy_snapshot!(IndexSnapshotV2, "v2");
-impl_legacy_snapshot!(IndexSnapshotV3, "v3");
-impl_legacy_snapshot!(IndexSnapshotV4, "v4");
-impl_legacy_snapshot!(IndexSnapshotV5, "v5");
-
-impl From<IndexSnapshotV2> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV2) -> Self {
-        LoadedSnapshot::V2(v)
-    }
-}
-impl From<IndexSnapshotV3> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV3) -> Self {
-        LoadedSnapshot::V3(v)
-    }
-}
-impl From<IndexSnapshotV4> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV4) -> Self {
-        LoadedSnapshot::V4(v)
-    }
-}
-impl From<IndexSnapshotV5> for LoadedSnapshot {
-    fn from(v: IndexSnapshotV5) -> Self {
-        LoadedSnapshot::V5(v)
-    }
-}
-
-fn load_legacy_snapshot<T: LegacySnapshot>(body: &[u8]) -> anyhow::Result<Option<LoadedSnapshot>> {
-    match T::deserialize_bincode(body) {
-        Ok(snap) => Ok(Some(snap.into_loaded())),
-        Err(e) => {
-            tracing::warn!("Snapshot {} deserialize failed: {}", T::VERSION_NAME, e);
-            Ok(None)
-        }
-    }
-}
-
-impl LoadedSnapshot {
-    /// 将加载出的老版本快照转换为 PersistentIndex，统一消除 tiered/load.rs 里的复制粘贴。
-    pub fn into_persistent_index(self, roots: Vec<PathBuf>) -> PersistentIndex {
-        match self {
-            LoadedSnapshot::V5(snap) => {
-                tracing::info!("Loaded index snapshot v5: {} docs", snap.metas.len());
-                PersistentIndex::from_snapshot_v5(snap, roots)
-            }
-            LoadedSnapshot::V4(snap) => {
-                tracing::info!("Loaded index snapshot v4: {} docs", snap.metas.len());
-                PersistentIndex::from_snapshot_v4(snap, roots)
-            }
-            LoadedSnapshot::V3(snap) => {
-                tracing::info!("Loaded index snapshot v3: {} files", snap.files.len());
-                PersistentIndex::from_snapshot_v3(snap, roots)
-            }
-            LoadedSnapshot::V2(snap) => {
-                tracing::info!("Loaded index snapshot v2: {} files", snap.files.len());
-                PersistentIndex::from_snapshot_v2(snap, roots)
-            }
-        }
-    }
 }
 
 /// v6：mmap 段式快照（只读视图）
@@ -350,10 +244,6 @@ struct V6SegDesc {
     checksum: u32,
 }
 
-fn align_up(v: usize, a: usize) -> usize {
-    (v + (a - 1)) & !(a - 1)
-}
-
 fn encode_roots_segment(roots: &[PathBuf]) -> Vec<u8> {
     let mut roots = roots.to_vec();
     roots.sort_by(|a, b| {
@@ -377,21 +267,21 @@ fn encode_roots_segment(roots: &[PathBuf]) -> Vec<u8> {
     out
 }
 
-fn decode_roots_segment(mut bytes: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
+fn decode_roots_segment(mut bytes: &[u8]) -> StorageResult<Vec<Vec<u8>>> {
     if bytes.len() < 2 {
-        anyhow::bail!("roots segment too small");
+        return Err(StorageError::Corruption("roots segment too small".into()));
     }
     let count = u16::from_le_bytes(bytes[0..2].try_into().unwrap()) as usize;
     bytes = &bytes[2..];
     let mut roots = Vec::with_capacity(count);
     for _ in 0..count {
         if bytes.len() < 2 {
-            anyhow::bail!("roots segment truncated");
+            return Err(StorageError::Corruption("roots segment truncated".into()));
         }
         let len = u16::from_le_bytes(bytes[0..2].try_into().unwrap()) as usize;
         bytes = &bytes[2..];
         if bytes.len() < len {
-            anyhow::bail!("roots segment truncated");
+            return Err(StorageError::Corruption("roots segment truncated".into()));
         }
         roots.push(bytes[..len].to_vec());
         bytes = &bytes[len..];
@@ -399,13 +289,13 @@ fn decode_roots_segment(mut bytes: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
     Ok(roots)
 }
 
-fn read_file_range(file: &mut std::fs::File, offset: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+fn read_file_range(file: &mut std::fs::File, offset: u64, len: u64) -> StorageResult<Vec<u8>> {
     use std::io::Read;
 
     file.seek(SeekFrom::Start(offset))?;
     let n: usize = len
         .try_into()
-        .map_err(|_| anyhow::anyhow!("range too large"))?;
+        .map_err(|_| StorageError::Corruption("range too large".into()))?;
     let mut buf = vec![0u8; n];
     file.read_exact(&mut buf)?;
     Ok(buf)
@@ -416,7 +306,7 @@ fn compute_file_checksum_with(
     offset: u64,
     len: u64,
     v7_crc32c: bool,
-) -> anyhow::Result<u32> {
+) -> StorageResult<u32> {
     use std::io::Read;
 
     file.seek(SeekFrom::Start(offset))?;
@@ -436,41 +326,10 @@ fn compute_file_checksum_with(
     }
     Ok(hasher.finalize())
 }
-
-use crate::storage::checksum::{simple_checksum, Checksum32, Crc32c, SimpleChecksum};
-
-struct ChecksumWriter<'a, W: Write> {
-    inner: &'a mut W,
-    checksum: Crc32c,
-    bytes: u64,
-}
-
-impl<'a, W: Write> ChecksumWriter<'a, W> {
-    fn new(inner: &'a mut W) -> Self {
-        Self {
-            inner,
-            checksum: Crc32c::new(),
-            bytes: 0,
-        }
-    }
-
-    fn finish(self) -> (u64, u32) {
-        (self.bytes, self.checksum.finalize())
-    }
-}
-
-impl<'a, W: Write> Write for ChecksumWriter<'a, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.checksum.update(&buf[..n]);
-        self.bytes += n as u64;
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
+use crate::storage::checksum::{
+    crc32c_checksum, simple_checksum, Checksum32, Crc32c, SimpleChecksum,
+};
+use crate::storage::error::{StorageError, StorageResult};
 
 impl SnapshotStore {
     pub fn new(path: PathBuf) -> Self {
@@ -489,7 +348,7 @@ impl SnapshotStore {
     }
 
     /// 兼容旧布局：当 `self.path` 指向目录（如 index.d）时，legacy db 路径为同名 index.db。
-    fn legacy_db_path(&self) -> PathBuf {
+    pub(crate) fn legacy_db_path(&self) -> PathBuf {
         if self.path.extension().and_then(|s| s.to_str()) == Some("db") {
             return self.path.clone();
         }
@@ -630,9 +489,7 @@ impl SnapshotStore {
         let mut manifest = vec![0u8; manifest_len];
         file.read_exact(&mut manifest)?;
         let computed = if v7 {
-            let mut c = Crc32c::new();
-            c.update(&manifest);
-            c.finalize()
+            crc32c_checksum(&manifest)
         } else {
             simple_checksum(&manifest)
         };
@@ -754,9 +611,7 @@ impl SnapshotStore {
                 }
                 let bytes = read_file_range(&mut file, d.offset, d.len)?;
                 let c = if v7 {
-                    let mut c = Crc32c::new();
-                    c.update(&bytes);
-                    c.finalize()
+                    crc32c_checksum(&bytes)
                 } else {
                     simple_checksum(&bytes)
                 };
@@ -879,19 +734,8 @@ impl SnapshotStore {
             return Ok(None);
         }
 
-        if version != VERSION_COMPAT_V5
-            && version != VERSION_COMPAT_V4
-            && version != VERSION_COMPAT_V3
-            && version != VERSION_COMPAT_V2
-        {
-            tracing::warn!(
-                "Snapshot version mismatch: {} not in [{}, {}, {}, {}]",
-                version,
-                VERSION_COMPAT_V2,
-                VERSION_COMPAT_V3,
-                VERSION_COMPAT_V4,
-                VERSION_COMPAT_V5
-            );
+        if !snapshot_legacy::is_legacy_version(version) {
+            tracing::warn!("Snapshot version mismatch: {} not in [2, 3, 4, 5]", version,);
             return Ok(None);
         }
         if state != STATE_COMMITTED {
@@ -916,90 +760,12 @@ impl SnapshotStore {
             return Ok(None);
         }
 
-        match version {
-            VERSION_COMPAT_V2 => load_legacy_snapshot::<IndexSnapshotV2>(body),
-            VERSION_COMPAT_V3 => load_legacy_snapshot::<IndexSnapshotV3>(body),
-            VERSION_COMPAT_V4 => load_legacy_snapshot::<IndexSnapshotV4>(body),
-            _ => load_legacy_snapshot::<IndexSnapshotV5>(body),
-        }
-    }
-
-    /// 原子写入快照 v5（bincode；兼容保留）
-    pub async fn write_atomic_v5_bincode(&self, snap: &IndexSnapshotV5) -> anyhow::Result<()> {
-        let path = self.legacy_db_path();
-        // 确保目录存在
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        let tmp_path = path.with_extension("db.tmp");
-
-        // 1) 写 INCOMPLETE header（len/checksum 先置 0），然后流式写 body。
-        // 这样可避免把整个 body 序列化进一个巨型 Vec，降低峰值内存，缓解 RSS 漂移。
-        let mut file = std::fs::File::create(&tmp_path)?;
-        {
-            let mut header = [0u8; HEADER_SIZE];
-            header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-            header[4..8].copy_from_slice(&VERSION_COMPAT_V5.to_le_bytes());
-            header[8..12].copy_from_slice(&STATE_INCOMPLETE.to_le_bytes());
-            header[12..16].copy_from_slice(&0u32.to_le_bytes()); // data_len placeholder
-            header[16..20].copy_from_slice(&0u32.to_le_bytes()); // checksum placeholder
-            file.write_all(&header)?;
-        }
-
-        // 2) 流式写 body 并计算长度/校验
-        let (data_len_u64, checksum) = {
-            let mut cw = ChecksumWriter::new(&mut file);
-            bincode::serialize_into(&mut cw, snap)?;
-            cw.finish()
-        };
-
-        let data_len: u32 = data_len_u64
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Snapshot too large (>{} bytes)", u32::MAX))?;
-
-        // 3) seek 回开头覆盖 COMMITTED header
-        file.seek(SeekFrom::Start(0))?;
-        {
-            let mut header = [0u8; HEADER_SIZE];
-            header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-            header[4..8].copy_from_slice(&VERSION_COMPAT_V5.to_le_bytes());
-            header[8..12].copy_from_slice(&STATE_COMMITTED.to_le_bytes());
-            header[12..16].copy_from_slice(&data_len.to_le_bytes());
-            header[16..20].copy_from_slice(&checksum.to_le_bytes());
-            file.write_all(&header)?;
-        }
-
-        // 4) fsync — 确保数据与 header 都落盘
-        file.sync_all()?;
-
-        // 4) rename 原子替换（POSIX 保证原子性）
-        std::fs::rename(&tmp_path, &path)?;
-
-        // 5) fsync(dir) — 确保目录项更新落盘
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                if let Err(e) = dir.sync_all() {
-                    tracing::warn!("fsync directory failed: {e}");
-                }
-            }
-        }
-
-        tracing::info!(
-            "Snapshot written: {} files, {} bytes",
-            snap.metas.len(),
-            HEADER_SIZE + data_len as usize
-        );
-        Ok(())
+        snapshot_legacy::load_legacy_by_version(body, version)
     }
 
     /// 原子写入快照 v6（段式 + mmap + lazy decode）
     pub async fn write_atomic_v6(&self, segs: &V6Segments) -> anyhow::Result<()> {
         let path = self.legacy_db_path();
-        // 确保目录存在
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
 
         // 组装 segments（顺序固定，便于调试）
         let seg_list: Vec<(V6SegKind, u32, Vec<u8>)> = vec![
@@ -1031,9 +797,7 @@ impl SnapshotStore {
             let start = cursor;
             let len = bytes.len();
             let checksum = if v7 {
-                let mut c = Crc32c::new();
-                c.update(bytes);
-                c.finalize()
+                crc32c_checksum(bytes)
             } else {
                 simple_checksum(bytes)
             };
@@ -1063,74 +827,63 @@ impl SnapshotStore {
         debug_assert_eq!(manifest.len(), manifest_len);
 
         let manifest_checksum = if v7 {
-            let mut c = Crc32c::new();
-            c.update(&manifest);
-            c.finalize()
+            crc32c_checksum(&manifest)
         } else {
             simple_checksum(&manifest)
         };
 
-        let tmp_path = path.with_extension("db.tmp");
-        let mut file = std::fs::File::create(&tmp_path)?;
-
-        // 1) INCOMPLETE header（manifest_len/checksum 先置 0）
-        {
-            let mut header = [0u8; HEADER_SIZE];
-            header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-            header[4..8].copy_from_slice(&VERSION_CURRENT.to_le_bytes());
-            header[8..12].copy_from_slice(&STATE_INCOMPLETE.to_le_bytes());
-            header[12..16].copy_from_slice(&0u32.to_le_bytes());
-            header[16..20].copy_from_slice(&0u32.to_le_bytes());
-            file.write_all(&header)?;
-        }
-
-        // 2) 写 manifest + segments（按 desc offset 对齐补零）
-        file.write_all(&manifest)?;
-        let mut written = HEADER_SIZE + manifest.len();
-        let pad0 = align_up(written, 8) - written;
-        if pad0 > 0 {
-            file.write_all(&vec![0u8; pad0])?;
-            written += pad0;
-        }
-
-        for (i, (_kind, _ver, bytes)) in seg_list.into_iter().enumerate() {
-            let d = &descs[i];
-            let target_off: usize = d.offset.try_into().unwrap_or(written);
-            if target_off > written {
-                let pad = target_off - written;
-                file.write_all(&vec![0u8; pad])?;
-                written += pad;
+        let written: usize = crate::storage::atomic_write(&path, "db.tmp", |file| {
+            // 1) INCOMPLETE header（manifest_len/checksum 先置 0）
+            {
+                let mut header = [0u8; HEADER_SIZE];
+                header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+                header[4..8].copy_from_slice(&VERSION_CURRENT.to_le_bytes());
+                header[8..12].copy_from_slice(&STATE_INCOMPLETE.to_le_bytes());
+                header[12..16].copy_from_slice(&0u32.to_le_bytes());
+                header[16..20].copy_from_slice(&0u32.to_le_bytes());
+                file.write_all(&header)?;
             }
-            file.write_all(&bytes)?;
-            written += bytes.len();
-            let pad = align_up(written, 8) - written;
-            if pad > 0 {
-                file.write_all(&vec![0u8; pad])?;
-                written += pad;
+
+            // 2) 写 manifest + segments（按 desc offset 对齐补零）
+            file.write_all(&manifest)?;
+            let mut written = HEADER_SIZE + manifest.len();
+            let pad0 = align_up(written, 8) - written;
+            if pad0 > 0 {
+                file.write_all(&vec![0u8; pad0])?;
+                written += pad0;
             }
-        }
 
-        // 3) COMMITTED header：写入 manifest_len/checksum
-        file.seek(SeekFrom::Start(0))?;
-        {
-            let mut header = [0u8; HEADER_SIZE];
-            header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-            header[4..8].copy_from_slice(&VERSION_CURRENT.to_le_bytes());
-            header[8..12].copy_from_slice(&STATE_COMMITTED.to_le_bytes());
-            header[12..16].copy_from_slice(&(manifest.len() as u32).to_le_bytes());
-            header[16..20].copy_from_slice(&manifest_checksum.to_le_bytes());
-            file.write_all(&header)?;
-        }
-
-        file.sync_all()?;
-        std::fs::rename(&tmp_path, &path)?;
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                if let Err(e) = dir.sync_all() {
-                    tracing::warn!("fsync directory failed: {e}");
+            for (i, (_kind, _ver, bytes)) in seg_list.into_iter().enumerate() {
+                let d = &descs[i];
+                let target_off: usize = d.offset.try_into().unwrap_or(written);
+                if target_off > written {
+                    let pad = target_off - written;
+                    file.write_all(&vec![0u8; pad])?;
+                    written += pad;
+                }
+                file.write_all(&bytes)?;
+                written += bytes.len();
+                let pad = align_up(written, 8) - written;
+                if pad > 0 {
+                    file.write_all(&vec![0u8; pad])?;
+                    written += pad;
                 }
             }
-        }
+
+            // 3) COMMITTED header：写入 manifest_len/checksum
+            file.seek(SeekFrom::Start(0))?;
+            {
+                let mut header = [0u8; HEADER_SIZE];
+                header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+                header[4..8].copy_from_slice(&VERSION_CURRENT.to_le_bytes());
+                header[8..12].copy_from_slice(&STATE_COMMITTED.to_le_bytes());
+                header[12..16].copy_from_slice(&(manifest.len() as u32).to_le_bytes());
+                header[16..20].copy_from_slice(&manifest_checksum.to_le_bytes());
+                file.write_all(&header)?;
+            }
+
+            Ok(written)
+        })?;
 
         tracing::info!(
             "Snapshot v6 written: metas={} bytes={}",
@@ -1193,22 +946,28 @@ fn lsm_encode_manifest_body(m: &LsmManifest) -> Vec<u8> {
     out
 }
 
-fn lsm_decode_manifest_body(body: &[u8]) -> anyhow::Result<LsmManifest> {
+fn lsm_decode_manifest_body(body: &[u8]) -> StorageResult<LsmManifest> {
     if body.len() < 8 + 8 + 4 {
-        anyhow::bail!("LSM manifest body too small");
+        return Err(StorageError::Corruption(
+            "LSM manifest body too small".into(),
+        ));
     }
     let next_id = u64::from_le_bytes(body[0..8].try_into()?);
     let base_id = u64::from_le_bytes(body[8..16].try_into()?);
     let n = u32::from_le_bytes(body[16..20].try_into()?) as usize;
     let max_n = body.len().saturating_sub(20) / 8;
     if n > max_n {
-        anyhow::bail!("LSM manifest body truncated");
+        return Err(StorageError::Corruption(
+            "LSM manifest body truncated".into(),
+        ));
     }
     let mut delta_ids = Vec::with_capacity(n);
     let mut off = 20;
     for _ in 0..n {
         if off + 8 > body.len() {
-            anyhow::bail!("LSM manifest body truncated");
+            return Err(StorageError::Corruption(
+                "LSM manifest body truncated".into(),
+            ));
         }
         let id = u64::from_le_bytes(body[off..off + 8].try_into()?);
         delta_ids.push(id);
@@ -1238,7 +997,6 @@ fn lsm_decode_manifest_body(body: &[u8]) -> anyhow::Result<LsmManifest> {
 }
 
 pub(crate) fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
-    use crate::storage::checksum::crc32c_checksum;
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut hdr = [0u8; LSM_MANIFEST_HEADER_SIZE];
@@ -1280,7 +1038,7 @@ pub(crate) fn lsm_read_manifest(path: &Path) -> anyhow::Result<LsmManifest> {
     if !checksum_ok {
         anyhow::bail!("LSM manifest checksum mismatch");
     }
-    lsm_decode_manifest_body(&body)
+    lsm_decode_manifest_body(&body).map_err(Into::into)
 }
 
 fn now_unix_nanos() -> u64 {
@@ -1292,26 +1050,18 @@ fn now_unix_nanos() -> u64 {
 }
 
 fn lsm_write_manifest_atomic(path: &Path, m: &LsmManifest) -> anyhow::Result<()> {
-    use crate::storage::checksum::crc32c_checksum;
     let body = lsm_encode_manifest_body(m);
     let body_len: u32 = body.len().try_into().unwrap_or(u32::MAX);
     let checksum = crc32c_checksum(&body);
 
-    let tmp = path.with_extension("bin.tmp");
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(&LSM_MANIFEST_MAGIC.to_le_bytes())?;
-    f.write_all(&LSM_MANIFEST_VERSION.to_le_bytes())?;
-    f.write_all(&body_len.to_le_bytes())?;
-    f.write_all(&checksum.to_le_bytes())?;
-    f.write_all(&body)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-    Ok(())
+    crate::storage::atomic_write(path, "bin.tmp", |f| {
+        f.write_all(&LSM_MANIFEST_MAGIC.to_le_bytes())?;
+        f.write_all(&LSM_MANIFEST_VERSION.to_le_bytes())?;
+        f.write_all(&body_len.to_le_bytes())?;
+        f.write_all(&checksum.to_le_bytes())?;
+        f.write_all(&body)?;
+        Ok(())
+    })
 }
 
 /// 解析 LSM segment 文件名中的 id（hex）。
@@ -1335,25 +1085,18 @@ const LSM_DEL_MAGIC: u32 = 0x314C_4544; // "DEL1"
 const LSM_DEL_VERSION: u32 = 1;
 
 fn lsm_write_deleted_paths_atomic(path: &Path, deleted_paths: &[Vec<u8>]) -> anyhow::Result<()> {
-    let tmp = path.with_extension("del.tmp");
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(&LSM_DEL_MAGIC.to_le_bytes())?;
-    f.write_all(&LSM_DEL_VERSION.to_le_bytes())?;
     let count: u32 = deleted_paths.len().try_into().unwrap_or(u32::MAX);
-    f.write_all(&count.to_le_bytes())?;
-    for p in deleted_paths.iter().take(count as usize) {
-        let len: u16 = p.len().try_into().unwrap_or(u16::MAX);
-        f.write_all(&len.to_le_bytes())?;
-        f.write_all(&p[..len as usize])?;
-    }
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
+    crate::storage::atomic_write(path, "del.tmp", |f| {
+        f.write_all(&LSM_DEL_MAGIC.to_le_bytes())?;
+        f.write_all(&LSM_DEL_VERSION.to_le_bytes())?;
+        f.write_all(&count.to_le_bytes())?;
+        for p in deleted_paths.iter().take(count as usize) {
+            let len: u16 = p.len().try_into().unwrap_or(u16::MAX);
+            f.write_all(&len.to_le_bytes())?;
+            f.write_all(&p[..len as usize])?;
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub(crate) fn lsm_read_deleted_paths(path: &Path) -> anyhow::Result<Vec<Vec<u8>>> {

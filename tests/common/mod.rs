@@ -61,6 +61,10 @@ impl FdRddProcess {
         let exe = fd_rdd_exe_path();
         let work_dir = unique_tmp_dir("daemon-cwd");
         std::fs::create_dir_all(&work_dir).expect("create daemon work dir");
+        let default_config_home = work_dir.join("xdg-config");
+        let default_runtime_dir = work_dir.join("xdg-runtime");
+        std::fs::create_dir_all(&default_config_home).expect("create daemon config dir");
+        std::fs::create_dir_all(&default_runtime_dir).expect("create daemon runtime dir");
         let mut cmd = Command::new(&exe);
         cmd.arg("--root")
             .arg(root)
@@ -72,6 +76,15 @@ impl FdRddProcess {
             .current_dir(&work_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Keep daemon integration tests hermetic when cargo runs test binaries
+        // concurrently. Otherwise one `--no-watch` test can persist a user
+        // config that makes a later watcher test start with watch mode off.
+        if !envs.iter().any(|(key, _)| *key == "XDG_CONFIG_HOME") {
+            cmd.env("XDG_CONFIG_HOME", &default_config_home);
+        }
+        if !envs.iter().any(|(key, _)| *key == "XDG_RUNTIME_DIR") {
+            cmd.env("XDG_RUNTIME_DIR", &default_runtime_dir);
+        }
         for (key, value) in envs {
             cmd.env(key, value);
         }

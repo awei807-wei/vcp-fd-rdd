@@ -18,6 +18,7 @@ pub mod fs_policy;
 pub mod index;
 pub mod io_governor;
 pub mod query;
+pub mod runtime;
 pub mod security;
 pub mod sim;
 pub mod stats;

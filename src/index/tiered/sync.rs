@@ -453,6 +453,15 @@ impl TieredIndex {
 
         loop {
             let step = {
+                // Lock order: rebuild_state → delta_buffer.
+                // This is the ONLY call site that holds both locks simultaneously.
+                // All other paths (capture_l2_for_apply, file_count, etc.) acquire
+                // them sequentially (lock-release-lock) or only touch one, so there
+                // is no AB-BA deadlock risk. The dual-lock is required here to make
+                // the "delta_buffer empty?" check and the atomic base/l2 switch
+                // indivisible — releasing either lock between them would open a
+                // window where new events could be lost or a second rebuild could
+                // start concurrently.
                 let mut st = self.rebuild_state.lock();
                 let mut db = self.delta_buffer.lock();
                 if db.is_empty() {

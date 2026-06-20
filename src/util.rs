@@ -120,6 +120,41 @@ pub fn path_has_excluded_component(path: &Path, exclude_dirs: &[String]) -> bool
     })
 }
 
+/// Current Unix timestamp in seconds. Returns 0 if the system clock is before the epoch.
+pub fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Atomically write serializable data as pretty-printed JSON to `path`.
+///
+/// Creates the parent directory, writes to a `.tmp` sidecar, fsyncs, renames
+/// into place, and fsyncs the parent dir. The write closure receives a
+/// `&mut std::fs::File` so callers can use `serde_json::to_writer_pretty` or
+/// any other serialization method.
+pub fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {path:?}"))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        serde_json::to_writer_pretty(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Ok(dir_file) = std::fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
 /// Estimate how many directory watches `notify::RecursiveMode::Recursive` will register.
 ///
 /// This intentionally does not apply fd-rdd's scan/index `exclude_dirs`: notify still
@@ -151,6 +186,21 @@ pub fn estimate_notify_recursive_watch_count(root: &Path, cap: usize) -> usize {
     let limit = cap.max(1).saturating_add(1);
     walk(root, limit, &mut count);
     count.max(1)
+}
+
+// ── 数值/字节工具 ──
+
+/// Round `v` up to the next multiple of `a`. `a` must be a power of two.
+pub fn align_up(v: usize, a: usize) -> usize {
+    (v + (a - 1)) & !(a - 1)
+}
+
+/// Read a little-endian `u32` at `*off`, advancing `*off` by 4.
+/// Returns `None` if fewer than 4 bytes remain.
+pub fn read_u32(bytes: &[u8], off: &mut usize) -> Option<u32> {
+    let value = u32::from_le_bytes(bytes.get(*off..*off + 4)?.try_into().ok()?);
+    *off += 4;
+    Some(value)
 }
 
 #[cfg(test)]

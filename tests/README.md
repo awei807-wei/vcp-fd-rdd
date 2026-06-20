@@ -46,7 +46,7 @@
 - `stress-hybrid-large-scale` workflow 继续显式运行 `p2_large_scale_hybrid` 的 80 万文件混合工作区测试，并保持 `continue-on-error`，避免 GitHub runner 资源波动阻塞普通分支推进。
 - 新增 `p1_api_e2e.rs`、`p1_real_watcher.rs`、`p1_crash_recovery_matrix.rs`，补齐 daemon HTTP/UDS 真实链路、真实 watcher 文件事件、坏快照/非干净退出后的启动修复组合。
 
-## v7.0.0 测试相关变更
+## v0.7.0 测试相关变更
 
 - M2 proc sampler 新增 `proc_sampler_*` 单元和序列化测试，覆盖 fdinfo flags 写权限解析、同 uid 写 fd 目录采样、非同 uid 拒绝后不读取 fdinfo、watch-state/health/metrics 中 proc sampler 观测字段与 budget/unavailable issue。
 - M1-3 分片 repair 新增 `sliced_repair_*` 单元测试，覆盖 Periodic cold scan 大目录首次 slice 只处理约 512 entries、cursor 重新入队、后续 slice 继续补齐，以及 `/health` 新增 cold sweep/backlog 字段的 JSON 序列化；完整恢复审计继续覆盖 StartupRepairDeferred 的递归 rename subtree 补偿。
@@ -57,6 +57,7 @@
 - `p1_fast_scan_sla.rs` 启动真实 tiered daemon 并隔离 `XDG_CONFIG_HOME`，验证 active lease hotset 内 create/delete/rename 在 5 秒 SLA 窗口内更新搜索结果，同时验证冷目录不按 5 秒断言、而是在配置的 cold sweep 周期内最终追平；CI 专项 job 保留但口径改为 hotset SLA + cold eventual consistency。
 - `scripts/smoke-search-syntax.sh` 支持自建临时 root、临时 HTTP 端口和自启动 daemon；在 `--no-watch` 下会递归分批调用 `/scan`，完整覆盖 HTTP search DSL smoke 矩阵。
 - `dupe:content` 新增 exclude/oversized/mount policy 回归，确认内容重复扫描复用 frozen/offline、exclude 目录、mount policy 与 `content_index.max_file_size` 准入，并把 partial/full hash 慢 I/O 放在 query generation guard 外。
+- daemon 集成测试 helper 默认隔离每个子进程的 `XDG_CONFIG_HOME` 与 `XDG_RUNTIME_DIR`，避免多线程 CI 中 `--no-watch`、tiered watcher 和 crash recovery 测试共享用户配置或 UDS runtime 状态。
 - `memory_light` 的 RSS/P95、idle RSS 和默认 profile 对照仍需在非沙箱 daemon 或真实数据集环境采集；本地测试不伪造性能数值。
 
 ## v0.6.0 更新（零拷贝序列化 P1 + Compaction 降维 P2）

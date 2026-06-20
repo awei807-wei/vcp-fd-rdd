@@ -32,10 +32,23 @@ const CONTENT_INDEX_UNSUPPORTED: &str =
     "content index is disabled; enable content_index before using content:/text:";
 type ContentMatcher<'a> = dyn Fn(&Path, &str) -> bool + 'a;
 
+/// Outcome of requesting one cold-result fs verification from the per-query budget.
+enum VerifyGrant {
+    /// Budget available — perform the fs verification.
+    Verify,
+    /// Per-query verification *count* cap reached: a deliberate load cap, so the
+    /// remaining cold candidates are dropped (their freshness stays unverified).
+    CountCapped,
+    /// Per-query verification *deadline* elapsed: usually cold-mmap page-fault
+    /// latency right after a snapshot remount rather than genuine verification
+    /// load. The candidate is returned unvalidated instead of dropped.
+    TimedOut,
+}
+
 struct QueryVerifyBudget {
     remaining: usize,
     deadline: Instant,
-    exhausted: bool,
+    count_capped: bool,
 }
 
 impl QueryVerifyBudget {
@@ -48,21 +61,29 @@ impl QueryVerifyBudget {
         Self {
             remaining: max_verify,
             deadline: Instant::now() + std::time::Duration::from_millis(timeout_ms),
-            exhausted: false,
+            count_capped: false,
         }
     }
 
-    fn try_consume(&mut self) -> bool {
-        if self.remaining == 0 || Instant::now() >= self.deadline {
-            self.exhausted = true;
-            return false;
+    fn try_consume(&mut self) -> VerifyGrant {
+        // Count cap takes precedence over the deadline: once the verification
+        // quota is spent we deliberately stop verifying and drop the rest.
+        if self.remaining == 0 {
+            self.count_capped = true;
+            return VerifyGrant::CountCapped;
+        }
+        if Instant::now() >= self.deadline {
+            return VerifyGrant::TimedOut;
         }
         self.remaining -= 1;
-        true
+        VerifyGrant::Verify
     }
 
-    fn exhausted(&self) -> bool {
-        self.exhausted
+    /// True once the verification *count* cap is spent. A deadline timeout does
+    /// not set this — timed-out candidates are returned unvalidated, so the scan
+    /// keeps collecting up to `limit` instead of bailing out to an empty result.
+    fn count_capped(&self) -> bool {
+        self.count_capped
     }
 }
 
@@ -188,7 +209,7 @@ impl TieredIndex {
             if let Some(result) = self.annotate_query_result(meta, &mut budget) {
                 results.push(result);
             }
-            if budget.exhausted() {
+            if budget.count_capped() {
                 break;
             }
         }
@@ -273,8 +294,10 @@ impl TieredIndex {
     }
 
     pub(crate) fn collect_live_metas_for_diagnostics(&self) -> Vec<FileMeta> {
-        let base = self.base.load_full();
+        // Lock the overlay before loading base for a consistent (base, overlay)
+        // snapshot vs. finish_rebuild's atomic publish (see execute_query_plan).
         let db = self.delta_buffer.lock();
+        let base = self.base.load_full();
         let mut del = PathArenaSet::default();
         for p in db.deleted_paths() {
             let _ = del.insert(p);
@@ -440,8 +463,15 @@ impl TieredIndex {
         };
         let (results, hardlink_dupe_keys, content_dupe_metas) = {
             let _guard = QueryGenerationGuard::new(self);
-            let base = self.base.load_full();
+            // Capture `base` while holding the delta_buffer lock so the (base, overlay)
+            // pair is consistent with finish_rebuild / materialize_snapshot_base, which
+            // publish `base` and clear the overlay atomically under this same lock.
+            // Loading base *before* locking races with that publish: a query can read
+            // the pre-publish (empty) base together with the post-publish (cleared)
+            // overlay and return [] even though the index is fully populated — the
+            // transient-empty-result race seen in the large-scale CI query test.
             let db = self.delta_buffer.lock();
+            let base = self.base.load_full();
             let mut del = PathArenaSet::default();
             for p in db.deleted_paths() {
                 let _ = del.insert(p);
@@ -558,7 +588,7 @@ impl TieredIndex {
                                 if results.len() >= scan_limit {
                                     break 'collect_results;
                                 }
-                            } else if verify_budget.exhausted() {
+                            } else if verify_budget.count_capped() {
                                 break 'collect_results;
                             }
                         }
@@ -578,7 +608,7 @@ impl TieredIndex {
                 ) {
                     break 'collect_results;
                 }
-                if verify_budget.exhausted() {
+                if verify_budget.count_capped() {
                     break 'collect_results;
                 }
 
@@ -655,7 +685,7 @@ impl TieredIndex {
     ) -> bool {
         for anchor in plan.anchors() {
             for hit in layer.query_metas(anchor.as_ref()) {
-                if verify_budget.exhausted() {
+                if verify_budget.count_capped() {
                     return true;
                 }
                 let meta = hit.meta;
@@ -688,7 +718,7 @@ impl TieredIndex {
                         if results.len() >= limit {
                             return true;
                         }
-                    } else if verify_budget.exhausted() {
+                    } else if verify_budget.count_capped() {
                         return true;
                     }
                 }
@@ -712,7 +742,7 @@ impl TieredIndex {
     ) -> bool {
         for anchor in plan.anchors() {
             for meta in layer.query(anchor.as_ref(), limit.saturating_sub(results.len())) {
-                if verify_budget.exhausted() {
+                if verify_budget.count_capped() {
                     return true;
                 }
                 let path_bytes = meta.path.as_os_str().as_encoded_bytes();
@@ -741,7 +771,7 @@ impl TieredIndex {
                         if results.len() >= limit {
                             return true;
                         }
-                    } else if verify_budget.exhausted() {
+                    } else if verify_budget.count_capped() {
                         return true;
                     }
                 }
@@ -832,8 +862,25 @@ impl TieredIndex {
             ));
         }
 
-        if !verify_budget.try_consume() {
-            return None;
+        match verify_budget.try_consume() {
+            VerifyGrant::Verify => {}
+            VerifyGrant::CountCapped => return None,
+            VerifyGrant::TimedOut => {
+                // Deadline elapsed before this cold candidate could be verified —
+                // typically cold-mmap page-fault latency right after a snapshot
+                // remount, not genuine verification load. The entry is present in
+                // the cold index, so return it unvalidated (Unknown freshness)
+                // rather than dropping it. Dropping here is what made the
+                // large-scale CI query test return [] for a fully-populated index
+                // once the 75ms verify deadline was consumed by the cold base walk
+                // before any result was validated.
+                return Some(QueryResultMeta::cold(
+                    meta,
+                    QueryResultFreshness::Unknown,
+                    index_tier,
+                    false,
+                ));
+            }
         }
 
         self.stats.record_cold_validate(1);
@@ -928,7 +975,7 @@ impl TieredIndex {
     }
 
     fn record_recent_stale_hit_dir(&self, dir: PathBuf) {
-        let mut dirs = self.recent_stale_hit_dirs.lock();
+        let mut dirs = self.tombstones.recent_stale_hit_dirs.lock();
         if !dirs.iter().any(|existing| existing == &dir) {
             dirs.push(dir);
         }
@@ -939,7 +986,7 @@ impl TieredIndex {
     }
 
     pub fn drain_recent_stale_hit_dirs(&self) -> Vec<PathBuf> {
-        let mut dirs = self.recent_stale_hit_dirs.lock();
+        let mut dirs = self.tombstones.recent_stale_hit_dirs.lock();
         let mut out = std::mem::take(&mut *dirs);
         out.sort();
         out.dedup();
@@ -977,16 +1024,20 @@ impl TieredIndex {
     }
 
     fn record_content_dupe_outcome(&self, outcome: &ContentDupeOutcome) {
-        self.content_hash_queue_pending.store(0, Ordering::Relaxed);
-        self.content_hash_candidate_count
+        self.content.hash_queue_pending.store(0, Ordering::Relaxed);
+        self.content
+            .hash_candidate_count
             .store(outcome.candidate_count as u64, Ordering::Relaxed);
-        self.content_hash_confirmed_groups
+        self.content
+            .hash_confirmed_groups
             .store(outcome.confirmed_groups as u64, Ordering::Relaxed);
-        self.content_hash_skipped_count
+        self.content
+            .hash_skipped_count
             .store(outcome.skipped_count as u64, Ordering::Relaxed);
-        self.content_hash_last_elapsed_ms
+        self.content
+            .hash_last_elapsed_ms
             .store(outcome.elapsed_ms, Ordering::Relaxed);
-        *self.content_hash_last_skip_reason.lock() = outcome.last_skip_reason.clone();
+        *self.content.hash_last_skip_reason.lock() = outcome.last_skip_reason.clone();
     }
 }
 
@@ -1119,7 +1170,7 @@ fn content_duplicate_paths(
     let started = Instant::now();
     let mut outcome = ContentDupeOutcome::default();
     let mut by_size: HashMap<u64, Vec<ContentDupeCandidate>> = HashMap::new();
-    let config = index.content_index_config.lock().clone();
+    let config = index.content.config.lock().clone();
     let fs_policy = FsPolicy::current_with_config(index.fs_policy_config());
 
     for meta in metas {

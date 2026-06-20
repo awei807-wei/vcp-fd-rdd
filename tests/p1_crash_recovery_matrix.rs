@@ -25,7 +25,19 @@ fn abrupt_kill_restart_recovers_visible_incremental_file() {
         &root,
         port,
         &snapshot,
-        &["--snapshot-interval-secs", "3600", "--debounce-ms", "20"],
+        &[
+            "--snapshot-interval-secs",
+            "3600",
+            "--debounce-ms",
+            "20",
+            // sync-always ensures every WAL write is fsync'd before the abrupt
+            // SIGKILL below, so the restart can replay the WAL and defer repair
+            // instead of falling back to an empty-source startup scan. Without
+            // this, CI (slower machines) can lose the unsealed WAL tail and the
+            // health assertions on the deferred-repair path become flaky.
+            "--wal-durability",
+            "sync-always",
+        ],
     );
     wait_for_indexed_count(port, 1, 15).unwrap();
     // The startup scan finding the initial probe does not mean the live watcher
@@ -49,7 +61,14 @@ fn abrupt_kill_restart_recovers_visible_incremental_file() {
         &root,
         port,
         &snapshot,
-        &["--snapshot-interval-secs", "3600", "--debounce-ms", "20"],
+        &[
+            "--snapshot-interval-secs",
+            "3600",
+            "--debounce-ms",
+            "20",
+            "--wal-durability",
+            "sync-always",
+        ],
     );
     assert!(
         wait_for_file_visible(port, &late, 15),

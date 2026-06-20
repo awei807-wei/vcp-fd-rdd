@@ -24,7 +24,7 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use crate::config::{ContentIndexConfig, MmapWarmupConfig, QueryConfig, RuntimeProfileSettings};
+use crate::config::{MmapWarmupConfig, QueryConfig, RuntimeProfileSettings};
 use crate::core::AdaptiveScheduler;
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource, RootCasePolicyDiagnostics};
 use crate::event::sync::DirtyQueue;
@@ -33,11 +33,13 @@ use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
 use crate::stats::{StatsCollector, StatsReport};
-use crate::storage::quarantine::{FreezeGate, QuarantineState, RootStateRecord};
+use crate::storage::quarantine::{FreezeGate, RootStateRecord};
 use crate::storage::recovery_audit::RecoveryAuditReport;
 use crate::storage::traits::WriteAheadLog;
 use crate::storage::wal::WalDurability;
+use crate::util::unix_secs;
 
+use self::quarantine::RecoveryQuarantine;
 use self::rebuild::RebuildState;
 pub use directory_manifest::DirectoryManifestReport;
 use directory_manifest::DirectoryManifestStore;
@@ -218,6 +220,52 @@ pub(crate) fn normalize_path(path: &std::path::Path) -> PathBuf {
     PathBuf::from(s.nfc().collect::<String>())
 }
 
+/// IO tuning knobs extracted from `TieredIndex`.
+pub struct IoTuning {
+    pub ioprio_idle_set: AtomicBool,
+    pub ioprio_set_failed: AtomicBool,
+    pub mmap_warmup_enabled: AtomicBool,
+    pub mmap_warmup_pages: AtomicU64,
+    pub mmap_warmup_elapsed_ms: AtomicU64,
+    pub mmap_warmup_cancel_reason: Mutex<String>,
+    pub stable_snapshot_enabled: AtomicBool,
+}
+
+impl Default for IoTuning {
+    fn default() -> Self {
+        Self {
+            ioprio_idle_set: AtomicBool::new(false),
+            ioprio_set_failed: AtomicBool::new(false),
+            mmap_warmup_enabled: AtomicBool::new(false),
+            mmap_warmup_pages: AtomicU64::new(0),
+            mmap_warmup_elapsed_ms: AtomicU64::new(0),
+            mmap_warmup_cancel_reason: Mutex::new("disabled".to_string()),
+            stable_snapshot_enabled: AtomicBool::new(true),
+        }
+    }
+}
+
+/// Runtime subtree tombstone & cold-sweep tracking extracted from `TieredIndex`.
+pub struct TombstoneTracker {
+    pub ttl_secs: AtomicU64,
+    pub(self) entries: Mutex<Vec<RuntimeSubtreeTombstone>>,
+    pub recent_stale_hit_dirs: Mutex<Vec<PathBuf>>,
+    pub cold_sweep_last_completed: AtomicU64,
+    pub cold_sweep_period_estimate: AtomicU64,
+}
+
+impl Default for TombstoneTracker {
+    fn default() -> Self {
+        Self {
+            ttl_secs: AtomicU64::new(RUNTIME_SUBTREE_TOMBSTONE_TTL.as_secs()),
+            entries: Mutex::new(Vec::new()),
+            recent_stale_hit_dirs: Mutex::new(Vec::new()),
+            cold_sweep_last_completed: AtomicU64::new(0),
+            cold_sweep_period_estimate: AtomicU64::new(0),
+        }
+    }
+}
+
 /// 三级索引：L1 热缓存 → L2 持久索引（内存常驻）→ L3 构建器（不在查询链路）
 pub struct TieredIndex {
     pub l1: L1Cache,
@@ -256,56 +304,20 @@ pub struct TieredIndex {
     pub(self) fast_sync_semaphore: Arc<tokio::sync::Semaphore>,
     pub(self) dirty_queue: Mutex<DirtyQueue>,
     pub(self) dirty_notify: Notify,
-    pub(self) recovery_status: Mutex<RecoveryStatus>,
-    pub(self) quarantine_state: Mutex<QuarantineState>,
-    pub(self) freeze_gate: Mutex<FreezeGate>,
-    pub(self) quarantine_verify_pending: AtomicU64,
-    pub(self) quarantine_verified_roots: AtomicU64,
+    pub(self) recovery_quarantine: RecoveryQuarantine,
     pub(self) clock_skew: Mutex<crate::clock::ClockSkewDetector>,
     pub(self) clock_reconciliation_count: AtomicU64,
     pub(self) root_case_policies: Mutex<Vec<RootCasePolicyDiagnostics>>,
-    pub(self) ioprio_idle_set: AtomicBool,
-    pub(self) ioprio_set_failed: AtomicBool,
-    pub(self) mmap_warmup_enabled: AtomicBool,
-    pub(self) mmap_warmup_pages: AtomicU64,
-    pub(self) mmap_warmup_elapsed_ms: AtomicU64,
-    pub(self) mmap_warmup_cancel_reason: Mutex<String>,
-    pub(self) stable_snapshot_enabled: AtomicBool,
+    pub(self) io_tuning: IoTuning,
     pub(self) mount_policy_counters: Arc<SharedMountPolicyCounters>,
     pub(self) io_governor: Arc<crate::io_governor::IoGovernor>,
     pub(self) stats: Arc<StatsCollector>,
-    pub(self) content_index_enabled: AtomicBool,
-    pub(self) content_index_config: Mutex<ContentIndexConfig>,
-    pub(self) content_index_docs: Mutex<std::collections::HashMap<PathBuf, String>>,
-    pub(self) content_indexed_paths: AtomicU64,
-    pub(self) content_indexed_bytes: AtomicU64,
-    pub(self) content_index_last_elapsed_ms: AtomicU64,
-    pub(self) content_hash_queue_pending: AtomicU64,
-    pub(self) content_hash_candidate_count: AtomicU64,
-    pub(self) content_hash_confirmed_groups: AtomicU64,
-    pub(self) content_hash_skipped_count: AtomicU64,
-    pub(self) content_hash_last_elapsed_ms: AtomicU64,
-    pub(self) content_hash_last_skip_reason: Mutex<String>,
+    pub(self) content: content::ContentIndexState,
     pub(self) directory_manifests: DirectoryManifestStore,
-    pub(self) lazy_validation_enabled: AtomicBool,
-    pub(self) lazy_validation_cache_entries: AtomicU64,
-    pub(self) lazy_validation_ttl_ns: AtomicU64,
-    pub(self) lazy_validation_stat_per_sec: AtomicU64,
-    pub(self) lazy_validation_state: Mutex<lazy_validation::LazyValidationState>,
-    pub(self) lazy_validation_notify: Notify,
-    pub(self) lazy_validation_enqueued: AtomicU64,
-    pub(self) lazy_validation_completed: AtomicU64,
-    pub(self) lazy_validation_stale_hits: AtomicU64,
-    pub(self) lazy_validation_cache_hits: AtomicU64,
-    pub(self) lazy_validation_rate_limited: AtomicU64,
-    pub(self) lazy_validation_queue_full: AtomicU64,
+    pub(self) lazy_validation: lazy_validation::LazyValidationRuntime,
     pub(self) query_max_verify_per_query: AtomicU64,
     pub(self) query_verify_timeout_ms: AtomicU64,
-    pub(self) runtime_subtree_tombstone_ttl_secs: AtomicU64,
-    pub(self) runtime_subtree_tombstones: Mutex<Vec<RuntimeSubtreeTombstone>>,
-    pub(self) recent_stale_hit_dirs: Mutex<Vec<PathBuf>>,
-    pub(self) cold_sweep_last_completed_unix_secs: AtomicU64,
-    pub(self) cold_sweep_period_estimate_secs: AtomicU64,
+    pub(self) tombstones: TombstoneTracker,
     pub(self) memory_report_cache: Mutex<MemoryReportCache>,
 }
 
@@ -313,13 +325,6 @@ pub struct TieredIndex {
 struct MemoryReportCache {
     report: Option<crate::stats::MemoryReport>,
     sampled_at: Option<Instant>,
-}
-
-fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 impl TieredIndex {
@@ -342,19 +347,19 @@ impl TieredIndex {
     }
 
     pub fn recovery_status(&self) -> RecoveryStatus {
-        self.recovery_status.lock().clone()
+        self.recovery_quarantine.status.lock().clone()
     }
 
     pub(crate) fn set_startup_recovery_report(&self, report: StartupRecoveryReport) {
-        self.recovery_status.lock().report = report;
+        self.recovery_quarantine.status.lock().report = report;
     }
 
     pub(crate) fn set_startup_repair_stats(&self, repair: StartupRepairStats) {
-        self.recovery_status.lock().repair = repair;
+        self.recovery_quarantine.status.lock().repair = repair;
     }
 
     pub(crate) fn mark_rebuild_recovery_complete(&self) {
-        let mut status = self.recovery_status.lock();
+        let mut status = self.recovery_quarantine.status.lock();
         let report = &mut status.report;
         if !(report.startup_scan_required
             || report.requires_repair
@@ -384,7 +389,8 @@ impl TieredIndex {
     }
 
     pub fn set_stable_snapshot_enabled(&self, enabled: bool) {
-        self.stable_snapshot_enabled
+        self.io_tuning
+            .stable_snapshot_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -408,8 +414,7 @@ impl TieredIndex {
     }
 
     pub fn set_runtime_subtree_tombstone_ttl_secs(&self, secs: u64) {
-        self.runtime_subtree_tombstone_ttl_secs
-            .store(secs, Ordering::Relaxed);
+        self.tombstones.ttl_secs.store(secs, Ordering::Relaxed);
     }
 
     pub fn apply_query_config(&self, config: QueryConfig) {
@@ -428,7 +433,7 @@ impl TieredIndex {
 
     // TODO: consider trie or sorted vec + binary search when tombstone count > 16.
     pub(self) fn path_blocked_by_runtime_subtree_tombstone(&self, path: &Path) -> bool {
-        let mut tombstones = self.runtime_subtree_tombstones.lock();
+        let mut tombstones = self.tombstones.entries.lock();
         Self::cleanup_runtime_subtree_tombstones_locked(&mut tombstones, Instant::now());
         tombstones
             .iter()
@@ -440,12 +445,10 @@ impl TieredIndex {
         events: &[crate::core::EventRecord],
     ) {
         let now = Instant::now();
-        let ttl_secs = self
-            .runtime_subtree_tombstone_ttl_secs
-            .load(Ordering::Relaxed);
+        let ttl_secs = self.tombstones.ttl_secs.load(Ordering::Relaxed);
         let expires_at = now + Duration::from_secs(ttl_secs);
         let current_generation = self.event_seq.load(Ordering::Relaxed);
-        let mut tombstones = self.runtime_subtree_tombstones.lock();
+        let mut tombstones = self.tombstones.entries.lock();
         Self::cleanup_runtime_subtree_tombstones_locked(&mut tombstones, now);
 
         for ev in events {
@@ -508,7 +511,7 @@ impl TieredIndex {
 
     #[cfg(test)]
     fn force_expire_runtime_subtree_tombstones(&self) {
-        let mut tombstones = self.runtime_subtree_tombstones.lock();
+        let mut tombstones = self.tombstones.entries.lock();
         for tombstone in tombstones.iter_mut() {
             tombstone.expires_at = Instant::now();
         }
@@ -517,27 +520,32 @@ impl TieredIndex {
 
     #[cfg(test)]
     fn runtime_subtree_tombstone_count(&self) -> usize {
-        let mut tombstones = self.runtime_subtree_tombstones.lock();
+        let mut tombstones = self.tombstones.entries.lock();
         Self::cleanup_runtime_subtree_tombstones_locked(&mut tombstones, Instant::now());
         tombstones.len()
     }
 
     pub fn cold_sweep_last_completed(&self) -> u64 {
-        self.cold_sweep_last_completed_unix_secs
+        self.tombstones
+            .cold_sweep_last_completed
             .load(Ordering::Relaxed)
     }
 
     pub fn cold_sweep_period_estimate(&self) -> u64 {
-        self.cold_sweep_period_estimate_secs.load(Ordering::Relaxed)
+        self.tombstones
+            .cold_sweep_period_estimate
+            .load(Ordering::Relaxed)
     }
 
     pub fn set_cold_sweep_period_estimate(&self, secs: u64) {
-        self.cold_sweep_period_estimate_secs
+        self.tombstones
+            .cold_sweep_period_estimate
             .store(secs, Ordering::Relaxed);
     }
 
     pub(self) fn mark_cold_sweep_completed(&self) {
-        self.cold_sweep_last_completed_unix_secs
+        self.tombstones
+            .cold_sweep_last_completed
             .store(unix_secs(), Ordering::Relaxed);
     }
 
@@ -556,17 +564,18 @@ impl TieredIndex {
     }
 
     pub fn install_freeze_gate(&self, gate: FreezeGate) {
-        *self.freeze_gate.lock() = gate;
+        *self.recovery_quarantine.freeze_gate.lock() = gate;
     }
 
     pub fn restore_quarantine_from_wal(&self, records: &[RootStateRecord]) {
         let (gate, pending) = {
-            let mut state = self.quarantine_state.lock();
+            let mut state = self.recovery_quarantine.quarantine_state.lock();
             state.apply_wal_records(records);
             (state.freeze_gate(), state.active_root_count() as u64)
         };
         self.install_freeze_gate(gate);
-        self.quarantine_verify_pending
+        self.recovery_quarantine
+            .verify_pending
             .store(pending, Ordering::Relaxed);
     }
 
@@ -595,12 +604,13 @@ impl TieredIndex {
 
     fn apply_root_state_record_in_memory(&self, record: RootStateRecord) {
         let (gate, pending) = {
-            let mut state = self.quarantine_state.lock();
+            let mut state = self.recovery_quarantine.quarantine_state.lock();
             state.apply_wal_record(record.clone());
             (state.freeze_gate(), state.active_root_count() as u64)
         };
         self.install_freeze_gate(gate);
-        self.quarantine_verify_pending
+        self.recovery_quarantine
+            .verify_pending
             .store(pending, Ordering::Relaxed);
 
         if matches!(
@@ -616,7 +626,10 @@ impl TieredIndex {
     }
 
     pub fn path_is_frozen(&self, path: &Path) -> bool {
-        self.freeze_gate.lock().is_path_frozen(path)
+        self.recovery_quarantine
+            .freeze_gate
+            .lock()
+            .is_path_frozen(path)
     }
 
     pub(crate) fn clock_cutoff_for_dirty(&self, cutoff_ns: u64) -> u64 {
@@ -655,10 +668,14 @@ impl TieredIndex {
     pub(crate) fn record_idle_io_priority_result(&self, result: std::io::Result<()>) {
         match result {
             Ok(()) => {
-                self.ioprio_idle_set.store(true, Ordering::Relaxed);
+                self.io_tuning
+                    .ioprio_idle_set
+                    .store(true, Ordering::Relaxed);
             }
             Err(err) => {
-                self.ioprio_set_failed.store(true, Ordering::Relaxed);
+                self.io_tuning
+                    .ioprio_set_failed
+                    .store(true, Ordering::Relaxed);
                 tracing::debug!("idle ioprio best-effort setup failed: {}", err);
             }
         }
@@ -750,33 +767,42 @@ impl TieredIndex {
     }
 
     pub fn apply_mmap_warmup_config(&self, config: MmapWarmupConfig) {
-        self.mmap_warmup_enabled
+        self.io_tuning
+            .mmap_warmup_enabled
             .store(config.enable, Ordering::Relaxed);
         if config.enable {
             self.warmup_current_mmap_segments(config.max_bytes);
         } else {
-            self.mmap_warmup_pages.store(0, Ordering::Relaxed);
-            self.mmap_warmup_elapsed_ms.store(0, Ordering::Relaxed);
-            *self.mmap_warmup_cancel_reason.lock() = "disabled".to_string();
+            self.io_tuning.mmap_warmup_pages.store(0, Ordering::Relaxed);
+            self.io_tuning
+                .mmap_warmup_elapsed_ms
+                .store(0, Ordering::Relaxed);
+            *self.io_tuning.mmap_warmup_cancel_reason.lock() = "disabled".to_string();
         }
     }
 
     pub(crate) fn warmup_current_mmap_segments(&self, max_bytes: u64) {
         self.io_governor.before_io();
         let report = self.base.load_full().warmup_cold_segments(max_bytes);
-        self.mmap_warmup_pages
+        self.io_tuning
+            .mmap_warmup_pages
             .store(report.pages, Ordering::Relaxed);
-        self.mmap_warmup_elapsed_ms
+        self.io_tuning
+            .mmap_warmup_elapsed_ms
             .store(report.elapsed_ms, Ordering::Relaxed);
-        *self.mmap_warmup_cancel_reason.lock() = report.cancel_reason;
+        *self.io_tuning.mmap_warmup_cancel_reason.lock() = report.cancel_reason;
     }
 }
 
 impl DiagnosticSource for TieredIndex {
     fn collect(&self, report: &mut DiagnosticReport) {
-        let quarantine_roots = self.quarantine_state.lock().active_root_count();
+        let quarantine_roots = self
+            .recovery_quarantine
+            .quarantine_state
+            .lock()
+            .active_root_count();
         let (freeze_gates, freeze_blocked_events) = {
-            let gate = self.freeze_gate.lock();
+            let gate = self.recovery_quarantine.freeze_gate.lock();
             (gate.frozen_root_count(), gate.blocked_events())
         };
         let (
@@ -798,31 +824,35 @@ impl DiagnosticSource for TieredIndex {
         report.storage.quarantine_roots = quarantine_roots;
         report.storage.freeze_gates = freeze_gates;
         report.storage.freeze_blocked_events = freeze_blocked_events;
-        report.storage.quarantine_verify_pending =
-            self.quarantine_verify_pending.load(Ordering::Relaxed) as usize;
-        report.storage.quarantine_verified_roots =
-            self.quarantine_verified_roots.load(Ordering::Relaxed);
+        report.storage.quarantine_verify_pending = self
+            .recovery_quarantine
+            .verify_pending
+            .load(Ordering::Relaxed) as usize;
+        report.storage.quarantine_verified_roots = self
+            .recovery_quarantine
+            .verified_roots
+            .load(Ordering::Relaxed);
         let l2_physical = self.l2.load().physical_dedupe_stats();
         report.storage.hardlink_group_count = l2_physical.hardlink_group_count;
         report.storage.hardlink_max_group_size = l2_physical.max_group_size;
-        report.storage.content_index_enabled = self.content_index_enabled.load(Ordering::Relaxed);
+        report.storage.content_index_enabled = self.content.enabled.load(Ordering::Relaxed);
         report.storage.content_indexed_paths =
-            self.content_indexed_paths.load(Ordering::Relaxed) as usize;
-        report.storage.content_indexed_bytes = self.content_indexed_bytes.load(Ordering::Relaxed);
+            self.content.indexed_paths.load(Ordering::Relaxed) as usize;
+        report.storage.content_indexed_bytes = self.content.indexed_bytes.load(Ordering::Relaxed);
         report.storage.content_index_last_elapsed_ms =
-            self.content_index_last_elapsed_ms.load(Ordering::Relaxed);
+            self.content.last_elapsed_ms.load(Ordering::Relaxed);
         report.storage.content_hash_queue_pending =
-            self.content_hash_queue_pending.load(Ordering::Relaxed) as usize;
+            self.content.hash_queue_pending.load(Ordering::Relaxed) as usize;
         report.storage.content_hash_candidate_count =
-            self.content_hash_candidate_count.load(Ordering::Relaxed) as usize;
+            self.content.hash_candidate_count.load(Ordering::Relaxed) as usize;
         report.storage.content_hash_confirmed_groups =
-            self.content_hash_confirmed_groups.load(Ordering::Relaxed) as usize;
+            self.content.hash_confirmed_groups.load(Ordering::Relaxed) as usize;
         report.storage.content_hash_skipped_count =
-            self.content_hash_skipped_count.load(Ordering::Relaxed) as usize;
+            self.content.hash_skipped_count.load(Ordering::Relaxed) as usize;
         report.storage.content_hash_last_elapsed_ms =
-            self.content_hash_last_elapsed_ms.load(Ordering::Relaxed);
+            self.content.hash_last_elapsed_ms.load(Ordering::Relaxed);
         report.storage.content_hash_last_skip_reason =
-            self.content_hash_last_skip_reason.lock().clone();
+            self.content.hash_last_skip_reason.lock().clone();
         report.storage.case_policy_roots = self.root_case_policy_diagnostics();
         report.storage.case_policy_conflict_count = report
             .storage
@@ -830,10 +860,15 @@ impl DiagnosticSource for TieredIndex {
             .iter()
             .map(|root| root.conflict_count)
             .sum();
-        report.storage.mmap_warmup_enabled = self.mmap_warmup_enabled.load(Ordering::Relaxed);
-        report.storage.mmap_warmup_pages = self.mmap_warmup_pages.load(Ordering::Relaxed);
-        report.storage.mmap_warmup_elapsed_ms = self.mmap_warmup_elapsed_ms.load(Ordering::Relaxed);
-        report.storage.mmap_warmup_cancel_reason = self.mmap_warmup_cancel_reason.lock().clone();
+        report.storage.mmap_warmup_enabled =
+            self.io_tuning.mmap_warmup_enabled.load(Ordering::Relaxed);
+        report.storage.mmap_warmup_pages = self.io_tuning.mmap_warmup_pages.load(Ordering::Relaxed);
+        report.storage.mmap_warmup_elapsed_ms = self
+            .io_tuning
+            .mmap_warmup_elapsed_ms
+            .load(Ordering::Relaxed);
+        report.storage.mmap_warmup_cancel_reason =
+            self.io_tuning.mmap_warmup_cancel_reason.lock().clone();
         report.storage.refresh_base_count = self.stats_report().refresh_base_count;
 
         report.clocks.skew_count = clock_skew_count;
@@ -842,8 +877,8 @@ impl DiagnosticSource for TieredIndex {
         report.clocks.reconciliation_count =
             self.clock_reconciliation_count.load(Ordering::Relaxed);
         report.clocks.reconciliation_window_active = reconciliation_window_active;
-        let ioprio_idle = self.ioprio_idle_set.load(Ordering::Relaxed);
-        let ioprio_failed = self.ioprio_set_failed.load(Ordering::Relaxed);
+        let ioprio_idle = self.io_tuning.ioprio_idle_set.load(Ordering::Relaxed);
+        let ioprio_failed = self.io_tuning.ioprio_set_failed.load(Ordering::Relaxed);
         report.io.ioprio_class = if ioprio_idle {
             "idle".to_string()
         } else if ioprio_failed {

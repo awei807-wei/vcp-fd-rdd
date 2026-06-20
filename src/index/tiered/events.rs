@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::core::{EventRecord, EventType, FileIdentifier, FileMeta};
 use crate::index::l2_partition::PersistentIndex;
+use crate::util::unix_secs;
 
 use super::TieredIndex;
 
@@ -235,7 +236,7 @@ impl TieredIndex {
     }
 
     fn filter_events_for_freeze(&self, events: &[EventRecord]) -> Vec<EventRecord> {
-        let mut gate = self.freeze_gate.lock();
+        let mut gate = self.recovery_quarantine.freeze_gate.lock();
         let mut filtered = Vec::with_capacity(events.len());
         for ev in events {
             if gate.should_block_event(ev) {
@@ -253,7 +254,7 @@ impl TieredIndex {
     }
 
     fn retain_events_allowed_by_freeze(&self, events: &mut Vec<EventRecord>) {
-        let mut gate = self.freeze_gate.lock();
+        let mut gate = self.recovery_quarantine.freeze_gate.lock();
         events.retain(|ev| {
             if gate.should_block_event(ev) {
                 gate.note_blocked();
@@ -282,7 +283,7 @@ impl TieredIndex {
             return filtered;
         }
 
-        let mut gate = self.freeze_gate.lock();
+        let mut gate = self.recovery_quarantine.freeze_gate.lock();
         let mut filtered_events = Vec::with_capacity(events.len());
         let mut filtered_metas = Vec::with_capacity(metas.len());
         for (ev, meta) in events.iter().zip(metas.iter()) {
@@ -398,11 +399,4 @@ pub(crate) fn event_record_estimated_bytes(ev: &EventRecord) -> u64 {
         }
     }
     bytes
-}
-
-fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

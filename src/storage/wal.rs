@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::core::{EventRecord, EventType, FileIdentifier};
 use crate::storage::checksum::crc32c_checksum;
+use crate::storage::error::StorageResult;
+use crate::storage::fsync_dir;
 use crate::storage::quarantine::{MountIdentity, RootStateKind, RootStateRecord};
 
 pub(crate) const WAL_MAGIC: u32 = 0x314C_4157; // "WAL1"
@@ -437,9 +439,7 @@ impl WalStore {
         }
 
         // fsync(dir) after rename to ensure the directory entry is persisted.
-        if let Ok(dir) = std::fs::File::open(&self.dir) {
-            let _ = dir.sync_all();
-        }
+        fsync_dir(&self.dir);
 
         let newf = open_or_init(&self.current)?;
         *self.file.lock().unwrap_or_else(|e| e.into_inner()) = newf;
@@ -590,7 +590,7 @@ impl crate::storage::traits::WriteAheadLog for WalStore {
     }
 }
 
-fn open_or_init(path: &Path) -> anyhow::Result<File> {
+fn open_or_init(path: &Path) -> StorageResult<File> {
     let exists = path.exists();
     let mut f = OpenOptions::new()
         .create(true)
@@ -647,9 +647,7 @@ fn open_or_init(path: &Path) -> anyhow::Result<File> {
 
         // fsync(dir) after rename to ensure the directory entry is persisted.
         if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+            fsync_dir(parent);
         }
 
         let mut nf = OpenOptions::new()
@@ -736,7 +734,7 @@ fn sealed_id_gap_detected(ids: &[u64]) -> bool {
     ids.windows(2).any(|pair| pair[1] > pair[0] + 1)
 }
 
-fn read_wal_file(path: &Path) -> anyhow::Result<(Vec<WalReplayRecord>, WalReplayDamage)> {
+fn read_wal_file(path: &Path) -> StorageResult<(Vec<WalReplayRecord>, WalReplayDamage)> {
     if !path.exists() {
         return Ok((Vec::new(), WalReplayDamage::default()));
     }
