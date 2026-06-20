@@ -211,7 +211,7 @@ impl DirectoryManifestStore {
         let mut manifests = self.manifests.lock();
         manifests
             .entry(path.to_path_buf())
-            .or_insert_with(DirectoryManifest::default)
+            .or_default()
             .dir_mtime_ns = mtime_ns;
     }
 

@@ -127,7 +127,7 @@ fn tiered_diagnostics_include_shared_mount_policy_counters() {
 // ===========================================================================
 
 /// 辅助：创建包含 n 个文件的目录（用于大目录测试，n > REPAIR_SLICE_MAX_ENTRIES=512）。
-fn phase3_create_large_dir(root: &PathBuf, n: usize) {
+fn phase3_create_large_dir(root: &Path, n: usize) {
     std::fs::create_dir_all(root).unwrap();
     for i in 0..n {
         std::fs::write(root.join(format!("file_{:04}.txt", i)), b"x").unwrap();
@@ -135,7 +135,7 @@ fn phase3_create_large_dir(root: &PathBuf, n: usize) {
 }
 
 /// 辅助：用 filetime 或 touch 改变目录 mtime 但不改内容。
-fn phase3_touch_dir_mtime(dir: &PathBuf) {
+fn phase3_touch_dir_mtime(dir: &Path) {
     // 在目录中创建并立即删除一个临时文件来触发 mtime 更新，
     // 但不改变最终目录内容（创建+删除 = net zero）。
     // 注意：需要先等一小段时间确保 mtime 精度。
@@ -412,10 +412,10 @@ fn mtime_precheck_pop_and_process(
 /// 辅助：运行完整 PeriodicColdScan（处理所有 slice 直到队列空）。
 fn mtime_precheck_run_cold_scan_to_completion(
     idx: &TieredIndex,
-    dir: &PathBuf,
+    dir: &Path,
     skip_dirs: &std::collections::HashSet<PathBuf>,
 ) -> Vec<DirtyProcessReport> {
-    idx.enqueue_dirty_dirs(vec![dir.clone()], DirtyReason::PeriodicColdScan);
+    idx.enqueue_dirty_dirs(vec![dir.to_path_buf()], DirtyReason::PeriodicColdScan);
     let mut reports = Vec::new();
     while let Some(r) = mtime_precheck_pop_and_process(idx, skip_dirs) {
         reports.push(r);

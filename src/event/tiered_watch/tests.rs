@@ -1880,19 +1880,20 @@ fn rotating_cold_window_budget_and_ttl_gate_selection() {
 // ── Waterline alarm tests ───────────────────────────────────────────────────
 
 fn waterline_config() -> TieredWatchConfig {
-    let mut cfg = TieredWatchConfig::default();
-    cfg.waterline_alarm_enabled = true;
-    cfg.waterline_sla_ms = 5_000;
-    cfg.waterline_soft_trigger_pct = 0.8;
-    cfg.waterline_soft_recover_pct = 0.4;
-    cfg.waterline_hard_trigger_pct = 0.8;
-    cfg.waterline_hard_recover_pct = 0.4;
-    cfg.waterline_hard_degraded_l3_interval_secs = 86_400;
-    cfg.waterline_soft_budget_reduction_pct = 0.5;
-    cfg.l2_scan_interval_secs = 300;
-    cfg.l3_scan_interval_secs = 21_600;
-    cfg.rotating_cold_window_budget = 128;
-    cfg
+    TieredWatchConfig {
+        waterline_alarm_enabled: true,
+        waterline_sla_ms: 5_000,
+        waterline_soft_trigger_pct: 0.8,
+        waterline_soft_recover_pct: 0.4,
+        waterline_hard_trigger_pct: 0.8,
+        waterline_hard_recover_pct: 0.4,
+        waterline_hard_degraded_l3_interval_secs: 86_400,
+        waterline_soft_budget_reduction_pct: 0.5,
+        l2_scan_interval_secs: 300,
+        l3_scan_interval_secs: 21_600,
+        rotating_cold_window_budget: 128,
+        ..Default::default()
+    }
 }
 
 #[test]
