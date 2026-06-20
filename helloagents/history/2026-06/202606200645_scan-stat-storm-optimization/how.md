@@ -235,14 +235,15 @@ fn directory_manifest_summary_unbounded(
 
 ## 收益汇总
 
-| Phase | 优化项 | 场景 | 优化前 | 优化后 |
-|---|---|---|---|---|
-| P1 | 目录 mtime 预检 | 未变化的 30 万文件目录 | 30 万次 stat, 15-60s | **1 次 stat, <1ms** |
-| P2 | readdir 批量删除对齐 | 删除对齐 30 万文件 | 30 万次 stat, 15-30s | **1 次 readdir, <100ms** |
-| P3 | manifest 大目录上限 | 大目录 manifest 跳过 | 永远不跳过 | 可跳过 |
-| — | P1+P2 组合 | 稳态周期扫描 | 60-90s | **<1ms** |
+| Phase | 优化项               | 场景                   | 优化前               | 优化后                   |
+| ----- | -------------------- | ---------------------- | -------------------- | ------------------------ |
+| P1    | 目录 mtime 预检      | 未变化的 30 万文件目录 | 30 万次 stat, 15-60s | **1 次 stat, <1ms**      |
+| P2    | readdir 批量删除对齐 | 删除对齐 30 万文件     | 30 万次 stat, 15-30s | **1 次 readdir, <100ms** |
+| P3    | manifest 大目录上限  | 大目录 manifest 跳过   | 永远不跳过           | 可跳过                   |
+| —     | P1+P2 组合           | 稳态周期扫描           | 60-90s               | **<1ms**                 |
 
 **预期效果**：
+
 - 热层 canary 成功率从 0/30 提升——Projects/ 虽然 mtime 变了需要扫描，但扫描速度大幅提升（P2 消除删除对齐的 stat 风暴）
 - L1→L2 降级速度加快——空扫描从 15-60s 降到 <1ms，目录能快速完成降级
 - M2 旋转窗口有更多目标——更多目录降级到 L2/L3 后，旋转窗口可以服务它们
@@ -279,3 +280,75 @@ Phase 3 (manifest 上限)    ← 补全 manifest 机制，~50 行
 ```
 
 每个 Phase 独立提交、独立测试、独立可回滚。Phase 1 和 Phase 2 互不依赖，可以并行开发。
+
+---
+
+## 附录：涉及代码位置与大纲
+
+### 文件 1：`src/index/tiered/sync.rs`（总 1758 行）
+
+| 行号      | 函数/符号                                                         | 说明                                                                | Phase      |
+| --------- | ----------------------------------------------------------------- | ------------------------------------------------------------------- | ---------- |
+| 1-23      | imports                                                           | `HashSet`, `OsString`, `mtime_to_ns`, `DirectoryManifestBuilder` 等 | —          |
+| 25-26     | `REPAIR_SLICE_MAX_ENTRIES=512`, `REPAIR_SLICE_MAX_MS=20`          | slice 扫描常量                                                      | P3         |
+| 56        | `visit_dirs_since`                                                | 已有的目录 mtime 爬取（fast_sync 用），**正确实现**，不改           | 参考       |
+| 599       | `process_dirty_entry`                                             | dirty queue 分发入口                                                | —          |
+| 621       | `process_dirty_entry_with_project_markers_and_manifest_skip_dirs` | 带 manifest skip 的分发入口                                         | —          |
+| 783       | `fast_sync`                                                       | 全量 fast-sync 路径（DirtyScope::All 触发）                         | —          |
+| 920       | `ent.metadata()`                                                  | fast_sync 中每文件 stat()                                           | 参考       |
+| 990-1005  | delete alignment 循环                                             | **逐文件 `symlink_metadata` 检查删除** ← P2 修改点                  | **P2**     |
+| 1044      | `scan_dirs_with_depth_and_project_markers_budgeted`               | 深度 1 即时扫描路径                                                 | —          |
+| 1149      | `ent.metadata()`                                                  | budgeted scan 中每文件 stat()                                       | 参考       |
+| 1222-1404 | `scan_dir_repair_slice_with_project_markers`                      | **周期扫描核心函数** ← P1/P3 修改点                                 | **P1, P3** |
+| 1230-1260 | manifest skip 检查段                                              | 现有 manifest skip（512 上限）                                      | P3         |
+| 1261      | `← P1 插入点`                                                     | mtime 预检插入位置（manifest skip 之后、sliced scan 之前）          | **P1**     |
+| 1299-1355 | sliced scan 内循环                                                | **每文件 `symlink_metadata`** ← 主瓶颈                              | 参考       |
+| 1385-1404 | `SlicedScanOutcome` 返回                                          | **← P1 插入点**：扫描完成后记录 mtime                               | **P1**     |
+| 1406      | `repair_slice_path_allowed`                                       | 路径过滤（exclude/hidden）                                          | —          |
+| 1447      | `directory_manifest_summary`                                      | 无界 manifest summary（已存在但未被调用）                           | 参考       |
+| 1533-1600 | `directory_manifest_summary_bounded`                              | **512 上限 manifest summary** ← P3 修改点                           | **P3**     |
+| 1566-1567 | `if seen >= max_entries { return (..., false) }`                  | **512 上限截断** ← P3 移除/放宽                                     | **P3**     |
+| 1571      | `child.metadata()`                                                | manifest summary 中每文件 stat()                                    | P3         |
+
+### 文件 2：`src/index/tiered/directory_manifest.rs`（总 182 行）
+
+| 行号     | 函数/符号                            | 说明                                                     | Phase  |
+| -------- | ------------------------------------ | -------------------------------------------------------- | ------ |
+| 11-18    | `struct DirectoryManifest`           | **← P1 添加 `dir_mtime_ns: i64` 字段**                   | **P1** |
+| 20-27    | `DirectoryManifest::matches_summary` | 现有 summary 比对                                        | —      |
+| 31-37    | `struct DirectoryManifestSummary`    | summary 结构                                             | —      |
+| 40-50    | `into_manifest`                      | summary → manifest 转换                                  | —      |
+| 53-57    | `struct DirectoryManifestChild`      | 单个子文件信息                                           | —      |
+| 60-114   | `DirectoryManifestBuilder`           | summary 构建器（push_child + finish）                    | —      |
+| 118-123  | `struct DirectoryManifestReport`     | 统计报告                                                 | —      |
+| 126-131  | `struct DirectoryManifestStore`      | **manifest 存储（HashMap + Mutex）** ← P1 新增方法的目标 | **P1** |
+| 134-138  | `update`                             | 现有：更新 manifest summary                              | —      |
+| 140+     | `should_skip`                        | 现有：判断是否跳过                                       | —      |
+| **新增** | `dir_unchanged`                      | **← P1 新增方法**：比较目录 mtime                        | **P1** |
+| **新增** | `record_dir_mtime`                   | **← P1 新增方法**：记录目录 mtime                        | **P1** |
+
+### 文件 3：`src/index/tiered/directory_manifest.rs` Default impl
+
+| 行号 | 说明                                        | Phase                                                  |
+| ---- | ------------------------------------------- | ------------------------------------------------------ |
+| 10   | `#[derive(Default)]` on `DirectoryManifest` | **P1**：`dir_mtime_ns` 默认 0，需确认 Default 派生兼容 |
+
+### 其他涉及文件（不修改，仅参考）
+
+| 文件                | 行号      | 说明                                                                                             |
+| ------------------- | --------- | ------------------------------------------------------------------------------------------------ |
+| `src/main.rs`       | 1250-1430 | `spawn_dirty_queue_loop`：调用 `process_dirty_entry_with_project_markers_and_manifest_skip_dirs` |
+| `src/main.rs`       | 1365-1375 | `apply_scan_policy` 调用：扫描后 tier 降级逻辑                                                   |
+| `src/event/sync.rs` | 70-90     | `DirtyReason::PeriodicColdScan`：周期扫描触发原因                                                |
+| `src/event/sync.rs` | 125-145   | `DirtyRepairCursor`：slice 游标（dir + offset）                                                  |
+| `src/event/sync.rs` | 283-310   | `pop_ready`：dirty queue 出队逻辑                                                                |
+
+### 修改量估算
+
+| Phase    | 文件                    | 新增行                               | 修改行                  | 总计        |
+| -------- | ----------------------- | ------------------------------------ | ----------------------- | ----------- |
+| P1       | `directory_manifest.rs` | ~20（字段 + 2 个方法）               | ~2（Default 兼容）      | ~22         |
+| P1       | `sync.rs`               | ~15（预检 + 记录 mtime）             | 0                       | ~15         |
+| P2       | `sync.rs`               | ~25（readdir + HashSet 比对）        | ~10（替换 delete 循环） | ~35         |
+| P3       | `sync.rs`               | ~40（unbounded summary 函数 + 调用） | ~5（调用点）            | ~45         |
+| **合计** | 2 个文件                | ~100                                 | ~17                     | **~117 行** |
