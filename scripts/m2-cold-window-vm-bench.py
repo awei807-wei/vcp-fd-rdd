@@ -13,11 +13,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -571,6 +573,8 @@ class EventStormRunner:
         subtree_depth: int = 2,
         inode_stress_iterations: int = 0,
         inode_stress_tmpfs_inodes: int = 200,
+        immediate_query_enabled: bool = False,
+        immediate_query_settle_secs: float = 5.0,
     ) -> None:
         self.base_url = base_url
         self.roots = roots
@@ -590,6 +594,12 @@ class EventStormRunner:
         # Task 2: inode_reuse_stress tmpfs tuning.
         self.inode_stress_iterations = max(0, inode_stress_iterations)
         self.inode_stress_tmpfs_inodes = max(16, inode_stress_tmpfs_inodes)
+        # Task 2: immediate-query two-pass mode. When enabled, after each burst
+        # we do an "immediate" query pass at immediate_query_settle_secs (e.g. 5s,
+        # simulating a user searching right after downloading) and then a "delayed"
+        # pass at the normal settle_secs. Both are reported separately.
+        self.immediate_query_enabled = bool(immediate_query_enabled)
+        self.immediate_query_settle_secs = max(0.0, immediate_query_settle_secs)
         self.kinds = normalize_event_storm_kinds(kinds)
         self.target_tiers = [tier.upper() for tier in target_tiers]
         tiers = self.target_tiers or [""]
@@ -673,7 +683,17 @@ class EventStormRunner:
             self.next_start_at = time.monotonic() + self.interval_secs
             return
         generation_secs = time.monotonic() - cycle_started
-        due_at = time.monotonic() + self.settle_secs
+        # Task 2: when immediate-query mode is enabled, the first due point is
+        # the immediate settle (e.g. 5s); after that pass we reschedule to the
+        # normal settle_secs for the delayed pass. Otherwise a single pass at
+        # settle_secs (backwards compatible).
+        use_immediate = (
+            self.immediate_query_enabled
+            and self.immediate_query_settle_secs < self.settle_secs
+        )
+        immediate_due = time.monotonic() + self.immediate_query_settle_secs
+        delayed_due = time.monotonic() + self.settle_secs
+        due_at = immediate_due if use_immediate else delayed_due
         self.active = {
             "cycle": self.cycle,
             "root": root,
@@ -683,6 +703,9 @@ class EventStormRunner:
             "events": events,
             "started_at": cycle_started,
             "due_at": due_at,
+            "stage": "immediate_query" if use_immediate else "delayed_query",
+            "delayed_due_at": delayed_due,
+            "immediate_done": False,
         }
         self.emit(
             {
@@ -1183,6 +1206,41 @@ class EventStormRunner:
 
     def process_due(self, now: float) -> None:
         assert self.active is not None
+        stage = str(self.active.get("stage", "delayed_query"))
+        # Task 2: immediate-query two-pass mode. The immediate pass runs at
+        # immediate_query_settle_secs (e.g. 5s) and only does a single-shot
+        # query (no after_query retry) so it does not block the main loop. After
+        # it, we reschedule to the delayed_due_at and return without finishing
+        # the cycle. The delayed pass is the full existing behavior.
+        if stage == "immediate_query":
+            self.run_query_pass(now, phase="immediate")
+            self.active["stage"] = "delayed_query"
+            self.active["due_at"] = float(self.active["delayed_due_at"])
+            self.active["immediate_done"] = True
+            return
+        # delayed_query (default, backwards compatible)
+        self.run_query_pass(now, phase="delayed")
+        # Fix E: best-effort teardown of the just-checked storm fixtures so the
+        # storm root does not grow unbounded and cannot poison a later re-run.
+        # Only removes per-burst subdirs (prefixed fd-rdd-m2-event-storm-),
+        # never the indexed root itself. ignore_errors so cleanup never crashes.
+        try:
+            for child in list(Path(self.active["root"]).iterdir()):
+                if child.name.startswith("fd-rdd-m2-event-storm-"):
+                    shutil.rmtree(child, ignore_errors=True)
+        except Exception:
+            pass
+        self.active = None
+        self.next_start_at = time.monotonic() + self.interval_secs
+
+    def run_query_pass(self, now: float, phase: str) -> None:
+        """Run a single query pass over the active burst's expected events.
+
+        phase is "immediate" or "delayed". The immediate pass skips the
+        after_query retry loop (it would block) and is tagged separately so the
+        summary can report immediate vs delayed success rates.
+        """
+        assert self.active is not None
         events = list(self.active["events"])
         root = Path(self.active["root"])
         tier_after = self.tier_for_root(root)
@@ -1190,6 +1248,7 @@ class EventStormRunner:
         positive_total = 0
         positive_ok = 0
         latencies: list[float] = []
+        do_retry = phase == "delayed" and self.timeout_secs > 0
         for event in events:
             event_details = self.event_details(event)
             ok, exists, latency, error = check_search_state_once(
@@ -1216,6 +1275,7 @@ class EventStormRunner:
                     "ok": ok,
                     "first_query_exists": exists,
                     "latency_secs": round(latency, 3),
+                    "query_phase": phase,
                     "settle_secs": round(now - float(self.active["started_at"]), 3),
                     "event_age_secs": round(
                         now
@@ -1233,7 +1293,7 @@ class EventStormRunner:
                     **({"error": error} if error else {}),
                 }
             )
-            if not ok and self.timeout_secs > 0:
+            if not ok and do_retry:
                 after_ok, after_latency, after_polls = wait_search_state(
                     self.base_url,
                     str(event["query"]),
@@ -1252,6 +1312,7 @@ class EventStormRunner:
                         "ok": after_ok,
                         "latency_secs": round(after_latency, 3),
                         "polls": after_polls,
+                        "query_phase": phase,
                         "event_age_secs": round(
                             now
                             - float(self.active["started_at"])
@@ -1284,23 +1345,12 @@ class EventStormRunner:
                 ),
                 "first_query_p50_secs": round(percentile(latencies, 50), 3),
                 "first_query_p95_secs": round(percentile(latencies, 95), 3),
+                "query_phase": phase,
                 "requested_tier": self.active.get("requested_tier", ""),
                 "tier_before": self.active.get("tier_before", ""),
                 "tier_after": tier_after,
             }
         )
-        # Fix E: best-effort teardown of the just-checked storm fixtures so the
-        # storm root does not grow unbounded and cannot poison a later re-run.
-        # Only removes per-burst subdirs (prefixed fd-rdd-m2-event-storm-),
-        # never the indexed root itself. ignore_errors so cleanup never crashes.
-        try:
-            for child in list(root.iterdir()):
-                if child.name.startswith("fd-rdd-m2-event-storm-"):
-                    shutil.rmtree(child, ignore_errors=True)
-        except Exception:
-            pass
-        self.active = None
-        self.next_start_at = time.monotonic() + self.interval_secs
 
     def event_details(self, event: dict[str, Any]) -> dict[str, Any]:
         core_keys = {
@@ -1341,6 +1391,185 @@ class EventStormRunner:
         record["ts"] = utc_now()
         record["elapsed_secs"] = round(time.monotonic() - self.started_at, 3)
         json_line(self.out_path, record)
+
+
+class HotChurnRunner:
+    """Task 3: background thread that continuously churns files in hot roots.
+
+    Simulates real L0 hot-layer pressure (IDE saves, git operations, build
+    artifacts) while cold rotation is trying to work. Every 2-5 seconds it
+    creates/modifies/deletes 10-50 files in hot roots, then periodically issues
+    a search query against a recently-created file to measure hot-layer query
+    latency. Records are written to hot-churn-samples.jsonl.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        roots: list[Path],
+        out_path: Path,
+        started_at: float,
+        interval_secs: float = 3.0,
+        start_delay_secs: float = 30.0,
+    ) -> None:
+        self.base_url = base_url
+        self.roots = [r for r in roots if r]
+        self.out_path = out_path
+        self.started_at = started_at
+        self.interval_secs = max(0.5, interval_secs)
+        self.start_delay_secs = max(0.0, start_delay_secs)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._run_id = f"{time.time_ns()}-{os.getpid()}"
+
+    def start(self) -> None:
+        if not self.roots:
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="hot-churn")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def _loop(self) -> None:
+        # Wait for the start delay, then churn continuously.
+        if self._stop.wait(self.start_delay_secs):
+            return
+        batch = 0
+        while not self._stop.is_set():
+            batch += 1
+            try:
+                self._churn_batch(batch)
+            except Exception as exc:  # noqa: BLE001 - keep churning on errors
+                self._emit({
+                    "event_kind": "hot_churn_error",
+                    "operation": "hot_churn_error",
+                    "batch": batch,
+                    "ok": False,
+                    "error": repr(exc),
+                })
+            # Jittered sleep 2-5 seconds.
+            jitter = random.uniform(max(1.0, self.interval_secs - 1.0), self.interval_secs + 2.0)
+            if self._stop.wait(jitter):
+                return
+
+    def _churn_batch(self, batch: int) -> None:
+        root = self.roots[(batch - 1) % len(self.roots)]
+        churn_dir = root / f"fd-rdd-m2-hot-churn-{self._run_id}-{batch:05d}"
+        churn_dir.mkdir(parents=True, exist_ok=True)
+        n_files = random.randint(10, 50)
+        created: list[Path] = []
+        churn_started = time.monotonic()
+        for i in range(n_files):
+            kind = random.choice(["ide_save", "git_op", "build_artifact"])
+            path = churn_dir / f"{kind}_{i:03d}.txt"
+            marker = f"fd_rdd_m2_hot_churn_{batch}_{i:03d}"
+            path.write_text(f"{utc_now()} {marker}\n", encoding="utf-8")
+            created.append(path)
+        # Modify a few (simulate IDE re-saves).
+        for path in created[: max(1, n_files // 4)]:
+            with path.open("a", encoding="utf-8") as f:
+                f.write("resave\n")
+        # Delete a few (simulate build cleanup).
+        for path in created[: max(1, n_files // 5)]:
+            path.unlink(missing_ok=True)
+        write_secs = time.monotonic() - churn_started
+        self._emit({
+            "event_kind": "hot_churn_batch",
+            "operation": "hot_churn_batch",
+            "batch": batch,
+            "root": str(root),
+            "files_created": n_files,
+            "write_secs": round(write_secs, 3),
+            "ok": True,
+        })
+        # Hot-layer query latency: query one of the just-created files.
+        query_target = created[len(created) // 2] if created else None
+        if query_target is not None and query_target.exists():
+            ok, exists, latency, error = check_search_state_once(
+                self.base_url,
+                query_target.name,
+                query_target,
+                True,
+            )
+            self._emit({
+                "event_kind": "hot_layer_query",
+                "operation": "hot_layer_query",
+                "batch": batch,
+                "path": str(query_target),
+                "query": query_target.name,
+                "ok": ok,
+                "first_query_exists": exists,
+                "latency_secs": round(latency, 3),
+                **({"error": error} if error else {}),
+            })
+        # Best-effort cleanup so churn dirs don't grow unbounded.
+        try:
+            shutil.rmtree(churn_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _emit(self, record: dict[str, Any]) -> None:
+        record.setdefault("ok", False)
+        record["ts"] = utc_now()
+        record["elapsed_secs"] = round(time.monotonic() - self.started_at, 3)
+        json_line(self.out_path, record)
+
+
+def resolve_root_paths(csv_value: str) -> list[Path]:
+    """Resolve a comma-separated list of root paths, skipping empties."""
+    return [Path(p).expanduser().resolve() for p in split_csv(csv_value)]
+
+
+def validate_realistic_fixture(args: argparse.Namespace) -> list[Path]:
+    """Task 1/6: validate that the realistic fixture roots exist.
+
+    Returns the list of all configured roots (hot + warm + cold). Prints a
+    helpful error and raises SystemExit if the fixture is missing.
+    """
+    hot = resolve_root_paths(args.hot_roots)
+    warm = resolve_root_paths(args.warm_roots)
+    cold = resolve_root_paths(args.cold_roots)
+    all_paths = hot + warm + cold
+    missing = [p for p in all_paths if not p.exists()]
+    if missing:
+        print(
+            "ERROR: realistic-mode fixture roots not found:\n"
+            + "\n".join(f"  - {p}" for p in missing)
+            + "\n\nThe realistic 1M-file fixture has not been created yet.\n"
+            "Ask the fixture-builder teammate to generate it, or point "
+            "--hot-roots/--warm-roots/--cold-roots at an existing fixture.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return all_paths
+
+
+def pick_fixture_canary_dirs(cold_roots: list[Path], hot_roots: list[Path]) -> tuple[Path | None, Path | None]:
+    """Task 6: pick a writable subdirectory inside a cold root (passive canary)
+    and a hot root (active canary). Returns (passive_dir, active_dir)."""
+    passive_dir: Path | None = None
+    active_dir: Path | None = None
+    for root in cold_roots:
+        candidate = root / ".m2-fixture-canary"
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            passive_dir = candidate
+            break
+        except OSError:
+            continue
+    for root in hot_roots:
+        candidate = root / ".m2-fixture-canary"
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            active_dir = candidate
+            break
+        except OSError:
+            continue
+    return passive_dir, active_dir
 
 
 def write_config(args: argparse.Namespace, config_home: Path) -> Path:
@@ -1411,6 +1640,7 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
     endpoint_samples = read_jsonl(run_dir / "endpoint-samples.jsonl")
     canary_samples = read_jsonl(run_dir / "canary-samples.jsonl")
     event_storm_samples = read_jsonl(run_dir / "event-storm-samples.jsonl")
+    hot_churn_samples = read_jsonl(run_dir / "hot-churn-samples.jsonl")
 
     cpu = [float(item.get("cpu_pct", 0.0)) for item in process_samples]
     rss = [int(item.get("vmrss_bytes", 0)) for item in process_samples]
@@ -1420,6 +1650,11 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         item["data"]
         for item in endpoint_samples
         if item.get("ok") and item.get("endpoint") == "/watch-state" and isinstance(item.get("data"), dict)
+    ]
+    status_samples = [
+        item["data"]
+        for item in endpoint_samples
+        if item.get("ok") and item.get("endpoint") == "/status" and isinstance(item.get("data"), dict)
     ]
     memory_samples = [
         item["data"]
@@ -1526,6 +1761,17 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
     ]
     event_written = [
         item for item in event_storm_samples if item.get("event_kind") == "burst_written"
+    ]
+    # Task 2: split first-query rows by query_phase (immediate vs delayed).
+    event_immediate_queries = [
+        item for item in event_first_queries if item.get("query_phase") == "immediate"
+    ]
+    event_delayed_queries = [
+        item for item in event_first_queries if item.get("query_phase") != "immediate"
+    ]
+    # Task 3: hot-layer query rows from the mixed-workload churn thread.
+    hot_layer_queries = [
+        item for item in hot_churn_samples if item.get("event_kind") == "hot_layer_query"
     ]
 
     def summarize_event_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1670,6 +1916,56 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         event_special["inode_reuse_stress_tmpfs_mounted"] = any(
             bool(item.get("tmpfs_mounted")) for item in inode_reuse_stress_rows
         )
+
+    # Task 4: scale-aware metrics.
+    # index_total_files / index_total_dirs from the last /status sample.
+    index_total_files = 0
+    index_total_dirs = 0
+    if status_samples:
+        last_status = status_samples[-1]
+        index_total_files = int(last_status.get("total_files", 0) or last_status.get("indexed_files", 0) or 0)
+        index_total_dirs = int(last_status.get("total_dirs", 0) or last_status.get("indexed_dirs", 0) or 0)
+    # cold_dir_count / hot_dir_count from the last /watch-state sample's dirs list.
+    cold_dir_count = 0
+    hot_dir_count = 0
+    if watch_samples:
+        last_watch = watch_samples[-1]
+        dirs = last_watch.get("dirs")
+        if isinstance(dirs, list):
+            for d in dirs:
+                if not isinstance(d, dict):
+                    continue
+                tier = str(d.get("watch_tier", "")).upper()
+                if tier in ("L2", "L3"):
+                    cold_dir_count += 1
+                elif tier in ("L0", "L1"):
+                    hot_dir_count += 1
+    # rotation_cycle_estimate_secs = (cold_dir_count / max_dirs_per_tick) * tick_secs.
+    # Uses the last watch-state sample's rotating params when available; falls
+    # back to 0 when the rotating window is disabled or no data.
+    rotation_cycle_estimate_secs = 0.0
+    if watch_samples and cold_dir_count > 0:
+        last_watch = watch_samples[-1]
+        max_dirs_per_tick = int(last_watch.get("rotating_cold_window_max_dirs_per_tick", 0) or 0)
+        tick_secs = float(last_watch.get("rotating_cold_window_tick_secs", 0) or 0)
+        if max_dirs_per_tick > 0 and tick_secs > 0:
+            rotation_cycle_estimate_secs = (cold_dir_count / max_dirs_per_tick) * tick_secs
+    # memory_per_file_bytes = RSS max / total files (efficiency metric).
+    rss_max_bytes = max(rss) if rss else 0
+    memory_per_file_bytes = round(rss_max_bytes / index_total_files, 3) if index_total_files > 0 else 0.0
+    # cold_freshness_age_trend: time series of cold_freshness_age_p95 samples.
+    # Task 5: cap to avoid unbounded growth on long-duration (7200s+) runs.
+    cold_freshness_age_trend = [
+        {"elapsed_secs": round(elapsed, 1), "cold_freshness_age_p95_secs": int(p95)}
+        for elapsed, p95 in watch_p95_series
+    ]
+    _trend_cap = 2000
+    if len(cold_freshness_age_trend) > _trend_cap:
+        # Evenly downsample to the cap.
+        step = len(cold_freshness_age_trend) / _trend_cap
+        cold_freshness_age_trend = [
+            cold_freshness_age_trend[int(i * step)] for i in range(_trend_cap)
+        ]
 
     summary = {
         "label": label,
@@ -1821,9 +2117,24 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "burst_duration_max_secs": round(max(burst_durations) if burst_durations else 0.0, 3),
             "first_query": summarize_event_rows(event_first_queries),
             "after_query": summarize_event_rows(event_after_queries),
+            # Task 2: immediate vs delayed query-phase breakdown.
+            "immediate_query": summarize_event_rows(event_immediate_queries),
+            "delayed_query": summarize_event_rows(event_delayed_queries),
             "by_workload": event_by_workload,
             "by_tier_before": event_by_tier,
             "special": event_special,
+        },
+        # Task 3: hot-layer query latency from the mixed-workload churn thread.
+        "hot_layer_query": summarize_event_rows(hot_layer_queries),
+        # Task 4: scale-aware metrics.
+        "scale_aware": {
+            "index_total_files": index_total_files,
+            "index_total_dirs": index_total_dirs,
+            "cold_dir_count": cold_dir_count,
+            "hot_dir_count": hot_dir_count,
+            "rotation_cycle_estimate_secs": round(rotation_cycle_estimate_secs, 1),
+            "memory_per_file_bytes": memory_per_file_bytes,
+            "cold_freshness_age_trend": cold_freshness_age_trend,
         },
         "built_in_metrics_dir": str(run_dir / "reports" / "metrics"),
     }
@@ -1873,6 +2184,17 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | event storm first-query age p95 s | {summary["event_storm"]["first_query"]["event_age_p95_secs"]} |
 | event storm after-query p95 s | {summary["event_storm"]["after_query"]["first_query_p95_secs"]} |
 | event storm burst duration max s | {summary["event_storm"]["burst_duration_max_secs"]} |
+| event storm immediate-query success rate | {summary["event_storm"]["immediate_query"]["success_rate"]} |
+| event storm immediate-query p95 s | {summary["event_storm"]["immediate_query"]["first_query_p95_secs"]} |
+| event storm delayed-query success rate | {summary["event_storm"]["delayed_query"]["success_rate"]} |
+| hot layer query success rate | {summary["hot_layer_query"]["success_rate"]} |
+| hot layer query p95 s | {summary["hot_layer_query"]["first_query_p95_secs"]} |
+| index total files | {summary["scale_aware"]["index_total_files"]} |
+| index total dirs | {summary["scale_aware"]["index_total_dirs"]} |
+| cold dir count (L2+L3) | {summary["scale_aware"]["cold_dir_count"]} |
+| hot dir count (L0+L1) | {summary["scale_aware"]["hot_dir_count"]} |
+| rotation cycle estimate s | {summary["scale_aware"]["rotation_cycle_estimate_secs"]} |
+| memory per file bytes | {summary["scale_aware"]["memory_per_file_bytes"]} |
 | index health last | {summary["health"]["index_health_last"]} |
 
 ## Canary
@@ -1930,6 +2252,22 @@ Event storm records are synthetic fixture bursts. They include rw100, save100, g
 {json.dumps(summary["event_storm"]["special"], ensure_ascii=False, indent=2)}
 ```
 
+## Hot-layer query (mixed workload)
+
+Hot-layer query latency from the background hot-churn thread (--mixed-workload). Measures how quickly newly-created files in hot roots become searchable while cold rotation is active.
+
+```json
+{json.dumps(summary["hot_layer_query"], ensure_ascii=False, indent=2)}
+```
+
+## Scale-aware metrics
+
+Scale-aware metrics for realistic 1M-file testing: total indexed files/dirs, cold/hot directory counts, estimated full rotation cycle time, memory efficiency, and the cold freshness age trend over time.
+
+```json
+{json.dumps(summary["scale_aware"], ensure_ascii=False, indent=2)}
+```
+
 ## Files
 
 - `config-home/fd-rdd/config.toml`: isolated fd-rdd config for this run.
@@ -1938,6 +2276,7 @@ Event storm records are synthetic fixture bursts. They include rw100, save100, g
 - `process-samples.jsonl`: `/proc/<pid>` CPU/RSS/FD/thread samples.
 - `canary-samples.jsonl`: optional active and passive create/rename/delete evidence.
 - `event-storm-samples.jsonl`: optional synthetic event burst writes and first-query evidence.
+- `hot-churn-samples.jsonl`: optional mixed-workload hot-root churn and hot-layer query evidence.
 - `reports/metrics/*.json`: fd-rdd built-in JSONL metrics, reusable for jq/offline analysis.
 """
     (run_dir / "REPORT.md").write_text(report, encoding="utf-8")
@@ -2048,6 +2387,66 @@ def parse_args() -> argparse.Namespace:
         help="nr_inodes for the inode_reuse_stress tmpfs mount (default 200).",
     )
     parser.add_argument(
+        "--realistic-mode",
+        action="store_true",
+        help="enable realistic-scale benchmark mode (1M-file fixture with tiered "
+             "directory layout). Requires --hot-roots/--cold-roots/--warm-roots "
+             "to point at an existing realistic fixture.",
+    )
+    parser.add_argument(
+        "--hot-roots",
+        default="",
+        help="comma-separated paths that should be L0 hot (e.g. Projects/). "
+             "Used by --mixed-workload and --canary-in-fixture.",
+    )
+    parser.add_argument(
+        "--cold-roots",
+        default="",
+        help="comma-separated L2/L3 cold paths (e.g. Downloads,Pictures,Music). "
+             "Used by --canary-in-fixture and cold dir counting.",
+    )
+    parser.add_argument(
+        "--warm-roots",
+        default="",
+        help="comma-separated L1 warm paths (e.g. Documents,.config).",
+    )
+    parser.add_argument(
+        "--immediate-query-settle-secs",
+        type=float,
+        default=5.0,
+        help="for immediate-query event storm mode, settle time before the first "
+             "query pass (default 5s). Simulates a user searching right after "
+             "downloading a file.",
+    )
+    parser.add_argument(
+        "--event-storm-immediate-query",
+        action="store_true",
+        help="after each burst, do TWO query passes: an immediate pass at "
+             "--immediate-query-settle-secs and a delayed pass at "
+             "--event-storm-settle-secs. Reports both in summary.",
+    )
+    parser.add_argument(
+        "--mixed-workload",
+        action="store_true",
+        help="run a background thread that continuously churns files in hot roots "
+             "(IDE saves, git ops, build artifacts) while cold rotation runs. "
+             "Tracks hot-layer query latency separately.",
+    )
+    parser.add_argument(
+        "--mixed-workload-interval-secs",
+        type=float,
+        default=3.0,
+        help="approximate interval between hot churn batches (default 3s, "
+             "jittered 2-5s).",
+    )
+    parser.add_argument(
+        "--canary-in-fixture",
+        action="store_true",
+        help="place canary files inside the realistic fixture's cold/hot "
+             "directories instead of separate canary roots. Passive canary in "
+             "cold dirs, active canary in hot dirs.",
+    )
+    parser.add_argument(
         "--sweep-config",
         default="",
         help="path to a JSON sweep config file. When set, runs one benchmark per "
@@ -2069,6 +2468,24 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit(f"binary not found: {binary}")
     if not port_is_free(args.port):
         raise SystemExit(f"127.0.0.1:{args.port} is already in use")
+
+    # Task 1: realistic-mode fixture validation. When --realistic-mode is set we
+    # verify the hot/warm/cold fixture roots exist before starting fd-rdd so the
+    # user gets a helpful error instead of a confusing empty-index run.
+    hot_roots = resolve_root_paths(args.hot_roots)
+    warm_roots = resolve_root_paths(args.warm_roots)
+    cold_roots = resolve_root_paths(args.cold_roots)
+    if args.realistic_mode:
+        validate_realistic_fixture(args)
+    # Task 6: fixture-aware canary. Override the separate canary roots with
+    # subdirectories inside the realistic fixture's cold (passive) and hot
+    # (active) directories.
+    if args.canary_in_fixture:
+        passive_dir, active_dir = pick_fixture_canary_dirs(cold_roots, hot_roots)
+        if passive_dir is not None:
+            args.passive_canary_root = str(passive_dir)
+        if active_dir is not None:
+            args.canary_root = str(active_dir)
 
     run_dir = Path(args.run_dir) if args.run_dir else repo / "reports" / "m2-cold-window-vm" / f"{utc_stamp()}_{args.run_label}"
     run_dir = run_dir.resolve()
@@ -2144,6 +2561,7 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
     started_at = time.monotonic()
     exit_code: int | None = None
     fatal_error = ""
+    hot_churn: HotChurnRunner | None = None
 
     try:
         wait_for_http(base_url, args.startup_timeout_secs)
@@ -2192,10 +2610,27 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
                 subtree_depth=args.event_storm_depth,
                 inode_stress_iterations=args.event_storm_inode_stress_iterations,
                 inode_stress_tmpfs_inodes=args.event_storm_inode_stress_tmpfs_inodes,
+                immediate_query_enabled=args.event_storm_immediate_query,
+                immediate_query_settle_secs=args.immediate_query_settle_secs,
             )
             if args.event_storm
             else None
         )
+        # Task 3: mixed-workload hot churn runs in a background thread,
+        # creating real L0 pressure while cold rotation works.
+        hot_churn = (
+            HotChurnRunner(
+                base_url=base_url,
+                roots=hot_roots,
+                out_path=run_dir / "hot-churn-samples.jsonl",
+                started_at=started_at,
+                interval_secs=args.mixed_workload_interval_secs,
+            )
+            if args.mixed_workload and hot_roots
+            else None
+        )
+        if hot_churn is not None:
+            hot_churn.start()
 
         while True:
             if proc.poll() is not None:
@@ -2233,6 +2668,8 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
             {"ts": utc_now(), "event": "fatal_error", "error": fatal_error},
         )
     finally:
+        if hot_churn is not None:
+            hot_churn.stop()
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
             try:
@@ -2274,6 +2711,9 @@ def _apply_overrides(args: argparse.Namespace, overrides: dict[str, Any]) -> arg
             "l3-scan-interval-secs", "l1-empty-scans-to-l2", "l2-empty-scans-to-l3",
             "fast-scan", "no-fast-scan", "event-storm-ops", "event-storm-file-count",
             "event-storm-depth", "event-storm-interval-secs", "event-storm-settle-secs",
+            "realistic-mode", "mixed-workload", "event-storm-immediate-query",
+            "canary-in-fixture", "immediate-query-settle-secs",
+            "mixed-workload-interval-secs",
         ]
     }
     for raw_key, value in overrides.items():
