@@ -245,6 +245,10 @@ impl TieredIndex {
             self.lazy_validation_stale_hits
                 .fetch_add(1, Ordering::Relaxed);
             self.enqueue_lazy_dirty_parent(meta.path.as_path());
+            // Phase 1：失效父目录的 mtime 预检记录，避免周期扫描错误跳过该目录。
+            if let Some(parent) = meta.path.parent() {
+                self.directory_manifests.invalidate_mtime_precheck(parent);
+            }
             let event = EventRecord {
                 seq: 0,
                 timestamp: std::time::SystemTime::now(),
@@ -273,6 +277,10 @@ impl TieredIndex {
         self.lazy_validation_stale_hits
             .fetch_add(1, Ordering::Relaxed);
         self.enqueue_lazy_dirty_parent(path.as_path());
+        // Phase 1：文件删除也改变目录 mtime，失效父目录的 mtime 预检记录。
+        if let Some(parent) = path.parent() {
+            self.directory_manifests.invalidate_mtime_precheck(parent);
+        }
         let event = EventRecord {
             seq: 0,
             timestamp: std::time::SystemTime::now(),

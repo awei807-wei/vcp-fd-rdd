@@ -122,6 +122,644 @@ fn tiered_diagnostics_include_shared_mount_policy_counters() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// ===========================================================================
+// Phase 3: manifest 大目录上限修复 — unbounded summary 二次确认
+// ===========================================================================
+
+/// 辅助：创建包含 n 个文件的目录（用于大目录测试，n > REPAIR_SLICE_MAX_ENTRIES=512）。
+fn phase3_create_large_dir(root: &PathBuf, n: usize) {
+    std::fs::create_dir_all(root).unwrap();
+    for i in 0..n {
+        std::fs::write(root.join(format!("file_{:04}.txt", i)), b"x").unwrap();
+    }
+}
+
+/// 辅助：用 filetime 或 touch 改变目录 mtime 但不改内容。
+fn phase3_touch_dir_mtime(dir: &PathBuf) {
+    // 在目录中创建并立即删除一个临时文件来触发 mtime 更新，
+    // 但不改变最终目录内容（创建+删除 = net zero）。
+    // 注意：需要先等一小段时间确保 mtime 精度。
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let tmp = dir.join(".phase3_touch_tmp");
+    std::fs::write(&tmp, b"").unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+}
+
+/// 超过 512 条的目录 manifest skip 能生效。
+#[test]
+fn manifest_skip_works_for_large_dir() {
+    let root = unique_tmp_dir("p3-large-skip");
+    phase3_create_large_dir(&root, 520); // > 512
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    // immediate scan 用 WalkBuilder（不受 512 限制）存储 manifest summary
+    let first = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    assert_eq!(first.scanned, 520);
+    assert_eq!(idx.directory_manifest_report().dirs, 1);
+
+    // PeriodicColdScan：段 1 返回 Some(false)（immediate scan 未记录 dir_mtime_ns），
+    // 段 1.5 用 unbounded summary 比对 → 匹配 → 跳过。
+    let skip_dirs = std::collections::HashSet::from([root.clone()]);
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert_eq!(reports.len(), 1);
+    assert!(
+        reports[0].outcomes[0].manifest_skipped,
+        "large dir (>512) should be skippable via unbounded summary"
+    );
+    assert_eq!(reports[0].outcomes[0].outcome.scanned, 0);
+
+    let manifest = idx.directory_manifest_report();
+    assert_eq!(manifest.unbounded_summary_hits, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 目录内容变化时 manifest skip 不生效。
+#[test]
+fn manifest_skip_fails_on_real_change() {
+    let root = unique_tmp_dir("p3-large-change");
+    phase3_create_large_dir(&root, 520);
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let first = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    assert_eq!(first.scanned, 520);
+
+    // 添加一个文件改变目录内容
+    std::fs::write(root.join("new_file.txt"), b"new").unwrap();
+
+    let skip_dirs = std::collections::HashSet::from([root.clone()]);
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    // 大目录（521 文件）需要多个 slice，可能有多个 report
+    assert!(!reports.is_empty());
+    for r in &reports {
+        assert!(
+            !r.outcomes[0].manifest_skipped,
+            "changed dir should not be skipped"
+        );
+    }
+    let total_scanned: usize = reports.iter().map(|r| r.outcomes[0].outcome.scanned).sum();
+    assert!(
+        total_scanned > 0,
+        "changed dir should be scanned, got {}",
+        total_scanned
+    );
+
+    let manifest = idx.directory_manifest_report();
+    // 段 1.5 未命中（内容变了）
+    assert!(manifest.unbounded_summary_misses >= 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// unbounded summary 对大目录（>512 条）能正确计算并比对。
+#[test]
+fn unbounded_summary_large_dir() {
+    let root = unique_tmp_dir("p3-unbounded-large");
+    phase3_create_large_dir(&root, 600); // 远超 512
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let first = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    assert_eq!(first.scanned, 600);
+    // manifest 被存储（WalkBuilder 不受 512 限制）
+    assert_eq!(idx.directory_manifest_report().dirs, 1);
+
+    // touch 目录 mtime（创建+删除临时文件，net zero 内容变化）
+    phase3_touch_dir_mtime(&root);
+
+    // PeriodicColdScan：段 1 Some(false)，段 1.5 unbounded summary 比对 → 匹配 → 跳过
+    let skip_dirs = std::collections::HashSet::from([root.clone()]);
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert_eq!(reports.len(), 1);
+    assert!(
+        reports[0].outcomes[0].manifest_skipped,
+        "unbounded summary should match for large dir with no content change"
+    );
+
+    let manifest = idx.directory_manifest_report();
+    assert_eq!(manifest.unbounded_summary_hits, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// unbounded summary 在目录 mtime 变了但内容没变时匹配（跳过）。
+#[test]
+fn unbounded_summary_matches_when_no_change() {
+    let root = unique_tmp_dir("p3-match-no-change");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), b"a").unwrap();
+    std::fs::write(root.join("b.txt"), b"b").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let first = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    assert_eq!(first.scanned, 2);
+
+    // touch 目录 mtime（内容不变）
+    phase3_touch_dir_mtime(&root);
+
+    let skip_dirs = std::collections::HashSet::from([root.clone()]);
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert_eq!(reports.len(), 1);
+    assert!(
+        reports[0].outcomes[0].manifest_skipped,
+        "unbounded summary should match when content unchanged but mtime changed"
+    );
+    assert_eq!(reports[0].outcomes[0].outcome.scanned, 0);
+
+    let manifest = idx.directory_manifest_report();
+    assert_eq!(manifest.unbounded_summary_hits, 1);
+    assert_eq!(manifest.unbounded_summary_misses, 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// unbounded summary 在内容变化时不匹配（继续扫描）。
+#[test]
+fn unbounded_summary_misses_on_change() {
+    let root = unique_tmp_dir("p3-miss-on-change");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), b"a").unwrap();
+    std::fs::write(root.join("b.txt"), b"b").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let first = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    assert_eq!(first.scanned, 2);
+
+    // 改变内容：删除一个文件
+    std::fs::remove_file(root.join("b.txt")).unwrap();
+
+    let skip_dirs = std::collections::HashSet::from([root.clone()]);
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert_eq!(reports.len(), 1);
+    assert!(
+        !reports[0].outcomes[0].manifest_skipped,
+        "unbounded summary should miss when content changed"
+    );
+    assert_eq!(reports[0].outcomes[0].outcome.scanned, 1);
+
+    let manifest = idx.directory_manifest_report();
+    assert_eq!(manifest.unbounded_summary_hits, 0);
+    assert_eq!(manifest.unbounded_summary_misses, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// unbounded summary 使用 WalkBuilder 过滤（ignore 规则），而非 read_dir。
+/// 在有 .gitignore 的目录中，被忽略的文件不计入 summary。
+#[test]
+fn unbounded_summary_uses_walkbuilder_filter() {
+    let root = unique_tmp_dir("p3-walkbuilder-filter");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("visible.txt"), b"v").unwrap();
+    std::fs::write(root.join(".gitignore"), b"*.log\n").unwrap();
+    std::fs::write(root.join("ignored.log"), b"ignored").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]); // ignore_enabled=true by default
+                                                      // immediate scan 用 WalkBuilder，.log 文件被忽略 → 只扫描 visible.txt + .gitignore
+                                                      // (.gitignore 本身不是隐藏文件，不被 ignore 规则忽略)
+    let first = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    // visible.txt 和 .gitignore 被扫描，ignored.log 被忽略
+    assert!(
+        first.scanned >= 2,
+        "should scan visible files, got {}",
+        first.scanned
+    );
+    assert_eq!(idx.directory_manifest_report().dirs, 1);
+
+    // touch 目录 mtime（内容不变）
+    phase3_touch_dir_mtime(&root);
+
+    let skip_dirs = std::collections::HashSet::from([root.clone()]);
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert_eq!(reports.len(), 1);
+    assert!(
+        reports[0].outcomes[0].manifest_skipped,
+        "unbounded summary should match because it uses WalkBuilder (same filter as immediate scan)"
+    );
+
+    let manifest = idx.directory_manifest_report();
+    assert_eq!(manifest.unbounded_summary_hits, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// unbounded summary 的 hits/misses 指标正确追踪。
+#[test]
+fn unbounded_summary_metrics() {
+    let root = unique_tmp_dir("p3-metrics");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("file.txt"), b"data").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let skip_dirs = std::collections::HashSet::from([root.clone()]);
+
+    // 1. 首次 PeriodicColdScan：无 manifest 记录 → 段 1 None → 段 1.5 miss（无 stored）
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert!(!reports[0].outcomes[0].manifest_skipped);
+    let m1 = idx.directory_manifest_report();
+    assert_eq!(m1.unbounded_summary_hits, 0);
+    assert_eq!(m1.unbounded_summary_misses, 1);
+
+    // 2. immediate scan 存储 WalkBuilder summary（覆盖首次扫描存储的 bounded summary）
+    idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+
+    // 3. touch 目录 mtime（内容不变）→ 段 1 Some(false) → 段 1.5 hit
+    phase3_touch_dir_mtime(&root);
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert!(reports[0].outcomes[0].manifest_skipped);
+    let m2 = idx.directory_manifest_report();
+    assert_eq!(m2.unbounded_summary_hits, 1);
+    assert_eq!(m2.unbounded_summary_misses, 1);
+
+    // 4. 改变内容 → 段 1 Some(false) → 段 1.5 miss
+    std::fs::write(root.join("extra.txt"), b"extra").unwrap();
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert!(!reports[0].outcomes[0].manifest_skipped);
+    let m3 = idx.directory_manifest_report();
+    assert_eq!(m3.unbounded_summary_hits, 1);
+    assert_eq!(m3.unbounded_summary_misses, 2);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ===========================================================================
+// Phase 1: 目录 mtime 预检集成测试
+// ===========================================================================
+
+use crate::index::l2_partition::mtime_to_ns;
+
+/// 辅助：获取目录 mtime 纳秒值。
+fn mtime_precheck_dir_mtime(path: &std::path::Path) -> i64 {
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    mtime_to_ns(meta.modified().ok())
+}
+
+/// 辅助：入队 + 弹出 + 处理一次 PeriodicColdScan。
+fn mtime_precheck_pop_and_process(
+    idx: &TieredIndex,
+    skip_dirs: &std::collections::HashSet<PathBuf>,
+) -> Option<DirtyProcessReport> {
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop()?;
+    Some(
+        idx.process_dirty_entry_with_project_markers_and_manifest_skip_dirs(
+            entry,
+            &[],
+            &[],
+            skip_dirs,
+        ),
+    )
+}
+
+/// 辅助：运行完整 PeriodicColdScan（处理所有 slice 直到队列空）。
+fn mtime_precheck_run_cold_scan_to_completion(
+    idx: &TieredIndex,
+    dir: &PathBuf,
+    skip_dirs: &std::collections::HashSet<PathBuf>,
+) -> Vec<DirtyProcessReport> {
+    idx.enqueue_dirty_dirs(vec![dir.clone()], DirtyReason::PeriodicColdScan);
+    let mut reports = Vec::new();
+    while let Some(r) = mtime_precheck_pop_and_process(idx, skip_dirs) {
+        reports.push(r);
+    }
+    reports
+}
+
+#[test]
+fn mtime_precheck_unconfigured_dir() {
+    // covering_tier=None 的目录（allow_manifest_skip=false），mtime 预检仍生效
+    let root = unique_tmp_dir("mtime-unconfigured");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("file.txt"), b"data").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let skip_dirs = std::collections::HashSet::new();
+
+    // 第一次 PeriodicColdScan：无 manifest 记录，全量扫描，记录 mtime
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert_eq!(reports.len(), 1);
+    assert!(!reports[0].outcomes[0].manifest_skipped);
+    assert_eq!(reports[0].outcomes[0].outcome.scanned, 1);
+
+    // 第二次 PeriodicColdScan：mtime 未变，预检命中，跳过
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert_eq!(reports.len(), 1);
+    assert!(
+        reports[0].outcomes[0].manifest_skipped,
+        "mtime precheck should skip unchanged dir even with allow_manifest_skip=false"
+    );
+    assert_eq!(reports[0].outcomes[0].outcome.scanned, 0);
+
+    let manifest = idx.directory_manifest_report();
+    assert_eq!(manifest.mtime_precheck_hits, 1);
+    assert_eq!(manifest.mtime_precheck_no_record, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mtime_precheck_l0_dir() {
+    // L0 tier 覆盖的目录（allow_manifest_skip=false），mtime 预检生效
+    let root = unique_tmp_dir("mtime-l0");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), b"a").unwrap();
+    std::fs::write(root.join("b.txt"), b"b").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let skip_dirs = std::collections::HashSet::new(); // L0: 不在 manifest_skip_dirs 中
+
+    // 第一次扫描：全量扫描 + 记录 mtime
+    mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+
+    // 第二次扫描：mtime 命中 → 跳过（即使 allow_manifest_skip=false）
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert!(reports[0].outcomes[0].manifest_skipped);
+    assert_eq!(reports[0].outcomes[0].outcome.scanned, 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mtime_precheck_l1_dir() {
+    // L1 tier 覆盖的目录（allow_manifest_skip=false），mtime 预检生效
+    let root = unique_tmp_dir("mtime-l1");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("file.txt"), b"data").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let skip_dirs = std::collections::HashSet::new(); // L1: 不在 manifest_skip_dirs 中
+
+    mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert!(reports[0].outcomes[0].manifest_skipped);
+    assert_eq!(reports[0].outcomes[0].outcome.scanned, 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mtime_precheck_l2_dir() {
+    // L2 tier 覆盖的目录（allow_manifest_skip=true），mtime 预检在 manifest skip 之前生效
+    let root = unique_tmp_dir("mtime-l2");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("file.txt"), b"data").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let skip_dirs = std::collections::HashSet::from([root.clone()]); // L2: 在 manifest_skip_dirs 中
+
+    // 第一次扫描：全量扫描 + 记录 mtime
+    mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+
+    // 第二次扫描：mtime 预检（段 1）在 manifest skip（段 2）之前生效
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert!(reports[0].outcomes[0].manifest_skipped);
+    assert_eq!(reports[0].outcomes[0].outcome.scanned, 0);
+
+    // mtime 预检命中（而非 manifest skip 命中）
+    let manifest = idx.directory_manifest_report();
+    assert_eq!(
+        manifest.mtime_precheck_hits, 1,
+        "mtime precheck should fire before manifest skip"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mtime_precheck_disabled_when_clock_untrusted() {
+    // clock 不可信时 mtime 预检不生效，mtime_precheck_untrusted_clock 递增
+    let root = unique_tmp_dir("mtime-clock-untrusted");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("file.txt"), b"data").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let skip_dirs = std::collections::HashSet::new();
+
+    // 第一次扫描：记录 mtime
+    mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+
+    // 让 clock 不可信
+    {
+        let mut clock = idx.clock_skew.lock();
+        let base_wall = std::time::SystemTime::now();
+        let base_mono = std::time::Instant::now();
+        assert!(!clock.observe(base_wall, base_mono));
+        assert!(clock.observe(
+            base_wall - std::time::Duration::from_secs(3),
+            base_mono + std::time::Duration::from_secs(3),
+        ));
+        assert!(!clock.cutoff_trusted());
+    }
+
+    // 第二次扫描：clock 不可信 → mtime 预检被禁用 → 正常扫描
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert_eq!(reports.len(), 1);
+    assert!(
+        !reports[0].outcomes[0].manifest_skipped,
+        "mtime precheck should be disabled when clock is untrusted"
+    );
+    assert!(
+        reports[0].outcomes[0].outcome.scanned > 0,
+        "should do full scan"
+    );
+
+    let manifest = idx.directory_manifest_report();
+    assert_eq!(
+        manifest.mtime_precheck_untrusted_clock, 1,
+        "mtime_precheck_untrusted_clock metric should increment"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mtime_record_skipped_on_stale_scan() {
+    // stale_low_priority_scan=true 时 mtime 记录不写入
+    let root = unique_tmp_dir("mtime-stale");
+    std::fs::create_dir_all(&root).unwrap();
+    // 创建大量文件使扫描耗时足够长，以便从另一线程推进 event_seq
+    for i in 0..400 {
+        std::fs::write(root.join(format!("file_{:04}.txt", i)), b"x").unwrap();
+    }
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let skip_dirs = std::collections::HashSet::new();
+
+    // 第一次扫描：记录 mtime
+    mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    let recorded_mtime = mtime_precheck_dir_mtime(&root);
+
+    // 添加新文件改变目录 mtime
+    std::fs::write(root.join("new_file.txt"), b"new").unwrap();
+    let new_mtime = mtime_precheck_dir_mtime(&root);
+    assert_ne!(
+        recorded_mtime, new_mtime,
+        "dir mtime should change after adding file"
+    );
+
+    // 第二次扫描：从另一线程推进 event_seq，触发 stale 条件
+    idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::PeriodicColdScan);
+    let report = std::thread::scope(|s| {
+        let handle = s.spawn(|| mtime_precheck_pop_and_process(&idx, &skip_dirs).unwrap());
+        // 等扫描开始后推进 event_seq
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        idx.event_seq
+            .fetch_add(1_000_000, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap()
+    });
+
+    // 验证 stale batch 被丢弃
+    assert!(
+        report.dropped_stale_batches >= 1,
+        "stale batch should be dropped: {report:?}"
+    );
+
+    // 验证 mtime 未被更新（仍为旧值，而非 new_mtime）
+    // stale 扫描不应记录 mtime，所以预检仍命中旧 mtime
+    assert_eq!(
+        idx.directory_manifests
+            .try_mtime_precheck(&root, recorded_mtime),
+        Some(true),
+        "mtime should NOT be updated after stale scan"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mtime_precheck_in_middle_slice() {
+    // 多 slice 目录的中间 slice 完成（completed=false）时不写入 mtime
+    let root = unique_tmp_dir("mtime-middle-slice");
+    std::fs::create_dir_all(&root).unwrap();
+    // 创建超过 REPAIR_SLICE_MAX_ENTRIES(512) 的文件
+    for i in 0..530 {
+        std::fs::write(root.join(format!("f_{:04}.txt", i)), b"x").unwrap();
+    }
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let skip_dirs = std::collections::HashSet::new();
+
+    // 入队第一次 PeriodicColdScan
+    idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::PeriodicColdScan);
+
+    // 处理第一个 slice（completed=false）
+    let report1 = mtime_precheck_pop_and_process(&idx, &skip_dirs).unwrap();
+    assert_eq!(report1.outcomes.len(), 1);
+    // 第一个 slice 不应完成（有 530 个文件，slice 大小 512）
+    assert!(
+        !report1.outcomes[0].manifest_skipped,
+        "first slice should not be skipped"
+    );
+
+    // 中间 slice（completed=false）后不应记录 mtime
+    // try_mtime_precheck 应返回 None（无记录）或 Some(false)
+    let current_mtime = mtime_precheck_dir_mtime(&root);
+    let precheck_result = idx
+        .directory_manifests
+        .try_mtime_precheck(&root, current_mtime);
+    assert!(
+        precheck_result.is_none() || precheck_result == Some(false),
+        "mtime should NOT be recorded after middle slice (completed=false): {:?}",
+        precheck_result
+    );
+
+    // 清理队列中剩余的 slice
+    while mtime_precheck_pop_and_process(&idx, &skip_dirs).is_some() {}
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mtime_precheck_first_slice_only() {
+    // 多 slice 目录的 mtime 仅在 last slice（completed=true）完成后写入
+    let root = unique_tmp_dir("mtime-last-slice");
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..530 {
+        std::fs::write(root.join(format!("f_{:04}.txt", i)), b"x").unwrap();
+    }
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let skip_dirs = std::collections::HashSet::new();
+
+    // 运行完整 PeriodicColdScan（处理所有 slice 直到完成）
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert!(
+        reports.len() >= 2,
+        "should have multiple slices: {} reports",
+        reports.len()
+    );
+
+    // 最后一个 slice 完成后应记录 mtime
+    let current_mtime = mtime_precheck_dir_mtime(&root);
+    assert_eq!(
+        idx.directory_manifests
+            .try_mtime_precheck(&root, current_mtime),
+        Some(true),
+        "mtime should be recorded after last slice completes"
+    );
+
+    // 再次扫描：mtime 预检应命中
+    let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    assert!(
+        reports[0].outcomes[0].manifest_skipped,
+        "mtime precheck should skip after all slices completed and mtime recorded"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mtime_precheck_metrics() {
+    // 验证 5 个 mtime 预检指标在各种场景下正确递增
+    let root = unique_tmp_dir("mtime-metrics");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("file.txt"), b"data").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let skip_dirs = std::collections::HashSet::new();
+
+    // 1. 第一次扫描：无记录 → mtime_precheck_no_record 递增
+    mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    let m1 = idx.directory_manifest_report();
+    assert_eq!(m1.mtime_precheck_no_record, 1);
+    assert_eq!(m1.mtime_precheck_hits, 0);
+    assert_eq!(m1.mtime_precheck_misses, 0);
+    assert_eq!(m1.mtime_precheck_stat_errors, 0);
+    assert_eq!(m1.mtime_precheck_untrusted_clock, 0);
+
+    // 2. 第二次扫描：mtime 匹配 → mtime_precheck_hits 递增
+    mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    let m2 = idx.directory_manifest_report();
+    assert_eq!(m2.mtime_precheck_no_record, 1);
+    assert_eq!(m2.mtime_precheck_hits, 1);
+    assert_eq!(m2.mtime_precheck_misses, 0);
+
+    // 3. 添加文件改变 mtime，第三次扫描：mtime 不匹配 → mtime_precheck_misses 递增
+    std::fs::write(root.join("new.txt"), b"new").unwrap();
+    mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    let m3 = idx.directory_manifest_report();
+    assert_eq!(m3.mtime_precheck_hits, 1);
+    assert_eq!(m3.mtime_precheck_misses, 1);
+    assert_eq!(m3.mtime_precheck_no_record, 1);
+
+    // 4. clock 不可信时扫描 → mtime_precheck_untrusted_clock 递增
+    {
+        let mut clock = idx.clock_skew.lock();
+        let base_wall = std::time::SystemTime::now();
+        let base_mono = std::time::Instant::now();
+        assert!(!clock.observe(base_wall, base_mono));
+        assert!(clock.observe(
+            base_wall - std::time::Duration::from_secs(3),
+            base_mono + std::time::Duration::from_secs(3),
+        ));
+    }
+    mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
+    let m4 = idx.directory_manifest_report();
+    assert_eq!(m4.mtime_precheck_untrusted_clock, 1);
+    // stat_errors 应始终为 0（目录存在且可读）
+    assert_eq!(m4.mtime_precheck_stat_errors, 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn tiered_diagnostics_include_ioprio_status() {
     let root = unique_tmp_dir("ioprio-diag");
@@ -2851,7 +3489,11 @@ fn periodic_cold_scan_skips_unchanged_directory_manifest() {
     assert_eq!(report.outcomes[0].outcome.changed, 0);
 
     let manifest = idx.directory_manifest_report();
-    assert_eq!(manifest.skipped_scans, 1);
+    // Phase 3：skip 现在由段 1.5（unbounded summary 二次确认）拦截，而非段 2。
+    // immediate scan 存储了 WalkBuilder summary 但未记录 dir_mtime_ns，
+    // 因此段 1 返回 Some(false)，段 1.5 匹配后跳过，段 2 的 skipped_scans 不递增。
+    assert_eq!(manifest.unbounded_summary_hits, 1);
+    assert_eq!(manifest.skipped_scans, 0);
     assert_eq!(manifest.changed_scans, 0);
 
     let _ = std::fs::remove_dir_all(&root);
@@ -3056,4 +3698,204 @@ async fn snapshot_loop_exits_promptly_on_begin_shutdown() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// =========================================================================
+// Phase 2: readdir 批量删除对齐单元测试
+//
+// 直接测试 `sync::readdir_delete_alignment`——按 parent dir 分组，每个 dirty 目录做
+// 一次 `read_dir` 构建 `HashSet<OsString>`，与索引文件名做差集检测删除。
+// =========================================================================
+
+/// 将 `readdir_delete_alignment` 返回的路径收集为 HashSet，便于断言。
+fn deleted_set(deleted: Vec<PathBuf>) -> std::collections::HashSet<PathBuf> {
+    deleted.into_iter().collect()
+}
+
+#[test]
+fn delete_alignment_uses_readdir() {
+    let dir = unique_tmp_dir("p2-uses-readdir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let keep = dir.join("keep.txt");
+    let gone = dir.join("gone.txt");
+    std::fs::write(&keep, b"x").unwrap();
+    std::fs::write(&gone, b"x").unwrap();
+
+    // 模拟索引中的候选条目 (doc_id, path)
+    let to_delete = vec![(0u64, keep.clone()), (1u64, gone.clone())];
+
+    // 删除 gone.txt，readdir 不再包含它 → 应被标记删除（走 readdir 路径而非逐文件 stat）
+    std::fs::remove_file(&gone).unwrap();
+    let set = deleted_set(super::sync::readdir_delete_alignment(to_delete, None));
+
+    assert!(
+        set.contains(&gone),
+        "gone.txt should be detected as deleted via readdir"
+    );
+    assert!(!set.contains(&keep), "keep.txt should not be deleted");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn delete_alignment_detects_missing_files() {
+    let dir = unique_tmp_dir("p2-detect-missing");
+    std::fs::create_dir_all(&dir).unwrap();
+    let keep1 = dir.join("keep1.txt");
+    let keep2 = dir.join("keep2.txt");
+    let gone1 = dir.join("gone1.txt");
+    let gone2 = dir.join("gone2.txt");
+    for p in [&keep1, &keep2, &gone1, &gone2] {
+        std::fs::write(p, b"x").unwrap();
+    }
+
+    let to_delete = vec![
+        (0u64, keep1.clone()),
+        (1u64, keep2.clone()),
+        (2u64, gone1.clone()),
+        (3u64, gone2.clone()),
+    ];
+
+    std::fs::remove_file(&gone1).unwrap();
+    std::fs::remove_file(&gone2).unwrap();
+    let set = deleted_set(super::sync::readdir_delete_alignment(to_delete, None));
+
+    assert_eq!(set.len(), 2);
+    assert!(set.contains(&gone1), "gone1 should be deleted");
+    assert!(set.contains(&gone2), "gone2 should be deleted");
+    assert!(!set.contains(&keep1), "keep1 should be retained");
+    assert!(!set.contains(&keep2), "keep2 should be retained");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn delete_alignment_keeps_existing_files() {
+    let dir = unique_tmp_dir("p2-keeps-existing");
+    std::fs::create_dir_all(&dir).unwrap();
+    let keep = dir.join("keep.txt");
+    std::fs::write(&keep, b"x").unwrap();
+
+    let to_delete = vec![(0u64, keep.clone())];
+    let set = deleted_set(super::sync::readdir_delete_alignment(to_delete, None));
+    assert!(set.is_empty(), "existing file must not be marked deleted");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn delete_alignment_dir_gone() {
+    // 目录不存在 → read_dir 失败 → 该目录下所有索引条目标记删除
+    let dir = unique_tmp_dir("p2-dir-gone");
+    // 故意不创建 dir，read_dir 必然失败
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    let to_delete = vec![(0u64, a.clone()), (1u64, b.clone())];
+
+    let set = deleted_set(super::sync::readdir_delete_alignment(to_delete, None));
+    assert_eq!(set.len(), 2, "all entries under a gone dir must be deleted");
+    assert!(set.contains(&a));
+    assert!(set.contains(&b));
+}
+
+#[test]
+fn delete_alignment_osstring_non_utf8() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = unique_tmp_dir("p2-non-utf8");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 构造非 UTF-8 文件名（0xFF 0xFE 在 UTF-8 中非法）
+    let existing_name = std::ffi::OsString::from_vec(vec![0xFF, 0xFE]);
+    let existing_path = dir.join(&existing_name);
+    std::fs::write(&existing_path, b"x").unwrap();
+
+    let missing_name = std::ffi::OsString::from_vec(vec![0xFD, 0xFC]);
+    let missing_path = dir.join(&missing_name);
+    std::fs::write(&missing_path, b"x").unwrap();
+    std::fs::remove_file(&missing_path).unwrap();
+
+    let to_delete = vec![(0u64, existing_path.clone()), (1u64, missing_path.clone())];
+    let set = deleted_set(super::sync::readdir_delete_alignment(to_delete, None));
+
+    assert!(
+        !set.contains(&existing_path),
+        "existing non-UTF-8 file must be matched via OsString and kept"
+    );
+    assert!(
+        set.contains(&missing_path),
+        "missing non-UTF-8 file must be detected as deleted"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn delete_alignment_multi_dir_grouping() {
+    let base = unique_tmp_dir("p2-multi-dir");
+    let dir_a = base.join("a");
+    let dir_b = base.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let keep_a = dir_a.join("keep_a.txt");
+    let gone_a = dir_a.join("gone_a.txt");
+    let keep_b = dir_b.join("keep_b.txt");
+    let gone_b = dir_b.join("gone_b.txt");
+    for p in [&keep_a, &gone_a, &keep_b, &gone_b] {
+        std::fs::write(p, b"x").unwrap();
+    }
+
+    let to_delete = vec![
+        (0u64, keep_a.clone()),
+        (1u64, gone_a.clone()),
+        (2u64, keep_b.clone()),
+        (3u64, gone_b.clone()),
+    ];
+
+    std::fs::remove_file(&gone_a).unwrap();
+    std::fs::remove_file(&gone_b).unwrap();
+    let set = deleted_set(super::sync::readdir_delete_alignment(to_delete, None));
+
+    assert_eq!(set.len(), 2);
+    assert!(set.contains(&gone_a), "gone_a should be deleted");
+    assert!(set.contains(&gone_b), "gone_b should be deleted");
+    assert!(!set.contains(&keep_a), "keep_a should be retained");
+    assert!(!set.contains(&keep_b), "keep_b should be retained");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn delete_alignment_memory_cleanup() {
+    // 验证 current_names HashSet 在每个目录处理完后立即 drop，不跨目录累积。
+    // 两个目录各有一个同名文件 "shared.txt"：dir_a 的保留，dir_b 的删除。
+    // 若 name set 跨目录泄漏（累积），dir_b 的 shared.txt 会因 dir_a 的 name set
+    // 仍包含 "shared.txt" 而被错误保留。
+    let base = unique_tmp_dir("p2-mem-cleanup");
+    let dir_a = base.join("a");
+    let dir_b = base.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let shared_a = dir_a.join("shared.txt");
+    let shared_b = dir_b.join("shared.txt");
+    std::fs::write(&shared_a, b"x").unwrap();
+    std::fs::write(&shared_b, b"x").unwrap();
+    std::fs::remove_file(&shared_b).unwrap();
+
+    let to_delete = vec![(0u64, shared_a.clone()), (1u64, shared_b.clone())];
+    let set = deleted_set(super::sync::readdir_delete_alignment(to_delete, None));
+
+    assert!(
+        !set.contains(&shared_a),
+        "dir_a/shared.txt exists and must be kept (per-dir name set)"
+    );
+    assert!(
+        set.contains(&shared_b),
+        "dir_b/shared.txt is gone and must be deleted; \
+         if the HashSet leaked across dirs this would falsely be kept"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }

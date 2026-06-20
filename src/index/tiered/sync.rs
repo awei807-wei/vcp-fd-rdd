@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -24,6 +24,64 @@ use super::{
 
 const REPAIR_SLICE_MAX_ENTRIES: usize = 512;
 const REPAIR_SLICE_MAX_MS: u64 = 20;
+
+/// readdir 批量删除对齐（v2）。
+///
+/// 将候选 `(doc_id, path)` 条目按 parent dir 分组，每个 dirty 目录做一次
+/// `std::fs::read_dir` 构建 `HashSet<OsString>`，与索引文件名做差集：文件名不在
+/// readdir 结果中即视为已删除。`read_dir` 失败（目录不存在/不可读）时该目录下所有
+/// 索引条目都标记删除。
+///
+/// 内存权衡：`HashSet<OsString>` 在每个 parent dir 处理完后立即 drop，不跨目录累积。
+/// 30 万文件目录的 HashSet 峰值约 20-30MB，远小于逐文件 stat 的 15-60s 开销。
+pub(super) fn readdir_delete_alignment(
+    to_delete: Vec<(u64, PathBuf)>,
+    io_governor: Option<&IoGovernor>,
+) -> Vec<PathBuf> {
+    // 按 parent dir 分组，每个 dirty 目录构建一次 name set，循环外不累积。
+    let mut by_parent: HashMap<PathBuf, Vec<(u64, PathBuf)>> = HashMap::new();
+    for (doc_id, path) in to_delete {
+        if let Some(parent) = path.parent() {
+            by_parent
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push((doc_id, path));
+        }
+    }
+
+    let mut deleted: Vec<PathBuf> = Vec::new();
+    for (parent_dir, files) in by_parent {
+        // 每个 dirty 目录构建一次 name set，用完立即 drop（作用域在本循环迭代内）。
+        if let Some(gov) = io_governor {
+            gov.before_io();
+        }
+        let current_names: Option<HashSet<OsString>> = match std::fs::read_dir(&parent_dir) {
+            Ok(entries) => Some(
+                entries
+                    .filter_map(|e| e.ok().map(|e| e.file_name()))
+                    .collect(),
+            ),
+            Err(_) => None, // 目录不存在或不可读 → 全部标记删除
+        };
+
+        for (_doc_id, path) in files {
+            let should_delete = match &current_names {
+                None => true, // 目录不可读，索引中所有文件视为已删除
+                Some(names) => {
+                    // 文件名不在 readdir 结果中 = 被删除；OsString 直接比对，支持非 UTF-8。
+                    path.file_name()
+                        .map(|name| !names.contains(name))
+                        .unwrap_or(false)
+                }
+            };
+            if should_delete {
+                deleted.push(path);
+            }
+        }
+        // current_names 在此处 drop，避免跨目录累积内存峰值。
+    }
+    deleted
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RebuildAdmission {
@@ -854,8 +912,10 @@ impl TieredIndex {
 
         // 2) 扫描目录：生成 upsert events。
         //
-        // 说明：这里不再构建"文件名集合（HashSet<OsString>）"用于删除对齐，
-        // 因为它会在大目录下产生大量短命分配，容易把非索引 PD 顶到高水位。
+        // 量化权衡（2026-06-20 实测）：
+        // - 旧实现：30 万 stat × 50-200μs = 15-60s
+        // - 新实现：1 readdir + 30 万 HashSet 查找（纳秒级）= 1-100ms
+        // 30 万文件目录的 HashSet<OsString> 峰值约 20-30MB，远小于 760MB 的索引 RSS。
         let mut upsert_events: Vec<EventRecord> = Vec::with_capacity(2048);
         let mut upsert_metas: Vec<FileMeta> = Vec::with_capacity(2048);
         let mut seq: u64 = 0;
@@ -964,7 +1024,9 @@ impl TieredIndex {
 
         let dirty_dirs: HashSet<PathBuf> = dirs.into_iter().collect();
 
-        // 3) 删除对齐：只对齐"被标记 dirty 的目录"下的条目（但对文件做轻量存在性检查，避免构建巨大的 names set）。
+        // 3) 删除对齐：对齐"被标记 dirty 的目录"下的条目。按 parent dir 分组，
+        //    每个 dirty 目录做一次 readdir 构建 HashSet<OsString>，与索引文件名做差集，
+        //    避免逐文件 stat() 风暴。HashSet 在每个目录处理完后立即 drop，不跨目录累积。
         let mut delete_events: Vec<EventRecord> = Vec::new();
 
         let base = self.base.load_full();
@@ -987,13 +1049,10 @@ impl TieredIndex {
         } else {
             Vec::new()
         };
-        for (_doc_id, path) in to_delete {
-            io_governor.before_io();
-            match std::fs::symlink_metadata(&path) {
-                Ok(_) => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => continue,
-            };
+
+        // v2: 按 parent dir 分组，readdir + HashSet 差集检测删除（见 `readdir_delete_alignment`）。
+        let deleted_paths = readdir_delete_alignment(to_delete, Some(io_governor));
+        for path in deleted_paths {
             seq = seq.wrapping_add(1);
             delete_events.push(EventRecord {
                 seq,
@@ -1227,6 +1286,110 @@ impl TieredIndex {
         allow_manifest_skip: bool,
         discard_if_event_seq_advances: bool,
     ) -> SlicedScanOutcome {
+        // Phase 3：标记 mtime 预检是否判定为"变了或首次扫描"（Some(false) 或 None）。
+        // 供段 1.5（unbounded summary 二次确认）使用。
+        let mut mtime_precheck_changed = false;
+
+        // ===== 段 1：目录 mtime 预检（Phase 1 新增）=====
+        // 对所有 PeriodicColdScan 目录生效，独立于 allow_manifest_skip，
+        // 在 manifest skip（段 2）之前执行——廉价优先（1 stat vs ≤512 stat）。
+        if cursor.is_none() {
+            if self.clock_cutoff_trusted() {
+                match std::fs::symlink_metadata(dir) {
+                    Ok(dir_meta) => match dir_meta.modified() {
+                        Ok(dir_modified) => {
+                            let current_mtime_ns = mtime_to_ns(Some(dir_modified));
+                            match self
+                                .directory_manifests
+                                .try_mtime_precheck(dir.as_path(), current_mtime_ns)
+                            {
+                                None => {
+                                    // 首次扫描，无 manifest 记录
+                                    self.directory_manifests
+                                        .mtime_precheck_no_record
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    mtime_precheck_changed = true;
+                                }
+                                Some(true) => {
+                                    // 目录 mtime 未变，跳过整个扫描
+                                    self.directory_manifests
+                                        .mtime_precheck_hits
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    return SlicedScanOutcome {
+                                        outcome: ScanOutcome {
+                                            elapsed_ms: 0,
+                                            ..ScanOutcome::default()
+                                        },
+                                        manifest_skipped: true,
+                                        completed: true,
+                                        next_cursor: None,
+                                        dropped_stale_batch: false,
+                                    };
+                                }
+                                Some(false) => {
+                                    // 目录 mtime 变了，继续走后续逻辑
+                                    self.directory_manifests
+                                        .mtime_precheck_misses
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    mtime_precheck_changed = true;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            self.directory_manifests
+                                .mtime_precheck_stat_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    },
+                    Err(_) => {
+                        self.directory_manifests
+                            .mtime_precheck_stat_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            } else {
+                // clock 不可信时不走预检，与 should_skip 行为一致
+                self.directory_manifests
+                    .mtime_precheck_untrusted_clock
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // ===== 段 1.5：unbounded summary 二次确认（Phase 3 新增）=====
+        // 仅在 mtime 预检判定"变了或首次扫描"（Some(false)/None）且 allow_manifest_skip 时执行。
+        // 计算不受 512 条限制的 summary（WalkBuilder 过滤），与已存储的 manifest 比对。
+        // 匹配则跳过（可能是 touch/atime 导致 mtime 变了但内容没变），不匹配才继续。
+        // 对大目录（>512 条）尤其重要：段 2 的 bounded summary 对大目录永远 complete=false，
+        // 而此处用 unbounded summary 可以覆盖大目录的 manifest 跳过。
+        if allow_manifest_skip && cursor.is_none() && mtime_precheck_changed {
+            if let Some(current_summary) =
+                self.directory_manifest_summary_with_limit(dir, project_markers, None)
+            {
+                if self
+                    .directory_manifests
+                    .stored_matches_summary(dir.as_path(), &current_summary)
+                {
+                    self.directory_manifests
+                        .unbounded_summary_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return SlicedScanOutcome {
+                        outcome: ScanOutcome {
+                            elapsed_ms: 0,
+                            ..ScanOutcome::default()
+                        },
+                        manifest_skipped: true,
+                        completed: true,
+                        next_cursor: None,
+                        dropped_stale_batch: false,
+                    };
+                }
+                self.directory_manifests
+                    .unbounded_summary_misses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // ===== 段 2：现有 manifest skip（仅 L2/L3 PeriodicColdScan 生效）=====
         if allow_manifest_skip && cursor.is_none() {
             if let Some((summary, complete)) = self.directory_manifest_summary_bounded(
                 dir,
@@ -1378,6 +1541,14 @@ impl TieredIndex {
                     self.event_seq.load(Ordering::Relaxed),
                 );
             }
+            // Phase 1 新增：记录目录 mtime（仅非 stale 路径，仅 last slice）
+            // stale scan 的中间状态不应被记录，否则会延长陈旧窗口。
+            if let Ok(dir_meta) = std::fs::symlink_metadata(dir) {
+                if let Ok(dir_modified) = dir_meta.modified() {
+                    self.directory_manifests
+                        .record_dir_mtime(dir.as_path(), mtime_to_ns(Some(dir_modified)));
+                }
+            }
         }
 
         project_roots.sort();
@@ -1449,85 +1620,113 @@ impl TieredIndex {
         dir: &Path,
         project_markers: &[String],
     ) -> Option<DirectoryManifestSummary> {
-        let hidden_markers_enabled = project_markers.iter().any(|marker| marker.starts_with('.'));
-        let mut builder = ignore::WalkBuilder::new(dir);
-        builder
-            .max_depth(Some(1))
-            .hidden(!self.include_hidden && !hidden_markers_enabled)
-            .follow_links(false)
-            .ignore(self.ignore_enabled)
-            .git_ignore(self.ignore_enabled)
-            .git_global(self.ignore_enabled)
-            .git_exclude(self.ignore_enabled);
-        let fs_policy = FsPolicy::current_with_config(self.fs_policy_config());
-        let root = dir.to_path_buf();
-        let exclude_dirs = self.exclude_dirs.clone();
-        let mount_policy_counters = self.mount_policy_counters();
-        let include_hidden = self.include_hidden;
-        let project_markers_filter = project_markers.to_vec();
-        builder.filter_entry(move |entry| {
-            (exclude_dirs.is_empty() || !path_has_excluded_component(entry.path(), &exclude_dirs))
-                && (include_hidden
-                    || !hidden_markers_enabled
-                    || !path_has_hidden_component_after_root(entry.path(), root.as_path())
-                    || project_root_for_marker(entry.path(), &project_markers_filter).is_some())
-                && fs_policy
-                    .as_ref()
-                    .map(|policy| {
-                        policy
-                            .check_path_counted(
-                                entry.path(),
-                                Some(root.as_path()),
-                                mount_policy_counters.as_ref(),
-                            )
-                            .is_allowed()
-                    })
-                    .unwrap_or(true)
-        });
+        self.directory_manifest_summary_with_limit(dir, project_markers, None)
+    }
 
-        let mut manifest = DirectoryManifestBuilder::default();
-        for ent in builder.build() {
-            let ent = match ent {
-                Ok(e) => e,
-                Err(err) => {
-                    tracing::debug!(
-                        "directory manifest skipped entry under {}: {}",
-                        dir.display(),
-                        err
+    /// 计算目录 manifest summary，可选择限制条目数（Phase 3）。
+    ///
+    /// - `max_entries=None`：使用 WalkBuilder（ignore-filtered）路径，不限制条目数。
+    ///   用于 mtime 预检失败后的二次确认（目录 mtime 变了但内容可能没变）。
+    /// - `max_entries=Some(n)`：使用 read_dir + repair_slice_path_allowed 路径，
+    ///   限制 n 条。返回 `Some` 仅当条目数 ≤ n（complete），否则 `None`（incomplete）。
+    fn directory_manifest_summary_with_limit(
+        &self,
+        dir: &Path,
+        project_markers: &[String],
+        max_entries: Option<usize>,
+    ) -> Option<DirectoryManifestSummary> {
+        match max_entries {
+            None => {
+                let hidden_markers_enabled =
+                    project_markers.iter().any(|marker| marker.starts_with('.'));
+                let mut builder = ignore::WalkBuilder::new(dir);
+                builder
+                    .max_depth(Some(1))
+                    .hidden(!self.include_hidden && !hidden_markers_enabled)
+                    .follow_links(false)
+                    .ignore(self.ignore_enabled)
+                    .git_ignore(self.ignore_enabled)
+                    .git_global(self.ignore_enabled)
+                    .git_exclude(self.ignore_enabled);
+                let fs_policy = FsPolicy::current_with_config(self.fs_policy_config());
+                let root = dir.to_path_buf();
+                let exclude_dirs = self.exclude_dirs.clone();
+                let mount_policy_counters = self.mount_policy_counters();
+                let include_hidden = self.include_hidden;
+                let project_markers_filter = project_markers.to_vec();
+                builder.filter_entry(move |entry| {
+                    (exclude_dirs.is_empty()
+                        || !path_has_excluded_component(entry.path(), &exclude_dirs))
+                        && (include_hidden
+                            || !hidden_markers_enabled
+                            || !path_has_hidden_component_after_root(entry.path(), root.as_path())
+                            || project_root_for_marker(entry.path(), &project_markers_filter)
+                                .is_some())
+                        && fs_policy
+                            .as_ref()
+                            .map(|policy| {
+                                policy
+                                    .check_path_counted(
+                                        entry.path(),
+                                        Some(root.as_path()),
+                                        mount_policy_counters.as_ref(),
+                                    )
+                                    .is_allowed()
+                            })
+                            .unwrap_or(true)
+                });
+
+                let mut manifest = DirectoryManifestBuilder::default();
+                for ent in builder.build() {
+                    let ent = match ent {
+                        Ok(e) => e,
+                        Err(err) => {
+                            tracing::debug!(
+                                "directory manifest skipped entry under {}: {}",
+                                dir.display(),
+                                err
+                            );
+                            continue;
+                        }
+                    };
+                    let path = ent.path();
+                    if path == dir {
+                        continue;
+                    }
+                    let Some(ft) = ent.file_type() else {
+                        continue;
+                    };
+                    if !ft.is_file() && !ft.is_dir() {
+                        continue;
+                    }
+                    self.io_governor.before_io();
+                    let meta = match ent.metadata() {
+                        Ok(meta) => meta,
+                        Err(err) => {
+                            tracing::debug!(
+                                "directory manifest metadata failed for {}: {}",
+                                path.display(),
+                                err
+                            );
+                            continue;
+                        }
+                    };
+                    manifest.push_child(
+                        path,
+                        FileKind::from_metadata(&meta),
+                        mtime_to_ns(meta.modified().ok()),
                     );
-                    continue;
                 }
-            };
-            let path = ent.path();
-            if path == dir {
-                continue;
+
+                Some(manifest.finish())
             }
-            let Some(ft) = ent.file_type() else {
-                continue;
-            };
-            if !ft.is_file() && !ft.is_dir() {
-                continue;
+            Some(n) => {
+                // read_dir + repair_slice_path_allowed 路径（bounded）。
+                // 复用 directory_manifest_summary_bounded，仅在 complete 时返回 Some。
+                self.directory_manifest_summary_bounded(dir, project_markers, n)
+                    .and_then(|(summary, complete)| if complete { Some(summary) } else { None })
             }
-            self.io_governor.before_io();
-            let meta = match ent.metadata() {
-                Ok(meta) => meta,
-                Err(err) => {
-                    tracing::debug!(
-                        "directory manifest metadata failed for {}: {}",
-                        path.display(),
-                        err
-                    );
-                    continue;
-                }
-            };
-            manifest.push_child(
-                path,
-                FileKind::from_metadata(&meta),
-                mtime_to_ns(meta.modified().ok()),
-            );
         }
-
-        Some(manifest.finish())
     }
 
     fn directory_manifest_summary_bounded(
