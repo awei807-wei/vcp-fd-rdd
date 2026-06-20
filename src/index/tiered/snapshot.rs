@@ -7,7 +7,7 @@ use crate::storage::snapshot::{
 };
 use crate::storage::snapshot_v7::{try_load_v7_cold, write_v7_snapshot_atomic};
 use crate::storage::traits::StorageBackend;
-use crate::util::maybe_trim_rss;
+use crate::util::{maybe_trim_rss, unix_secs};
 
 use super::TieredIndex;
 
@@ -84,7 +84,11 @@ impl TieredIndex {
             remount_path = Some(v7_path.clone());
         }
 
-        if self.stable_snapshot_enabled.load(Ordering::Relaxed) {
+        if self
+            .io_tuning
+            .stable_snapshot_enabled
+            .load(Ordering::Relaxed)
+        {
             if let Err(e) = write_stable_v7_atomic(store.path(), &base) {
                 tracing::warn!("stable v7 snapshot write failed: {}", e);
             } else {
@@ -234,11 +238,4 @@ impl TieredIndex {
         self.last_snapshot_time.store(ts, Ordering::Relaxed);
         self.stats.record_snapshot();
     }
-}
-
-fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

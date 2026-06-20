@@ -121,7 +121,22 @@ impl LruState {
 
 /// L1 查询结果缓存。
 ///
-/// 数据使用 `RwLock<HashMap>` 保存，淘汰顺序由一个单独的 O(1) LRU 链表维护。
+/// # Lock ordering
+///
+/// Three locks protect related state. To prevent deadlocks, all methods that
+/// acquire more than one lock do so in this fixed order:
+///
+/// 1. `inner` (RwLock) — main storage: FileKey → FileMeta
+/// 2. `path_index` (RwLock) — reverse lookup: path → FileKey
+/// 3. `lru` (Mutex) — eviction order heuristic
+///
+/// `inner` and `path_index` form a bidirectional mapping that must stay
+/// consistent (if `path_index[path] == fid` then `inner[fid].path == path`).
+/// Mutating methods (`insert`, `remove`, `remove_by_path`) therefore hold both
+/// write locks simultaneously. The `lru` lock is acquired separately because it
+/// is only a heuristic — a stale LRU entry is harmless (`pop_lru` on an
+/// already-removed key is a no-op, and a missed touch just means slightly
+/// suboptimal eviction order).
 pub struct L1Cache {
     /// 主存储：FileKey -> FileMeta
     pub inner: RwLock<HashMap<FileKey, FileMeta>>,
@@ -142,10 +157,16 @@ impl L1Cache {
     }
 
     pub fn query(&self, matcher: &dyn Matcher) -> Option<Vec<FileMeta>> {
-        // O(1) fast path: exact full-path lookup via path_index
+        // O(1) fast path: exact full-path lookup via path_index.
+        // Lock order: inner(read) → path_index(read) → lru — consistent with the
+        // write paths in insert/remove/remove_by_path. Acquiring inner before
+        // path_index prevents an AB-BA deadlock with concurrent writers that hold
+        // inner.write() and wait for path_index.write().
         if let Some(path) = matcher.exact_path() {
-            if let Some(&fkey) = self.path_index.read().get(path) {
-                if let Some(meta) = self.inner.read().get(&fkey) {
+            let inner = self.inner.read();
+            let path_index = self.path_index.read();
+            if let Some(&fkey) = path_index.get(path) {
+                if let Some(meta) = inner.get(&fkey) {
                     let mut lru = self.lru.lock();
                     lru.touch(fkey);
                     return Some(vec![meta.clone()]);
@@ -211,40 +232,77 @@ impl L1Cache {
         }
 
         let fid = meta.file_key;
-        if let Some(old_path) = self.inner.read().get(&fid).map(|e| e.path.clone()) {
-            if old_path != meta.path {
-                self.path_index.write().remove(&old_path);
+
+        // Hold inner + path_index write locks together to keep the bidirectional
+        // mapping (fid ↔ path) atomically consistent. Lock order: inner → path_index
+        // → lru. Previously this method read old_path under a read lock, released it,
+        // then mutated path_index separately — a TOCTOU race where two concurrent
+        // inserts of the same fid with different paths could leave a stale
+        // path_index entry pointing to a removed path.
+        let mut inner = self.inner.write();
+        let mut path_index = self.path_index.write();
+
+        // If the file_key already exists with a different path, remove the stale
+        // path_index entry atomically.
+        if let Some(old) = inner.get(&fid) {
+            if old.path != meta.path {
+                path_index.remove(&old.path);
             }
         }
 
+        // LRU eviction: decide which key to evict under the lru lock, then apply
+        // the eviction to inner + path_index while still holding those write locks.
+        // The lru lock is released immediately after the decision — a stale lru
+        // entry is harmless (pop_lru on an already-removed key is a no-op).
         if let Some(evicted) = self.lru.lock().insert(fid, self.capacity) {
-            if let Some(old) = self.inner.write().remove(&evicted) {
-                self.path_index.write().remove(&old.path);
+            if let Some(old) = inner.remove(&evicted) {
+                path_index.remove(&old.path);
             }
         }
 
-        self.path_index.write().insert(meta.path.clone(), fid);
-        self.inner.write().insert(fid, meta);
+        path_index.insert(meta.path.clone(), fid);
+        inner.insert(fid, meta);
     }
 
     pub fn remove_by_path(&self, path: &Path) {
-        if let Some(fid) = self.path_index.write().remove(path) {
-            self.inner.write().remove(&fid);
+        // Lock order: inner → path_index → lru. Acquire both write locks before
+        // mutating either to prevent a TOCTOU race where, between removing from
+        // path_index and removing from inner, another thread re-inserts the same
+        // fid — which would then be wrongly deleted by this remove.
+        let mut inner = self.inner.write();
+        let mut path_index = self.path_index.write();
+
+        if let Some(fid) = path_index.remove(path) {
+            inner.remove(&fid);
+            // lru cleanup is best-effort — a stale lru entry is harmless.
             self.lru.lock().remove(fid);
         }
     }
 
     pub fn remove(&self, fid: &FileKey) {
-        if let Some(meta) = self.inner.write().remove(fid) {
-            self.path_index.write().remove(&meta.path);
+        // Lock order: inner → path_index → lru. Hold both write locks to keep the
+        // bidirectional mapping consistent — previously the path_index removal
+        // happened after releasing inner's write lock, leaving a window where a
+        // stale path_index entry could persist.
+        let mut inner = self.inner.write();
+        let mut path_index = self.path_index.write();
+
+        if let Some(meta) = inner.remove(fid) {
+            path_index.remove(&meta.path);
         }
+        // lru cleanup is best-effort — a stale lru entry is harmless.
         self.lru.lock().remove(*fid);
     }
 
     pub fn clear(&self) {
-        self.inner.write().clear();
-        self.path_index.write().clear();
-        self.lru.lock().clear();
+        // Lock order: inner → path_index → lru. Acquire all three before clearing
+        // so that a concurrent query cannot observe a partially-cleared state.
+        let mut inner = self.inner.write();
+        let mut path_index = self.path_index.write();
+        let mut lru = self.lru.lock();
+        inner.clear();
+        path_index.clear();
+        lru.clear();
     }
 
     pub fn memory_stats(&self) -> L1Stats {

@@ -28,9 +28,31 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  gate:
+    # Fast-fail gate: catches compile errors (e.g. duplicate definitions, missing
+    # imports) before any of the heavier test/release/sanitizer matrices spin up.
+    # All compilation-dependent jobs declare `needs: [gate]` so a broken build
+    # only burns this single job instead of 15 parallel runners.
+    name: cargo check (fast gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify lockfile matches manifest
+        run: cargo update -w --locked
+
+      - name: cargo check --all-targets
+        run: cargo check --locked --all-targets
+
   check-test-clippy:
     name: ubuntu / stable
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
 
@@ -56,6 +78,7 @@ jobs:
   test-release:
     name: Test release profile (LTO)
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
 
@@ -70,6 +93,7 @@ jobs:
   test-no-default-features:
     name: Test without default features
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
 
@@ -84,6 +108,7 @@ jobs:
   poweroff-recovery:
     name: Poweroff recovery regression
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
 
@@ -107,6 +132,7 @@ jobs:
   sim-regression:
     name: Tiered watcher sim regression
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
 
@@ -133,6 +159,7 @@ jobs:
   test-multi-thread:
     name: Test multi-threaded (may expose flaky concurrency bugs)
     runs-on: ubuntu-latest
+    needs: [gate]
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -148,6 +175,7 @@ jobs:
   sanitizer:
     name: ThreadSanitizer (nightly)
     runs-on: ubuntu-latest
+    needs: [gate]
     continue-on-error: false
     steps:
       - uses: actions/checkout@v4
@@ -172,6 +200,7 @@ jobs:
   doc:
     name: Documentation check
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
 
@@ -186,6 +215,7 @@ jobs:
   musl-build:
     name: Build check for musl target
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
 
@@ -206,6 +236,7 @@ jobs:
   smoke:
     name: Smoke test (ubuntu)
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
 
@@ -276,6 +307,7 @@ jobs:
   compaction-correctness:
     name: Fast compaction correctness
     runs-on: ubuntu-latest
+    needs: [gate]
     env:
       FAST_COMPACTION: "1"
     steps:
@@ -292,6 +324,7 @@ jobs:
   streaming-export-check:
     name: Streaming export byte-identical
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
 
@@ -306,6 +339,7 @@ jobs:
   visibility-latency:
     name: Visibility latency placeholder
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
 
@@ -320,6 +354,7 @@ jobs:
   fast-scan-sla:
     name: L1/L2 fast scan SLA
     runs-on: ubuntu-latest
+    needs: [gate]
     steps:
       - uses: actions/checkout@v4
 

@@ -204,8 +204,6 @@ impl CompiledExpr {
 }
 
 /// Filter enum for compiled query expressions.
-/// `Content(String)` is intentionally kept as a placeholder for future full-text search integration.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum Filter {
     ExtAny(Vec<Vec<u8>>),
@@ -297,6 +295,11 @@ pub enum QueryCompileError {
     Syntax(String),
     #[error("invalid filter: {0}")]
     Filter(String),
+    #[error("unsupported atom `{atom}`: {reason}")]
+    UnsupportedAtom {
+        atom: &'static str,
+        reason: &'static str,
+    },
 }
 
 fn is_path_initials_query(input: &str) -> bool {
@@ -454,14 +457,51 @@ fn compile_expr(expr: &Expr, case_sensitive: bool) -> Result<CompiledExpr, Query
                 .map(|e| compile_expr(e, case_sensitive))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
-        Expr::And(v) => Ok(CompiledExpr::And(
-            v.iter()
+        Expr::And(v) => {
+            // HardlinkDupe and ContentDupe are meta-filters handled at a higher
+            // level via CompiledQuery::requires_hardlink_dupe() /
+            // requires_content_dupe().  They must not silently compile to
+            // CompiledExpr::True (which would match *every* file), so we strip
+            // them from AND expressions here.  If the AND becomes empty after
+            // stripping, it means the query consisted solely of meta-filters,
+            // which is rejected as too broad.
+            let compiled: Vec<CompiledExpr> = v
+                .iter()
+                .filter(|e| !is_meta_filter_atom(e))
                 .map(|e| compile_expr(e, case_sensitive))
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
+                .collect::<Result<Vec<_>, _>>()?;
+            match compiled.len() {
+                0 => Err(QueryCompileError::UnsupportedAtom {
+                    atom: "dupe",
+                    reason: "dupe filters are meta-filters and must be combined \
+                             with other search criteria",
+                }),
+                1 => Ok(compiled
+                    .into_iter()
+                    .next()
+                    .expect("compiled.len()==1 guarantees exactly one element")),
+                _ => Ok(CompiledExpr::And(compiled)),
+            }
+        }
         Expr::True => Ok(CompiledExpr::True),
+        Expr::Atom(Atom::HardlinkDupe) | Expr::Atom(Atom::ContentDupe) => {
+            Err(QueryCompileError::UnsupportedAtom {
+                atom: "dupe",
+                reason: "dupe filters are meta-filters and must be combined with \
+                         other search criteria",
+            })
+        }
         Expr::Atom(a) => compile_atom(a, case_sensitive),
     }
+}
+
+/// Returns true for atoms that are meta-filters (handled outside the compiled
+/// expression tree) and should be stripped before compilation.
+fn is_meta_filter_atom(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Atom(Atom::HardlinkDupe) | Expr::Atom(Atom::ContentDupe)
+    )
 }
 
 fn compile_atom(atom: &Atom, case_sensitive: bool) -> Result<CompiledExpr, QueryCompileError> {
@@ -520,8 +560,13 @@ fn compile_atom(atom: &Atom, case_sensitive: bool) -> Result<CompiledExpr, Query
         Atom::NameLen(op, n) => Ok(CompiledExpr::Filter(Filter::NameLen(*op, *n))),
         Atom::EntryType(k) => Ok(CompiledExpr::Filter(Filter::EntryType(*k))),
         Atom::EmptyDir => Ok(CompiledExpr::Filter(Filter::EmptyDir)),
-        Atom::HardlinkDupe => Ok(CompiledExpr::True),
-        Atom::ContentDupe => Ok(CompiledExpr::True),
+        // HardlinkDupe / ContentDupe are meta-filters handled in compile_expr;
+        // they should never reach compile_atom.  This arm is a safety net.
+        Atom::HardlinkDupe | Atom::ContentDupe => Err(QueryCompileError::UnsupportedAtom {
+            atom: "dupe",
+            reason: "dupe filters are meta-filters and must be combined with \
+                     other search criteria",
+        }),
         Atom::Content(s) => Ok(CompiledExpr::Filter(Filter::Content(s.clone()))),
     }
 }
@@ -727,7 +772,9 @@ impl Parser {
                     };
                     let e = parse_atom_expr(&word, case_sensitive)?;
                     if !matches!(e, Expr::True) {
-                        branches.last_mut().expect("branches non-empty").push(e);
+                        if let Some(last) = branches.last_mut() {
+                            last.push(e);
+                        }
                     }
                 }
             }
@@ -944,7 +991,12 @@ fn build_or_and(
             continue;
         }
         if factors.len() == 1 {
-            built.push(factors.into_iter().next().unwrap());
+            built.push(
+                factors
+                    .into_iter()
+                    .next()
+                    .expect("factors.len()==1 guarantees exactly one element"),
+            );
         } else {
             built.push(Expr::And(factors));
         }
@@ -1209,10 +1261,12 @@ fn parse_local_date_range(s: &str) -> Result<DateRange, String> {
 
 #[cfg(unix)]
 fn local_date_range(year: i32, month: i32, day: i32) -> Result<DateRange, String> {
+    use std::mem::MaybeUninit;
+
     // SAFETY: mktime is a standard POSIX function that converts broken-down local time
     // to calendar time. It modifies the tm struct in-place (normalizing fields) and
     // returns -1 on error. We check the return value. The tm struct is zero-initialized
-    // via std::mem::zeroed() and then populated with valid date fields.
+    // via MaybeUninit::zeroed() and then populated with valid date fields.
     unsafe fn mktime_local(mut tm: libc::tm) -> Result<libc::time_t, String> {
         tm.tm_isdst = -1;
         let t = libc::mktime(&mut tm as *mut libc::tm);
@@ -1223,16 +1277,18 @@ fn local_date_range(year: i32, month: i32, day: i32) -> Result<DateRange, String
         }
     }
 
-    // SAFETY: std::mem::zeroed() produces a valid all-zeros libc::tm struct.
+    // SAFETY: MaybeUninit::zeroed() produces a valid all-zeros libc::tm struct.
     // We then set the date fields to valid values before passing to mktime_local.
     unsafe {
-        let mut tm0: libc::tm = std::mem::zeroed();
-        tm0.tm_year = year - 1900;
-        tm0.tm_mon = month - 1;
-        tm0.tm_mday = day;
-        tm0.tm_hour = 0;
-        tm0.tm_min = 0;
-        tm0.tm_sec = 0;
+        let mut tm0 = MaybeUninit::<libc::tm>::zeroed();
+        let p = tm0.as_mut_ptr();
+        (*p).tm_year = year - 1900;
+        (*p).tm_mon = month - 1;
+        (*p).tm_mday = day;
+        (*p).tm_hour = 0;
+        (*p).tm_min = 0;
+        (*p).tm_sec = 0;
+        let tm0 = tm0.assume_init();
 
         let t0 = mktime_local(tm0)?;
 
@@ -1388,9 +1444,15 @@ mod tests {
         assert!(q.matches(&meta("/work/alias-a.txt", 1, None)));
         assert!(!q.matches(&meta("/work/original.txt", 1, None)));
 
-        let all = compile_query("dupe:").unwrap();
-        assert!(all.requires_hardlink_dupe());
-        assert!(all.matches(&meta("/work/original.txt", 1, None)));
+        // Standalone dupe: (no other criteria) should be rejected — it would
+        // silently match every file otherwise.
+        let result = compile_query("dupe:");
+        assert!(result.is_err());
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("dupe filters are meta-filters"));
     }
 
     #[test]
@@ -1410,10 +1472,14 @@ mod tests {
 
     #[test]
     fn dupe_content_filter_sets_content_dupe_flag() {
-        let q = compile_query("dupe:content").unwrap();
-        assert!(q.requires_content_dupe());
-        assert!(!q.requires_hardlink_dupe());
-        assert!(q.matches(&meta("/work/original.txt", 1, None)));
+        // Standalone dupe:content (no other criteria) should be rejected.
+        let result = compile_query("dupe:content");
+        assert!(result.is_err());
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("dupe filters are meta-filters"));
 
         let filtered = compile_query("dupe:content alias").unwrap();
         assert!(filtered.requires_content_dupe());

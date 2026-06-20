@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::entry_to_meta;
 use crate::core::{FileKey, FileMeta};
 use crate::index::case_policy::unicode_case_fold_lookup;
 pub use crate::index::file_entry_v2::{FileEntry, FileEntryIndex};
@@ -840,22 +841,6 @@ fn cold_segment_id(path: &Path, generation: u64) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h ^ generation
-}
-
-fn entry_to_meta(entry: &FileEntry, path_bytes: &[u8]) -> FileMeta {
-    FileMeta {
-        file_key: entry.file_key(),
-        path: pathbuf_from_encoded_vec(path_bytes.to_vec()),
-        size: 0,
-        mtime: if entry.mtime_ns >= 0 {
-            Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(entry.mtime_ns as u64))
-        } else {
-            None
-        },
-        ctime: None,
-        atime: None,
-        kind: entry.kind(),
-    }
 }
 
 impl crate::index::IndexLayer for BaseIndexData {

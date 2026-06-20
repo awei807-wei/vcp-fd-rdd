@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use crate::config::ContentIndexConfig;
 use crate::core::FileMeta;
@@ -11,6 +13,41 @@ use crate::index::content_filter::ContentFilter;
 use crate::util::path_has_excluded_component;
 
 use super::TieredIndex;
+
+/// 内容索引与内容哈希去重的运行时状态子结构。
+pub(super) struct ContentIndexState {
+    pub enabled: AtomicBool,
+    pub config: Mutex<ContentIndexConfig>,
+    pub docs: Mutex<HashMap<PathBuf, String>>,
+    pub indexed_paths: AtomicU64,
+    pub indexed_bytes: AtomicU64,
+    pub last_elapsed_ms: AtomicU64,
+    pub hash_queue_pending: AtomicU64,
+    pub hash_candidate_count: AtomicU64,
+    pub hash_confirmed_groups: AtomicU64,
+    pub hash_skipped_count: AtomicU64,
+    pub hash_last_elapsed_ms: AtomicU64,
+    pub hash_last_skip_reason: Mutex<String>,
+}
+
+impl Default for ContentIndexState {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            config: Mutex::new(ContentIndexConfig::default()),
+            docs: Mutex::new(HashMap::new()),
+            indexed_paths: AtomicU64::new(0),
+            indexed_bytes: AtomicU64::new(0),
+            last_elapsed_ms: AtomicU64::new(0),
+            hash_queue_pending: AtomicU64::new(0),
+            hash_candidate_count: AtomicU64::new(0),
+            hash_confirmed_groups: AtomicU64::new(0),
+            hash_skipped_count: AtomicU64::new(0),
+            hash_last_elapsed_ms: AtomicU64::new(0),
+            hash_last_skip_reason: Mutex::new(String::new()),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ContentReadEligibility {
@@ -42,20 +79,18 @@ impl ContentQueryContext {
 
 impl TieredIndex {
     pub fn apply_content_index_config(&self, config: ContentIndexConfig) {
-        self.content_index_enabled
-            .store(config.enable, Ordering::Relaxed);
-        *self.content_index_config.lock() = normalize_content_config(config.clone());
+        self.content.enabled.store(config.enable, Ordering::Relaxed);
+        *self.content.config.lock() = normalize_content_config(config.clone());
         if !config.enable {
-            self.content_index_docs.lock().clear();
-            self.content_indexed_paths.store(0, Ordering::Relaxed);
-            self.content_indexed_bytes.store(0, Ordering::Relaxed);
-            self.content_index_last_elapsed_ms
-                .store(0, Ordering::Relaxed);
+            self.content.docs.lock().clear();
+            self.content.indexed_paths.store(0, Ordering::Relaxed);
+            self.content.indexed_bytes.store(0, Ordering::Relaxed);
+            self.content.last_elapsed_ms.store(0, Ordering::Relaxed);
         }
     }
 
     pub fn spawn_content_index_worker(self: &Arc<Self>, interval: Duration) {
-        if !self.content_index_enabled.load(Ordering::Relaxed) {
+        if !self.content.enabled.load(Ordering::Relaxed) {
             return;
         }
         let index = self.clone();
@@ -76,12 +111,12 @@ impl TieredIndex {
 
     pub fn rebuild_content_index_now(&self) -> ContentIndexReport {
         let started = Instant::now();
-        if !self.content_index_enabled.load(Ordering::Relaxed) {
-            self.content_index_docs.lock().clear();
+        if !self.content.enabled.load(Ordering::Relaxed) {
+            self.content.docs.lock().clear();
             return ContentIndexReport::default();
         }
 
-        let config = self.content_index_config.lock().clone();
+        let config = self.content.config.lock().clone();
         let mut docs: HashMap<PathBuf, String> = HashMap::new();
         let mut report = ContentIndexReport::default();
         let fs_policy = FsPolicy::current_with_config(self.fs_policy_config());
@@ -98,18 +133,21 @@ impl TieredIndex {
         }
 
         report.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        *self.content_index_docs.lock() = docs;
-        self.content_indexed_paths
+        *self.content.docs.lock() = docs;
+        self.content
+            .indexed_paths
             .store(report.indexed_paths as u64, Ordering::Relaxed);
-        self.content_indexed_bytes
+        self.content
+            .indexed_bytes
             .store(report.indexed_bytes, Ordering::Relaxed);
-        self.content_index_last_elapsed_ms
+        self.content
+            .last_elapsed_ms
             .store(report.elapsed_ms, Ordering::Relaxed);
         report
     }
 
     pub(crate) fn content_query_context(&self, terms: &[String]) -> Option<ContentQueryContext> {
-        if !self.content_index_enabled.load(Ordering::Relaxed) {
+        if !self.content.enabled.load(Ordering::Relaxed) {
             return None;
         }
         let mut normalized_terms = terms
@@ -120,7 +158,7 @@ impl TieredIndex {
         normalized_terms.sort();
         normalized_terms.dedup();
 
-        let docs = self.content_index_docs.lock();
+        let docs = self.content.docs.lock();
         let mut matches_by_term = HashMap::new();
         for term in normalized_terms {
             let paths = docs

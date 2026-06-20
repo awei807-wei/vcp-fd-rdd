@@ -1,7 +1,7 @@
 //! Best-effort I/O governor primitives for background scanners.
 
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -224,7 +224,7 @@ impl IoGovernor {
         }
         let operation = self.operations.fetch_add(1, Ordering::Relaxed) + 1;
         loop {
-            if self.bucket.lock().unwrap().try_take_at(Instant::now(), 1) {
+            if self.bucket.lock().try_take_at(Instant::now(), 1) {
                 break;
             }
             self.token_bucket_limited_count
@@ -246,8 +246,8 @@ impl IoGovernor {
         if !self.enabled {
             return;
         }
-        *self.last_pressure.lock().unwrap() = Some(pressure);
-        let delay = self.backoff.lock().unwrap().observe(pressure, policy);
+        *self.last_pressure.lock() = Some(pressure);
+        let delay = self.backoff.lock().observe(pressure, policy);
         if delay.is_zero() {
             return;
         }
@@ -266,11 +266,11 @@ impl IoGovernor {
     }
 
     pub fn current_backoff_ms(&self) -> u64 {
-        self.backoff.lock().unwrap().current_delay.as_millis() as u64
+        self.backoff.lock().current_delay.as_millis() as u64
     }
 
     pub fn last_pressure(&self) -> Option<IoPressure> {
-        *self.last_pressure.lock().unwrap()
+        *self.last_pressure.lock()
     }
 
     pub fn token_bucket_limited_count(&self) -> u64 {
