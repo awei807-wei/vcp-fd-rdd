@@ -229,6 +229,24 @@ def debug_tiered_watch(base_url: str, root: Path | None = None) -> dict[str, Any
     return data if isinstance(data, dict) else {}
 
 
+def compute_tier_distribution(watch_sample: dict[str, Any] | None) -> dict[str, int]:
+    """Count directories at each watch tier (L0/L1/L2/L3) from a /watch-state sample."""
+    counts: dict[str, int] = {"L0": 0, "L1": 0, "L2": 0, "L3": 0, "unknown": 0}
+    if not watch_sample:
+        return counts
+    dirs = watch_sample.get("dirs")
+    if isinstance(dirs, list):
+        for d in dirs:
+            if not isinstance(d, dict):
+                continue
+            tier = str(d.get("watch_tier", "")).upper()
+            if tier in counts:
+                counts[tier] += 1
+            else:
+                counts["unknown"] += 1
+    return counts
+
+
 def safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in value).strip("-")
 
@@ -627,6 +645,10 @@ class EventStormRunner:
         if not self.roots:
             return
         self.cycle += 1
+        # Task 3: on the very first burst, capture and report tier distribution
+        # so the summary can show how many dirs demoted during the settle phase.
+        if self.cycle == 1:
+            self._emit_tier_distribution("storm_start")
         requested_tier, selected_kind = self.work_items[(self.cycle - 1) % len(self.work_items)]
         root = self.select_root(requested_tier)
         root.mkdir(parents=True, exist_ok=True)
@@ -1366,6 +1388,33 @@ class EventStormRunner:
         }
         return {key: value for key, value in event.items() if key not in core_keys}
 
+    def _emit_tier_distribution(self, phase: str) -> None:
+        """Task 3: capture directory tier counts and emit them to the JSONL log.
+
+        Called at the start of the first event-storm burst (phase='storm_start')
+        so the summary can report how many directories demoted during the settle
+        phase. Also prints to stdout for live progress.
+        """
+        try:
+            dump = debug_tiered_watch(self.base_url)
+            counts = compute_tier_distribution(dump)
+            total = sum(counts.values())
+            self.emit(
+                {
+                    "event_kind": "tier_distribution",
+                    "operation": "tier_distribution",
+                    "phase": phase,
+                    "tier_counts": counts,
+                    "total_dirs": total,
+                }
+            )
+            print(
+                f"Tier distribution ({phase}): {counts} (total={total})",
+                flush=True,
+            )
+        except Exception:
+            pass
+
     def tier_for_root(self, root: Path) -> str:
         try:
             dump = debug_tiered_watch(self.base_url, root)
@@ -1967,6 +2016,20 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             cold_freshness_age_trend[int(i * step)] for i in range(_trend_cap)
         ]
 
+    # Task 3: tier distribution at three points: start of run, start of event
+    # storm (after settle delay), and end of run. The storm_start snapshot is
+    # emitted by EventStormRunner._emit_tier_distribution into the JSONL log.
+    tier_dist_start = compute_tier_distribution(watch_samples[0] if watch_samples else None)
+    tier_dist_end = compute_tier_distribution(watch_samples[-1] if watch_samples else None)
+    tier_dist_storm_start: dict[str, int] | None = None
+    for item in event_storm_samples:
+        if (
+            item.get("event_kind") == "tier_distribution"
+            and item.get("phase") == "storm_start"
+        ):
+            tier_dist_storm_start = item.get("tier_counts")
+            break
+
     summary = {
         "label": label,
         "generated_at": utc_now(),
@@ -2136,6 +2199,13 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "memory_per_file_bytes": memory_per_file_bytes,
             "cold_freshness_age_trend": cold_freshness_age_trend,
         },
+        # Task 3: tier distribution showing how many directories are at each
+        # tier (L0/L1/L2/L3) at three points during the run.
+        "tier_distribution": {
+            "start_of_run": tier_dist_start,
+            "storm_start": tier_dist_storm_start if tier_dist_storm_start is not None else {},
+            "end_of_run": tier_dist_end,
+        },
         "built_in_metrics_dir": str(run_dir / "reports" / "metrics"),
     }
     (run_dir / "summary.json").write_text(
@@ -2195,6 +2265,9 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | hot dir count (L0+L1) | {summary["scale_aware"]["hot_dir_count"]} |
 | rotation cycle estimate s | {summary["scale_aware"]["rotation_cycle_estimate_secs"]} |
 | memory per file bytes | {summary["scale_aware"]["memory_per_file_bytes"]} |
+| tier dist start (L0/L1/L2/L3) | {summary["tier_distribution"]["start_of_run"]} |
+| tier dist storm start (L0/L1/L2/L3) | {summary["tier_distribution"]["storm_start"]} |
+| tier dist end (L0/L1/L2/L3) | {summary["tier_distribution"]["end_of_run"]} |
 | index health last | {summary["health"]["index_health_last"]} |
 
 ## Canary
@@ -2283,7 +2356,25 @@ Scale-aware metrics for realistic 1M-file testing: total indexed files/dirs, col
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="fd-rdd M2 cold-window VM benchmark runner")
+    parser = argparse.ArgumentParser(
+        description="fd-rdd M2 cold-window VM benchmark runner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Realistic 1M-file mode recommendations:\n"
+            "  --runtime-profile memory_light      lower overlay flush thresholds (50K vs 250K paths), reduces peak RSS\n"
+            "  --l1-empty-scans-to-l2 1            demote after 1 empty scan instead of 5 (default)\n"
+            "  --l1-scan-interval-secs 5           scan every 5s instead of 30s for faster demotion\n"
+            "  --event-storm-start-delay-secs 120  settle phase: 120s allows tier demotion before events arrive\n"
+            "  --snapshot-path-disk               put snapshot on disk instead of tmpfs (mmap pages count toward RSS)\n"
+            "\n"
+            "Example realistic-mode command:\n"
+            "  python3 scripts/m2-cold-window-vm-bench.py --root /path/to/fixture \\\n"
+            "    --realistic-mode --hot-roots ... --cold-roots ... \\\n"
+            "    --runtime-profile memory_light --l1-empty-scans-to-l2 1 \\\n"
+            "    --l1-scan-interval-secs 5 --event-storm-start-delay-secs 120 \\\n"
+            "    --snapshot-path-disk --event-storm --duration-secs 3600\n"
+        ),
+    )
     parser.add_argument("--root", action="append", required=True, help="indexed root; repeatable")
     parser.add_argument("--repo", default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--binary", default="target/release/fd-rdd")
@@ -2295,7 +2386,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-interval-secs", type=float, default=10.0)
     parser.add_argument("--snapshot-interval-secs", type=int, default=300)
     parser.add_argument("--watch-mode", choices=["tiered", "recursive", "off"], default="tiered")
-    parser.add_argument("--runtime-profile", choices=["default", "memory_light", "memory-light"], default="default")
+    parser.add_argument(
+        "--runtime-profile",
+        choices=["default", "memory_light", "memory-light"],
+        default="default",
+        help="runtime profile. 'memory_light' is recommended for 1M-file tests: it "
+             "uses lower overlay flush thresholds (50K paths vs 250K), reducing peak RSS.",
+    )
     parser.add_argument("--tiered-profile", choices=["balanced", "strict", "low_power"], default="balanced")
     parser.add_argument("--include-hidden", action="store_true")
     parser.add_argument("--rotating-cold-window", dest="rotating_cold_window", action="store_true", default=True)
@@ -2307,11 +2404,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rotating-max-dirs-per-tick", type=int, default=8)
     parser.add_argument("--max-watch-dirs", type=int, default=131072)
     parser.add_argument("--l0-max-cost-per-root", type=int, default=8192)
-    parser.add_argument("--l1-scan-interval-secs", type=int, default=30)
+    parser.add_argument(
+        "--l1-scan-interval-secs",
+        type=int,
+        default=30,
+        help="L1 directory scan interval in seconds. For realistic 1M-file mode, use 5 "
+             "with --l1-empty-scans-to-l2 1 for rapid tier demotion.",
+    )
     parser.add_argument("--l2-scan-interval-secs", type=int, default=300)
     parser.add_argument("--l3-scan-interval-secs", type=int, default=21600)
-    parser.add_argument("--l1-empty-scans-to-l2", type=int, default=5)
-    parser.add_argument("--l2-empty-scans-to-l3", type=int, default=3)
+    parser.add_argument(
+        "--l1-empty-scans-to-l2",
+        type=int,
+        default=5,
+        help="consecutive empty L1 scans required to demote a directory to L2. "
+             "For realistic 1M-file mode, use 1 for rapid demotion. Default 5.",
+    )
+    parser.add_argument(
+        "--l2-empty-scans-to-l3",
+        type=int,
+        default=3,
+        help="consecutive empty L2 scans required to demote a directory to L3. Default 3.",
+    )
     parser.add_argument("--fast-scan", dest="fast_scan", action="store_true", default=True)
     parser.add_argument("--no-fast-scan", dest="fast_scan", action="store_false")
     parser.add_argument("--proc-sampler", dest="proc_sampler", action="store_true", default=True)
@@ -2343,7 +2457,15 @@ def parse_args() -> argparse.Namespace:
             "mount_storm,inode_reuse,time_skew"
         ),
     )
-    parser.add_argument("--event-storm-start-delay-secs", type=float, default=120.0)
+    parser.add_argument(
+        "--event-storm-start-delay-secs",
+        type=float,
+        default=120.0,
+        help="seconds to wait after fd-rdd starts before beginning the event storm. "
+             "This serves as a settle phase that lets tiered-watch demote directories "
+             "from L1 to L2/L3 before events arrive. For realistic 1M-file mode, use 120+ "
+             "with --l1-empty-scans-to-l2 1 --l1-scan-interval-secs 5. Default 120.",
+    )
     parser.add_argument("--event-storm-interval-secs", type=float, default=300.0)
     parser.add_argument("--event-storm-settle-secs", type=float, default=120.0)
     parser.add_argument("--event-storm-timeout-secs", type=float, default=0.0)
@@ -2453,6 +2575,15 @@ def parse_args() -> argparse.Namespace:
              "variant (overriding base args) and prints a comparison table. "
              "Format: {\"base_args\": {...}, \"variants\": [{\"label\": ..., ...}]}.",
     )
+    parser.add_argument(
+        "--snapshot-path-disk",
+        action="store_true",
+        default=False,
+        help="put the fd-rdd snapshot (index.db) on a known disk path "
+             "($HOME/.fd-rdd-bench-snapshots/<run-label>/index.db) instead of the run "
+             "directory (which may be on tmpfs if /tmp is tmpfs). Important because "
+             "mmap'd snapshot pages on tmpfs count toward RSS.",
+    )
     parser.add_argument("--startup-timeout-secs", type=float, default=60.0)
     return parser.parse_args()
 
@@ -2500,7 +2631,17 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
     env["XDG_RUNTIME_DIR"] = str(runtime_dir)
     env.setdefault("RUST_LOG", "info")
     base_url = f"http://127.0.0.1:{args.port}"
-    snapshot_path = run_dir / "index.db"
+    # Task 5: when --snapshot-path-disk is set, put the snapshot on a known disk
+    # path instead of the run directory (which may be on tmpfs if /tmp is tmpfs).
+    # mmap'd snapshot pages on tmpfs count toward RSS, skewing memory benchmarks.
+    if args.snapshot_path_disk:
+        home = Path(os.environ.get("HOME", str(Path.home())))
+        snapshot_dir = home / ".fd-rdd-bench-snapshots" / safe_name(args.run_label)
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = snapshot_dir / "index.db"
+        print(f"Snapshot path (on disk): {snapshot_path}", flush=True)
+    else:
+        snapshot_path = run_dir / "index.db"
     uds_socket = runtime_dir / "fd-rdd.sock"
     cmd = [
         str(binary),
@@ -2550,6 +2691,8 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
         "event_storm_depth": args.event_storm_depth,
         "event_storm_inode_stress_iterations": args.event_storm_inode_stress_iterations,
         "event_storm_inode_stress_tmpfs_inodes": args.event_storm_inode_stress_tmpfs_inodes,
+        "snapshot_path_disk": args.snapshot_path_disk,
+        "snapshot_path": str(snapshot_path),
     }
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -2631,6 +2774,15 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
         )
         if hot_churn is not None:
             hot_churn.start()
+
+        # Task 1: settle phase progress. If the event storm has a start delay,
+        # inform the user that we're waiting for tier demotion before events begin.
+        if event_storm is not None and args.event_storm_start_delay_secs > 0:
+            print(
+                f"Settle phase: waiting {args.event_storm_start_delay_secs:.0f} seconds "
+                f"for tier demotion before event storm starts...",
+                flush=True,
+            )
 
         while True:
             if proc.poll() is not None:
@@ -2714,6 +2866,7 @@ def _apply_overrides(args: argparse.Namespace, overrides: dict[str, Any]) -> arg
             "realistic-mode", "mixed-workload", "event-storm-immediate-query",
             "canary-in-fixture", "immediate-query-settle-secs",
             "mixed-workload-interval-secs",
+            "snapshot-path-disk", "event-storm-start-delay-secs",
         ]
     }
     for raw_key, value in overrides.items():
@@ -2782,6 +2935,8 @@ def run_sweep(args: argparse.Namespace) -> int:
         ("cf_slope", lambda s: s.get("watch_state", {}).get("cold_freshness_age_slope_max", "")),
         ("dirty_q_max", lambda s: s.get("watch_state", {}).get("dirty_queue_len_max", "")),
         ("rss_max", lambda s: s.get("process", {}).get("rss_bytes_max", "")),
+        ("cold_dirs", lambda s: s.get("scale_aware", {}).get("cold_dir_count", "")),
+        ("tier_end", lambda s: s.get("tier_distribution", {}).get("end_of_run", "")),
         ("passive_sr", lambda s: s.get("passive_first_query", {}).get("success_rate", "")),
         ("inode_reuse_obs", lambda s: s.get("event_storm", {}).get("special", {}).get("inode_reuse_observed", "")),
         ("fatal", lambda s: s.get("fatal_error", "")),
