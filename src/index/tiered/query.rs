@@ -360,6 +360,7 @@ impl TieredIndex {
         results
     }
 
+    #[cfg(test)]
     pub(crate) fn materialize_snapshot_base(
         self: &Arc<Self>,
     ) -> anyhow::Result<Arc<BaseIndexData>> {
@@ -432,7 +433,7 @@ impl TieredIndex {
             upserted_paths,
             new_base.file_count(),
         )?;
-        db.clear();
+        db.reset_complete_generation();
         self.base.store(new_base.clone());
         self.l2.store(Arc::new(PersistentIndex::new_with_roots(
             self.roots.clone(),
@@ -644,7 +645,7 @@ impl TieredIndex {
         )
     }
 
-    fn overlay_meta_for_event(&self, ev: &EventRecord) -> Option<FileMeta> {
+    pub(super) fn overlay_meta_for_event(&self, ev: &EventRecord) -> Option<FileMeta> {
         let path = ev.best_path().map(super::normalize_path)?;
         if let Ok(m) = std::fs::metadata(&path) {
             let file_key = FileKey::from_path_and_metadata(&path, &m)?;
@@ -660,7 +661,10 @@ impl TieredIndex {
         }
 
         let fk = ev.id.as_file_key()?;
-        self.l2.load_full().get_meta(fk)
+        self.l2
+            .load_full()
+            .get_meta(fk)
+            .filter(|meta| meta.path == path)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1325,15 +1329,18 @@ fn path_is_under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
 }
 
 /// Threshold below which a cold base is too small to judge as corrupt.
+#[cfg(test)]
 const COLD_BASE_CORRUPTION_MIN_COUNT: usize = 10_000;
 /// Reciprocal of the materialized-fraction floor: emitting fewer than
 /// 1/COLD_BASE_CORRUPTION_RATIO_DIVISOR (5%) of the claimed entries is treated
 /// as a corrupt cold base.
+#[cfg(test)]
 const COLD_BASE_CORRUPTION_RATIO_DIVISOR: usize = 20;
 
 /// Decide whether a base that reported `base_count_before` entries but only
 /// materialized `base_emitted` of them is corrupt. Pure so the threshold is
 /// unit-testable without constructing a corrupt cold segment.
+#[cfg(test)]
 fn cold_base_corruption_suspected(base_count_before: usize, base_emitted: usize) -> bool {
     if base_count_before < COLD_BASE_CORRUPTION_MIN_COUNT {
         return false;
@@ -1342,6 +1349,7 @@ fn cold_base_corruption_suspected(base_count_before: usize, base_emitted: usize)
     base_emitted.saturating_mul(COLD_BASE_CORRUPTION_RATIO_DIVISOR) < base_count_before
 }
 
+#[cfg(test)]
 fn validate_snapshot_materialization(
     base_count_before: usize,
     deleted_paths: usize,
@@ -1390,6 +1398,7 @@ fn collect_live_meta(
     results.push(meta);
 }
 
+#[cfg(test)]
 fn materialize_live_meta(
     meta: FileMeta,
     deleted_sources: &[Arc<PathArenaSet>],

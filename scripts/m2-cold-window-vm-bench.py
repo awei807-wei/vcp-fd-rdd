@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import errno
 import hashlib
 import json
 import os
@@ -27,10 +28,27 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 ENDPOINTS = ["/health", "/status", "/metrics", "/memory", "/watch-state"]
+
+AB_PARAMETER_FINGERPRINT_SCHEMA = 2
+INITIAL_STATE_FINGERPRINT_SCHEMA = 1
+EXECUTION_FINGERPRINT_SCHEMA = 1
+AB_PARAMETER_FINGERPRINT_IGNORED_ARGS = frozenset(
+    {
+        # A/B legs intentionally differ in checkout/artifact identity and output
+        # location. These remain fully recorded in runner_args, but do not make
+        # otherwise identical workloads compare unequal.
+        "repo",
+        "binary",
+        "run_label",
+        "run_dir",
+        "port",
+        "sweep_config",
+    }
+)
 
 
 def utc_now() -> str:
@@ -45,6 +63,27 @@ def json_line(path: Path, record: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, separators=(",", ":"))
         f.write("\n")
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Durably replace a JSON document without exposing a truncated manifest."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    next_path = path.with_name(path.name + ".next")
+    try:
+        with next_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(next_path, path)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        dir_fd = os.open(path.parent, flags)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        next_path.unlink(missing_ok=True)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -94,6 +133,520 @@ def short_uds_socket_path(run_dir: Path) -> Path:
 def cleanup_uds_socket(socket_path: Path) -> None:
     """Remove a stale or stopped daemon socket without masking run teardown."""
     socket_path.unlink(missing_ok=True)
+
+
+def _json_manifest_value(value: Any) -> Any:
+    """Convert argparse values to deterministic JSON without dropping fields."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _json_manifest_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_manifest_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def manifest_runner_args(args: argparse.Namespace) -> dict[str, Any]:
+    """Return every effective argparse field in a stable, JSON-safe mapping."""
+    return {
+        key: _json_manifest_value(value)
+        for key, value in sorted(vars(args).items())
+    }
+
+
+def ab_parameter_fingerprint_inputs(runner_args: dict[str, Any]) -> dict[str, Any]:
+    """Build the auditable payload used to decide whether two legs are comparable."""
+    comparable_args = {
+        key: value
+        for key, value in sorted(runner_args.items())
+        if key not in AB_PARAMETER_FINGERPRINT_IGNORED_ARGS
+    }
+    return {
+        "schema": AB_PARAMETER_FINGERPRINT_SCHEMA,
+        "runner_args": comparable_args,
+    }
+
+
+def ab_parameter_fingerprint(runner_args: dict[str, Any]) -> str:
+    """Hash all workload-affecting parameters while excluding A/B leg identity."""
+    payload = ab_parameter_fingerprint_inputs(runner_args)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def git_head_sha(repo: Path) -> str:
+    """Return the exact commit under test, or an empty string with no false guess."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    sha = result.stdout.strip().lower()
+    if result.returncode == 0 and len(sha) == 40 and all(ch in "0123456789abcdef" for ch in sha):
+        return sha
+    return ""
+
+
+def git_worktree_dirty(repo: Path) -> bool | None:
+    """Return whether tracked or untracked worktree content differs from HEAD."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
+def _deduplicated_fixture_roots(roots: list[Path]) -> list[Path]:
+    resolved = sorted(
+        {root.expanduser().resolve() for root in roots},
+        key=lambda path: (len(path.parts), str(path)),
+    )
+    selected: list[Path] = []
+    for candidate in resolved:
+        if any(candidate == parent or candidate.is_relative_to(parent) for parent in selected):
+            continue
+        selected.append(candidate)
+    return selected
+
+
+def _fixture_json_declaration(root: Path) -> dict[str, Any] | None:
+    path = root / ".fd-rdd-m2-fixture.json"
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return {"trusted": False, "error": f"{path}: {exc!r}"}
+    if not isinstance(data, dict):
+        return {"trusted": False, "error": f"{path}: fixture manifest must be an object"}
+    count = next(
+        (
+            data.get(key)
+            for key in ("actual_file_count", "actual_files", "file_count", "total_files")
+            if data.get(key) is not None
+        ),
+        None,
+    )
+    if data.get("completed") is not True:
+        return {"trusted": False, "error": f"{path}: fixture manifest is not completed"}
+    try:
+        file_count = int(count)
+    except (TypeError, ValueError):
+        return {"trusted": False, "error": f"{path}: missing valid file count"}
+    if file_count < 0:
+        return {"trusted": False, "error": f"{path}: negative file count"}
+    return {
+        "trusted": True,
+        "verified": True,
+        "source": "fixture_manifest",
+        "file_count": file_count,
+        "seed": data.get("seed"),
+        "layout_version": data.get("layout_version", data.get("schema_version", "")),
+        "declaration_sha256": hashlib.sha256(raw).hexdigest(),
+        "path": str(path),
+    }
+
+
+def _fixture_text_declaration(root: Path) -> dict[str, Any] | None:
+    path = root / ".fd-rdd-m2-fixture"
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return {"trusted": False, "error": f"{path}: {exc!r}"}
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "fd-rdd m2 realistic fixture":
+        return {"trusted": False, "error": f"{path}: unrecognized fixture marker"}
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        key, separator, value = line.partition("=")
+        if separator:
+            fields[key.strip()] = value.strip()
+    try:
+        file_count = int(fields["total_files"])
+        seed = int(fields["seed"])
+    except (KeyError, ValueError):
+        return {"trusted": False, "error": f"{path}: invalid seed/total_files declaration"}
+    if file_count <= 0:
+        return {"trusted": False, "error": f"{path}: non-positive total_files"}
+    return {
+        "trusted": True,
+        # The legacy builder writes this declaration before generation. It is a
+        # trusted workload declaration, not an exhaustive post-build verification.
+        "verified": False,
+        "source": "fixture_marker_declared",
+        "file_count": file_count,
+        "seed": seed,
+        "layout_version": "legacy-marker-v1",
+        "declaration_sha256": hashlib.sha256(raw).hexdigest(),
+        "path": str(path),
+    }
+
+
+def load_fixture_identity(roots: list[Path]) -> dict[str, Any]:
+    """Read small fixture declarations only; never traverse the indexed tree."""
+    declarations: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for root in _deduplicated_fixture_roots(roots):
+        declaration = _fixture_json_declaration(root)
+        if declaration is None:
+            declaration = _fixture_text_declaration(root)
+        if declaration is None:
+            errors.append(f"{root}: fixture declaration not found")
+            continue
+        if not declaration.get("trusted"):
+            errors.append(str(declaration.get("error", f"{root}: untrusted declaration")))
+            continue
+        declarations.append({"root": str(root), **declaration})
+
+    trusted = bool(declarations) and not errors
+    sources = {str(item["source"]) for item in declarations}
+    source = next(iter(sources)) if len(sources) == 1 else "mixed_fixture_declarations"
+    file_count = (
+        sum(int(item["file_count"]) for item in declarations) if trusted else None
+    )
+    seeds = {item.get("seed") for item in declarations}
+    seed = next(iter(seeds)) if len(seeds) == 1 else None
+    identity_payload = [
+        {
+            "root": item["root"],
+            "source": item["source"],
+            "file_count": item["file_count"],
+            "seed": item.get("seed"),
+            "layout_version": item.get("layout_version", ""),
+            "declaration_sha256": item["declaration_sha256"],
+        }
+        for item in declarations
+    ]
+    identity_sha256 = hashlib.sha256(
+        json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "file_count": file_count,
+        "count_source": source if trusted else "unverified",
+        "count_verified": trusted and all(bool(item.get("verified")) for item in declarations),
+        "trusted": trusted,
+        "seed": seed,
+        "identity_sha256": identity_sha256,
+        "roots": declarations,
+        "errors": errors,
+    }
+
+
+def sha256_file(path: Path) -> str:
+    """Hash an artifact in bounded chunks for an auditable binary identity."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            while chunk := f.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def snapshot_initial_state(snapshot_path: Path) -> dict[str, Any]:
+    """Inspect fixed recovery paths without reading snapshot contents or walking dirs."""
+    state_dir = snapshot_path.with_suffix(".d")
+    candidates = {
+        "primary": snapshot_path,
+        "legacy_v7": snapshot_path.with_suffix(".v7"),
+        "stable": state_dir / "stable.v7",
+        "stable_prev": state_dir / "stable.prev.v7",
+        "stable_next": state_dir / "stable.next.v7",
+        "runtime_state": state_dir / "runtime-state.json",
+        "events_wal": state_dir / "events.wal",
+    }
+    artifacts: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    try:
+        parent_device = snapshot_path.parent.stat().st_dev
+    except OSError as exc:
+        parent_device = None
+        errors.append(f"{snapshot_path.parent}: {exc!r}")
+    for label, path in candidates.items():
+        try:
+            stat = path.stat()
+            artifacts[label] = {"exists": True, "size_bytes": stat.st_size}
+        except FileNotFoundError:
+            artifacts[label] = {"exists": False, "size_bytes": 0}
+        except OSError as exc:
+            artifacts[label] = {"exists": False, "size_bytes": 0}
+            errors.append(f"{path}: {exc!r}")
+    try:
+        state_dir_exists = state_dir.exists()
+    except OSError as exc:
+        state_dir_exists = False
+        errors.append(f"{state_dir}: {exc!r}")
+    fresh = not state_dir_exists and not any(
+        bool(item["exists"]) for item in artifacts.values()
+    )
+    return {
+        "fresh": fresh,
+        "state_dir_exists": state_dir_exists,
+        "parent_device": parent_device,
+        "artifacts": artifacts,
+        "errors": errors,
+    }
+
+
+def build_initial_state(
+    snapshot_path: Path,
+    fixture: dict[str, Any],
+    *,
+    rust_log: str,
+    binary: Path,
+    git_sha: str,
+    git_dirty: bool | None,
+    artifact_provenance: dict[str, Any],
+    run_dir_preexisting: bool = False,
+) -> dict[str, Any]:
+    snapshot = snapshot_initial_state(snapshot_path)
+    collection_errors = [
+        *[str(error) for error in fixture.get("errors", [])],
+        *[str(error) for error in snapshot.get("errors", [])],
+    ]
+    return {
+        "fixture": fixture,
+        "snapshot": snapshot,
+        "rust_log": rust_log,
+        "binary_sha256": sha256_file(binary),
+        "git_sha": git_sha,
+        "git_dirty": git_dirty,
+        "artifact_provenance": artifact_provenance,
+        "run_dir_preexisting": run_dir_preexisting,
+        "collection_errors": collection_errors,
+    }
+
+
+def _fingerprint(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def initial_state_fingerprint(initial_state: dict[str, Any]) -> str:
+    # Code identity is audited separately because A/B legs intentionally run
+    # different binaries. This fingerprint covers the state that must match.
+    return _fingerprint(
+        {
+            "schema": INITIAL_STATE_FINGERPRINT_SCHEMA,
+            "fixture": initial_state.get("fixture"),
+            "snapshot": initial_state.get("snapshot"),
+            "rust_log": initial_state.get("rust_log"),
+            "run_dir_preexisting": initial_state.get("run_dir_preexisting", False),
+            "collection_errors": initial_state.get("collection_errors", []),
+        }
+    )
+
+
+def _log_contains(path: Path, needle: str) -> bool:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            return any(needle in line for line in f)
+    except OSError:
+        return False
+
+
+def build_execution_state(
+    run_dir: Path,
+    *,
+    requested_duration_secs: int,
+    actual_duration_secs: float,
+    exit_code: int | None,
+    fatal_error: str,
+    process_sampler_error: str,
+    completion_reason: str,
+    cleanup_errors: list[str],
+    shutdown_signal_elapsed_secs: float | None = None,
+    event_storm_enabled: bool = False,
+    mixed_workload_enabled: bool = False,
+) -> dict[str, Any]:
+    """Summarize realized workload and harness health after one benchmark leg."""
+    event_rows = read_jsonl(run_dir / "event-storm-samples.jsonl")
+    hot_rows = read_jsonl(run_dir / "hot-churn-samples.jsonl")
+    endpoint_rows = read_jsonl(run_dir / "endpoint-samples.jsonl")
+    process_rows = read_jsonl(run_dir / "process-samples.jsonl")
+    burst_rows = [row for row in event_rows if row.get("event_kind") == "burst_written"]
+    burst_write_failures = sum(
+        1 for row in event_rows if row.get("event_kind") == "burst_write_failed"
+    )
+    unsupported_workloads = sum(
+        1 for row in event_rows if row.get("event_kind") == "unsupported_workload"
+    )
+    hot_churn_errors = sum(
+        1 for row in hot_rows if row.get("event_kind") == "hot_churn_error"
+    )
+    final_snapshot_failed = _log_contains(
+        run_dir / "fd-rdd.log", "Final snapshot failed:"
+    )
+    bursts_by_kind: dict[str, int] = {}
+    events_by_kind: dict[str, int] = {}
+    for row in burst_rows:
+        kind = str(row.get("selected_kind", "unknown"))
+        bursts_by_kind[kind] = bursts_by_kind.get(kind, 0) + 1
+        events_by_kind[kind] = events_by_kind.get(kind, 0) + int(
+            row.get("events_total", 0) or 0
+        )
+    payload: dict[str, Any] = {
+        "schema": EXECUTION_FINGERPRINT_SCHEMA,
+        "requested_duration_secs": int(requested_duration_secs),
+        "actual_duration_secs": round(float(actual_duration_secs), 3),
+        "duration_completed": (
+            requested_duration_secs > 0
+            and completion_reason == "duration_elapsed"
+            and actual_duration_secs >= requested_duration_secs
+        ),
+        "completion_reason": completion_reason,
+        "exit_code": exit_code,
+        "fatal_error": fatal_error,
+        "process_sampler_error": process_sampler_error,
+        "cleanup_errors": list(cleanup_errors),
+        "shutdown_signal_elapsed_secs": shutdown_signal_elapsed_secs,
+        "event_storm_bursts": len(burst_rows),
+        "event_storm_enabled": event_storm_enabled,
+        "event_storm_events_written": sum(
+            int(row.get("events_total", 0) or 0) for row in burst_rows
+        ),
+        "event_storm_bursts_by_kind": bursts_by_kind,
+        "event_storm_events_by_kind": events_by_kind,
+        "event_storm_first_queries": sum(
+            1 for row in event_rows if row.get("event_kind") == "first_query"
+        ),
+        "event_storm_write_failures": burst_write_failures,
+        "unsupported_workloads": unsupported_workloads,
+        "hot_churn_batches": sum(
+            1 for row in hot_rows if row.get("event_kind") == "hot_churn_batch"
+        ),
+        "mixed_workload_enabled": mixed_workload_enabled,
+        "hot_churn_files_created": sum(
+            int(row.get("files_created", 0) or 0)
+            for row in hot_rows
+            if row.get("event_kind") == "hot_churn_batch"
+        ),
+        "hot_churn_errors": hot_churn_errors,
+        "endpoint_sample_failures": sum(
+            1 for row in endpoint_rows if not bool(row.get("ok"))
+        ),
+        "process_sample_count": len(process_rows),
+        "memory_endpoint_sample_count": sum(
+            1
+            for row in endpoint_rows
+            if row.get("endpoint") == "/memory" and bool(row.get("ok"))
+        ),
+        "final_snapshot_failed": final_snapshot_failed,
+        "phase_attribution": {
+            "final_snapshot_window_bounded": shutdown_signal_elapsed_secs is not None,
+            "periodic_snapshot_lifecycle_available": False,
+            "limitation": "periodic snapshot intervals cannot be distinguished without daemon lifecycle telemetry",
+        },
+    }
+    payload["fingerprint"] = _fingerprint(payload)
+    return payload
+
+
+def evaluate_ab_comparability(
+    initial_state: dict[str, Any],
+    execution_state: dict[str, Any] | None = None,
+) -> tuple[bool, list[str]]:
+    """Fail closed when a run lacks reproducible initial state or harness health."""
+    reasons: list[str] = []
+    fixture = initial_state.get("fixture")
+    snapshot = initial_state.get("snapshot")
+    if not isinstance(fixture, dict) or not fixture.get("trusted"):
+        reasons.append("fixture_count_unverified")
+    elif fixture.get("count_verified") is not True:
+        reasons.append("fixture_count_not_verified")
+    if not isinstance(snapshot, dict) or not snapshot.get("fresh"):
+        reasons.append("snapshot_preexisting")
+    if not initial_state.get("binary_sha256"):
+        reasons.append("binary_identity_unavailable")
+    if not initial_state.get("git_sha"):
+        reasons.append("git_sha_unavailable")
+    if initial_state.get("git_dirty") is True:
+        reasons.append("git_worktree_dirty")
+    elif initial_state.get("git_dirty") is None:
+        reasons.append("git_worktree_state_unavailable")
+    provenance = initial_state.get("artifact_provenance")
+    if not isinstance(provenance, dict) or not provenance.get("verified"):
+        reasons.append("artifact_provenance_unverified")
+    if initial_state.get("collection_errors"):
+        reasons.append("initial_state_collection_failed")
+    if initial_state.get("run_dir_preexisting"):
+        reasons.append("run_dir_preexisting")
+
+    if execution_state is not None:
+        completion_reason = str(execution_state.get("completion_reason", ""))
+        if int(execution_state.get("requested_duration_secs", 0) or 0) <= 0:
+            reasons.append("duration_not_fixed")
+        if completion_reason == "interrupted":
+            reasons.append("run_interrupted")
+        elif not execution_state.get("duration_completed"):
+            reasons.append("duration_not_completed")
+        if execution_state.get("exit_code") not in (0, -signal.SIGTERM):
+            reasons.append("daemon_exit_failed")
+        if execution_state.get("fatal_error"):
+            reasons.append("runner_fatal_error")
+        if execution_state.get("process_sampler_error"):
+            reasons.append("process_sampler_failed")
+        if execution_state.get("cleanup_errors"):
+            reasons.append("cleanup_failed")
+        if int(execution_state.get("event_storm_write_failures", 0) or 0) > 0:
+            reasons.append("event_storm_write_failed")
+        if (
+            execution_state.get("event_storm_enabled")
+            and int(execution_state.get("event_storm_bursts", 0) or 0) <= 0
+        ):
+            reasons.append("event_storm_not_exercised")
+        if int(execution_state.get("unsupported_workloads", 0) or 0) > 0:
+            reasons.append("unsupported_workload")
+        if int(execution_state.get("hot_churn_errors", 0) or 0) > 0:
+            reasons.append("hot_churn_failed")
+        if (
+            execution_state.get("mixed_workload_enabled")
+            and int(execution_state.get("hot_churn_batches", 0) or 0) <= 0
+        ):
+            reasons.append("mixed_workload_not_exercised")
+        if int(execution_state.get("endpoint_sample_failures", 0) or 0) > 0:
+            reasons.append("endpoint_sampling_failed")
+        if int(execution_state.get("process_sample_count", 0) or 0) <= 0:
+            reasons.append("process_samples_missing")
+        if int(execution_state.get("memory_endpoint_sample_count", 0) or 0) <= 0:
+            reasons.append("memory_endpoint_samples_missing")
+        if execution_state.get("final_snapshot_failed"):
+            reasons.append("final_snapshot_failed")
+        if execution_state.get("shutdown_signal_elapsed_secs") is None:
+            reasons.append("shutdown_boundary_missing")
+    return not reasons, reasons
 
 
 def http_json(base_url: str, path: str, params: dict[str, str] | None = None, timeout: float = 2.0) -> Any:
@@ -207,11 +760,13 @@ class ProcessSampleRunner:
         out_path: Path,
         started_at: float,
         interval_secs: float,
+        process_running: Callable[[], bool] | None = None,
     ) -> None:
         self.pid = pid
         self.out_path = out_path
         self.started_at = started_at
         self.interval_secs = max(0.05, interval_secs)
+        self.process_running = process_running
         self.error = ""
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -234,16 +789,37 @@ class ProcessSampleRunner:
         sampler = process_sampler(self.pid)
         try:
             while not self._stop.is_set():
+                sample = next(sampler)
+                if not sample and not self._daemon_is_running():
+                    return
                 record = {
                     "ts": utc_now(),
                     "elapsed_secs": round(time.monotonic() - self.started_at, 3),
-                    **next(sampler),
+                    **sample,
                 }
                 json_line(self.out_path, record)
                 if self._stop.wait(self.interval_secs):
                     return
         except Exception as exc:  # noqa: BLE001 - surfaced in the run summary
+            if self._is_procfs_exit_race(exc) and not self._daemon_is_running():
+                return
             self.error = repr(exc)
+
+    def _daemon_is_running(self) -> bool:
+        if self.process_running is not None:
+            try:
+                return bool(self.process_running())
+            except Exception:  # noqa: BLE001 - do not hide a real sampler error
+                return True
+        return Path(f"/proc/{self.pid}").exists()
+
+    @staticmethod
+    def _is_procfs_exit_race(exc: Exception) -> bool:
+        return isinstance(exc, OSError) and exc.errno in {
+            errno.ENOENT,
+            errno.EACCES,
+            errno.ESRCH,
+        }
 
 
 def search_results(base_url: str, query: str, limit: int = 50) -> list[dict[str, Any]]:
@@ -310,6 +886,14 @@ def compute_tier_distribution(watch_sample: dict[str, Any] | None) -> dict[str, 
     """Count directories at each watch tier (L0/L1/L2/L3) from a /watch-state sample."""
     counts: dict[str, int] = {"L0": 0, "L1": 0, "L2": 0, "L3": 0, "unknown": 0}
     if not watch_sample:
+        return counts
+    # The public /watch-state endpoint exposes aggregate counters. A per-dir
+    # `dirs` array belongs to /debug/tiered-watch, and is retained only as a
+    # compatibility fallback for callers that intentionally pass that dump.
+    aggregate_keys = {tier: f"{tier.lower()}_dirs" for tier in ("L0", "L1", "L2", "L3")}
+    if any(key in watch_sample for key in aggregate_keys.values()):
+        for tier, key in aggregate_keys.items():
+            counts[tier] = int(watch_sample.get(key, 0) or 0)
         return counts
     dirs = watch_sample.get("dirs")
     if isinstance(dirs, list):
@@ -906,7 +1490,31 @@ class EventStormRunner:
             ]
             for path, marker in files:
                 path.write_text(f"{utc_now()} {marker}\n", encoding="utf-8")
-                records.append(self.expected_record("npm_install", "npm_file_visible", path, path.name, True, tier_before))
+                records.append(
+                    self.expected_record(
+                        "npm_install",
+                        "npm_node_modules_hidden",
+                        path,
+                        path.name,
+                        False,
+                        tier_before,
+                    )
+                )
+        package_manifest = pkg_root / f"fd_rdd_m2_npm_root_{self.cycle:03d}.probe"
+        package_manifest.write_text(
+            f"{utc_now()} fd_rdd_m2_storm_npm_package_root_{self.cycle}\n",
+            encoding="utf-8",
+        )
+        records.append(
+            self.expected_record(
+                "npm_install",
+                "npm_package_root_visible",
+                package_manifest,
+                package_manifest.name,
+                True,
+                tier_before,
+            )
+        )
         lock = pkg_root / "package-lock.json"
         lock.parent.mkdir(parents=True, exist_ok=True)
         lock.write_text(f"{utc_now()} fd_rdd_m2_storm_npm_lock_{self.cycle}\n", encoding="utf-8")
@@ -1541,6 +2149,7 @@ class HotChurnRunner:
         started_at: float,
         interval_secs: float = 3.0,
         start_delay_secs: float = 30.0,
+        workload_seed: int = 42,
     ) -> None:
         self.base_url = base_url
         self.roots = [r for r in roots if r]
@@ -1548,6 +2157,7 @@ class HotChurnRunner:
         self.started_at = started_at
         self.interval_secs = max(0.5, interval_secs)
         self.start_delay_secs = max(0.0, start_delay_secs)
+        self.random = random.Random(workload_seed)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._run_id = f"{time.time_ns()}-{os.getpid()}"
@@ -1582,7 +2192,9 @@ class HotChurnRunner:
                     "error": repr(exc),
                 })
             # Jittered sleep 2-5 seconds.
-            jitter = random.uniform(max(1.0, self.interval_secs - 1.0), self.interval_secs + 2.0)
+            jitter = self.random.uniform(
+                max(1.0, self.interval_secs - 1.0), self.interval_secs + 2.0
+            )
             if self._stop.wait(jitter):
                 return
 
@@ -1590,11 +2202,11 @@ class HotChurnRunner:
         root = self.roots[(batch - 1) % len(self.roots)]
         churn_dir = root / f"fd-rdd-m2-hot-churn-{self._run_id}-{batch:05d}"
         churn_dir.mkdir(parents=True, exist_ok=True)
-        n_files = random.randint(10, 50)
+        n_files = self.random.randint(10, 50)
         created: list[Path] = []
         churn_started = time.monotonic()
         for i in range(n_files):
-            kind = random.choice(["ide_save", "git_op", "build_artifact"])
+            kind = self.random.choice(["ide_save", "git_op", "build_artifact"])
             path = churn_dir / f"{kind}_{i:03d}.txt"
             marker = f"fd_rdd_m2_hot_churn_{batch}_{i:03d}"
             path.write_text(f"{utc_now()} {marker}\n", encoding="utf-8")
@@ -1744,12 +2356,34 @@ def write_config(args: argparse.Namespace, config_home: Path) -> Path:
     return cfg_path
 
 
-def build_if_needed(repo: Path, binary: Path, build: str) -> None:
-    if build == "never":
-        return
-    if build == "auto" and binary.exists():
-        return
-    subprocess.run(["cargo", "build", "--release"], cwd=repo, check=True)
+def build_if_needed(
+    repo: Path,
+    binary: Path,
+    build: str,
+    source_git_sha: str,
+) -> dict[str, Any]:
+    cargo_lock = repo / "Cargo.lock"
+    provenance: dict[str, Any] = {
+        "verified": False,
+        "build_mode": build,
+        "built_this_run": False,
+        "source_git_sha": source_git_sha,
+        "cargo_lock_sha256": sha256_file(cargo_lock),
+        "cargo_args": ["cargo", "build", "--release", "--locked"],
+    }
+    if build == "never" or (build == "auto" and binary.exists()):
+        return provenance
+    subprocess.run(provenance["cargo_args"], cwd=repo, check=True)
+    post_build_sha = git_head_sha(repo)
+    provenance["built_this_run"] = True
+    provenance["post_build_git_sha"] = post_build_sha
+    provenance["verified"] = bool(
+        source_git_sha
+        and post_build_sha == source_git_sha
+        and binary.exists()
+        and provenance["cargo_lock_sha256"]
+    )
+    return provenance
 
 
 def collect_endpoint_samples(base_url: str, out: Path, started_at: float) -> None:
@@ -1786,6 +2420,8 @@ def classify_memory_phase(data: dict[str, Any]) -> str:
     base = data.get("base") if isinstance(data.get("base"), dict) else {}
     if bool(rebuild.get("in_progress")):
         return "rebuild"
+    if str(rebuild.get("owned_snapshot_state", "none")) in {"pending", "writing"}:
+        return "initial_build_publish"
     if int(base.get("hot_memory_entries", 0) or 0) > 0:
         return "hot_base_snapshot"
     if (
@@ -1799,6 +2435,7 @@ def classify_memory_phase(data: dict[str, Any]) -> str:
 def build_memory_timeline(
     endpoint_samples: list[dict[str, Any]],
     process_samples: list[dict[str, Any]],
+    shutdown_signal_elapsed_secs: float | None = None,
 ) -> dict[str, Any]:
     """Summarize lifecycle RSS peaks and the requested L2 component time series."""
     memory_points: list[dict[str, Any]] = []
@@ -1812,10 +2449,14 @@ def build_memory_timeline(
             continue
         base = data.get("base") if isinstance(data.get("base"), dict) else {}
         l2 = data.get("l2") if isinstance(data.get("l2"), dict) else {}
+        rebuild = data.get("rebuild") if isinstance(data.get("rebuild"), dict) else {}
         memory_points.append(
             {
                 "elapsed_secs": float(item.get("elapsed_secs", 0.0) or 0.0),
                 "phase": classify_memory_phase(data),
+                "owned_snapshot_state": str(
+                    rebuild.get("owned_snapshot_state", "none")
+                ),
                 "endpoint_rss_bytes": int(data.get("process_rss_bytes", 0) or 0),
                 "base_hot_memory_entries": int(base.get("hot_memory_entries", 0) or 0),
                 "base_manifest_only_entries": int(
@@ -1837,8 +2478,12 @@ def build_memory_timeline(
             point["phase"] = "initial_build_publish"
 
     elapsed_points = [float(point["elapsed_secs"]) for point in memory_points]
-
     def nearest_phase(elapsed_secs: float) -> str:
+        if (
+            shutdown_signal_elapsed_secs is not None
+            and elapsed_secs >= shutdown_signal_elapsed_secs
+        ):
+            return "final_snapshot_window"
         if not memory_points:
             return "unclassified"
         idx = bisect.bisect_left(elapsed_points, elapsed_secs)
@@ -1866,6 +2511,7 @@ def build_memory_timeline(
         "initial_build_publish",
         "cold_steady",
         "hot_base_snapshot",
+        "final_snapshot_window",
     ):
         endpoint_rows = [point for point in memory_points if point["phase"] == phase]
         process_rows = process_by_phase.get(phase, [])
@@ -1934,6 +2580,26 @@ def build_memory_timeline(
 
     return {
         "phase_peaks": phase_peaks,
+        "limitations": {
+            "final_snapshot_window_bounded": shutdown_signal_elapsed_secs is not None,
+            "periodic_snapshot_lifecycle_available": False,
+            "periodic_snapshot_phase_attribution": (
+                "unavailable_without_daemon_snapshot_lifecycle_telemetry"
+            ),
+            "owned_snapshot_l2_semantics": (
+                "pending/writing L2 components preserve the captured generation "
+                "high-water mark; after ownership consumption they are conservative, "
+                "not the writer's real-time external-sort working set"
+            ),
+            "formal_ab_fixture_reset": (
+                "restore the same pristine read-only VM/disk snapshot before each leg; "
+                "a verified manifest does not prove the current tree or page-cache state"
+            ),
+            "formal_ab_sweep_reuse": (
+                "sequential sweep variants are exploratory only and must not replace "
+                "per-leg VM snapshot restoration for formal memory A/B"
+            ),
+        },
         "l2": {
             "sample_count": len(memory_points),
             "components": component_summaries,
@@ -1943,6 +2609,15 @@ def build_memory_timeline(
 
 
 def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any]:
+    manifest: dict[str, Any] = {}
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_manifest, dict):
+                manifest = loaded_manifest
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
     process_samples = read_jsonl(run_dir / "process-samples.jsonl")
     endpoint_samples = read_jsonl(run_dir / "endpoint-samples.jsonl")
     canary_samples = read_jsonl(run_dir / "canary-samples.jsonl")
@@ -2253,32 +2928,49 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
     index_total_dirs = 0
     if status_samples:
         last_status = status_samples[-1]
-        index_total_files = int(last_status.get("total_files", 0) or last_status.get("indexed_files", 0) or 0)
+        index_total_files = int(
+            last_status.get("indexed_count", 0)
+            or last_status.get("total_files", 0)
+            or last_status.get("indexed_files", 0)
+            or 0
+        )
         index_total_dirs = int(last_status.get("total_dirs", 0) or last_status.get("indexed_dirs", 0) or 0)
-    # cold_dir_count / hot_dir_count from the last /watch-state sample's dirs list.
+    # Current /watch-state reports aggregate l0_dirs/l1_dirs/l2_dirs/l3_dirs.
+    # Older debug dumps with a dirs array remain supported by the helper.
     cold_dir_count = 0
     hot_dir_count = 0
     if watch_samples:
-        last_watch = watch_samples[-1]
-        dirs = last_watch.get("dirs")
-        if isinstance(dirs, list):
-            for d in dirs:
-                if not isinstance(d, dict):
-                    continue
-                tier = str(d.get("watch_tier", "")).upper()
-                if tier in ("L2", "L3"):
-                    cold_dir_count += 1
-                elif tier in ("L0", "L1"):
-                    hot_dir_count += 1
+        last_tiers = compute_tier_distribution(watch_samples[-1])
+        cold_dir_count = last_tiers["L2"] + last_tiers["L3"]
+        hot_dir_count = last_tiers["L0"] + last_tiers["L1"]
     # rotation_cycle_estimate_secs = (cold_dir_count / max_dirs_per_tick) * tick_secs.
     # Uses the last watch-state sample's rotating params when available; falls
     # back to 0 when the rotating window is disabled or no data.
     rotation_cycle_estimate_secs = 0.0
     if watch_samples and cold_dir_count > 0:
         last_watch = watch_samples[-1]
-        max_dirs_per_tick = int(last_watch.get("rotating_cold_window_max_dirs_per_tick", 0) or 0)
-        tick_secs = float(last_watch.get("rotating_cold_window_tick_secs", 0) or 0)
-        if max_dirs_per_tick > 0 and tick_secs > 0:
+        runner_args = (
+            manifest.get("runner_args")
+            if isinstance(manifest.get("runner_args"), dict)
+            else {}
+        )
+        rotating_enabled = bool(
+            last_watch.get(
+                "rotating_cold_window_enabled",
+                runner_args.get("rotating_cold_window", False),
+            )
+        )
+        max_dirs_per_tick = int(
+            last_watch.get("rotating_cold_window_max_dirs_per_tick", 0)
+            or runner_args.get("rotating_max_dirs_per_tick", 0)
+            or 0
+        )
+        tick_secs = float(
+            last_watch.get("rotating_cold_window_tick_secs", 0)
+            or runner_args.get("rotating_tick_secs", 0)
+            or 0
+        )
+        if rotating_enabled and max_dirs_per_tick > 0 and tick_secs > 0:
             rotation_cycle_estimate_secs = (cold_dir_count / max_dirs_per_tick) * tick_secs
     # memory_per_file_bytes = RSS max / total files (efficiency metric).
     rss_max_bytes = max(rss) if rss else 0
@@ -2312,12 +3004,60 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             break
 
     event_first_query_summary = summarize_event_rows(event_first_queries)
-    memory_timeline = build_memory_timeline(endpoint_samples, process_samples)
+    raw_shutdown_elapsed = manifest.get("shutdown_signal_elapsed_secs")
+    shutdown_signal_elapsed_secs = (
+        float(raw_shutdown_elapsed) if raw_shutdown_elapsed is not None else None
+    )
+    memory_timeline = build_memory_timeline(
+        endpoint_samples,
+        process_samples,
+        shutdown_signal_elapsed_secs=shutdown_signal_elapsed_secs,
+    )
 
     summary = {
         "label": label,
         "generated_at": utc_now(),
         "fd_rdd_exit_code": exit_code,
+        "ab_comparable": bool(manifest.get("ab_comparable")),
+        "ab_comparability_reasons": list(
+            manifest.get("ab_comparability_reasons", []) or []
+        ),
+        "run_audit": {
+            "git_sha": str(manifest.get("git_sha", "")),
+            "git_dirty": manifest.get("git_dirty"),
+            "binary_sha256": str(manifest.get("binary_sha256", "")),
+            "artifact_provenance": manifest.get("artifact_provenance", {}),
+            "run_state": str(manifest.get("run_state", "")),
+            "completion_reason": str(manifest.get("completion_reason", "")),
+            "ab_parameter_fingerprint": str(
+                manifest.get("ab_parameter_fingerprint", "")
+            ),
+            "initial_state_fingerprint": str(
+                manifest.get("initial_state_fingerprint", "")
+            ),
+            "execution_fingerprint": str(
+                manifest.get("execution_fingerprint", "")
+            ),
+            "ab_comparable": bool(manifest.get("ab_comparable")),
+            "ab_comparability_reasons": list(
+                manifest.get("ab_comparability_reasons", []) or []
+            ),
+            "fixture_initial_file_count": manifest.get("fixture_initial_file_count"),
+            "fixture_initial_file_count_source": str(
+                manifest.get("fixture_initial_file_count_source", "unverified")
+            ),
+            "fixture_initial_file_count_verified": bool(
+                (manifest.get("fixture") or {}).get("count_verified", False)
+                if isinstance(manifest.get("fixture"), dict)
+                else False
+            ),
+            "requested_duration_secs": int(
+                manifest.get("duration_secs", 0) or 0
+            ),
+            "actual_duration_secs": float(
+                manifest.get("actual_duration_secs", 0.0) or 0.0
+            ),
+        },
         "sample_counts": {
             "process": len(process_samples),
             "endpoint": len(endpoint_samples),
@@ -2490,6 +3230,7 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
     memory_timeline = summary["memory_timeline"]
     memory_report = {
         "phase_peaks": memory_timeline["phase_peaks"],
+        "limitations": memory_timeline["limitations"],
         "l2": {
             "sample_count": memory_timeline["l2"]["sample_count"],
             "components": memory_timeline["l2"]["components"],
@@ -2503,6 +3244,17 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 - Generated: `{summary["generated_at"]}`
 - fd-rdd exit code: `{summary["fd_rdd_exit_code"]}`
 - Fatal error: `{summary.get("fatal_error", "")}`
+- Run state/reason: `{summary["run_audit"]["run_state"]}` / `{summary["run_audit"]["completion_reason"]}`
+- Git SHA: `{summary["run_audit"]["git_sha"]}`
+- Git dirty: `{summary["run_audit"]["git_dirty"]}`
+- Binary SHA256: `{summary["run_audit"]["binary_sha256"]}`
+- Artifact provenance: `{summary["run_audit"]["artifact_provenance"]}`
+- A/B parameter fingerprint: `{summary["run_audit"]["ab_parameter_fingerprint"]}`
+- Initial-state fingerprint: `{summary["run_audit"]["initial_state_fingerprint"]}`
+- Execution fingerprint: `{summary["run_audit"]["execution_fingerprint"]}`
+- A/B comparable: `{summary["run_audit"]["ab_comparable"]}` — `{summary["run_audit"]["ab_comparability_reasons"]}`
+- Fixture initial file count/source/verified: `{summary["run_audit"]["fixture_initial_file_count"]}` / `{summary["run_audit"]["fixture_initial_file_count_source"]}` / `{summary["run_audit"]["fixture_initial_file_count_verified"]}`
+- Requested/actual duration seconds: `{summary["run_audit"]["requested_duration_secs"]}` / `{summary["run_audit"]["actual_duration_secs"]}`
 - Built-in metrics: `{summary["built_in_metrics_dir"]}`
 
 ## Key single-run metrics
@@ -2517,6 +3269,7 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | initial build publish RSS max | {summary["memory_timeline"]["phase_peaks"]["initial_build_publish"]["process_rss_bytes_max"]} |
 | cold steady RSS max | {summary["memory_timeline"]["phase_peaks"]["cold_steady"]["process_rss_bytes_max"]} |
 | hot-base snapshot RSS max | {summary["memory_timeline"]["phase_peaks"]["hot_base_snapshot"]["process_rss_bytes_max"]} |
+| final snapshot window RSS max | {summary["memory_timeline"]["phase_peaks"]["final_snapshot_window"]["process_rss_bytes_max"]} |
 | fd count max | {summary["process"]["fd_count_max"]} |
 | dirty queue max | {summary["watch_state"]["dirty_queue_len_max"]} |
 | fast scan lag p99 max ms | {summary["watch_state"]["fast_scan_coverage_lag_p99_ms_max"]} |
@@ -2560,9 +3313,20 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 ## Memory lifecycle and L2 timeline
 
 `rebuild` covers samples where `/memory.rebuild.in_progress` is true.
-`initial_build_publish` covers the first complete hot-base publication before the
-first mmap/manifest cold remount. `cold_steady` covers cold-base samples with no
-hot entries. `hot_base_snapshot` covers later periodic full-base materialization.
+`initial_build_publish` covers either the legacy first hot-base publication or
+the owned rebuild generation while it is pending/writing its first cold remount.
+`cold_steady` covers cold-base samples with no hot entries. `hot_base_snapshot`
+covers later full-base materialization only when that state is visible through
+`/memory`. `final_snapshot_window` begins at the
+runner's exact SIGTERM boundary. Periodic direct-streaming snapshot intervals
+cannot be distinguished until daemon lifecycle telemetry is available; affected
+peaks may remain under `cold_steady`, as recorded in the limitations field.
+
+Formal memory A/B legs must each start by restoring the same pristine read-only
+VM/disk snapshot. A completed verified fixture manifest proves generation-time
+completeness only; it does not prove the current tree or page-cache state.
+Sequential `--sweep-config` variants therefore remain exploratory and are not a
+substitute for per-leg VM snapshot restoration.
 
 ```json
 {json.dumps(memory_report, ensure_ascii=False, indent=2)}
@@ -2866,6 +3630,12 @@ def parse_args() -> argparse.Namespace:
              "jittered 2-5s).",
     )
     parser.add_argument(
+        "--workload-seed",
+        type=int,
+        default=42,
+        help="deterministic seed for mixed-workload file counts, kinds, and jitter",
+    )
+    parser.add_argument(
         "--canary-in-fixture",
         action="store_true",
         help="place canary files inside the realistic fixture's cold/hot "
@@ -2889,32 +3659,169 @@ def parse_args() -> argparse.Namespace:
              "mmap'd snapshot pages on tmpfs count toward RSS.",
     )
     parser.add_argument("--startup-timeout-secs", type=float, default=60.0)
+    parser.add_argument(
+        "--shutdown-timeout-secs",
+        type=float,
+        default=300.0,
+        help="maximum seconds to wait for the final snapshot after SIGTERM",
+    )
     return parser.parse_args()
 
 
+def _update_manifest(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    **updates: Any,
+) -> None:
+    manifest.update(updates)
+    atomic_write_json(manifest_path, manifest)
+
+
+def _start_daemon_process(
+    cmd: list[str],
+    *,
+    run_dir: Path,
+    env: dict[str, str],
+    process_sample_interval_secs: float,
+) -> tuple[subprocess.Popen[bytes], Any, ProcessSampleRunner, float]:
+    """Start daemon and sampler, cleaning partial resources if startup fails."""
+    log_file = (run_dir / "fd-rdd.log").open("wb")
+    proc: subprocess.Popen[bytes] | None = None
+    samples: ProcessSampleRunner | None = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=run_dir,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        started_at = time.monotonic()
+        samples = ProcessSampleRunner(
+            proc.pid,
+            run_dir / "process-samples.jsonl",
+            started_at,
+            process_sample_interval_secs,
+            process_running=lambda: proc.poll() is None,
+        )
+        samples.start()
+        return proc, log_file, samples, started_at
+    except BaseException:
+        if samples is not None:
+            samples.stop()
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:  # noqa: BLE001 - startup failure must still clean up
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+        log_file.close()
+        raise
+
+
 def run_single(args: argparse.Namespace) -> dict[str, Any]:
-    """Run a single benchmark and return its summary dict."""
+    """Run one benchmark with an atomic, fail-closed lifecycle manifest."""
     repo = Path(args.repo).resolve()
+    run_dir = (
+        Path(args.run_dir)
+        if args.run_dir
+        else repo
+        / "reports"
+        / "m2-cold-window-vm"
+        / f"{utc_stamp()}_{args.run_label}"
+    ).resolve()
+    args.run_dir = str(run_dir)
+    run_dir_preexisting = run_dir.exists()
+    checkout_git_sha = git_head_sha(repo)
+    checkout_git_dirty = git_worktree_dirty(repo)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / "manifest.json"
+    attempt_started_at = time.monotonic()
+    manifest: dict[str, Any] = {
+        "label": args.run_label,
+        "created_at": utc_now(),
+        "repo": str(repo),
+        "git_sha": checkout_git_sha,
+        "git_dirty": checkout_git_dirty,
+        "run_dir": str(run_dir),
+        "run_dir_preexisting": run_dir_preexisting,
+        "runner_args": manifest_runner_args(args),
+        "run_state": "preparing",
+        "failure_stage": "preflight",
+        "completion_reason": "",
+        "ab_comparable": False,
+        "ab_comparability_reasons": ["run_not_completed"],
+    }
+    atomic_write_json(manifest_path, manifest)
+    try:
+        return _run_single_prepared(
+            args,
+            repo=repo,
+            run_dir=run_dir,
+            manifest_path=manifest_path,
+            manifest=manifest,
+        )
+    except BaseException as exc:
+        stage = str(manifest.get("failure_stage", "preflight"))
+        startup_stages = {
+            "preflight",
+            "build",
+            "fixture_validation",
+            "configuring",
+            "starting_daemon",
+        }
+        failure_reasons = list(manifest.get("ab_comparability_reasons", []) or [])
+        if "run_failed_before_completion" not in failure_reasons:
+            failure_reasons.append("run_failed_before_completion")
+        _update_manifest(
+            manifest_path,
+            manifest,
+            run_state="failed",
+            failure_stage=stage,
+            completion_reason=(
+                "startup_failed" if stage in startup_stages else "runner_exception"
+            ),
+            fatal_error=repr(exc),
+            finished_at=utc_now(),
+            attempt_duration_secs=round(time.monotonic() - attempt_started_at, 3),
+            ab_comparable=False,
+            ab_comparability_reasons=failure_reasons,
+        )
+        raise
+
+
+def _run_single_prepared(
+    args: argparse.Namespace,
+    *,
+    repo: Path,
+    run_dir: Path,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    _update_manifest(manifest_path, manifest, failure_stage="build")
     binary = Path(args.binary)
     if not binary.is_absolute():
         binary = repo / binary
-    build_if_needed(repo, binary, args.build)
+    artifact_provenance = build_if_needed(
+        repo,
+        binary,
+        args.build,
+        str(manifest.get("git_sha", "")),
+    )
     if not binary.exists():
         raise SystemExit(f"binary not found: {binary}")
     if not port_is_free(args.port):
         raise SystemExit(f"127.0.0.1:{args.port} is already in use")
 
-    # Task 1: realistic-mode fixture validation. When --realistic-mode is set we
-    # verify the hot/warm/cold fixture roots exist before starting fd-rdd so the
-    # user gets a helpful error instead of a confusing empty-index run.
+    _update_manifest(manifest_path, manifest, failure_stage="fixture_validation")
     hot_roots = resolve_root_paths(args.hot_roots)
-    warm_roots = resolve_root_paths(args.warm_roots)
     cold_roots = resolve_root_paths(args.cold_roots)
     if args.realistic_mode:
         validate_realistic_fixture(args)
-    # Task 6: fixture-aware canary. Override the separate canary roots with
-    # subdirectories inside the realistic fixture's cold (passive) and hot
-    # (active) directories.
     if args.canary_in_fixture:
         passive_dir, active_dir = pick_fixture_canary_dirs(cold_roots, hot_roots)
         if passive_dir is not None:
@@ -2922,22 +3829,25 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
         if active_dir is not None:
             args.canary_root = str(active_dir)
 
-    run_dir = Path(args.run_dir) if args.run_dir else repo / "reports" / "m2-cold-window-vm" / f"{utc_stamp()}_{args.run_label}"
-    run_dir = run_dir.resolve()
-    run_dir.mkdir(parents=True, exist_ok=True)
+    fixture_roots = [Path(root).expanduser().resolve() for root in args.root]
+    fixture_identity = load_fixture_identity(fixture_roots)
+    print(
+        "Fixture declared file count: "
+        f"{fixture_identity.get('file_count')} "
+        f"(source: {fixture_identity.get('count_source')})",
+        flush=True,
+    )
+
+    _update_manifest(manifest_path, manifest, failure_stage="configuring")
     config_home = run_dir / "config-home"
     runtime_dir = run_dir / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = write_config(args, config_home)
-
     env = os.environ.copy()
     env["XDG_CONFIG_HOME"] = str(config_home)
     env["XDG_RUNTIME_DIR"] = str(runtime_dir)
     env.setdefault("RUST_LOG", "info")
     base_url = f"http://127.0.0.1:{args.port}"
-    # Task 5: when --snapshot-path-disk is set, put the snapshot on a known disk
-    # path instead of the run directory (which may be on tmpfs if /tmp is tmpfs).
-    # mmap'd snapshot pages on tmpfs count toward RSS, skewing memory benchmarks.
     if args.snapshot_path_disk:
         home = Path(os.environ.get("HOME", str(Path.home())))
         snapshot_dir = home / ".fd-rdd-bench-snapshots" / safe_name(args.run_label)
@@ -2966,70 +3876,125 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
     for root in args.root:
         cmd.extend(["--root", str(Path(root).expanduser().resolve())])
 
-    manifest = {
-        "label": args.run_label,
-        "created_at": utc_now(),
-        "repo": str(repo),
-        "binary": str(binary),
-        "run_dir": str(run_dir),
-        "config": str(cfg_path),
-        "base_url": base_url,
-        "uds_socket": str(uds_socket),
-        "command": cmd,
-        "roots": [str(Path(root).expanduser().resolve()) for root in args.root],
-        "rotating_cold_window": args.rotating_cold_window,
-        "active_canary_root": str(Path(args.canary_root).expanduser().resolve()) if args.canary_root else "",
-        "passive_canary_root": (
+    effective_runner_args = manifest_runner_args(args)
+    parameter_inputs = ab_parameter_fingerprint_inputs(effective_runner_args)
+    git_sha = str(manifest.get("git_sha", ""))
+    initial_state = build_initial_state(
+        snapshot_path,
+        fixture_identity,
+        rust_log=str(env["RUST_LOG"]),
+        binary=binary,
+        git_sha=git_sha,
+        git_dirty=manifest.get("git_dirty"),
+        artifact_provenance=artifact_provenance,
+        run_dir_preexisting=bool(manifest.get("run_dir_preexisting")),
+    )
+    initially_comparable, initial_reasons = evaluate_ab_comparability(initial_state)
+    _update_manifest(
+        manifest_path,
+        manifest,
+        run_state="starting",
+        failure_stage="starting_daemon",
+        git_sha=git_sha,
+        git_dirty=initial_state["git_dirty"],
+        binary=str(binary),
+        binary_sha256=initial_state["binary_sha256"],
+        artifact_provenance=artifact_provenance,
+        config=str(cfg_path),
+        base_url=base_url,
+        uds_socket=str(uds_socket),
+        command=cmd,
+        roots=[str(root) for root in fixture_roots],
+        runner_args=effective_runner_args,
+        duration_secs=args.duration_secs,
+        sample_interval_secs=args.sample_interval_secs,
+        process_sample_interval_secs=args.process_sample_interval_secs,
+        event_storm_ops=args.event_storm_ops,
+        mixed_workload=args.mixed_workload,
+        workload_seed=args.workload_seed,
+        fixture=fixture_identity,
+        fixture_initial_file_count=fixture_identity.get("file_count"),
+        fixture_initial_file_count_source=fixture_identity.get("count_source"),
+        fixture_initial_file_count_errors=fixture_identity.get("errors", []),
+        initial_state=initial_state,
+        initial_state_fingerprint_schema=INITIAL_STATE_FINGERPRINT_SCHEMA,
+        initial_state_fingerprint=initial_state_fingerprint(initial_state),
+        ab_parameter_fingerprint_schema=AB_PARAMETER_FINGERPRINT_SCHEMA,
+        ab_parameter_fingerprint=ab_parameter_fingerprint(effective_runner_args),
+        ab_parameter_fingerprint_inputs=parameter_inputs,
+        ab_comparable=initially_comparable,
+        ab_comparability_reasons=initial_reasons,
+        rotating_cold_window=args.rotating_cold_window,
+        active_canary_root=(
+            str(Path(args.canary_root).expanduser().resolve())
+            if args.canary_root
+            else ""
+        ),
+        passive_canary_root=(
             str(Path(args.passive_canary_root).expanduser().resolve())
             if args.passive_canary_root
             else ""
         ),
-        "passive_canary_settle_secs": args.passive_canary_settle_secs,
-        "event_storm": args.event_storm,
-        "event_storm_roots": [
+        passive_canary_settle_secs=args.passive_canary_settle_secs,
+        event_storm=args.event_storm,
+        event_storm_roots=[
             str(Path(root).expanduser().resolve())
             for root in (args.event_storm_root or args.root)
         ],
-        "event_storm_kind": normalize_event_storm_kinds(split_csv(args.event_storm_kind)),
-        "event_storm_target_tier": split_csv(args.event_storm_target_tier),
-        "event_storm_time_skew_secs": args.event_storm_time_skew_secs,
-        "event_storm_file_count": args.event_storm_file_count,
-        "event_storm_depth": args.event_storm_depth,
-        "event_storm_inode_stress_iterations": args.event_storm_inode_stress_iterations,
-        "event_storm_inode_stress_tmpfs_inodes": args.event_storm_inode_stress_tmpfs_inodes,
-        "snapshot_path_disk": args.snapshot_path_disk,
-        "snapshot_path": str(snapshot_path),
-        "process_sample_interval_secs": args.process_sample_interval_secs,
-    }
-    (run_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        event_storm_kind=normalize_event_storm_kinds(
+            split_csv(args.event_storm_kind)
+        ),
+        event_storm_target_tier=split_csv(args.event_storm_target_tier),
+        event_storm_time_skew_secs=args.event_storm_time_skew_secs,
+        event_storm_file_count=args.event_storm_file_count,
+        event_storm_depth=args.event_storm_depth,
+        event_storm_inode_stress_iterations=args.event_storm_inode_stress_iterations,
+        event_storm_inode_stress_tmpfs_inodes=(
+            args.event_storm_inode_stress_tmpfs_inodes
+        ),
+        snapshot_path_disk=args.snapshot_path_disk,
+        snapshot_path=str(snapshot_path),
+        snapshot_initial_state=initial_state["snapshot"],
+        rust_log=str(env["RUST_LOG"]),
+        shutdown_signal_elapsed_secs=None,
     )
 
-    log_file = (run_dir / "fd-rdd.log").open("wb")
-    proc = subprocess.Popen(cmd, cwd=run_dir, env=env, stdout=log_file, stderr=subprocess.STDOUT)
-    started_at = time.monotonic()
-    process_samples = ProcessSampleRunner(
-        proc.pid,
-        run_dir / "process-samples.jsonl",
-        started_at,
-        args.process_sample_interval_secs,
+    proc, log_file, process_samples, started_at = _start_daemon_process(
+        cmd,
+        run_dir=run_dir,
+        env=env,
+        process_sample_interval_secs=args.process_sample_interval_secs,
     )
-    process_samples.start()
     exit_code: int | None = None
     fatal_error = ""
+    completion_reason = "runtime_error"
+    cleanup_errors: list[str] = []
+    shutdown_signal_elapsed_secs: float | None = None
     hot_churn: HotChurnRunner | None = None
-
     try:
+        _update_manifest(
+            manifest_path,
+            manifest,
+            run_state="running",
+            failure_stage="runtime",
+            daemon_pid=proc.pid,
+            daemon_started_at=utc_now(),
+        )
         wait_for_http(base_url, args.startup_timeout_secs)
         json_line(
             run_dir / "events.jsonl",
             {"ts": utc_now(), "event": "http_ready", "pid": proc.pid},
         )
-
         next_endpoint_sample = time.monotonic()
         next_canary = time.monotonic() + args.canary_interval_secs
-        deadline = None if args.duration_secs == 0 else time.monotonic() + args.duration_secs
-        canary_root = Path(args.canary_root).expanduser().resolve() if args.canary_root else None
+        deadline = (
+            None if args.duration_secs == 0 else time.monotonic() + args.duration_secs
+        )
+        canary_root = (
+            Path(args.canary_root).expanduser().resolve()
+            if args.canary_root
+            else None
+        )
         passive_canary = (
             PassiveCanaryRunner(
                 base_url=base_url,
@@ -3072,8 +4037,6 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
             if args.event_storm
             else None
         )
-        # Task 3: mixed-workload hot churn runs in a background thread,
-        # creating real L0 pressure while cold rotation works.
         hot_churn = (
             HotChurnRunner(
                 base_url=base_url,
@@ -3081,36 +4044,42 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
                 out_path=run_dir / "hot-churn-samples.jsonl",
                 started_at=started_at,
                 interval_secs=args.mixed_workload_interval_secs,
+                workload_seed=args.workload_seed,
             )
             if args.mixed_workload and hot_roots
             else None
         )
         if hot_churn is not None:
             hot_churn.start()
-
-        # Task 1: settle phase progress. If the event storm has a start delay,
-        # inform the user that we're waiting for tier demotion before events begin.
         if event_storm is not None and args.event_storm_start_delay_secs > 0:
             print(
                 f"Settle phase: waiting {args.event_storm_start_delay_secs:.0f} seconds "
-                f"for tier demotion before event storm starts...",
+                "for tier demotion before event storm starts...",
                 flush=True,
             )
 
         while True:
             if proc.poll() is not None:
                 exit_code = proc.returncode
+                completion_reason = "daemon_exit"
                 break
             now = time.monotonic()
             if deadline is not None and now >= deadline:
+                completion_reason = "duration_elapsed"
                 break
             if now >= next_endpoint_sample:
-                collect_endpoint_samples(base_url, run_dir / "endpoint-samples.jsonl", started_at)
+                collect_endpoint_samples(
+                    base_url, run_dir / "endpoint-samples.jsonl", started_at
+                )
                 next_endpoint_sample = time.monotonic() + args.sample_interval_secs
             if canary_root and now >= next_canary:
-                for record in run_canary_cycle(base_url, canary_root, args.canary_timeout_secs):
+                for record in run_canary_cycle(
+                    base_url, canary_root, args.canary_timeout_secs
+                ):
                     record["ts"] = utc_now()
-                    record["elapsed_secs"] = round(time.monotonic() - started_at, 3)
+                    record["elapsed_secs"] = round(
+                        time.monotonic() - started_at, 3
+                    )
                     json_line(run_dir / "canary-samples.jsonl", record)
                 next_canary = time.monotonic() + args.canary_interval_secs
             if passive_canary:
@@ -3119,47 +4088,171 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
                 event_storm.tick(now)
             time.sleep(0.2)
     except KeyboardInterrupt:
+        completion_reason = "interrupted"
         json_line(run_dir / "events.jsonl", {"ts": utc_now(), "event": "interrupted"})
-    except Exception as exc:  # noqa: BLE001 - keep partial evidence on startup/runtime failure
+    except Exception as exc:  # noqa: BLE001 - preserve partial benchmark evidence
+        completion_reason = "runtime_error"
         fatal_error = repr(exc)
         json_line(
             run_dir / "events.jsonl",
             {"ts": utc_now(), "event": "fatal_error", "error": fatal_error},
         )
     finally:
-        if hot_churn is not None:
-            hot_churn.stop()
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGTERM)
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
-        process_samples.stop()
-        if process_samples.error:
-            json_line(
-                run_dir / "events.jsonl",
-                {
-                    "ts": utc_now(),
-                    "event": "process_sampler_error",
-                    "error": process_samples.error,
-                },
+        try:
+            _update_manifest(
+                manifest_path,
+                manifest,
+                run_state="stopping",
+                failure_stage="cleanup",
+                completion_reason=completion_reason,
             )
+        except Exception as exc:  # noqa: BLE001 - cleanup must still stop daemon
+            cleanup_errors.append(f"stopping_manifest: {exc!r}")
+        if hot_churn is not None:
+            try:
+                hot_churn.stop()
+            except Exception as exc:  # noqa: BLE001 - continue daemon cleanup
+                cleanup_errors.append(f"hot_churn_stop: {exc!r}")
+        if proc.poll() is None:
+            signal_elapsed = round(time.monotonic() - started_at, 6)
+            try:
+                proc.send_signal(signal.SIGTERM)
+            except Exception as exc:  # noqa: BLE001 - continue sampler/log cleanup
+                cleanup_errors.append(f"daemon_signal: {exc!r}")
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=10)
+                    except Exception as kill_exc:  # noqa: BLE001
+                        cleanup_errors.append(f"daemon_signal_kill: {kill_exc!r}")
+            else:
+                shutdown_signal_elapsed_secs = signal_elapsed
+                try:
+                    _update_manifest(
+                        manifest_path,
+                        manifest,
+                        shutdown_signal_elapsed_secs=shutdown_signal_elapsed_secs,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    cleanup_errors.append(f"shutdown_manifest: {exc!r}")
+                try:
+                    json_line(
+                        run_dir / "events.jsonl",
+                        {
+                            "ts": utc_now(),
+                            "event": "shutdown_signal",
+                            "signal": "SIGTERM",
+                            "elapsed_secs": shutdown_signal_elapsed_secs,
+                        },
+                    )
+                except OSError as exc:
+                    cleanup_errors.append(f"shutdown_event: {exc!r}")
+                try:
+                    proc.wait(timeout=max(1.0, args.shutdown_timeout_secs))
+                except subprocess.TimeoutExpired:
+                    cleanup_errors.append("daemon_shutdown_timeout")
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=10)
+                    except Exception as exc:  # noqa: BLE001
+                        cleanup_errors.append(f"daemon_kill: {exc!r}")
+                except Exception as exc:  # noqa: BLE001
+                    cleanup_errors.append(f"daemon_wait: {exc!r}")
+        try:
+            process_samples.stop()
+        except Exception as exc:  # noqa: BLE001
+            cleanup_errors.append(f"process_sampler_stop: {exc!r}")
+        if process_samples.error:
+            try:
+                json_line(
+                    run_dir / "events.jsonl",
+                    {
+                        "ts": utc_now(),
+                        "event": "process_sampler_error",
+                        "error": process_samples.error,
+                    },
+                )
+            except OSError as exc:
+                cleanup_errors.append(f"sampler_error_record: {exc!r}")
             if not fatal_error:
                 fatal_error = f"process sampler failed: {process_samples.error}"
-        exit_code = proc.returncode if exit_code is None else exit_code
-        log_file.close()
-        cleanup_uds_socket(uds_socket)
+        if exit_code is None:
+            exit_code = proc.poll()
+        try:
+            log_file.close()
+        except OSError as exc:
+            cleanup_errors.append(f"log_close: {exc!r}")
+        try:
+            cleanup_uds_socket(uds_socket)
+        except OSError as exc:
+            cleanup_errors.append(f"uds_cleanup: {exc!r}")
 
-    summary = summarize(run_dir, args.run_label, exit_code)
-    if fatal_error:
-        summary["fatal_error"] = fatal_error
-        (run_dir / "summary.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    actual_duration_secs = round(time.monotonic() - started_at, 3)
+    execution_state = build_execution_state(
+        run_dir,
+        requested_duration_secs=args.duration_secs,
+        actual_duration_secs=actual_duration_secs,
+        exit_code=exit_code,
+        fatal_error=fatal_error,
+        process_sampler_error=process_samples.error,
+        completion_reason=completion_reason,
+        cleanup_errors=cleanup_errors,
+        shutdown_signal_elapsed_secs=shutdown_signal_elapsed_secs,
+        event_storm_enabled=args.event_storm,
+        mixed_workload_enabled=args.mixed_workload,
+    )
+    comparable, reasons = evaluate_ab_comparability(initial_state, execution_state)
+    terminal_failed = bool(
+        fatal_error
+        or cleanup_errors
+        or exit_code not in (0, -signal.SIGTERM)
+        or completion_reason == "runtime_error"
+        or not execution_state["duration_completed"]
+    )
+    terminal_state = "failed" if terminal_failed else "completed"
+    terminal_failure_stage = (
+        "cleanup"
+        if cleanup_errors
+        else "runtime"
+        if terminal_failed
+        else ""
+    )
+    _update_manifest(
+        manifest_path,
+        manifest,
+        run_state=terminal_state,
+        failure_stage=terminal_failure_stage,
+        completion_reason=completion_reason,
+        finished_at=utc_now(),
+        actual_duration_secs=actual_duration_secs,
+        fd_rdd_exit_code=exit_code,
+        process_sampler_error=process_samples.error,
+        fatal_error=fatal_error,
+        cleanup_errors=cleanup_errors,
+        shutdown_signal_elapsed_secs=shutdown_signal_elapsed_secs,
+        execution=execution_state,
+        execution_fingerprint_schema=EXECUTION_FINGERPRINT_SCHEMA,
+        execution_fingerprint=execution_state["fingerprint"],
+        ab_comparable=comparable,
+        ab_comparability_reasons=reasons,
+    )
+
+    try:
+        summary = summarize(run_dir, args.run_label, exit_code)
+        if fatal_error:
+            summary["fatal_error"] = fatal_error
+            atomic_write_json(run_dir / "summary.json", summary)
+        write_report(run_dir, summary)
+    except BaseException:
+        _update_manifest(manifest_path, manifest, failure_stage="reporting")
+        raise
+    print(
+        json.dumps(
+            {"run_dir": str(run_dir), "summary": summary},
+            ensure_ascii=False,
+            indent=2,
         )
-    write_report(run_dir, summary)
-    print(json.dumps({"run_dir": str(run_dir), "summary": summary}, ensure_ascii=False, indent=2))
+    )
     return summary
 
 
@@ -3178,7 +4271,7 @@ def _apply_overrides(args: argparse.Namespace, overrides: dict[str, Any]) -> arg
             "rotating-max-cost-per-root", "rotating-max-dirs-per-tick",
             "rotating-cold-window", "no-rotating-cold-window",
             "duration-secs", "sample-interval-secs", "process-sample-interval-secs",
-            "snapshot-interval-secs",
+            "snapshot-interval-secs", "shutdown-timeout-secs",
             "tiered-profile", "watch-mode", "max-watch-dirs",
             "l0-max-cost-per-root", "l1-scan-interval-secs", "l2-scan-interval-secs",
             "l3-scan-interval-secs", "l1-empty-scans-to-l2", "l2-empty-scans-to-l3",
@@ -3186,7 +4279,7 @@ def _apply_overrides(args: argparse.Namespace, overrides: dict[str, Any]) -> arg
             "event-storm-depth", "event-storm-interval-secs", "event-storm-settle-secs",
             "realistic-mode", "mixed-workload", "event-storm-immediate-query",
             "canary-in-fixture", "immediate-query-settle-secs",
-            "mixed-workload-interval-secs",
+            "mixed-workload-interval-secs", "workload-seed",
             "snapshot-path-disk", "event-storm-start-delay-secs",
         ]
     }

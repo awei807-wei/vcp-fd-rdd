@@ -132,6 +132,7 @@ impl TieredIndex {
             wal: Mutex::new(None),
             event_seq: AtomicU64::new(0),
             rebuild_state: Mutex::new(RebuildState::default()),
+            snapshot_event_gate: Mutex::new(()),
             delta_buffer: Mutex::new(crate::index::delta_buffer::DeltaBuffer::with_capacity(
                 262_144,
             )),
@@ -153,6 +154,9 @@ impl TieredIndex {
             pending_flush_events: AtomicU64::new(0),
             pending_flush_bytes: AtomicU64::new(0),
             last_snapshot_time: AtomicU64::new(0),
+            rebuild_snapshot_pending: AtomicBool::new(false),
+            pending_snapshot_generation: Mutex::new(None),
+            owned_snapshot_telemetry: Mutex::new(super::OwnedSnapshotTelemetry::default()),
             roots,
             include_hidden,
             ignore_enabled,

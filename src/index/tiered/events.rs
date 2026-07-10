@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::core::{EventRecord, EventType, FileIdentifier, FileMeta};
+use crate::core::{EventRecord, EventType, FileIdentifier, FileKind, FileMeta};
 use crate::index::l2_partition::PersistentIndex;
 use crate::util::unix_secs;
 
@@ -201,6 +201,7 @@ impl TieredIndex {
         &self,
         events: &[EventRecord],
         log_to_wal: bool,
+        known_metas: Option<&[FileMeta]>,
     ) -> Option<ApplyBatchState> {
         if events.is_empty() {
             return None;
@@ -213,8 +214,25 @@ impl TieredIndex {
         // 若 rebuild 在进行：先缓冲 pending 事件；并在持锁期间捕获当前 l2 指针，
         // 避免切换窗口导致"事件已缓冲但应用到了新索引"而重复回放。
         let (l2, rebuild_in_progress) = self.capture_l2_for_apply(events);
+        let target_kinds = rebuild_in_progress.then(|| {
+            events
+                .iter()
+                .enumerate()
+                .map(|(index, event)| {
+                    known_metas
+                        .and_then(|metas| metas.get(index))
+                        .map(|meta| meta.kind)
+                        .or_else(|| resolve_event_target_kind(event))
+                })
+                .collect::<Vec<_>>()
+        });
         let mut db = self.delta_buffer.lock();
         let all_applied = db.apply_events(events);
+        if let Some(target_kinds) = target_kinds {
+            for (event, target_kind) in events.iter().zip(target_kinds) {
+                db.note_rebuild_event_target(event, target_kind);
+            }
+        }
         let overlay_paths = db.len();
         let overlay_arena_bytes = db.estimated_bytes() as u64;
         drop(db);
@@ -325,11 +343,12 @@ impl TieredIndex {
     }
 
     pub(super) fn apply_events_inner(&self, events: &[EventRecord], log_to_wal: bool) {
+        let _snapshot_boundary = self.snapshot_event_gate.lock();
         let events = self.filter_events_for_freeze(events);
         if events.is_empty() {
             return;
         }
-        let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal) else {
+        let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal, None) else {
             return;
         };
         batch.l2.apply_events(events.as_slice());
@@ -339,11 +358,12 @@ impl TieredIndex {
     }
 
     pub(super) fn apply_events_inner_drain(&self, events: &mut Vec<EventRecord>, log_to_wal: bool) {
+        let _snapshot_boundary = self.snapshot_event_gate.lock();
         self.retain_events_allowed_by_freeze(events);
         if events.is_empty() {
             return;
         }
-        let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal) else {
+        let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal, None) else {
             return;
         };
         batch.l2.apply_events(events.as_slice());
@@ -359,8 +379,11 @@ impl TieredIndex {
         metas: &mut Vec<FileMeta>,
         log_to_wal: bool,
     ) {
+        let _snapshot_boundary = self.snapshot_event_gate.lock();
         let events = self.filter_upserted_for_freeze(events, metas);
-        let Some(batch) = self.begin_apply_batch(events.as_slice(), log_to_wal) else {
+        let Some(batch) =
+            self.begin_apply_batch(events.as_slice(), log_to_wal, Some(metas.as_slice()))
+        else {
             metas.clear();
             return;
         };
@@ -374,6 +397,16 @@ impl TieredIndex {
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
         self.stats.record_events_applied(batch.event_count as u64);
     }
+}
+
+fn resolve_event_target_kind(event: &EventRecord) -> Option<FileKind> {
+    if matches!(&event.event_type, EventType::Delete) {
+        return None;
+    }
+    let path = event.best_path()?;
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| FileKind::from_metadata(&metadata))
 }
 
 fn file_identifier_estimated_bytes(id: &FileIdentifier) -> u64 {

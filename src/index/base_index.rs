@@ -223,6 +223,17 @@ impl ColdSegmentStore {
         self.segments.iter().map(|segment| &segment.manifest)
     }
 
+    fn single_current_v7_snapshot(&self) -> anyhow::Result<Arc<V7Snapshot>> {
+        let [segment] = self.segments.as_slice() else {
+            anyhow::bail!(
+                "direct_v7_unsupported: expected one cold segment, found {}",
+                self.segments.len()
+            );
+        };
+        segment.snapshot.ensure_direct_delta_compatible()?;
+        Ok(segment.snapshot.clone())
+    }
+
     fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
         let mut out = Vec::new();
         for segment in &self.segments {
@@ -418,6 +429,19 @@ impl BaseIndexData {
     pub fn file_count(&self) -> usize {
         self.resident_file_count()
             .saturating_add(self.cold_segments.manifest_only_entries())
+    }
+
+    pub(crate) fn single_current_v7_snapshot(&self) -> anyhow::Result<Arc<V7Snapshot>> {
+        if !self.path_table.is_empty()
+            || !self.entries_by_key.is_empty()
+            || !self.trigram_index.is_empty()
+            || self.parent_index.file_dir_count() != 0
+            || self.parent_index.subdir_dir_count() != 0
+            || !self.tombstones.is_empty()
+        {
+            anyhow::bail!("direct_v7_unsupported: base still contains resident index data");
+        }
+        self.cold_segments.single_current_v7_snapshot()
     }
 
     fn resident_file_count(&self) -> usize {

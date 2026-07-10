@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import shutil
@@ -32,6 +33,7 @@ KiB = 1024
 GiB = 1024 * 1024 * 1024
 
 DEFAULT_TARGET = 1_000_000
+FIXTURE_MANIFEST_VERSION = 1
 
 # 各区段的默认比例（按 1M 目标缩放，--total-files 改变时整体等比缩放）
 # 字段: (name, weight, dirs_per_million, files_per_dir, kind)
@@ -527,6 +529,68 @@ def _clean_root(test_root: Path) -> None:
         shutil.rmtree(test_root)
 
 
+def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, sort_keys=True, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    dir_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _write_completed_fixture_manifest(
+    test_root: Path,
+    *,
+    seed: int,
+    requested_total_files: int,
+    plans: list[SectionPlan],
+    results: list[GenResult],
+    generation_started_clean: bool,
+) -> bool:
+    result_by_name = {result.name: result for result in results}
+    completed = generation_started_clean and len(result_by_name) == len(plans) and all(
+        result_by_name.get(plan.name) is not None
+        and result_by_name[plan.name].files_created == plan.target_files
+        for plan in plans
+    )
+    manifest_path = test_root / ".fd-rdd-m2-fixture.json"
+    if not completed:
+        manifest_path.unlink(missing_ok=True)
+        return False
+
+    actual_file_count = sum(result.files_created for result in results)
+    actual_dir_count = sum(result.dirs_created for result in results)
+    _atomic_write_json(
+        manifest_path,
+        {
+            "schema_version": FIXTURE_MANIFEST_VERSION,
+            "layout_version": "m2-realistic-v1",
+            "completed": True,
+            "seed": seed,
+            "requested_total_files": requested_total_files,
+            "actual_file_count": actual_file_count,
+            "actual_dir_count": actual_dir_count,
+            "sections": [
+                {
+                    "name": plan.name,
+                    "target_files": plan.target_files,
+                    "files_created": result_by_name[plan.name].files_created,
+                    "dirs_created": result_by_name[plan.name].dirs_created,
+                }
+                for plan in plans
+            ],
+        },
+    )
+    return True
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
         description="生成 ~1M 文件的逼真主目录结构（fd-rdd M2 真实规模基准）"
@@ -555,10 +619,19 @@ def main(argv: list[str]) -> int:
         print("[dry-run] 不创建任何文件。")
         return 0
 
+    try:
+        generation_started_clean = not test_root.exists() or next(test_root.iterdir(), None) is None
+    except OSError:
+        generation_started_clean = False
     if args.clean:
         _clean_root(test_root)
+        generation_started_clean = True
 
     test_root.mkdir(parents=True, exist_ok=True)
+    # Any generation attempt mutates the fixture. Revoke an older completion
+    # declaration before the first write so an interrupted rebuild can never be
+    # mistaken for a verified A/B input.
+    (test_root / ".fd-rdd-m2-fixture.json").unlink(missing_ok=True)
     # 写入 marker，便于外部工具识别
     (test_root / ".fd-rdd-m2-fixture").write_text(
         f"fd-rdd m2 realistic fixture\nseed={args.seed}\ntotal_files={args.total_files}\n",
@@ -597,6 +670,14 @@ def main(argv: list[str]) -> int:
 
     total_files_created = sum(r.files_created for r in results)
     total_dirs_created = sum(r.dirs_created for r in results)
+    manifest_completed = _write_completed_fixture_manifest(
+        test_root,
+        seed=args.seed,
+        requested_total_files=args.total_files,
+        plans=plans,
+        results=results,
+        generation_started_clean=generation_started_clean,
+    )
     elapsed = time.time() - overall_start
     print("==== Summary ====")
     print(f"root             : {test_root}")
@@ -604,7 +685,14 @@ def main(argv: list[str]) -> int:
     print(f"total dirs       : {total_dirs_created}")
     print(f"elapsed          : {elapsed:.1f}s")
     print(f"throughput       : {total_files_created / elapsed:.0f} files/s" if elapsed > 0 else "throughput: N/A")
+    print(f"verified manifest: {'yes' if manifest_completed else 'no'}")
     print("=================")
+    if not manifest_completed:
+        print(
+            "[error] fixture generation was incomplete; verified manifest was not written",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

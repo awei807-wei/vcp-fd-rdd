@@ -3,6 +3,7 @@ use memmap2::Mmap;
 use memmap2::{Advice, UncheckedAdvice};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,7 +16,13 @@ use crate::index::path_table_v2::{PathTableBuilder, PathTableV2};
 use crate::query::Matcher;
 use crate::storage::checksum::{crc32c_checksum, Crc32c};
 use crate::storage::error::{StorageError, StorageResult};
-use crate::util::{align_up, read_u32};
+#[cfg(test)]
+use crate::util::align_up;
+use crate::util::read_u32;
+
+#[path = "snapshot_v7_owned.rs"]
+mod snapshot_v7_owned;
+pub use snapshot_v7_owned::{write_v7_owned_index_atomic, OwnedV7WriteOptions, OwnedV7WriteReport};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // v7 单文件 mmap 格式常量
@@ -82,6 +89,7 @@ struct V7SegDesc {
 // PathTable 序列化 / 反序列化（不依赖 serde，避免修改 pathtable.rs）
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 fn encode_path_table(pt: &PathTableV2) -> Vec<u8> {
     pt.encode_raw()
 }
@@ -116,6 +124,7 @@ fn decode_path_table(bytes: &[u8]) -> StorageResult<PathTableV2> {
 // FileEntryIndex 序列化 / 反序列化
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 fn encode_file_entry_index(fei: &FileEntryIndex) -> Vec<u8> {
     let mut out = Vec::new();
     let len = fei.len() as u32;
@@ -210,6 +219,7 @@ fn encode_trigram_index(ti: &TrigramIndex) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn encode_full_path_trigram_index(data: &BaseIndexData) -> Vec<u8> {
     let mut full_path_index: HashMap<[u8; 3], RoaringBitmap> = HashMap::new();
 
@@ -234,6 +244,7 @@ fn encode_full_path_trigram_index(data: &BaseIndexData) -> Vec<u8> {
     encode_trigram_map(&full_path_index)
 }
 
+#[cfg(test)]
 fn encode_trigram_map(index: &HashMap<[u8; 3], RoaringBitmap>) -> Vec<u8> {
     let mut entries: Vec<([u8; 3], &RoaringBitmap)> =
         index.iter().map(|(tri, bitmap)| (*tri, bitmap)).collect();
@@ -288,6 +299,7 @@ fn decode_trigram_index(bytes: &[u8]) -> StorageResult<TrigramIndex> {
 // ParentIndex 序列化 / 反序列化
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 fn encode_parent_index(pi: &ParentIndex) -> Vec<u8> {
     let mut out = Vec::new();
     // Encode dir_to_files: HashMap<u32, RoaringBitmap>
@@ -381,6 +393,7 @@ fn decode_parent_index(bytes: &[u8]) -> StorageResult<ParentIndex> {
 // Tombstones 序列化 / 反序列化（RoaringBitmap）
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 fn encode_tombstones(t: &RoaringBitmap) -> Vec<u8> {
     let mut out = Vec::new();
     t.serialize_into(&mut out).expect("roaring serialize");
@@ -795,6 +808,10 @@ pub struct V7Snapshot {
 }
 
 impl V7Snapshot {
+    pub(crate) fn ensure_direct_delta_compatible(&self) -> anyhow::Result<()> {
+        validate_cold_delta_source(self).map(|_| ())
+    }
+
     pub fn bytes(&self) -> &[u8] {
         self.mmap.as_ref()
     }
@@ -1521,35 +1538,43 @@ pub fn shallow_validate_v7(path: &Path) -> anyhow::Result<bool> {
 // v7 写入：base + delta → 排序 → 归并 → atomic write v7 单文件
 // ─────────────────────────────────────────────────────────────────────────────
 
+mod cold_delta;
+mod stream_writer;
+
+#[cfg(test)]
+use cold_delta::validate_current_parent_segment;
+use cold_delta::{
+    encoded_shared_prefix, validate_cold_delta_source, validate_encoded_path_lengths,
+    validate_posting_docids,
+};
+pub use cold_delta::{
+    write_v7_cold_delta_atomic, ColdDeltaLimits, ColdDeltaPlan, ColdDeltaWriteReport,
+};
+use stream_writer::{
+    write_file_entry, write_file_entry_index, write_parent_index, write_parent_posting,
+    write_trigram_posting, V7StreamingWriter, V7_SEGMENT_ORDER,
+};
+
 /// 将 BaseIndexData 原子写入 v7 单文件（tmp + rename）。
-///
-/// 写入流程：
-/// 1) 各段序列化为 Vec<u8>
-/// 2) 计算 offset / len / crc
-/// 3) 写 header + segments + trailer 到 .tmp
-/// 4) fsync + rename
 pub fn write_v7_snapshot_atomic(path: &Path, data: &BaseIndexData) -> anyhow::Result<()> {
-    let segments_bytes: Vec<(V7SegKind, Vec<u8>)> = vec![
-        (V7SegKind::PathTable, encode_path_table(&data.path_table)),
-        (
-            V7SegKind::EntriesByKey,
-            encode_file_entry_index(&data.entries_by_key),
-        ),
-        (
-            V7SegKind::EntriesByPath,
-            encode_file_entry_index(&data.entries_by_key),
-        ),
-        (
-            V7SegKind::TrigramIndex,
-            encode_full_path_trigram_index(data),
-        ),
-        (
-            V7SegKind::ParentIndex,
-            encode_parent_index(&data.parent_index),
-        ),
-        (V7SegKind::Tombstones, encode_tombstones(&data.tombstones)),
-    ];
-    write_v7_segments_atomic(path, segments_bytes)
+    snapshot_v7_owned::write_v7_hot_base_bounded_atomic(path, data)
+}
+
+fn validate_written_v7(
+    path: &Path,
+    expected_live_entries: Option<usize>,
+    error_label: &str,
+) -> anyhow::Result<()> {
+    let snapshot = load_v7_from_path(path)?
+        .ok_or_else(|| anyhow::anyhow!("{error_label}: newly written snapshot was rejected"))?;
+    if let Some(expected) = expected_live_entries {
+        let (actual, _, _) = snapshot.live_entry_summary()?;
+        if actual != expected {
+            anyhow::bail!("{error_label}: expected {expected} live entries, reloaded {actual}");
+        }
+    }
+    snapshot.advise_dontneed();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1608,6 +1633,7 @@ fn write_v7_snapshot_atomic_legacy_40b_entry(
     write_v7_segments_atomic_with_version(path, segments_bytes, V7_VERSION_LEGACY_40B_ENTRY)
 }
 
+#[cfg(test)]
 fn write_v7_segments_atomic(
     path: &Path,
     segments_bytes: Vec<(V7SegKind, Vec<u8>)>,
@@ -1615,6 +1641,7 @@ fn write_v7_segments_atomic(
     write_v7_segments_atomic_with_version(path, segments_bytes, V7_VERSION)
 }
 
+#[cfg(test)]
 fn write_v7_segments_atomic_with_version(
     path: &Path,
     segments_bytes: Vec<(V7SegKind, Vec<u8>)>,
@@ -2053,11 +2080,11 @@ mod tests {
             ..BaseIndexData::default()
         };
 
-        write_v7_snapshot_atomic(&path, &data).unwrap();
-        // CRC validation alone would accept it; the path-table guard must not.
+        let error = write_v7_snapshot_atomic(&path, &data).unwrap_err();
+        assert!(error.to_string().contains("hot_v7_validation_failed"));
         assert!(
-            load_v7_from_path(&path).unwrap().is_none(),
-            "snapshot with unresolvable entries must be rejected"
+            !path.exists(),
+            "validated atomic write must not publish an unresolvable snapshot"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -2594,5 +2621,466 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v7_streaming_writer_roundtrips_fixed_segment_order() {
+        let path = tmp_v7_path("streaming-writer");
+        let empty_paths = encode_path_table(&PathTableV2::default());
+        let empty_entries = 0u32.to_le_bytes();
+        let mut trigram = HashMap::new();
+        trigram.insert(TRIGRAM_SENTINEL, RoaringBitmap::new());
+        let trigram = encode_trigram_map(&trigram);
+        let empty_parent = [0u8; 8];
+        let empty_tombstones = encode_tombstones(&RoaringBitmap::new());
+
+        crate::storage::atomic_write(&path, "v7.tmp", |file| {
+            let mut writer = V7StreamingWriter::new(file, V7_VERSION)?;
+            writer.write_segment(V7SegKind::PathTable, |sink| {
+                sink.write_all(&empty_paths)?;
+                Ok(())
+            })?;
+            writer.write_segment(V7SegKind::EntriesByKey, |sink| {
+                sink.write_all(&empty_entries)?;
+                Ok(())
+            })?;
+            writer.write_segment(V7SegKind::EntriesByPath, |sink| {
+                sink.write_all(&empty_entries)?;
+                Ok(())
+            })?;
+            writer.write_segment(V7SegKind::TrigramIndex, |sink| {
+                sink.write_all(&trigram)?;
+                Ok(())
+            })?;
+            writer.write_segment(V7SegKind::ParentIndex, |sink| {
+                sink.write_all(&empty_parent)?;
+                Ok(())
+            })?;
+            writer.write_segment(V7SegKind::Tombstones, |sink| {
+                sink.write_all(&empty_tombstones)?;
+                Ok(())
+            })?;
+            writer.finish()
+        })
+        .unwrap();
+
+        let loaded = load_v7_from_path(&path).unwrap().unwrap();
+        assert_eq!(loaded.live_entry_summary().unwrap().0, 0);
+        assert!(loaded
+            .segment(V7SegKind::TrigramIndex)
+            .is_some_and(|bytes| trigram_index_has_sentinel(bytes).unwrap()));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn cold_delta_meta(path: &str, ino: u64, mtime_ns: u64) -> FileMeta {
+        FileMeta {
+            file_key: FileKey {
+                dev: 7,
+                ino,
+                generation: 0,
+            },
+            path: PathBuf::from(path),
+            size: 0,
+            mtime: Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(mtime_ns)),
+            ctime: None,
+            atime: None,
+            kind: FileKind::File,
+        }
+    }
+
+    fn cold_delta_base() -> (BaseIndexData, FileKey) {
+        let paths = [
+            "/tmp/tree",
+            "/tmp/tree/keep.txt",
+            "/tmp/tree/modify.txt",
+            "/tmp/tree/delete.txt",
+            "/tmp/tree/sub",
+            "/tmp/tree/sub/child.txt",
+            "/tmp/tree/oldname.txt",
+            "/tmp/tree/links",
+            "/tmp/tree/links/p1",
+            "/tmp/tree/links/p2",
+        ];
+        let mut path_table = PathTableBuilder::with_capacity(paths.len());
+        for (idx, path) in paths.iter().enumerate() {
+            path_table.push(idx as u32, path.as_bytes());
+        }
+
+        let hardlink_key = FileKey {
+            dev: 7,
+            ino: 90,
+            generation: 0,
+        };
+        let entries = [
+            (11, 1, 10),
+            (12, 2, 20),
+            (13, 3, 30),
+            (14, 5, 40),
+            (15, 6, 50),
+            (90, 8, 60),
+            (90, 9, 70),
+        ];
+        let mut entry_index = FileEntryIndex::with_capacity(entries.len());
+        for (ino, path_idx, mtime) in entries {
+            entry_index.push(FileEntry::from_file_key(
+                FileKey {
+                    dev: 7,
+                    ino,
+                    generation: 0,
+                },
+                path_idx,
+                mtime,
+            ));
+        }
+
+        let mut base = BaseIndexData {
+            path_table: path_table.build(),
+            entries_by_key: entry_index.build(),
+            ..BaseIndexData::default()
+        };
+        for (docid, (_, path_idx, _)) in entries.iter().enumerate() {
+            add_path_trigrams(
+                &mut base.trigram_index,
+                paths[*path_idx as usize],
+                docid as u32,
+            );
+        }
+        add_trigram_sentinel(&mut base.trigram_index);
+        base.parent_index.dir_to_files.insert(0, vec![0, 1, 2, 4]);
+        base.parent_index.dir_to_files.insert(4, vec![3]);
+        base.parent_index.dir_to_files.insert(7, vec![5, 6]);
+        (base, hardlink_key)
+    }
+
+    #[test]
+    fn cold_delta_writer_preserves_docids_and_merges_all_query_indexes() {
+        let source_path = tmp_v7_path("cold-delta-source");
+        let output_path = tmp_v7_path("cold-delta-output");
+        let (base, hardlink_key) = cold_delta_base();
+        write_v7_snapshot_atomic(&source_path, &base).unwrap();
+        let source = load_v7_from_path(&source_path).unwrap().unwrap();
+        let old_entries = source.segment(V7SegKind::EntriesByKey).unwrap().to_vec();
+
+        let modified = cold_delta_meta("/tmp/tree/modify.txt", 12, 2_000);
+        let created = cold_delta_meta("/tmp/tree/new/deep/newneedle.txt", 16, 3_000);
+        let renamed = cold_delta_meta("/tmp/tree/newname.txt", 15, 4_000);
+        let hardlink = FileMeta {
+            file_key: hardlink_key,
+            ..cold_delta_meta("/tmp/tree/links/p3", 90, 5_000)
+        };
+        let plan = ColdDeltaPlan::new(
+            vec![
+                b"/tmp/tree/delete.txt".to_vec(),
+                b"/tmp/tree/sub".to_vec(),
+                b"/tmp/tree/oldname.txt".to_vec(),
+            ],
+            vec![modified, created, renamed, hardlink],
+        );
+
+        let report =
+            write_v7_cold_delta_atomic(&output_path, &source, plan, ColdDeltaLimits::default())
+                .unwrap();
+        assert_eq!(report.old_entries, 7);
+        assert_eq!(report.appended_entries, 4);
+        assert_eq!(report.live_entries, 7);
+
+        let loaded = load_v7_from_path(&output_path).unwrap().unwrap();
+        let merged_entries = loaded.segment(V7SegKind::EntriesByKey).unwrap();
+        assert_eq!(
+            &merged_entries[4..old_entries.len()],
+            &old_entries[4..],
+            "old entry records and their DocIds must stay byte-for-byte stable"
+        );
+
+        assert_eq!(
+            loaded
+                .query_keys(&ExactMatcher::new("keep", false))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(loaded
+            .query_keys(&ExactMatcher::new("delete", false))
+            .unwrap()
+            .is_empty());
+        assert!(loaded
+            .query_keys(&ExactMatcher::new("child", false))
+            .unwrap()
+            .is_empty());
+        assert!(loaded
+            .query_keys(&ExactMatcher::new("oldname", false))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            loaded
+                .query_keys(&ExactMatcher::new("newneedle", false))
+                .unwrap(),
+            vec![FileKey {
+                dev: 7,
+                ino: 16,
+                generation: 0
+            }]
+        );
+        assert_eq!(
+            loaded
+                .get_meta(FileKey {
+                    dev: 7,
+                    ino: 12,
+                    generation: 0
+                })
+                .unwrap()
+                .unwrap()
+                .mtime,
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(2_000))
+        );
+
+        let aliases = loaded
+            .query_metas(&ExactMatcher::new("/tmp/tree/links/p", false))
+            .unwrap();
+        assert_eq!(aliases.len(), 3);
+        assert!(aliases.iter().all(|meta| meta.file_key == hardlink_key));
+        let parent_paths: Vec<_> = loaded
+            .parent_metas("/tmp/tree/links")
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.path)
+            .collect();
+        assert_eq!(parent_paths.len(), 3);
+        assert_eq!(loaded.parent_metas("/tmp/tree/sub").unwrap().len(), 0);
+        assert_eq!(loaded.parent_metas("/tmp/tree/new/deep").unwrap().len(), 1);
+
+        let decoded = loaded.to_base_index_data().unwrap();
+        assert_eq!(decoded.entries_by_key.len(), 11);
+        assert_eq!(decoded.tombstones.len(), 4);
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn cold_delta_writer_fails_closed_when_amplification_limit_is_exceeded() {
+        let source_path = tmp_v7_path("cold-delta-guard-source");
+        let output_path = tmp_v7_path("cold-delta-guard-output");
+        let (base, _) = cold_delta_base();
+        write_v7_snapshot_atomic(&source_path, &base).unwrap();
+        let source = load_v7_from_path(&source_path).unwrap().unwrap();
+        let plan = ColdDeltaPlan::new(
+            vec![b"/tmp/tree".to_vec()],
+            vec![cold_delta_meta("/tmp/replacement.txt", 100, 1)],
+        );
+
+        let error = write_v7_cold_delta_atomic(
+            &output_path,
+            &source,
+            plan,
+            ColdDeltaLimits {
+                max_entry_amplification_bps: 10_000,
+                max_path_amplification_bps: 10_000,
+                min_live_entries_for_amplification: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("streaming_compaction_required"));
+        assert!(!output_path.exists());
+
+        let _ = std::fs::remove_file(source_path);
+    }
+
+    #[test]
+    fn cold_delta_plan_reports_owned_overlay_shape() {
+        let empty = ColdDeltaPlan::new(Vec::<Vec<u8>>::new(), Vec::<FileMeta>::new());
+        assert!(empty.is_empty());
+        assert_eq!(empty.deleted_count(), 0);
+        assert_eq!(empty.upsert_count(), 0);
+
+        let plan = ColdDeltaPlan::new(
+            vec![b"/tmp/a".to_vec(), b"/tmp/a".to_vec()],
+            vec![
+                cold_delta_meta("/tmp/b", 1, 1),
+                cold_delta_meta("/tmp/b", 2, 2),
+            ],
+        );
+        assert!(!plan.is_empty());
+        assert_eq!(plan.deleted_count(), 1);
+        assert_eq!(plan.upsert_count(), 1);
+    }
+
+    #[test]
+    fn cold_delta_writer_can_replace_its_mmap_source_path() {
+        let path = tmp_v7_path("cold-delta-in-place");
+        let (base, _) = cold_delta_base();
+        write_v7_snapshot_atomic(&path, &base).unwrap();
+        let source = load_v7_from_path(&path).unwrap().unwrap();
+        let plan = ColdDeltaPlan::new(
+            Vec::<Vec<u8>>::new(),
+            vec![cold_delta_meta("/tmp/tree/in-place.txt", 101, 10)],
+        );
+
+        write_v7_cold_delta_atomic(&path, &source, plan, ColdDeltaLimits::default()).unwrap();
+        let reloaded = load_v7_from_path(&path).unwrap().unwrap();
+        assert_eq!(
+            reloaded
+                .query_keys(&ExactMatcher::new("in-place", false))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(source.live_entry_summary().unwrap().0, 7);
+        assert_eq!(reloaded.live_entry_summary().unwrap().0, 8);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cold_delta_writer_rejects_unproven_subtree_rename() {
+        let source_path = tmp_v7_path("cold-delta-subtree-source");
+        let output_path = tmp_v7_path("cold-delta-subtree-output");
+        let (base, _) = cold_delta_base();
+        write_v7_snapshot_atomic(&source_path, &base).unwrap();
+        let source = load_v7_from_path(&source_path).unwrap().unwrap();
+        let mut renamed_dir = cold_delta_meta("/tmp/tree/moved", 200, 1);
+        renamed_dir.kind = FileKind::Directory;
+        let plan = ColdDeltaPlan::new(vec![b"/tmp/tree/sub".to_vec()], vec![renamed_dir]);
+
+        let error =
+            write_v7_cold_delta_atomic(&output_path, &source, plan, ColdDeltaLimits::default())
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("subtree move completeness is unproven"));
+        assert!(!output_path.exists());
+
+        let _ = std::fs::remove_file(source_path);
+    }
+
+    #[test]
+    fn cold_delta_writer_rejects_legacy_entry_layout() {
+        let source_path = tmp_v7_path("cold-delta-legacy-source");
+        let output_path = tmp_v7_path("cold-delta-legacy-output");
+        let (base, _) = cold_delta_base();
+        write_v7_snapshot_atomic_legacy_40b_entry(&source_path, &base).unwrap();
+        let source = load_v7_from_path(&source_path).unwrap().unwrap();
+        let error = write_v7_cold_delta_atomic(
+            &output_path,
+            &source,
+            ColdDeltaPlan::new(Vec::<Vec<u8>>::new(), Vec::<FileMeta>::new()),
+            ColdDeltaLimits::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("direct_v7_unsupported"));
+        assert!(!output_path.exists());
+
+        let _ = std::fs::remove_file(source_path);
+    }
+
+    #[test]
+    fn direct_gate_rejects_parent_path_index_with_kind_bit_or_out_of_range() {
+        let mut posting = RoaringBitmap::new();
+        posting.insert(0);
+        let mut segment = Vec::new();
+        segment.extend_from_slice(&1u32.to_le_bytes());
+        segment.extend_from_slice(&(1u32 << 31).to_le_bytes());
+        segment.extend_from_slice(&(posting.serialized_size() as u32).to_le_bytes());
+        posting.serialize_into(&mut segment).unwrap();
+        segment.extend_from_slice(&0u32.to_le_bytes());
+
+        let error = validate_current_parent_segment(&segment, 1, 10).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("parent path index is out of range"));
+    }
+
+    #[test]
+    fn cold_delta_append_starts_after_raw_count_and_preserves_old_tombstone() {
+        let source_path = tmp_v7_path("cold-delta-old-tombstone-source");
+        let output_path = tmp_v7_path("cold-delta-old-tombstone-output");
+        let (mut base, _) = cold_delta_base();
+        base.tombstones.insert(1);
+        write_v7_snapshot_atomic(&source_path, &base).unwrap();
+        let source = load_v7_from_path(&source_path).unwrap().unwrap();
+        let appended_key = FileKey {
+            dev: 7,
+            ino: 300,
+            generation: 0,
+        };
+        let plan = ColdDeltaPlan::new(
+            Vec::<Vec<u8>>::new(),
+            vec![cold_delta_meta("/tmp/tree/tombappend.txt", 300, 1)],
+        );
+
+        let report =
+            write_v7_cold_delta_atomic(&output_path, &source, plan, ColdDeltaLimits::default())
+                .unwrap();
+        assert_eq!(report.old_entries, 7);
+        assert_eq!(report.appended_entries, 1);
+        assert_eq!(report.tombstone_entries, 1);
+
+        let loaded = load_v7_from_path(&output_path).unwrap().unwrap();
+        let entries = loaded.segment(V7SegKind::EntriesByKey).unwrap();
+        assert_eq!(entry_count_from_segment(entries, V7_VERSION), Some(8));
+        assert_eq!(
+            file_entry_at(entries, V7_VERSION, 7).map(|entry| entry.file_key()),
+            Some(appended_key),
+            "new DocId must start at the raw count, not the old live count"
+        );
+        let tombstones = loaded.tombstones().unwrap();
+        assert!(tombstones.contains(1));
+        assert!(loaded
+            .query_keys(&ExactMatcher::new("modify", false))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            loaded
+                .query_keys(&ExactMatcher::new("tombappend", false))
+                .unwrap(),
+            vec![appended_key]
+        );
+        assert!(loaded
+            .parent_metas("/tmp/tree")
+            .unwrap()
+            .iter()
+            .any(|meta| meta.file_key == appended_key));
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn cold_delta_same_path_inode_replacement_hides_old_file_key() {
+        let source_path = tmp_v7_path("cold-delta-inode-source");
+        let output_path = tmp_v7_path("cold-delta-inode-output");
+        let (base, _) = cold_delta_base();
+        write_v7_snapshot_atomic(&source_path, &base).unwrap();
+        let source = load_v7_from_path(&source_path).unwrap().unwrap();
+        let old_key = FileKey {
+            dev: 7,
+            ino: 12,
+            generation: 0,
+        };
+        let new_key = FileKey {
+            dev: 7,
+            ino: 212,
+            generation: 1,
+        };
+        let replacement = FileMeta {
+            file_key: new_key,
+            ..cold_delta_meta("/tmp/tree/modify.txt", 212, 9_000)
+        };
+        let plan = ColdDeltaPlan::new(Vec::<Vec<u8>>::new(), vec![replacement]);
+        write_v7_cold_delta_atomic(&output_path, &source, plan, ColdDeltaLimits::default())
+            .unwrap();
+
+        let loaded = load_v7_from_path(&output_path).unwrap().unwrap();
+        assert!(loaded.get_meta(old_key).unwrap().is_none());
+        assert_eq!(loaded.get_meta(new_key).unwrap().unwrap().file_key, new_key);
+        let matches = loaded
+            .query_metas(&ExactMatcher::new("modify", false))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].file_key, new_key);
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(output_path);
     }
 }

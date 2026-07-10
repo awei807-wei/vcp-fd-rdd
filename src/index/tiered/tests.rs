@@ -313,16 +313,11 @@ fn unbounded_summary_uses_walkbuilder_filter() {
     std::fs::write(root.join(".gitignore"), b"*.log\n").unwrap();
     std::fs::write(root.join("ignored.log"), b"ignored").unwrap();
 
-    let idx = TieredIndex::empty(vec![root.clone()]); // ignore_enabled=true by default
-                                                      // immediate scan 用 WalkBuilder，.log 文件被忽略 → 只扫描 visible.txt + .gitignore
-                                                      // (.gitignore 本身不是隐藏文件，不被 ignore 规则忽略)
+    let idx = TieredIndex::empty(vec![root.clone()]); // ignore_enabled=true, include_hidden=false
+                                                      // immediate scan 用 WalkBuilder：ignored.log 命中 ignore，
+                                                      // .gitignore 命中 hidden 过滤，仅 visible.txt 被扫描。
     let first = idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
-    // visible.txt 和 .gitignore 被扫描，ignored.log 被忽略
-    assert!(
-        first.scanned >= 2,
-        "should scan visible files, got {}",
-        first.scanned
-    );
+    assert_eq!(first.scanned, 1, "only visible.txt should be scanned");
     assert_eq!(idx.directory_manifest_report().dirs, 1);
 
     // touch 目录 mtime（内容不变）
@@ -1451,6 +1446,11 @@ fn rebuild_in_progress_does_not_publish_partial_l2_as_ready() {
     partial_l2.apply_events(&[mk_event(1, EventType::Create, partial_path.clone())]);
     idx.l2.store(partial_l2.clone());
 
+    let rebuilding_memory = idx.memory_report_light(EventPipelineStats::default());
+    assert!(rebuilding_memory.rebuild.in_progress);
+    assert_eq!(rebuilding_memory.l2.file_count, 1);
+    assert!(rebuilding_memory.l2.estimated_bytes > 0);
+
     assert_eq!(
         idx.file_count(),
         0,
@@ -1462,8 +1462,17 @@ fn rebuild_in_progress_does_not_publish_partial_l2_as_ready() {
     );
 
     idx.finish_rebuild(partial_l2);
-    assert_eq!(idx.file_count(), 1);
-    assert!(!idx.query("partial_ready").is_empty());
+    assert_eq!(idx.file_count(), 0);
+    assert!(idx.query("partial_ready").is_empty());
+    assert!(
+        idx.pending_snapshot_generation.lock().is_some(),
+        "completed scratch generation stays owned until durable snapshot publication"
+    );
+    assert!(idx.rebuild_snapshot_pending.load(Ordering::Acquire));
+    assert_eq!(
+        idx.reserve_rebuild_with_cooldown("pending owned generation"),
+        RebuildAdmission::Coalesced
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1499,6 +1508,9 @@ fn rebuild_cooldown_coalesces_duplicate_requests() {
     let new_l2 = Arc::new(PersistentIndex::new_with_roots(vec![root.clone()]));
     assert!(!idx.finish_rebuild(new_l2));
     assert!(!idx.rebuild_in_progress());
+    idx.pending_snapshot_generation.lock().take();
+    idx.rebuild_snapshot_pending.store(false, Ordering::Release);
+    *idx.owned_snapshot_telemetry.lock() = Default::default();
 
     let first = idx.reserve_rebuild_with_cooldown("test full build");
     assert!(matches!(first, RebuildAdmission::Scheduled(wait) if wait <= REBUILD_COOLDOWN));
@@ -1585,6 +1597,9 @@ fn memory_light_rebuild_cooldown_is_shorter_than_default() {
     assert!(idx.try_start_rebuild_force());
     let new_l2 = Arc::new(PersistentIndex::new_with_roots(vec![root.clone()]));
     assert!(!idx.finish_rebuild(new_l2));
+    idx.pending_snapshot_generation.lock().take();
+    idx.rebuild_snapshot_pending.store(false, Ordering::Release);
+    *idx.owned_snapshot_telemetry.lock() = Default::default();
 
     let admission = idx.reserve_rebuild_with_cooldown("memory light test");
     assert!(matches!(
@@ -2448,6 +2463,365 @@ async fn v7_load_mounts_base_without_l2_hydration_and_preserves_next_snapshot() 
 }
 
 #[tokio::test]
+async fn initial_hot_streaming_snapshot_includes_same_generation_overlay() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("v7-hot-base-with-overlay");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    let base_path = content_root.join("base_before_publish.txt");
+    std::fs::write(&base_path, b"base")?;
+    idx.apply_events(&[mk_event(1, EventType::Create, base_path.clone())]);
+    idx.refresh_base();
+
+    let overlay_path = content_root.join("overlay_before_publish.txt");
+    std::fs::write(&overlay_path, b"overlay")?;
+    idx.apply_events(&[mk_event(2, EventType::Create, overlay_path.clone())]);
+    idx.snapshot_now(store.clone()).await?;
+
+    let report = idx.memory_report(EventPipelineStats::default()).base;
+    assert_eq!(report.hot_memory_entries, 0);
+    assert_eq!(report.manifest_only_entries, 2);
+    let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    assert_eq!(reloaded.query("base_before_publish").len(), 1);
+    assert_eq!(reloaded.query("overlay_before_publish").len(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rebuild_owned_generation_streams_once_and_restarts_cold() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("owned-rebuild-snapshot");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let alpha = content_root.join("owned_rebuild_alpha.txt");
+    let beta = content_root.join("owned_rebuild_beta.txt");
+    std::fs::write(&alpha, b"alpha")?;
+    std::fs::write(&beta, b"beta")?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    assert!(idx.try_start_rebuild_force());
+    let generation = Arc::new(PersistentIndex::new_with_roots(vec![content_root.clone()]));
+    generation.apply_events(&[
+        mk_event(1, EventType::Create, alpha.clone()),
+        mk_event(2, EventType::Create, beta.clone()),
+    ]);
+
+    assert!(!idx.finish_rebuild(generation));
+    assert!(idx.pending_snapshot_generation.lock().is_some());
+    assert_eq!(
+        idx.base.load().memory_stats().hot_memory_entries,
+        0,
+        "rebuild publication must not materialize a hot BaseIndexData"
+    );
+    let pending_memory = idx.memory_report_light(EventPipelineStats::default());
+    assert_eq!(pending_memory.rebuild.owned_snapshot_state, "pending");
+    assert_eq!(pending_memory.l2.file_count, 2);
+    assert!(pending_memory.l2.estimated_bytes > 0);
+
+    idx.snapshot_now(store.clone()).await?;
+    assert!(idx.pending_snapshot_generation.lock().is_none());
+    let memory = idx.memory_report(EventPipelineStats::default()).base;
+    assert_eq!(memory.hot_memory_entries, 0);
+    assert_eq!(memory.manifest_only_entries, 2);
+
+    let restarted = TieredIndex::load_or_empty(store.as_ref(), vec![content_root.clone()]).await?;
+    assert_eq!(restarted.query("owned_rebuild_alpha").len(), 1);
+    assert_eq!(restarted.query("owned_rebuild_beta").len(), 1);
+    assert_eq!(restarted.l2.load().file_count(), 0);
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rebuild_replays_many_exact_file_deletes_without_retry() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("rebuild-file-delete-churn");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.attach_wal(store.as_ref())?;
+    assert!(idx.try_start_rebuild_force());
+    idx.delta_buffer.lock().begin_full_rebuild_generation();
+
+    let generation = Arc::new(PersistentIndex::new_with_roots(vec![content_root.clone()]));
+    let keep = content_root.join("keep_after_file_delete_churn.txt");
+    std::fs::write(&keep, b"keep")?;
+    let mut scanned_events = vec![mk_event(1, EventType::Create, keep.clone())];
+    let mut delete_events = Vec::new();
+    for ordinal in 0..64u64 {
+        let path = content_root.join(format!("transient-file-{ordinal:03}.tmp"));
+        std::fs::write(&path, b"transient")?;
+        scanned_events.push(mk_event(ordinal + 2, EventType::Create, path.clone()));
+        delete_events.push(mk_event(ordinal + 1000, EventType::Delete, path.clone()));
+    }
+    generation.apply_events(&scanned_events);
+    idx.l2.store(generation.clone());
+    for event in &delete_events {
+        if let Some(path) = event.best_path() {
+            std::fs::remove_file(path)?;
+        }
+    }
+    idx.apply_events(&delete_events);
+    assert!(idx.delta_buffer.lock().has_subtree_invalidations());
+
+    assert!(
+        !idx.finish_rebuild(generation),
+        "exact file deletes must replay into the completed scan instead of restarting it"
+    );
+    idx.snapshot_now(store.clone()).await?;
+
+    let restarted = TieredIndex::load_or_empty(store.as_ref(), vec![content_root]).await?;
+    assert_eq!(restarted.query("keep_after_file_delete_churn").len(), 1);
+    assert!(restarted.query("transient-file").is_empty());
+    assert_eq!(store.open_wal()?.replay_since_seal(0)?.events_replayed, 0);
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn rebuild_retries_directory_rename_when_source_subtree_was_not_scanned() {
+    let root = unique_tmp_dir("rebuild-directory-rename-scan-order");
+    let source = root.join("source-tree");
+    let target_parent = root.join("already-scanned-target");
+    let scanned_marker = target_parent.join("scanned-marker.txt");
+    let source_child = source.join("nested/missed-child.txt");
+    std::fs::create_dir_all(source_child.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&target_parent).unwrap();
+    std::fs::write(&source_child, b"must survive rename").unwrap();
+    std::fs::write(&scanned_marker, b"scanner passed this parent").unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    assert!(idx.try_start_rebuild_force());
+    idx.delta_buffer.lock().begin_full_rebuild_generation();
+
+    // Model the scan order precisely: the destination parent is complete in
+    // scratch, while the source subtree has not been visited yet.
+    let scratch = Arc::new(PersistentIndex::new_with_roots(vec![root.clone()]));
+    scratch.upsert(file_meta_from_path(target_parent.clone()));
+    scratch.upsert(file_meta_from_path(scanned_marker));
+    idx.l2.store(scratch.clone());
+
+    let moved = target_parent.join("moved-tree");
+    std::fs::rename(&source, &moved).unwrap();
+    idx.apply_events(&[mk_event(
+        1,
+        EventType::Rename {
+            from: FileIdentifier::Path(source.clone()),
+            from_path_hint: Some(source),
+        },
+        moved,
+    )]);
+
+    assert!(
+        idx.finish_rebuild(scratch),
+        "a directory rename cannot be replayed exactly when its source subtree was not scanned"
+    );
+    assert!(idx.pending_snapshot_generation.lock().is_none());
+    assert!(!idx.rebuild_snapshot_pending.load(Ordering::Acquire));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn overflow_after_scan_rebuilds_again_before_wal_cleanup() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("rebuild-overflow-retry");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.attach_wal(store.as_ref())?;
+
+    assert!(idx.try_start_rebuild_force());
+    idx.delta_buffer.lock().begin_full_rebuild_generation();
+    idx.delta_buffer.lock().set_max_capacity_for_test(1);
+    let stale_scan = Arc::new(PersistentIndex::new_with_roots(vec![content_root.clone()]));
+    idx.l2.store(stale_scan.clone());
+
+    let late_a = content_root.join("late_after_scan_a.txt");
+    let late_b = content_root.join("late_after_scan_b.txt");
+    std::fs::write(&late_a, b"a")?;
+    std::fs::write(&late_b, b"b")?;
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, late_a.clone()),
+        mk_event(2, EventType::Create, late_b.clone()),
+    ]);
+    assert!(!idx.delta_buffer.lock().is_complete());
+
+    assert!(
+        idx.finish_rebuild(stale_scan),
+        "an incomplete replay generation must request another full scan"
+    );
+    assert!(idx.pending_snapshot_generation.lock().is_none());
+    assert_eq!(idx.l2.load().file_count(), 0);
+    assert_eq!(store.open_wal()?.replay_since_seal(0)?.events_replayed, 2);
+
+    assert!(idx.try_start_rebuild_force());
+    idx.delta_buffer.lock().begin_full_rebuild_generation();
+    let complete_scan = Arc::new(PersistentIndex::new_with_roots(vec![content_root.clone()]));
+    complete_scan.apply_events(&[
+        mk_event(3, EventType::Create, late_a),
+        mk_event(4, EventType::Create, late_b),
+    ]);
+    assert!(!idx.finish_rebuild(complete_scan));
+    idx.snapshot_now(store.clone()).await?;
+
+    assert_eq!(store.open_wal()?.replay_since_seal(0)?.events_replayed, 0);
+    let restarted = TieredIndex::load_or_empty(store.as_ref(), vec![content_root]).await?;
+    assert_eq!(restarted.query("late_after_scan_a").len(), 1);
+    assert_eq!(restarted.query("late_after_scan_b").len(), 1);
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_rebuild_generation_replaces_old_cold_snapshot() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("empty-rebuild-checkpoint");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    let old_path = content_root.join("must_not_return_after_empty_rebuild.txt");
+    std::fs::write(&old_path, b"old")?;
+    idx.apply_events(&[mk_event(1, EventType::Create, old_path.clone())]);
+    idx.snapshot_now(store.clone()).await?;
+    assert_eq!(idx.query("must_not_return_after_empty_rebuild").len(), 1);
+
+    std::fs::remove_file(old_path)?;
+    assert!(idx.try_start_rebuild_force());
+    idx.delta_buffer.lock().begin_full_rebuild_generation();
+    let empty_scan = Arc::new(PersistentIndex::new_with_roots(vec![content_root.clone()]));
+    assert!(!idx.finish_rebuild(empty_scan));
+    assert!(idx.rebuild_snapshot_pending.load(Ordering::Acquire));
+    idx.snapshot_now(store.clone()).await?;
+
+    let restarted = TieredIndex::load_or_empty(store.as_ref(), vec![content_root]).await?;
+    assert_eq!(restarted.file_count(), 0);
+    assert!(restarted
+        .query("must_not_return_after_empty_rebuild")
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn snapshot_event_gate_covers_wal_append_and_delta_mutation() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("snapshot-event-boundary");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = SnapshotStore::new(state_root.join("index.db"));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.attach_wal(&store)?;
+    let path = content_root.join("boundary_event.txt");
+    std::fs::write(&path, b"boundary")?;
+
+    let boundary = idx.snapshot_event_gate.lock();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let apply_idx = idx.clone();
+    let apply_path = path.clone();
+    let handle = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        apply_idx.apply_events(&[mk_event(1, EventType::Create, apply_path)]);
+        done_tx.send(()).unwrap();
+    });
+
+    started_rx.recv_timeout(std::time::Duration::from_secs(1))?;
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "event application must wait before both WAL append and delta mutation"
+    );
+    assert!(idx.delta_buffer.lock().is_empty());
+    assert_eq!(store.open_wal()?.replay_since_seal(0)?.events_replayed, 0);
+
+    drop(boundary);
+    done_rx.recv_timeout(std::time::Duration::from_secs(1))?;
+    handle.join().expect("event apply thread");
+    assert!(idx
+        .delta_buffer
+        .lock()
+        .is_live(path.as_os_str().as_encoded_bytes()));
+    assert_eq!(store.open_wal()?.replay_since_seal(0)?.events_replayed, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsupported_directory_rename_retains_delta_and_sealed_wal() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("snapshot-directory-rename-fail-closed");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let old_dir = content_root.join("old-tree");
+    let old_child = old_dir.join("child.txt");
+    std::fs::create_dir_all(&old_dir)?;
+    std::fs::create_dir_all(&state_root)?;
+    std::fs::write(&old_child, b"child")?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.attach_wal(store.as_ref())?;
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, old_dir.clone()),
+        mk_event(2, EventType::Create, old_child),
+    ]);
+    idx.snapshot_now(store.clone()).await?;
+
+    let moved_dir = content_root.join("moved-tree");
+    std::fs::rename(&old_dir, &moved_dir)?;
+    idx.apply_events(&[mk_event(
+        3,
+        EventType::Rename {
+            from: FileIdentifier::Path(old_dir.clone()),
+            from_path_hint: Some(old_dir),
+        },
+        moved_dir,
+    )]);
+    idx.begin_shutdown();
+
+    let error = idx.snapshot_now(store.clone()).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("subtree move completeness is unproven"));
+    assert_eq!(idx.delta_buffer.lock().len(), 2);
+    let replay = store.open_wal()?.replay_since_seal(0)?;
+    assert_eq!(replay.events_replayed, 1);
+    assert!(matches!(
+        replay.events[0].event_type,
+        EventType::Rename { .. }
+    ));
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn v7_load_mounts_manifest_only_cold_segment_and_queries_on_demand() -> anyhow::Result<()> {
     let root = unique_tmp_dir("v7-cold-manifest");
     let content_root = root.join("content");
@@ -2654,8 +3028,7 @@ async fn tiny_stable_without_large_prev_requires_rebuild_after_root_probe() -> a
 }
 
 #[tokio::test]
-async fn subtree_tombstone_runtime_only_hides_cold_children_for_parent_delete() -> anyhow::Result<()>
-{
+async fn subtree_delete_persists_cold_child_tombstones_across_snapshot() -> anyhow::Result<()> {
     let root = unique_tmp_dir("cold-parent-delete");
     let content_root = root.join("content");
     let state_root = root.join("state");
@@ -2691,8 +3064,110 @@ async fn subtree_tombstone_runtime_only_hides_cold_children_for_parent_delete() 
 
     let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
     let results = reloaded.query_limit_detailed("编年史", 10);
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].meta.path, chronicle);
+    assert!(
+        results.is_empty(),
+        "directory delete must not resurrect cold descendants after restart"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn directory_delete_recreate_rebuilds_without_resurrecting_old_children() -> anyhow::Result<()>
+{
+    let root = unique_tmp_dir("cold-directory-recreate");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let tree = content_root.join("tree");
+    let old_child = tree.join("old-child.txt");
+    std::fs::create_dir_all(&tree)?;
+    std::fs::create_dir_all(&state_root)?;
+    std::fs::write(&old_child, b"old")?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.rebuild_cooldown_secs.store(1, Ordering::Relaxed);
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, tree.clone()),
+        mk_event(2, EventType::Create, old_child),
+    ]);
+    idx.snapshot_now(store.clone()).await?;
+
+    std::fs::remove_dir_all(&tree)?;
+    idx.apply_events(&[mk_event(3, EventType::Delete, tree.clone())]);
+    std::fs::create_dir_all(&tree)?;
+    idx.apply_events(&[mk_event(4, EventType::Create, tree.clone())]);
+
+    let error = idx.snapshot_now(store.clone()).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("subtree move completeness is unproven"));
+    for _ in 0..200 {
+        if !idx.rebuild_in_progress() && idx.rebuild_snapshot_pending.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!idx.rebuild_in_progress());
+    assert!(idx.rebuild_snapshot_pending.load(Ordering::Acquire));
+    assert!(
+        idx.query("old-child").is_empty(),
+        "the old cold child must stay hidden while the rebuilt generation is pending durability"
+    );
+    idx.snapshot_now(store.clone()).await?;
+
+    let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    assert!(reloaded.query("old-child").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn quarantine_sidecar_failure_blocks_wal_cleanup_until_retry() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("snapshot-quarantine-checkpoint");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let frozen_root = content_root.join("offline-root");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.attach_wal(store.as_ref())?;
+    let initial = content_root.join("initial.txt");
+    std::fs::write(&initial, b"initial")?;
+    idx.apply_events(&[mk_event(1, EventType::Create, initial)]);
+    idx.snapshot_now(store.clone()).await?;
+
+    idx.apply_root_state_record(RootStateRecord::offline(
+        2,
+        frozen_root.clone(),
+        test_mount_identity(),
+        vec![frozen_root.clone()],
+        Some("test offline".to_string()),
+    ));
+    let trigger = content_root.join("checkpoint-trigger.txt");
+    std::fs::write(&trigger, b"trigger")?;
+    idx.apply_events(&[mk_event(3, EventType::Create, trigger)]);
+
+    let sidecar_path = quarantine_sidecar_path_for(store.path());
+    std::fs::remove_file(&sidecar_path)?;
+    std::fs::create_dir(&sidecar_path)?;
+    idx.begin_shutdown();
+    let error = idx.snapshot_now(store.clone()).await.unwrap_err();
+    assert!(error.to_string().contains("sealed WAL retained"));
+    let replay = store.open_wal()?.replay_since_seal(0)?;
+    assert_eq!(replay.events_replayed, 1);
+    assert_eq!(replay.root_events_replayed, 1);
+    assert_eq!(idx.delta_buffer.lock().len(), 1);
+
+    std::fs::remove_dir(&sidecar_path)?;
+    idx.snapshot_now(store.clone()).await?;
+    assert_eq!(store.open_wal()?.replay_since_seal(0)?.events_replayed, 0);
+    let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    assert!(reloaded.path_is_frozen(&frozen_root));
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -3158,7 +3633,7 @@ fn subtree_tombstone_ttl_cleanup_allows_runtime_filter_to_expire() {
 }
 
 #[test]
-fn subtree_tombstone_does_not_hide_recreated_same_name_after_create_event() {
+fn subtree_tombstone_keeps_prefix_but_allows_recreated_overlay() {
     let root = unique_tmp_dir("subtree-tombstone-recreate");
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -3184,7 +3659,11 @@ fn subtree_tombstone_does_not_hide_recreated_same_name_after_create_event() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].meta.path, new_path);
     assert_eq!(results[0].freshness, QueryResultFreshness::Fresh);
-    assert_eq!(idx.runtime_subtree_tombstone_count(), 0);
+    assert_eq!(
+        idx.runtime_subtree_tombstone_count(),
+        1,
+        "the prefix must stay invalidated until a complete generation is published"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

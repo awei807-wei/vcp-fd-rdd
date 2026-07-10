@@ -60,3 +60,31 @@ where
     }
     Ok(result)
 }
+
+/// Variant of [`atomic_write`] that validates the synced temporary file before
+/// it can replace the current durable generation.
+pub(crate) fn atomic_write_validated<R, F, V>(
+    path: &Path,
+    tmp_ext: &str,
+    write_fn: F,
+    validate_fn: V,
+) -> anyhow::Result<R>
+where
+    F: FnOnce(&mut std::fs::File) -> anyhow::Result<R>,
+    V: FnOnce(&Path) -> anyhow::Result<()>,
+{
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(tmp_ext);
+    let mut file = std::fs::File::create(&tmp)?;
+    let result = write_fn(&mut file)?;
+    file.sync_all()?;
+    drop(file);
+    validate_fn(&tmp)?;
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent);
+    }
+    Ok(result)
+}

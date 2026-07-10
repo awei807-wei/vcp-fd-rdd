@@ -389,6 +389,13 @@ impl TieredIndex {
 
     pub(super) fn reserve_rebuild_with_cooldown(&self, reason: &'static str) -> RebuildAdmission {
         let mut st = self.rebuild_state.lock();
+        if self.rebuild_snapshot_pending.load(Ordering::Acquire) {
+            tracing::debug!(
+                "Rebuild request coalesced into owned generation awaiting snapshot ({})",
+                reason
+            );
+            return RebuildAdmission::Coalesced;
+        }
         st.requested = true;
 
         if st.in_progress {
@@ -447,66 +454,143 @@ impl TieredIndex {
 
     pub(super) fn finish_rebuild(self: &Arc<Self>, new_l2: Arc<PersistentIndex>) -> bool {
         enum FinishStep {
-            Complete(bool),
+            Complete,
             Apply(Vec<EventRecord>),
+            RetryIncomplete,
+            WaitForReaders,
+            RetrySharedGeneration,
         }
 
+        let _event_boundary = self.snapshot_event_gate.lock();
+        let mut new_l2 = Some(new_l2);
+        let mut shared_generation_waits = 0usize;
         loop {
             let step = {
-                // Lock order: rebuild_state → delta_buffer.
-                // This is the ONLY call site that holds both locks simultaneously.
-                // All other paths (capture_l2_for_apply, file_count, etc.) acquire
-                // them sequentially (lock-release-lock) or only touch one, so there
-                // is no AB-BA deadlock risk. The dual-lock is required here to make
-                // the "delta_buffer empty?" check and the atomic base/l2 switch
-                // indivisible — releasing either lock between them would open a
-                // window where new events could be lost or a second rebuild could
-                // start concurrently.
+                // Global lock order is snapshot_event_gate →
+                // rebuild_state → delta_buffer. The dual lock makes the replay
+                // completeness check and base/L2 switch indivisible.
                 let mut st = self.rebuild_state.lock();
                 let mut db = self.delta_buffer.lock();
-                if db.is_empty() {
-                    // 切换点：持锁判空 -> 原子切换，避免丢事件窗口。
-                    self.l1.clear();
-                    let new_base = Arc::new(new_l2.to_base_index_data());
-                    self.base.store(new_base);
-                    self.note_pending_flush_rebuild(new_l2.as_ref());
+                let structural_replay_unproven = db.structural_replay_unproven();
+                let subtree_requires_retry = if db.has_subtree_invalidations() {
+                    let prefixes = db.snapshot_subtree_invalidations();
+                    new_l2
+                        .as_ref()
+                        .expect("rebuild generation is present")
+                        .snapshot_prefixes_match_descendants(&prefixes)
+                } else {
+                    false
+                };
+                if !db.is_complete() || structural_replay_unproven || subtree_requires_retry {
+                    // A path was rejected after this rebuild's start boundary.
+                    // A directory rename/recreate or a subtree invalidated
+                    // after it was scanned is likewise unproven. Retain
+                    // delta+WAL and retry instead of publishing stale or
+                    // missing descendants. Exact file deletes have no
+                    // descendants and are replayed below without restarting.
                     self.l2.store(Arc::new(PersistentIndex::new_with_roots(
                         self.roots.clone(),
                     )));
                     self.invalidate_memory_report_cache();
-                    if !self.flush_requested.swap(true, Ordering::AcqRel) {
-                        self.flush_notify.notify_one();
-                    }
                     st.in_progress = false;
-                    // 若 rebuild 期间又被请求（例如 overflow 风暴），合并为下一轮 rebuild。
-                    let again = st.requested;
                     st.requested = false;
                     st.scheduled = false;
-                    FinishStep::Complete(again)
+                    FinishStep::RetryIncomplete
                 } else {
-                    let mut events: Vec<EventRecord> = db.live_records().cloned().collect();
-                    for path_bytes in db.deleted_paths() {
-                        let path = pathbuf_from_bytes(path_bytes);
-                        events.push(EventRecord {
-                            seq: 0,
-                            timestamp: std::time::SystemTime::UNIX_EPOCH,
-                            event_type: EventType::Delete,
-                            id: FileIdentifier::Path(path.clone()),
-                            path_hint: Some(path),
-                        });
+                    db.clear_subtree_invalidations();
+                    if !db.is_empty() {
+                        let mut events: Vec<EventRecord> = db.live_records().cloned().collect();
+                        for path_bytes in db.deleted_paths() {
+                            let path = pathbuf_from_bytes(path_bytes);
+                            events.push(EventRecord {
+                                seq: 0,
+                                timestamp: std::time::SystemTime::UNIX_EPOCH,
+                                event_type: EventType::Delete,
+                                id: FileIdentifier::Path(path.clone()),
+                                path_hint: Some(path),
+                            });
+                        }
+                        events.sort_by_key(|e| e.seq);
+                        db.clear();
+                        FinishStep::Apply(events)
+                    } else {
+                        // 切换点：持锁判空 -> 原子切换，避免丢事件窗口。
+                        self.l1.clear();
+                        let current_l2 = self.l2.load_full();
+                        if Arc::ptr_eq(
+                            &current_l2,
+                            new_l2.as_ref().expect("rebuild generation is present"),
+                        ) {
+                            self.l2.store(Arc::new(PersistentIndex::new_with_roots(
+                                self.roots.clone(),
+                            )));
+                        }
+                        drop(current_l2);
+                        match Arc::try_unwrap(new_l2.take().expect("rebuild generation is present"))
+                        {
+                            Ok(generation) => {
+                                self.note_pending_flush_rebuild(&generation);
+                                let generation_stats = generation.memory_stats();
+                                *self.pending_snapshot_generation.lock() = Some(generation);
+                                {
+                                    let mut telemetry = self.owned_snapshot_telemetry.lock();
+                                    telemetry.lifecycle = super::OwnedSnapshotLifecycle::Pending;
+                                    telemetry.l2 = generation_stats;
+                                }
+                                db.finish_full_rebuild_generation();
+                                self.rebuild_snapshot_pending.store(true, Ordering::Release);
+                                self.invalidate_memory_report_cache();
+                                if !self.flush_requested.swap(true, Ordering::AcqRel) {
+                                    self.flush_notify.notify_one();
+                                }
+                                st.in_progress = false;
+                                // A complete scan plus complete boundary replay subsumes
+                                // requests coalesced while this generation was building.
+                                st.requested = false;
+                                st.scheduled = false;
+                                FinishStep::Complete
+                            }
+                            Err(shared) => {
+                                new_l2 = Some(shared);
+                                if shared_generation_waits < 500 {
+                                    FinishStep::WaitForReaders
+                                } else {
+                                    st.in_progress = false;
+                                    st.requested = false;
+                                    st.scheduled = false;
+                                    FinishStep::RetrySharedGeneration
+                                }
+                            }
+                        }
                     }
-                    events.sort_by_key(|e| e.seq);
-                    db.clear();
-                    FinishStep::Apply(events)
                 }
             };
 
             match step {
-                FinishStep::Complete(again) => {
+                FinishStep::Complete => {
                     self.mark_rebuild_recovery_complete();
-                    return again;
+                    return false;
                 }
-                FinishStep::Apply(batch) => new_l2.apply_events(&batch),
+                FinishStep::Apply(batch) => new_l2
+                    .as_ref()
+                    .expect("rebuild generation is present")
+                    .apply_events(&batch),
+                FinishStep::RetryIncomplete => {
+                    tracing::warn!(
+                        "rebuild replay generation incomplete or subtree-stale; retaining delta/WAL and retrying"
+                    );
+                    return true;
+                }
+                FinishStep::WaitForReaders => {
+                    shared_generation_waits += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                FinishStep::RetrySharedGeneration => {
+                    tracing::warn!(
+                        "rebuild generation remained shared at publication; retaining WAL and retrying"
+                    );
+                    return true;
+                }
             }
         }
     }
@@ -529,8 +613,14 @@ impl TieredIndex {
                 strategy
             );
             let new_l2 = Arc::new(PersistentIndex::new_with_roots(idx.roots.clone()));
+            {
+                let _snapshot_boundary = idx.snapshot_event_gate.lock();
+                idx.delta_buffer.lock().begin_full_rebuild_generation();
+                idx.l2.store(new_l2.clone());
+                idx.invalidate_memory_report_cache();
+            }
             idx.l3.full_build_with_strategy(&new_l2, strategy);
-            let again = idx.finish_rebuild(new_l2.clone());
+            let again = idx.finish_rebuild(new_l2);
             tracing::warn!("Rebuild complete, triggering manual RSS trim...");
             maybe_trim_rss();
             tracing::warn!(

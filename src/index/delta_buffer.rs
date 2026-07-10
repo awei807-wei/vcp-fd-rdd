@@ -1,5 +1,5 @@
-use crate::core::{EventRecord, EventType};
-use std::collections::HashMap;
+use crate::core::{EventRecord, EventType, FileKind};
+use std::collections::{BTreeSet, HashMap};
 
 /// 统一增量缓冲区，替代 overlay_state + pending_events
 #[derive(Debug, Clone)]
@@ -8,6 +8,20 @@ pub struct DeltaBuffer {
     entries: HashMap<Vec<u8>, DeltaState>,
     /// 硬容量上限（默认 256K 条）
     max_capacity: usize,
+    /// Normal operating limit restored after a rebuild/snapshot generation is
+    /// durably closed.
+    base_max_capacity: usize,
+    /// Prefixes whose pre-event descendants are invalid for this generation.
+    /// This survives a later Live state at the same path so delete→recreate
+    /// cannot resurrect cold children.
+    subtree_invalidations: std::collections::HashSet<Vec<u8>>,
+    /// Once a path has been rejected, this generation is no longer a complete
+    /// description of the mutable L2. A direct snapshot must fail closed and
+    /// rebuild from the filesystem instead of persisting a partial delta.
+    overflowed: bool,
+    /// A directory rename/recreate crossed the active scan boundary. Replaying
+    /// one directory record cannot prove that every descendant was scanned.
+    structural_replay_unproven: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +37,10 @@ impl DeltaBuffer {
         Self {
             entries: HashMap::with_capacity(cap.min(1024)),
             max_capacity: cap,
+            base_max_capacity: cap,
+            subtree_invalidations: std::collections::HashSet::new(),
+            overflowed: false,
+            structural_replay_unproven: false,
         }
     }
 
@@ -31,6 +49,10 @@ impl DeltaBuffer {
         Self {
             entries: HashMap::with_capacity(cap.min(1024)),
             max_capacity,
+            base_max_capacity: max_capacity,
+            subtree_invalidations: std::collections::HashSet::new(),
+            overflowed: false,
+            structural_replay_unproven: false,
         }
     }
 
@@ -39,6 +61,7 @@ impl DeltaBuffer {
     pub fn apply_events(&mut self, events: &[EventRecord]) -> bool {
         for ev in events {
             if !self.insert(ev.clone()) {
+                self.overflowed = true;
                 return false;
             }
         }
@@ -61,6 +84,7 @@ impl DeltaBuffer {
                 {
                     return false;
                 }
+                self.subtree_invalidations.insert(path_bytes.clone());
                 self.entries.insert(path_bytes, DeltaState::Deleted);
                 true
             }
@@ -96,6 +120,7 @@ impl DeltaBuffer {
                 }
 
                 if let Some(fb) = from_bytes {
+                    self.subtree_invalidations.insert(fb.clone());
                     self.entries.insert(fb, DeltaState::Deleted);
                 }
                 self.entries.insert(path_bytes, DeltaState::Live(event));
@@ -118,6 +143,67 @@ impl DeltaBuffer {
             DeltaState::Deleted => Some(path.as_slice()),
             DeltaState::Live(_) => None,
         })
+    }
+
+    /// Prefix deletions that must be persisted even if a later Live state at
+    /// the same path replaced the exact Deleted state.
+    pub fn snapshot_deleted_paths(&self) -> impl Iterator<Item = &[u8]> {
+        self.deleted_paths().chain(
+            self.subtree_invalidations
+                .iter()
+                .map(std::vec::Vec::as_slice),
+        )
+    }
+
+    pub fn has_subtree_invalidations(&self) -> bool {
+        !self.subtree_invalidations.is_empty()
+    }
+
+    pub fn snapshot_subtree_invalidations(&self) -> BTreeSet<Vec<u8>> {
+        self.subtree_invalidations.iter().cloned().collect()
+    }
+
+    pub fn clear_subtree_invalidations(&mut self) {
+        self.subtree_invalidations.clear();
+    }
+
+    /// Record the resolved target type for an event that crossed an active
+    /// full-scan boundary. Directory renames are always structural. A
+    /// directory create/modify is structural only when the same path was
+    /// invalidated earlier in this generation (delete then recreate).
+    /// Unresolved rename/recreate targets fail closed because they may have
+    /// been directories before another concurrent event removed them.
+    pub(crate) fn note_rebuild_event_target(
+        &mut self,
+        event: &EventRecord,
+        target_kind: Option<FileKind>,
+    ) {
+        let Some(path) = event.best_path() else {
+            if matches!(&event.event_type, EventType::Rename { .. }) {
+                self.structural_replay_unproven = true;
+            }
+            return;
+        };
+        let path_bytes = path.as_os_str().as_encoded_bytes();
+        match &event.event_type {
+            EventType::Rename { .. } => {
+                if !matches!(target_kind, Some(FileKind::File)) {
+                    self.structural_replay_unproven = true;
+                }
+            }
+            EventType::Create | EventType::Modify => {
+                if self.subtree_invalidations.contains(path_bytes)
+                    && !matches!(target_kind, Some(FileKind::File))
+                {
+                    self.structural_replay_unproven = true;
+                }
+            }
+            EventType::Delete => {}
+        }
+    }
+
+    pub(crate) fn structural_replay_unproven(&self) -> bool {
+        self.structural_replay_unproven
     }
 
     /// 查询时：返回所有 upserted 路径 bytes（替代 upserted_paths）
@@ -148,12 +234,59 @@ impl DeltaBuffer {
         self.entries.is_empty()
     }
 
+    /// Whether this generation contains every event applied to the mutable L2.
+    pub fn is_complete(&self) -> bool {
+        !self.overflowed
+    }
+
     /// 清空（flush 后调用）
     pub fn clear(&mut self) {
         self.entries.clear();
         if self.entries.capacity() > 4096 {
             self.entries.shrink_to(1024);
         }
+    }
+
+    /// Start a new filesystem-rebuild boundary without hiding previously
+    /// represented paths from queries. Missing pre-boundary events are covered
+    /// by the subsequent full scan; events after the boundary get additional,
+    /// still-bounded headroom and must all fit or the rebuild is retried.
+    pub fn begin_full_rebuild_generation(&mut self) {
+        const MAX_RECOVERY_CAPACITY: usize = 1_048_576;
+        self.overflowed = false;
+        self.structural_replay_unproven = false;
+        // The full scan starts after this boundary and therefore proves all
+        // pre-boundary subtree state from the filesystem itself.
+        self.subtree_invalidations.clear();
+        let ceiling = self.base_max_capacity.max(MAX_RECOVERY_CAPACITY);
+        let with_headroom = self.entries.len().saturating_add(self.base_max_capacity);
+        self.max_capacity = self
+            .max_capacity
+            .saturating_mul(2)
+            .max(with_headroom)
+            .min(ceiling);
+    }
+
+    /// Close a proven-complete generation after durable snapshot publication
+    /// or a complete full rebuild.
+    pub fn reset_complete_generation(&mut self) {
+        self.clear();
+        self.subtree_invalidations.clear();
+        self.overflowed = false;
+        self.structural_replay_unproven = false;
+        self.max_capacity = self.base_max_capacity;
+    }
+
+    /// Restore the normal capacity after a rebuild whose replay buffer drained
+    /// completely. The caller must have checked `is_complete()` first.
+    pub fn finish_full_rebuild_generation(&mut self) {
+        debug_assert!(self.is_complete());
+        self.max_capacity = self.base_max_capacity;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_capacity_for_test(&mut self, max_capacity: usize) {
+        self.max_capacity = max_capacity;
     }
 
     /// 提取需要写入 seg-*.del 的删除路径（Deleted 状态）
@@ -176,6 +309,11 @@ impl DeltaBuffer {
         self.entries.len() * entry_overhead
             + self.entries.capacity().saturating_sub(self.entries.len())
                 * size_of::<(Vec<u8>, DeltaState)>()
+            + self
+                .subtree_invalidations
+                .iter()
+                .map(|path| path.capacity() + size_of::<Vec<u8>>() + 16)
+                .sum::<usize>()
     }
 }
 
@@ -212,6 +350,7 @@ mod tests {
         db.apply_events(&[make_event(2, EventType::Create, "/tmp/a")]);
         assert!(db.is_live(b"/tmp/a"));
         assert!(!db.is_deleted(b"/tmp/a"));
+        assert!(db.snapshot_deleted_paths().any(|path| path == b"/tmp/a"));
     }
 
     #[test]
@@ -261,17 +400,25 @@ mod tests {
         // 容量超限拒绝新路径
         assert!(!db.apply_events(&[make_event(3, EventType::Create, "/tmp/c")]));
         assert_eq!(db.len(), 2);
+        assert!(!db.is_complete());
         // 更新已有路径仍允许
         assert!(db.apply_events(&[make_event(4, EventType::Modify, "/tmp/a")]));
         assert_eq!(db.len(), 2);
+        assert!(
+            !db.is_complete(),
+            "later updates must not hide an earlier rejected path"
+        );
         // 删除已有路径仍允许
         assert!(db.apply_events(&[make_event(5, EventType::Delete, "/tmp/a")]));
         assert_eq!(db.len(), 2);
         assert!(db.is_deleted(b"/tmp/a"));
-        // clear 后腾出空间
+        // 普通 clear 只释放条目，不能把已丢事件的 generation 伪装为完整。
         db.clear();
+        assert!(!db.is_complete());
         assert!(db.apply_events(&[make_event(6, EventType::Create, "/tmp/c")]));
         assert_eq!(db.len(), 1);
+        db.reset_complete_generation();
+        assert!(db.is_complete());
     }
 
     #[test]
@@ -294,6 +441,7 @@ mod tests {
         // drain_deleted_for_flush 后（内部调用 clear）可以重新插入
         let _ = db.drain_deleted_for_flush();
         assert!(db.is_empty());
+        assert!(!db.is_complete());
         assert!(db.apply_events(&[make_event(1, EventType::Create, "/tmp/after_clear")]));
         assert_eq!(db.len(), 1);
     }
@@ -315,6 +463,26 @@ mod tests {
             "clear should shrink large overlay capacity, got {}",
             db.entries.capacity()
         );
+    }
+
+    #[test]
+    fn full_rebuild_boundary_recovers_completeness_with_bounded_headroom() {
+        let mut db = DeltaBuffer::with_capacity_and_limit(2, 2);
+        assert!(db.apply_events(&[
+            make_event(1, EventType::Create, "/tmp/a"),
+            make_event(2, EventType::Create, "/tmp/b"),
+        ]));
+        assert!(!db.apply_events(&[make_event(3, EventType::Create, "/tmp/missed")]));
+
+        db.begin_full_rebuild_generation();
+
+        assert!(db.is_complete());
+        assert!(db.apply_events(&[make_event(4, EventType::Create, "/tmp/after-boundary")]));
+        assert_eq!(db.len(), 3);
+        db.clear();
+        db.finish_full_rebuild_generation();
+        assert!(db.is_complete());
+        assert_eq!(db.max_capacity, 2);
     }
 
     #[test]

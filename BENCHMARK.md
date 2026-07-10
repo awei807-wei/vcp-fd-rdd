@@ -146,6 +146,8 @@ python3 scripts/m2-cold-window-vm-bench.py \
 
 ### A/B 判定标准
 
+正式内存 A/B 的两腿必须分别从同一个已关机、只读的 VM/磁盘基线快照恢复；fixture 的 completed verified manifest 只证明生成时完整，不能证明当前目录树或 page cache 未被上一腿污染。报告目录应放在快照外并在每腿结束后立即导出。正式结果使用同一候选版 runner、`--build always`、相同参数指纹和初始状态指纹；顺序执行的 `--sweep-config` 只用于探索，不能单独作为初始构建峰值的正式 A/B。
+
 | 类别 | 通过条件 |
 |---|---|
 | 正确性 | canary create 可见、rename 新路径可见且旧路径隐藏、delete 隐藏；delete/rename storm 后旧结果不复活。 |

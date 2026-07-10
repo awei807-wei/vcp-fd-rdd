@@ -362,6 +362,11 @@ pub struct OverlayStats {
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct RebuildStats {
     pub in_progress: bool,
+    /// Owned rebuild generation lifecycle: none / pending / writing.
+    pub owned_snapshot_state: String,
+    /// Last complete mutable-generation estimate retained through owned writing.
+    pub owned_snapshot_estimated_bytes: u64,
+    pub owned_snapshot_file_count: usize,
     pub pending_paths: usize,
     pub pending_map_cap: usize,
     /// PathBuf 路径字节总量（下界估算：len，不含容量与 allocator 开销）

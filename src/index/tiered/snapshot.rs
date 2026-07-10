@@ -2,15 +2,14 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::storage::snapshot::{
-    install_stable_v7_from_source, remove_stable_v7_recovery_copies, stable_v7_path_for,
-    write_recovery_runtime_state, write_stable_v7_atomic, RecoveryRuntimeState,
-};
-use crate::storage::snapshot_v7::{try_load_v7_cold, write_v7_snapshot_atomic};
 use crate::storage::traits::StorageBackend;
-use crate::util::{maybe_trim_rss, unix_secs};
+use crate::util::maybe_trim_rss;
 
 use super::TieredIndex;
+
+mod generation;
+
+use generation::{build_durable_snapshot_generation, publish_snapshot_generation};
 
 const MIN_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -22,154 +21,15 @@ impl TieredIndex {
     {
         let idx = self.clone();
         let store_for_sync = store.clone();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let delta = idx.l2.load_full();
-            let delta_dirty = delta.is_dirty();
-
-            let overlay_dirty = {
-                let db = idx.delta_buffer.lock();
-                !db.is_empty()
-            };
-            let pending_flush_dirty = idx.pending_flush_events.load(Ordering::Relaxed) > 0
-                || idx.pending_flush_bytes.load(Ordering::Relaxed) > 0;
-            let unsnapshotted_base = idx.last_snapshot_time.load(Ordering::Relaxed) == 0
-                && idx.base.load().file_count() > 0;
-            if !delta_dirty && !overlay_dirty && !pending_flush_dirty && !unsnapshotted_base {
-                tracing::debug!("No delta/overlay changes, skipping flush");
-                idx.flush_requested.store(false, Ordering::Release);
-                idx.reset_pending_flush_batch();
-                return Ok(None);
-            }
-
-            // WAL：在 snapshot 边界 seal，确保新事件进入新 WAL。
-            let wal_seal_id = match idx.wal.lock().clone() {
-                Some(w) => match w.seal() {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::warn!("WAL seal failed, continuing: {}", e);
-                        0
-                    }
-                },
-                None => 0,
-            };
-
-            // Snapshot is the materialization boundary: ordinary event batches
-            // update the delta path only, so the full visible BaseIndex is
-            // rebuilt on this cold path and then written as v7.
-            let base = idx.materialize_snapshot_base()?;
-            let v7_path = store_for_sync.path().with_extension("v7");
-
-            // delta_buffer has been cleared by materialize_snapshot_base after
-            // its content was folded into base.
-            idx.flush_requested.store(false, Ordering::Release);
-
-            Ok(Some((base, v7_path, wal_seal_id)))
+        let wrote_snapshot = tokio::task::spawn_blocking(move || {
+            snapshot_generation_blocking(&idx, store_for_sync.as_ref())
         })
         .await
-        .map_err(|e| anyhow::anyhow!("snapshot sync phase panicked: {}", e))??;
+        .map_err(|error| anyhow::anyhow!("snapshot sync phase panicked: {error}"))??;
 
-        let (base, v7_path, wal_seal_id) = match result {
-            Some(v) => v,
-            None => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                return Ok(());
-            }
-        };
-
-        // 写入 v7 快照（原子写：tmp + rename）
-        let mut remount_path = None;
-        let mut primary_written = false;
-        if let Err(e) = write_v7_snapshot_atomic(&v7_path, &base) {
-            tracing::warn!("v7 snapshot write failed: {}", e);
-        } else {
-            tracing::info!("v7 snapshot written to {:?}", v7_path);
-            remount_path = Some(v7_path.clone());
-            primary_written = true;
+        if !wrote_snapshot {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-
-        let stable_enabled = self
-            .io_tuning
-            .stable_snapshot_enabled
-            .load(Ordering::Relaxed);
-        let mut recovery_snapshot_durable = false;
-        if stable_enabled {
-            let stable_result = if primary_written {
-                install_stable_v7_from_source(store.path(), &v7_path).or_else(|copy_error| {
-                    tracing::warn!(
-                        "stable v7 install from primary failed, falling back to encode: {}",
-                        copy_error
-                    );
-                    write_stable_v7_atomic(store.path(), &base)
-                })
-            } else {
-                write_stable_v7_atomic(store.path(), &base)
-            };
-
-            if let Err(e) = stable_result {
-                tracing::warn!("stable v7 snapshot write failed: {}", e);
-            } else {
-                recovery_snapshot_durable = true;
-                remount_path = Some(stable_v7_path_for(store.path()));
-                // Once a shutdown is in progress every snapshot belongs to the
-                // clean-shutdown sequence, so mark it clean. During normal
-                // operation the marker stays false so an actual crash is
-                // detected on the next start.
-                let state = RecoveryRuntimeState {
-                    last_clean_shutdown: self.is_shutting_down(),
-                    last_snapshot_unix_secs: unix_secs(),
-                    last_wal_seal_id: wal_seal_id,
-                    last_startup_source: self.recovery_status().report.snapshot_source,
-                    last_recovery_mode: "snapshot".to_string(),
-                    root_case_policies: self.root_case_policy_diagnostics(),
-                };
-                if let Err(e) = write_recovery_runtime_state(store.path(), &state) {
-                    tracing::warn!("recovery runtime state write failed: {}", e);
-                }
-                tracing::info!("stable v7 snapshot written for recovery");
-            }
-        } else if primary_written {
-            match sync_primary_snapshot_parent(&v7_path)
-                .and_then(|()| remove_stable_v7_recovery_copies(store.path()))
-            {
-                Ok(()) => recovery_snapshot_durable = true,
-                Err(error) => tracing::warn!(
-                    "failed to confirm primary durability and retire disabled stable snapshots: {}",
-                    error
-                ),
-            }
-        }
-
-        if let Some(path) = remount_path {
-            match try_load_v7_cold(&path, self.roots.as_slice()) {
-                Ok(Some(cold_base)) => {
-                    self.base.store(Arc::new(cold_base));
-                    self.invalidate_memory_report_cache();
-                    tracing::info!("snapshot base remounted cold from {:?}", path);
-                }
-                Ok(None) => {
-                    tracing::warn!("snapshot cold remount skipped: {:?} was not loadable", path);
-                }
-                Err(e) => {
-                    tracing::warn!("snapshot cold remount failed for {:?}: {}", path, e);
-                }
-            }
-        }
-        drop(base);
-
-        if !recovery_snapshot_durable {
-            self.flush_requested.store(true, Ordering::Release);
-            maybe_trim_rss();
-            anyhow::bail!("snapshot has no durable recovery copy; sealed WAL retained for retry");
-        }
-
-        self.l1.clear();
-        if let Some(w) = self.wal.lock().clone() {
-            let _ = w.cleanup_sealed_up_to(wal_seal_id);
-        }
-        self.record_snapshot_success();
-        self.reset_pending_flush_batch();
-
-        // snapshot/flush 是临时分配大户；完成后尝试回吐。
         maybe_trim_rss();
         Ok(())
     }
@@ -273,10 +133,101 @@ impl TieredIndex {
     }
 }
 
-fn sync_primary_snapshot_parent(path: &std::path::Path) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
+fn snapshot_generation_blocking<S>(idx: &Arc<TieredIndex>, store: &S) -> anyhow::Result<bool>
+where
+    S: StorageBackend + ?Sized,
+{
+    // Event application holds the same gate from WAL append through mutable
+    // L2 apply. Rebuild publication is frozen by the rebuild-state guard. The
+    // captured (base, delta, WAL seal) generation therefore cannot change
+    // while its files are written, validated, and mounted.
+    let event_boundary = idx.snapshot_event_gate.lock();
+    let rebuild_generation = idx.rebuild_state.lock();
+    if rebuild_generation.in_progress
+        || rebuild_generation.scheduled
+        || rebuild_generation.requested
+    {
+        anyhow::bail!("snapshot deferred while full rebuild recovery is pending");
     }
-    Ok(())
+    // Rebuild admission may mark a request while writing, but the rebuild
+    // worker cannot cross `snapshot_event_gate` until this generation is fully
+    // published. Releasing this mutex keeps `/memory` and health telemetry
+    // responsive throughout long external-sort/fsync phases.
+    drop(rebuild_generation);
+
+    if !snapshot_work_pending(idx) {
+        idx.flush_requested.store(false, Ordering::Release);
+        idx.reset_pending_flush_batch();
+        return Ok(false);
+    }
+
+    let result = build_durable_snapshot_generation(idx, store)
+        .and_then(|generation| {
+            let consumed_owned_generation = generation.consumed_owned_generation;
+            publish_snapshot_generation(idx, generation).map_err(|error| {
+                if consumed_owned_generation {
+                    anyhow::anyhow!("owned_v7_generation_consumed: {error:#}")
+                } else {
+                    error
+                }
+            })
+        })
+        .map_err(|error| {
+            anyhow::anyhow!("snapshot generation failed; sealed WAL retained for retry: {error:#}")
+        });
+    if let Err(error) = result {
+        idx.flush_requested.store(true, Ordering::Release);
+        let rebuild_required = snapshot_error_requires_rebuild(&error);
+        let owned_generation_consumed =
+            format!("{error:#}").contains("owned_v7_generation_consumed");
+        if owned_generation_consumed {
+            idx.pending_snapshot_generation.lock().take();
+            *idx.owned_snapshot_telemetry.lock() = Default::default();
+            idx.rebuild_snapshot_pending.store(false, Ordering::Release);
+            idx.invalidate_memory_report_cache();
+        }
+        drop(event_boundary);
+        if rebuild_required && !idx.is_shutting_down() {
+            // A rebuild supersedes any in-memory generation that could not be
+            // durably published. Drop it before scanning to avoid two full
+            // rebuild generations coexisting at the next peak.
+            idx.pending_snapshot_generation.lock().take();
+            tracing::warn!(
+                "direct snapshot entered rebuild recovery; delta and sealed WAL retained: {error:#}"
+            );
+            idx.spawn_full_build();
+        }
+        return Err(error);
+    }
+
+    Ok(true)
+}
+
+fn snapshot_work_pending(idx: &TieredIndex) -> bool {
+    let delta_dirty = idx.l2.load().is_dirty();
+    let db = idx.delta_buffer.lock();
+    let base = idx.base.load();
+    let owned_rebuild_pending = idx.pending_snapshot_generation.lock().is_some();
+    let hot_base_needs_publish = base.cold_segments.is_empty() && base.file_count() > 0;
+    delta_dirty
+        || !db.is_empty()
+        || !db.is_complete()
+        || hot_base_needs_publish
+        || owned_rebuild_pending
+        || idx.rebuild_snapshot_pending.load(Ordering::Acquire)
+}
+
+fn snapshot_error_requires_rebuild(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    [
+        "direct_v7_unsupported",
+        "direct_v7_corrupt",
+        "direct_v7_validation_failed",
+        "streaming_compaction_required",
+        "snapshot_delta_incomplete",
+        "snapshot_upsert_unresolved",
+        "owned_v7_generation_consumed",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }

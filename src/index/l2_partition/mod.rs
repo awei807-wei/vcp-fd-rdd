@@ -45,6 +45,7 @@ mod path_arena;
 mod path_store;
 mod query;
 mod snapshot_format;
+mod snapshot_source;
 mod stats;
 mod types;
 mod upsert;
@@ -55,6 +56,7 @@ pub use snapshot_format::{
     CompactMeta, CompactMetaV4, IndexSnapshotV2, IndexSnapshotV3, IndexSnapshotV4, IndexSnapshotV5,
     V6Segments,
 };
+pub use snapshot_source::OwnedV7Source;
 
 pub(crate) use helpers::mtime_to_ns;
 

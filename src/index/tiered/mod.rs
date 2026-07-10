@@ -32,7 +32,7 @@ use crate::fs_policy::{FsPolicyConfig, SharedMountPolicyCounters};
 use crate::index::l1_cache::L1Cache;
 use crate::index::l2_partition::PersistentIndex;
 use crate::index::l3_cold::IndexBuilder;
-use crate::stats::{StatsCollector, StatsReport};
+use crate::stats::{L2Stats, StatsCollector, StatsReport};
 use crate::storage::quarantine::{FreezeGate, RootStateRecord};
 use crate::storage::recovery_audit::RecoveryAuditReport;
 use crate::storage::traits::WriteAheadLog;
@@ -50,8 +50,31 @@ const RUNTIME_SUBTREE_TOMBSTONE_TTL: Duration = Duration::from_secs(300);
 #[derive(Clone, Debug)]
 struct RuntimeSubtreeTombstone {
     root_path: PathBuf,
-    generation: u64,
     expires_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OwnedSnapshotLifecycle {
+    #[default]
+    None,
+    Pending,
+    Writing,
+}
+
+impl OwnedSnapshotLifecycle {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pending => "pending",
+            Self::Writing => "writing",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct OwnedSnapshotTelemetry {
+    lifecycle: OwnedSnapshotLifecycle,
+    l2: L2Stats,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -275,6 +298,12 @@ pub struct TieredIndex {
     pub(self) wal: Mutex<Option<Arc<dyn WriteAheadLog + Send + Sync>>>,
     pub event_seq: AtomicU64,
     pub(self) rebuild_state: Mutex<RebuildState>,
+    /// Serializes the WAL/delta mutation boundary with snapshot generation
+    /// capture. Event application holds this gate from WAL append through the
+    /// mutable L2 update; snapshotting holds it from WAL seal through durable
+    /// publication. This prevents a sealed WAL record from landing in the next
+    /// delta generation after the sealed file has been retired.
+    pub(self) snapshot_event_gate: Mutex<()>,
     pub(self) delta_buffer: Mutex<crate::index::delta_buffer::DeltaBuffer>,
     pub base: ArcSwap<crate::index::base_index::BaseIndexData>,
     pub(self) flush_requested: AtomicBool,
@@ -295,6 +324,17 @@ pub struct TieredIndex {
     pub(self) pending_flush_events: AtomicU64,
     pub(self) pending_flush_bytes: AtomicU64,
     pub(self) last_snapshot_time: AtomicU64,
+    /// A completed rebuild must be checkpointed even when it produced an empty
+    /// index; file_count alone cannot distinguish that generation from "no work".
+    pub(self) rebuild_snapshot_pending: AtomicBool,
+    /// Exclusively owned rebuild output waiting for bounded-memory v7 writing.
+    /// It is intentionally not query-visible and is consumed exactly once by
+    /// the snapshot generation gate.
+    pub(self) pending_snapshot_generation:
+        Mutex<Option<crate::index::l2_partition::PersistentIndex>>,
+    /// Lock-independent memory/lifecycle snapshot retained while the owned
+    /// generation moves out of `pending_snapshot_generation` into the writer.
+    pub(self) owned_snapshot_telemetry: Mutex<OwnedSnapshotTelemetry>,
     pub roots: Vec<PathBuf>,
     pub include_hidden: bool,
     pub ignore_enabled: bool,
@@ -447,18 +487,15 @@ impl TieredIndex {
         let now = Instant::now();
         let ttl_secs = self.tombstones.ttl_secs.load(Ordering::Relaxed);
         let expires_at = now + Duration::from_secs(ttl_secs);
-        let current_generation = self.event_seq.load(Ordering::Relaxed);
         let mut tombstones = self.tombstones.entries.lock();
         Self::cleanup_runtime_subtree_tombstones_locked(&mut tombstones, now);
 
         for ev in events {
-            let generation = ev.seq.max(current_generation.saturating_add(1));
             match &ev.event_type {
                 crate::core::EventType::Delete => {
                     if let Some(path) = ev.best_path() {
                         tombstones.push(RuntimeSubtreeTombstone {
                             root_path: normalize_path(path),
-                            generation,
                             expires_at,
                         });
                     }
@@ -470,43 +507,18 @@ impl TieredIndex {
                     if let Some(from_path) = from_path_hint.as_deref().or_else(|| from.as_path()) {
                         tombstones.push(RuntimeSubtreeTombstone {
                             root_path: normalize_path(from_path),
-                            generation,
                             expires_at,
                         });
                     }
-                    if let Some(to_path) = ev.best_path() {
-                        Self::clear_runtime_subtree_tombstones_for_path(
-                            &mut tombstones,
-                            normalize_path(to_path).as_path(),
-                            generation,
-                        );
-                    }
                 }
-                crate::core::EventType::Create | crate::core::EventType::Modify => {
-                    if let Some(path) = ev.best_path() {
-                        Self::clear_runtime_subtree_tombstones_for_path(
-                            &mut tombstones,
-                            normalize_path(path).as_path(),
-                            generation,
-                        );
-                    }
-                }
+                crate::core::EventType::Create | crate::core::EventType::Modify => {}
             }
         }
     }
 
-    fn clear_runtime_subtree_tombstones_for_path(
-        tombstones: &mut Vec<RuntimeSubtreeTombstone>,
-        path: &Path,
-        generation: u64,
-    ) {
-        tombstones.retain(|tombstone| {
-            if generation < tombstone.generation {
-                return true;
-            }
-            !(path.starts_with(tombstone.root_path.as_path())
-                || tombstone.root_path.starts_with(path))
-        });
+    pub(super) fn clear_runtime_subtree_tombstones_after_generation(&self) {
+        self.tombstones.entries.lock().clear();
+        self.tombstones.recent_stale_hit_dirs.lock().clear();
     }
 
     #[cfg(test)]
@@ -580,6 +592,7 @@ impl TieredIndex {
     }
 
     pub fn apply_root_state_record(&self, record: RootStateRecord) {
+        let _snapshot_boundary = self.snapshot_event_gate.lock();
         if let Some(wal) = self.wal.lock().clone() {
             if let Err(e) = wal.append_root_events(std::slice::from_ref(&record)) {
                 tracing::warn!("WAL root-state append failed (continuing): {}", e);
@@ -590,6 +603,7 @@ impl TieredIndex {
     }
 
     fn try_apply_root_state_record_after_wal(&self, record: RootStateRecord) -> bool {
+        let _snapshot_boundary = self.snapshot_event_gate.lock();
         let Some(wal) = self.wal.lock().clone() else {
             tracing::warn!("WAL root-state append skipped: WAL is not attached");
             return false;

@@ -1,6 +1,6 @@
 use crate::stats::{
-    infer_heap_high_water, EventPipelineStats, GenerationStats, MemoryReport, MemorySampleDepth,
-    OverlayStats, QueryGuardStats, RebuildStats,
+    infer_heap_high_water, EventPipelineStats, GenerationStats, L2Stats, MemoryReport,
+    MemorySampleDepth, OverlayStats, QueryGuardStats, RebuildStats,
 };
 use crate::util::maybe_trim_rss;
 use std::collections::VecDeque;
@@ -23,11 +23,13 @@ impl TieredIndex {
     /// Ordinary query, event apply, fast-sync, and watcher paths must not call
     /// this method; they should read base + overlay/L2 without full materializing.
     pub fn refresh_base(&self) {
+        let _snapshot_boundary = self.snapshot_event_gate.lock();
+        let _rebuild_generation = self.rebuild_state.lock();
         self.stats.record_refresh_base();
         let l2 = self.l2.load_full();
         let new_base = Arc::new(l2.to_base_index_data());
         self.base.store(new_base);
-        self.delta_buffer.lock().clear();
+        self.delta_buffer.lock().reset_complete_generation();
         self.invalidate_memory_report_cache();
     }
 
@@ -76,14 +78,28 @@ impl TieredIndex {
 
     fn rebuild_memory_stats(&self) -> RebuildStats {
         let st = self.rebuild_state.lock();
+        let owned = self.owned_snapshot_telemetry.lock();
         RebuildStats {
             in_progress: st.in_progress,
+            owned_snapshot_state: owned.lifecycle.as_str().to_string(),
+            owned_snapshot_estimated_bytes: owned.l2.estimated_bytes,
+            owned_snapshot_file_count: owned.l2.file_count,
             pending_paths: 0,
             pending_map_cap: 0,
             pending_key_bytes: 0,
             pending_from_bytes: 0,
             estimated_bytes: 0,
         }
+    }
+
+    fn l2_memory_stats_for_report(&self) -> (L2Stats, usize) {
+        let owned = self.owned_snapshot_telemetry.lock().clone();
+        if owned.lifecycle != super::OwnedSnapshotLifecycle::None {
+            return (owned.l2, 0);
+        }
+        let generation = self.l2.load_full();
+        let strong_refs = Arc::strong_count(&generation);
+        (generation.memory_stats(), strong_refs)
     }
 
     fn query_guard_memory_stats(&self) -> QueryGuardStats {
@@ -111,6 +127,9 @@ impl TieredIndex {
         report.cached_full_age_ms = cached_full_age_ms;
         report.event_pipeline = pipeline_stats;
         report.l1 = self.l1.memory_stats();
+        let (l2, l2_strong_refs) = self.l2_memory_stats_for_report();
+        report.l2 = l2;
+        report.generation.l2_strong_refs = l2_strong_refs;
         report.dirty_queue = self.dirty_queue.lock().memory_stats();
         report.overlay = self.overlay_memory_stats();
         report.rebuild = self.rebuild_memory_stats();
@@ -148,9 +167,7 @@ impl TieredIndex {
         let base_generation = self.base.load_full();
         let base_strong_refs = Arc::strong_count(&base_generation);
         let base = base_generation.memory_stats();
-        let l2_generation = self.l2.load_full();
-        let l2_strong_refs = Arc::strong_count(&l2_generation);
-        let l2 = l2_generation.memory_stats();
+        let (l2, l2_strong_refs) = self.l2_memory_stats_for_report();
 
         MemoryReport {
             sample_depth: MemorySampleDepth::Light,
@@ -174,9 +191,7 @@ impl TieredIndex {
         let base_generation = self.base.load_full();
         let base_strong_refs = Arc::strong_count(&base_generation);
         let base = base_generation.memory_stats();
-        let l2_generation = self.l2.load_full();
-        let l2_strong_refs = Arc::strong_count(&l2_generation);
-        let l2 = l2_generation.memory_stats();
+        let (l2, l2_strong_refs) = self.l2_memory_stats_for_report();
         let dirty_queue = self.dirty_queue.lock().memory_stats();
         let overlay = self.overlay_memory_stats();
         let rebuild = self.rebuild_memory_stats();

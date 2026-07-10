@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 性能
 
+- 百万文件初始 rebuild 不再把完整 `PersistentIndex` 转成第二份 `BaseIndexData`：完成扫描的 generation 直接转交 current-v7 owned writer，先释放 FileKey、trigram、parent 等查询派生表，再以 32 MiB 有界外排/归并生成路径、entry、trigram 与 parent 段；源 entries/path arena 在最终段归并前释放。
+- current-v7 周期快照新增 cold mmap + delta 直接流式合并：保留旧 DocId/path index，对覆盖、精确删除和子树删除追加 tombstone/new DocId，并按段增量合并 posting，避免重新热化 cold base 或同时持有六个完整编码段。
 - 快照物化不再先构造百万级 `Vec<FileMeta>`：overlay 与 cold base 直接流入临时 `PersistentIndex`，再通过消费式 `into_base_index_data()` 转换，复用 trigram/tombstone 所有权并提前释放派生查找结构，缩短两代全量对象的共存窗口。
 - 主 v7 写入成功后，stable 恢复副本改为复制、mmap/CRC 校验和原子轮转，不再对同一 `BaseIndexData` 做第二次完整编码与热反序列化；stable 禁用时会在确认主文件目录持久化后退休旧恢复副本。
 - `PersistentIndex` 运行时路径从每条路径独立分配的 `Vec<Vec<u8>>` 改为连续 `PathStore` Arena 与 8 字节 `PathRef`，保留超长内存路径和重命名语义，同时消除百万级小对象分配与对应 allocator 碎片。
@@ -26,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- full rebuild 发布改为 fail-closed generation 边界：扫描期间的 overflow、目录 rename/子树失效会保留 delta 与 sealed WAL 并重试，普通文件精确 delete 仍可在边界内重放；snapshot 验证、stable 安装、cold remount 或 quarantine sidecar 任一步失败都不得清理恢复证据。
+- M2 VM benchmark 新增参数、初始状态、执行三层指纹和 `ab_comparable` 门禁；正式 A/B 必须使用本轮 `cargo build --release --locked` 且来源 SHA 可证明的二进制、原子 completed verified fixture manifest、干净工作区与完整采样，legacy fixture 标记只展示、不再进入可比结果。
+- benchmark manifest 改为原子生命周期状态机，并以独立 `/proc` sampler 精确覆盖 SIGTERM 后最终快照窗口；`--workload-seed` 固定 mixed workload，runner 报告 owned snapshot 状态及六项 L2 时间序列。
 - M2 VM benchmark 将首次查询的传输成功与语义正确性分开统计，否定查询不再把 HTTP/解析失败误计为正确；inode reuse 输出 `not_run` / `inconclusive` / `exercised`，UDS 使用 `/tmp` 短哈希路径。
 - M2 VM benchmark 从 daemon 启动时独立以默认 0.5 秒采集 `/proc` RSS，并输出 rebuild、initial build publish、cold steady、hot-base snapshot 四阶段峰值和六项 L2 时间序列；压缩序列保留每次阶段边界、尾点与指标极值。
 - stable 写入、轮转、禁用清理或目录同步失败时，快照不再清理 sealed WAL 或记录成功，而是保留恢复日志并请求重试，避免旧 stable 抢先于新主 v7 导致恢复丢数。

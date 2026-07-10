@@ -63,12 +63,7 @@ impl QuarantineSidecar {
     }
 
     pub fn write_to(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, text)?;
-        Ok(())
+        crate::util::atomic_write_json(path, self)
     }
 
     pub fn active_roots(&self) -> impl Iterator<Item = &QuarantineRoot> {
@@ -239,6 +234,13 @@ impl QuarantineState {
 
     pub fn active_root_count(&self) -> usize {
         self.roots.len()
+    }
+
+    pub fn to_sidecar(&self) -> QuarantineSidecar {
+        QuarantineSidecar {
+            version: QUARANTINE_SIDECAR_VERSION,
+            roots: self.roots.clone(),
+        }
     }
 
     pub fn freeze_gate(&self) -> FreezeGate {

@@ -169,23 +169,34 @@ impl PathTableV2 {
 
     pub fn encode_raw(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(RAW_V2_HEADER_SIZE + self.allocated_bytes());
-        out.extend_from_slice(RAW_MAGIC_V2);
-        out.extend_from_slice(&(self.slots.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.suffix_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.idx_to_sorted.len() as u32).to_le_bytes());
-        // Padding for the old anchors_len field; kept for header-size stability.
-        out.extend_from_slice(&0u32.to_le_bytes());
-        for slot in &self.slots {
-            out.extend_from_slice(&slot.suffix_offset.to_le_bytes());
-            out.extend_from_slice(&slot.shared_len.to_le_bytes());
-            out.extend_from_slice(&slot.suffix_len.to_le_bytes());
-            out.extend_from_slice(&slot.orig_idx.to_le_bytes());
-        }
-        out.extend_from_slice(&self.suffix_bytes);
-        for v in &self.idx_to_sorted {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
+        self.encode_raw_to_writer(&mut out)
+            .expect("writing a path table to Vec cannot fail");
         out
+    }
+
+    /// Stream the current raw layout without allocating a second full encoded
+    /// path-table buffer.
+    pub fn encode_raw_to_writer(
+        &self,
+        writer: &mut (impl std::io::Write + ?Sized),
+    ) -> std::io::Result<()> {
+        writer.write_all(RAW_MAGIC_V2)?;
+        writer.write_all(&(self.slots.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.suffix_bytes.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.idx_to_sorted.len() as u32).to_le_bytes())?;
+        // Padding for the old anchors_len field; kept for header-size stability.
+        writer.write_all(&0u32.to_le_bytes())?;
+        for slot in &self.slots {
+            writer.write_all(&slot.suffix_offset.to_le_bytes())?;
+            writer.write_all(&slot.shared_len.to_le_bytes())?;
+            writer.write_all(&slot.suffix_len.to_le_bytes())?;
+            writer.write_all(&slot.orig_idx.to_le_bytes())?;
+        }
+        writer.write_all(&self.suffix_bytes)?;
+        for v in &self.idx_to_sorted {
+            writer.write_all(&v.to_le_bytes())?;
+        }
+        Ok(())
     }
 
     /// Decode a raw path table, transparently handling the current layout and
@@ -619,6 +630,15 @@ mod tests {
             assert_eq!(std::str::from_utf8(&resolved).unwrap(), *expected);
             assert_eq!(decoded.lookup(expected.as_bytes()), Some(idx as PathIdx));
         }
+    }
+
+    #[test]
+    fn raw_stream_encoding_matches_vec_encoding() {
+        let table = make_table(&["/tmp/a", "/tmp/deep/b", "/var/log/c"]);
+        let expected = table.encode_raw();
+        let mut streamed = Vec::new();
+        table.encode_raw_to_writer(&mut streamed).unwrap();
+        assert_eq!(streamed, expected);
     }
 
     /// Encode `paths` (idx == position in the slice) in the pre-slot-merge
