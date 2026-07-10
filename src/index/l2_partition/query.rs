@@ -1,6 +1,7 @@
 use roaring::RoaringBitmap;
 
 use crate::core::{FileKey, FileMeta};
+use crate::index::base_index::{BaseIndexData, TrigramIndex};
 use crate::index::file_entry_v2::FileEntry;
 use crate::index::IndexLayer;
 use crate::query::matcher::Matcher;
@@ -11,6 +12,7 @@ use super::helpers::{
     trigram_matches_short_hint,
 };
 use super::parent_path::CompactPathTable;
+use super::path_store::PathStore;
 use super::{DocId, PersistentIndex};
 
 impl PersistentIndex {
@@ -143,83 +145,152 @@ impl PersistentIndex {
         Some(acc)
     }
 
-    pub fn to_base_index_data(&self) -> crate::index::base_index::BaseIndexData {
+    pub fn to_base_index_data(&self) -> BaseIndexData {
         let entries_v2 = self.entries.read();
         let paths_v2 = self.paths.read();
         let tombstones = self.tombstones.read();
         let trigram_index = self.trigram_index.read();
 
-        let mut rebuild_path_table = CompactPathTable::new();
-        for root in &self.roots_bytes {
-            if !root.is_empty() {
-                let _ = rebuild_path_table.intern(root, true);
-            }
-        }
-        let mut entry_path_idxs: Vec<u32> = Vec::with_capacity(entries_v2.len());
-        let mut parent_entries: Vec<(u32, u64)> = Vec::with_capacity(entries_v2.len());
+        build_base_index_data(
+            &self.roots_bytes,
+            &entries_v2,
+            &paths_v2,
+            tombstones.clone(),
+            TrigramIndex {
+                inner: trigram_index.clone(),
+            },
+        )
+    }
 
-        for docid_usize in 0..entries_v2.len() {
-            let docid = DocId::try_from(docid_usize).expect("entries fit in u32 DocId");
-            let Some(abs_bytes) = paths_v2.get_bytes(docid) else {
-                continue;
-            };
-            intern_parent_dirs(&mut rebuild_path_table, abs_bytes);
-            let entry = &entries_v2[docid_usize];
-            let path_idx = rebuild_path_table.intern(abs_bytes, entry.kind().is_directory());
-            entry_path_idxs.push(path_idx);
-            if !tombstones.contains(docid) {
-                parent_entries.push((path_idx, docid as u64));
-            }
-        }
-
-        let mut path_table_builder =
-            crate::index::path_table_v2::PathTableBuilder::with_capacity(rebuild_path_table.len());
-        for idx in 0..rebuild_path_table.len() {
-            let path_id = u32::try_from(idx).expect("path table fits in u32");
-            let path_bytes = rebuild_path_table
-                .path_bytes(path_id)
-                .expect("path table contains valid refs");
-            path_table_builder.push(path_id, path_bytes);
-        }
-        let mut entry_index =
-            crate::index::file_entry_v2::FileEntryIndex::with_capacity(entries_v2.len());
-
-        for (docid_usize, entry) in entries_v2.iter().enumerate() {
-            let Some(&path_idx) = entry_path_idxs.get(docid_usize) else {
-                continue;
-            };
-            let new_entry = crate::index::file_entry_v2::FileEntry::from_file_key_and_kind(
-                entry.file_key(),
-                path_idx,
-                entry.mtime_ns,
-                entry.kind(),
-            );
-            entry_index.push(new_entry);
-        }
-
-        let path_table = path_table_builder.build();
-        let entries_by_key = entry_index.build();
-        let parent_index = crate::index::parent_index::ParentIndex::build_from_entries(
-            &parent_entries,
-            &rebuild_path_table,
-        );
-
-        let mut tri = crate::index::base_index::TrigramIndex::new();
-        for (trigram, posting) in trigram_index.iter() {
-            tri.insert(*trigram, posting.clone());
-        }
-
-        let tombstones_bitmap = tombstones.clone();
-
-        crate::index::base_index::BaseIndexData {
-            path_table,
-            entries_by_key,
-            trigram_index: tri,
+    /// Consume this mutable L2 index and build an immutable base without
+    /// cloning its largest reusable allocations (trigram postings and
+    /// tombstones). Callers must relinquish the L2 generation first.
+    pub fn into_base_index_data(self) -> BaseIndexData {
+        let PersistentIndex {
+            roots,
+            roots_bytes,
+            entries,
+            paths,
+            filekey_to_docid,
+            path_hash_to_id,
+            trigram_index,
+            tombstones,
+            dirty: _,
             parent_index,
-            tombstones: tombstones_bitmap,
-            cold_segments: Default::default(),
+            parent_path_table,
+        } = self;
+
+        // These derived lookup structures are not part of BaseIndexData. Drop
+        // them before allocating the new path table and parent index so the
+        // conversion does not retain both generations at their peak.
+        drop(roots);
+        drop(filekey_to_docid.into_inner());
+        drop(path_hash_to_id.into_inner());
+        drop(parent_index.into_inner());
+        drop(parent_path_table.into_inner());
+
+        let entries = entries.into_inner();
+        let paths = paths.into_inner();
+        let tombstones = tombstones.into_inner();
+        let trigram_index = TrigramIndex {
+            inner: trigram_index.into_inner(),
+        };
+
+        build_base_index_data(&roots_bytes, &entries, &paths, tombstones, trigram_index)
+    }
+}
+
+fn build_base_index_data(
+    roots_bytes: &[Vec<u8>],
+    entries_v2: &[FileEntry],
+    paths_v2: &PathStore,
+    tombstones: RoaringBitmap,
+    trigram_index: TrigramIndex,
+) -> BaseIndexData {
+    let (rebuild_path_table, entry_path_idxs, parent_entries) =
+        build_base_path_layout(roots_bytes, entries_v2, paths_v2, &tombstones);
+    let path_table = build_base_path_table(&rebuild_path_table);
+    let entries_by_key = build_base_entry_index(entries_v2, &entry_path_idxs);
+    let parent_index = crate::index::parent_index::ParentIndex::build_from_entries(
+        &parent_entries,
+        &rebuild_path_table,
+    );
+
+    BaseIndexData {
+        path_table,
+        entries_by_key,
+        trigram_index,
+        parent_index,
+        tombstones,
+        cold_segments: Default::default(),
+    }
+}
+
+fn build_base_path_layout(
+    roots_bytes: &[Vec<u8>],
+    entries_v2: &[FileEntry],
+    paths_v2: &PathStore,
+    tombstones: &RoaringBitmap,
+) -> (CompactPathTable, Vec<u32>, Vec<(u32, u64)>) {
+    let mut rebuild_path_table = CompactPathTable::new();
+    for root in roots_bytes {
+        if !root.is_empty() {
+            let _ = rebuild_path_table.intern(root, true);
         }
     }
+    let mut entry_path_idxs: Vec<u32> = Vec::with_capacity(entries_v2.len());
+    let mut parent_entries: Vec<(u32, u64)> = Vec::with_capacity(entries_v2.len());
+
+    for (docid_usize, entry) in entries_v2.iter().enumerate() {
+        let docid = DocId::try_from(docid_usize).expect("entries fit in u32 DocId");
+        let Some(abs_bytes) = paths_v2.get_bytes(docid) else {
+            continue;
+        };
+        intern_parent_dirs(&mut rebuild_path_table, abs_bytes);
+        let path_idx = rebuild_path_table.intern(abs_bytes, entry.kind().is_directory());
+        entry_path_idxs.push(path_idx);
+        if !tombstones.contains(docid) {
+            parent_entries.push((path_idx, docid as u64));
+        }
+    }
+
+    (rebuild_path_table, entry_path_idxs, parent_entries)
+}
+
+fn build_base_path_table(
+    rebuild_path_table: &CompactPathTable,
+) -> crate::index::path_table_v2::PathTableV2 {
+    let mut path_table_builder =
+        crate::index::path_table_v2::PathTableBuilder::with_capacity(rebuild_path_table.len());
+    for idx in 0..rebuild_path_table.len() {
+        let path_id = u32::try_from(idx).expect("path table fits in u32");
+        let path_bytes = rebuild_path_table
+            .path_bytes(path_id)
+            .expect("path table contains valid refs");
+        path_table_builder.push(path_id, path_bytes);
+    }
+    path_table_builder.build()
+}
+
+fn build_base_entry_index(
+    entries_v2: &[FileEntry],
+    entry_path_idxs: &[u32],
+) -> crate::index::file_entry_v2::FileEntryIndex {
+    let mut entry_index =
+        crate::index::file_entry_v2::FileEntryIndex::with_capacity(entries_v2.len());
+
+    for (docid_usize, entry) in entries_v2.iter().enumerate() {
+        let Some(&path_idx) = entry_path_idxs.get(docid_usize) else {
+            continue;
+        };
+        entry_index.push(FileEntry::from_file_key_and_kind(
+            entry.file_key(),
+            path_idx,
+            entry.mtime_ns,
+            entry.kind(),
+        ));
+    }
+    entry_index.build()
 }
 
 impl IndexLayer for PersistentIndex {
@@ -288,5 +359,105 @@ impl IndexLayer for PersistentIndex {
         let entry = entries.get(docid as usize)?;
         let path_bytes = paths.get_bytes(docid)?;
         Some(PersistentIndex::meta_from_entry_and_path(entry, path_bytes))
+    }
+}
+
+#[cfg(test)]
+mod owned_conversion_tests {
+    use std::path::PathBuf;
+
+    use crate::core::{FileKey, FileKind, FileMeta};
+    use crate::query::matcher::create_matcher;
+
+    use super::PersistentIndex;
+
+    fn meta(file_key: FileKey, path: &str, kind: FileKind) -> FileMeta {
+        FileMeta {
+            file_key,
+            path: PathBuf::from(path),
+            size: 0,
+            mtime: None,
+            ctime: None,
+            atime: None,
+            kind,
+        }
+    }
+
+    fn populated_index() -> PersistentIndex {
+        let index = PersistentIndex::new_with_roots(vec![PathBuf::from("/tmp/owned-base")]);
+        let shared_key = FileKey {
+            dev: 7,
+            ino: 11,
+            generation: 0,
+        };
+        index.upsert(meta(
+            FileKey {
+                dev: 7,
+                ino: 10,
+                generation: 0,
+            },
+            "/tmp/owned-base/dir",
+            FileKind::Directory,
+        ));
+        index.upsert_path_alias(meta(
+            shared_key,
+            "/tmp/owned-base/dir/hardlink-a.txt",
+            FileKind::File,
+        ));
+        index.upsert_path_alias(meta(
+            shared_key,
+            "/tmp/owned-base/dir/hardlink-b.txt",
+            FileKind::File,
+        ));
+        index.upsert(meta(
+            FileKey {
+                dev: 7,
+                ino: 12,
+                generation: 0,
+            },
+            "/tmp/owned-base/deleted.txt",
+            FileKind::File,
+        ));
+        index.mark_deleted_by_path(PathBuf::from("/tmp/owned-base/deleted.txt").as_path());
+        index
+    }
+
+    fn live_paths(base: &crate::index::base_index::BaseIndexData) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        base.for_each_live_meta(|meta| paths.push(meta.path));
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn owned_base_conversion_matches_borrowed_query_parent_tombstone_and_hardlinks() {
+        let borrowed_source = populated_index();
+        let owned_source = populated_index();
+
+        let borrowed = borrowed_source.to_base_index_data();
+        let owned = owned_source.into_base_index_data();
+
+        assert_eq!(live_paths(&owned), live_paths(&borrowed));
+        assert_eq!(owned.tombstones, borrowed.tombstones);
+        assert_eq!(
+            owned.parent_candidates("/tmp/owned-base/dir"),
+            borrowed.parent_candidates("/tmp/owned-base/dir")
+        );
+
+        let matcher = create_matcher("hardlink", true);
+        let mut borrowed_matches = borrowed
+            .query_metas(matcher.as_ref())
+            .into_iter()
+            .map(|item| item.meta.path)
+            .collect::<Vec<_>>();
+        let mut owned_matches = owned
+            .query_metas(matcher.as_ref())
+            .into_iter()
+            .map(|item| item.meta.path)
+            .collect::<Vec<_>>();
+        borrowed_matches.sort();
+        owned_matches.sort();
+        assert_eq!(owned_matches, borrowed_matches);
+        assert_eq!(owned_matches.len(), 2, "both hardlink aliases must survive");
     }
 }

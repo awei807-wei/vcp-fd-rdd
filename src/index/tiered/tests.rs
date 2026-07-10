@@ -3663,6 +3663,10 @@ fn materialize_self_heals_when_cold_base_resolves_nothing() {
         Some(corrupt_base),
         governor,
     ));
+    let overlay_path = root.join("overlay-must-survive.txt");
+    std::fs::write(&overlay_path, b"overlay").unwrap();
+    idx.apply_events(&[mk_event(1, EventType::Create, overlay_path)]);
+    assert_eq!(idx.delta_buffer.lock().len(), 1);
 
     // Materialize must refuse to collapse the base into the tiny resolvable set,
     // instead reporting corruption (which also triggers a full rebuild).
@@ -3674,6 +3678,104 @@ fn materialize_self_heals_when_cold_base_resolves_nothing() {
         msg.contains("corruption suspected"),
         "unexpected error: {msg}"
     );
+    assert_eq!(
+        idx.delta_buffer.lock().len(),
+        1,
+        "failed materialization must preserve the delta buffer for retry/rebuild"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn materialize_snapshot_overlay_wins_for_the_same_path() {
+    let root = unique_tmp_dir("materialize-overlay-wins");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("same-path.txt");
+    std::fs::write(&path, b"new").unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.l2.load_full().upsert_path_alias(FileMeta {
+        file_key: FileKey {
+            dev: 99,
+            ino: 123,
+            generation: 0,
+        },
+        path: path.clone(),
+        size: 0,
+        mtime: None,
+        ctime: None,
+        atime: None,
+        kind: FileKind::File,
+    });
+    idx.refresh_base();
+
+    let expected_key = file_meta_from_path(path.clone()).file_key;
+    idx.apply_events(&[mk_event(1, EventType::Create, path.clone())]);
+
+    let materialized = idx.materialize_snapshot_base().unwrap();
+    let matches =
+        materialized.query_metas(crate::query::matcher::create_matcher("same-path", true).as_ref());
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].meta.file_key, expected_key);
+    assert_eq!(idx.delta_buffer.lock().len(), 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn materialize_snapshot_delete_does_not_resurrect_base_path() {
+    let root = unique_tmp_dir("materialize-delete");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("deleted-from-base.txt");
+    std::fs::write(&path, b"delete-me").unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.l2
+        .load_full()
+        .upsert_path_alias(file_meta_from_path(path.clone()));
+    idx.refresh_base();
+
+    std::fs::remove_file(&path).unwrap();
+    idx.apply_events(&[mk_event(1, EventType::Delete, path.clone())]);
+
+    let materialized = idx.materialize_snapshot_base().unwrap();
+    assert_eq!(materialized.file_count(), 0);
+    assert!(materialized
+        .query_metas(crate::query::matcher::create_matcher("deleted-from-base", true).as_ref())
+        .is_empty());
+    assert_eq!(idx.delta_buffer.lock().len(), 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn materialize_snapshot_preserves_overlay_hardlink_aliases() {
+    let root = unique_tmp_dir("materialize-hardlinks");
+    std::fs::create_dir_all(&root).unwrap();
+    let original = root.join("hardlink-original.txt");
+    let alias = root.join("hardlink-alias.txt");
+    std::fs::write(&original, b"same-inode").unwrap();
+    std::fs::hard_link(&original, &alias).unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, original.clone()),
+        mk_event(2, EventType::Create, alias.clone()),
+    ]);
+
+    let materialized = idx.materialize_snapshot_base().unwrap();
+    let mut paths = materialized
+        .query_metas(crate::query::matcher::create_matcher("hardlink-", true).as_ref())
+        .into_iter()
+        .map(|item| item.meta.path)
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut expected = vec![original, alias];
+    expected.sort();
+    assert_eq!(paths, expected);
+    assert_eq!(materialized.file_count(), 2);
+    assert_eq!(idx.delta_buffer.lock().len(), 0);
 
     let _ = std::fs::remove_dir_all(&root);
 }

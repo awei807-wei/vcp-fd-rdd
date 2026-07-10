@@ -18,12 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 性能
 
+- 快照物化不再先构造百万级 `Vec<FileMeta>`：overlay 与 cold base 直接流入临时 `PersistentIndex`，再通过消费式 `into_base_index_data()` 转换，复用 trigram/tombstone 所有权并提前释放派生查找结构，缩短两代全量对象的共存窗口。
+- 主 v7 写入成功后，stable 恢复副本改为复制、mmap/CRC 校验和原子轮转，不再对同一 `BaseIndexData` 做第二次完整编码与热反序列化；stable 禁用时会在确认主文件目录持久化后退休旧恢复副本。
 - `PersistentIndex` 运行时路径从每条路径独立分配的 `Vec<Vec<u8>>` 改为连续 `PathStore` Arena 与 8 字节 `PathRef`，保留超长内存路径和重命名语义，同时消除百万级小对象分配与对应 allocator 碎片。
 - L2 `DocId`、trigram posting 和 tombstone 收敛为 `u32` / `RoaringBitmap`；`FileKey` 代表索引改为只保存 `u32 DocId` 桶的开放寻址表，不再重复存储每个 20 字节 `FileKey`，并补齐同路径 inode generation 变化时的旧身份替换。
 - ParentIndex 构建路径表改为连续 Arena + 哈希碰撞核验，构建后常驻表只保留目录路径反查；`/memory.l2` 新增 `parent_index_bytes` 与 `parent_path_lookup_bytes`，使百万文件 VM 基准可直接归因父路径索引内存。
 
 ### 修复
 
+- M2 VM benchmark 将首次查询的传输成功与语义正确性分开统计，否定查询不再把 HTTP/解析失败误计为正确；inode reuse 输出 `not_run` / `inconclusive` / `exercised`，UDS 使用 `/tmp` 短哈希路径。
+- M2 VM benchmark 从 daemon 启动时独立以默认 0.5 秒采集 `/proc` RSS，并输出 rebuild、initial build publish、cold steady、hot-base snapshot 四阶段峰值和六项 L2 时间序列；压缩序列保留每次阶段边界、尾点与指标极值。
+- stable 写入、轮转、禁用清理或目录同步失败时，快照不再清理 sealed WAL 或记录成功，而是保留恢复日志并请求重试，避免旧 stable 抢先于新主 v7 导致恢复丢数。
 - M2 冷层轮转在 Ephemeral Watch 或 fast scan lease 发放失败时会降级为 scan-only 并入 `PeriodicColdScan`，不再直接取消轮转租约，避免冷目录已滞后但 `rotating_cold_window_active_dirs` 始终为 0、canary create / rename 无法追平。
 
 ### 代码审查与质量加固（2026-06-19）

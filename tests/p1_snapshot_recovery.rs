@@ -12,8 +12,9 @@ use fd_rdd::index::l2_partition::PersistentIndex;
 use fd_rdd::index::TieredIndex;
 use fd_rdd::storage::snapshot::SnapshotStore;
 use fd_rdd::storage::snapshot::{
-    read_recovery_runtime_state, runtime_state_path_for, stable_prev_v7_path_for,
-    stable_v7_path_for, write_recovery_runtime_state, write_stable_v7_atomic, RecoveryRuntimeState,
+    install_stable_v7_from_source, read_recovery_runtime_state, runtime_state_path_for,
+    stable_next_v7_path_for, stable_prev_v7_path_for, stable_v7_path_for,
+    write_recovery_runtime_state, write_stable_v7_atomic, RecoveryRuntimeState,
 };
 use fd_rdd::storage::snapshot_v7::{try_load_v7, write_v7_snapshot_atomic};
 
@@ -116,6 +117,67 @@ fn stable_snapshot_rotates_current_to_prev() {
         .unwrap()
         .unwrap();
     assert_eq!(loaded_prev.file_count(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn stable_snapshot_installs_validated_primary_and_rotates() {
+    let root = unique_tmp_dir("stable-install-source");
+    std::fs::create_dir_all(&root).unwrap();
+    let snap_path = root.join("index.db");
+    let primary = root.join("primary.v7");
+
+    let first = one_file_base(&root, "first.txt");
+    write_v7_snapshot_atomic(&primary, &first).unwrap();
+    let first_bytes = std::fs::read(&primary).unwrap();
+    install_stable_v7_from_source(&snap_path, &primary).unwrap();
+
+    assert_eq!(
+        std::fs::read(stable_v7_path_for(&snap_path)).unwrap(),
+        first_bytes
+    );
+    assert!(primary.exists());
+    assert!(!stable_prev_v7_path_for(&snap_path).exists());
+
+    let second = one_file_base(&root, "second.txt");
+    write_v7_snapshot_atomic(&primary, &second).unwrap();
+    let second_bytes = std::fs::read(&primary).unwrap();
+    install_stable_v7_from_source(&snap_path, &primary).unwrap();
+
+    assert_eq!(
+        std::fs::read(stable_v7_path_for(&snap_path)).unwrap(),
+        second_bytes
+    );
+    assert_eq!(
+        std::fs::read(stable_prev_v7_path_for(&snap_path)).unwrap(),
+        first_bytes
+    );
+    assert!(primary.exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn invalid_primary_does_not_replace_existing_stable_snapshot() {
+    let root = unique_tmp_dir("stable-install-invalid");
+    std::fs::create_dir_all(&root).unwrap();
+    let snap_path = root.join("index.db");
+    let primary = root.join("primary.v7");
+
+    let first = one_file_base(&root, "first.txt");
+    write_stable_v7_atomic(&snap_path, &first).unwrap();
+    let stable_before = std::fs::read(stable_v7_path_for(&snap_path)).unwrap();
+    std::fs::write(&primary, b"not a valid v7 snapshot").unwrap();
+
+    let error = install_stable_v7_from_source(&snap_path, &primary).unwrap_err();
+    assert!(error.to_string().contains("validation failed"));
+    assert_eq!(
+        std::fs::read(stable_v7_path_for(&snap_path)).unwrap(),
+        stable_before
+    );
+    assert!(!stable_next_v7_path_for(&snap_path).exists());
+    assert!(!stable_prev_v7_path_for(&snap_path).exists());
 
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -369,27 +369,25 @@ impl TieredIndex {
             let _ = del.insert(p);
         }
         let deleted_paths = db.deleted_paths().count();
-        let live_events: Vec<EventRecord> = db.live_records().cloned().collect();
+        let upserted_paths = db.live_records().count();
 
         let base = self.base.load_full();
         let base_count_before = base.file_count();
         let overlay_deleted = Arc::new(del);
         let mut blocked_paths = PathArenaSet::default();
         let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
-        let mut metas: Vec<FileMeta> = Vec::with_capacity(base.file_count().saturating_add(256));
+        let compact = PersistentIndex::new_with_roots(self.roots.clone());
 
-        for ev in &live_events {
+        for ev in db.live_records() {
             let Some(meta) = self.overlay_meta_for_event(ev) else {
                 continue;
             };
-            let path_bytes = meta.path.as_os_str().as_encoded_bytes();
-            if blocked_paths.contains(path_bytes)
-                || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
-            {
-                continue;
-            }
-            let _ = blocked_paths.insert(path_bytes);
-            metas.push(meta);
+            materialize_live_meta(
+                meta,
+                deleted_sources.as_slice(),
+                &mut blocked_paths,
+                &compact,
+            );
         }
 
         // Count entries the base actually yields. A healthy base yields ~one
@@ -398,12 +396,11 @@ impl TieredIndex {
         let mut base_emitted = 0usize;
         base.for_each_live_meta(|meta| {
             base_emitted += 1;
-            collect_live_meta(
+            materialize_live_meta(
                 meta,
-                None,
                 deleted_sources.as_slice(),
                 &mut blocked_paths,
-                &mut metas,
+                &compact,
             );
         });
 
@@ -428,15 +425,11 @@ impl TieredIndex {
             );
         }
 
-        let compact = PersistentIndex::new_with_roots(self.roots.clone());
-        for meta in metas {
-            compact.upsert_path_alias(meta);
-        }
-        let new_base = Arc::new(compact.to_base_index_data());
+        let new_base = Arc::new(compact.into_base_index_data());
         validate_snapshot_materialization(
             base_count_before,
             deleted_paths,
-            live_events.len(),
+            upserted_paths,
             new_base.file_count(),
         )?;
         db.clear();
@@ -1397,9 +1390,24 @@ fn collect_live_meta(
     results.push(meta);
 }
 
+fn materialize_live_meta(
+    meta: FileMeta,
+    deleted_sources: &[Arc<PathArenaSet>],
+    blocked_paths: &mut PathArenaSet,
+    compact: &PersistentIndex,
+) {
+    let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+    if blocked_paths.contains(path_bytes) || path_deleted_by_any(path_bytes, deleted_sources) {
+        return;
+    }
+
+    let _ = blocked_paths.insert(path_bytes);
+    compact.upsert_path_alias(meta);
+}
+
 #[cfg(test)]
 mod corruption_threshold_tests {
-    use super::cold_base_corruption_suspected;
+    use super::{cold_base_corruption_suspected, validate_snapshot_materialization};
 
     #[test]
     fn small_bases_are_never_judged_corrupt() {
@@ -1424,5 +1432,20 @@ mod corruption_threshold_tests {
         assert!(!cold_base_corruption_suspected(647_591, 647_000));
         assert!(!cold_base_corruption_suspected(20_000, 1_000)); // exactly 5%
         assert!(!cold_base_corruption_suspected(20_000, 19_000));
+    }
+
+    #[test]
+    fn shrink_guard_rejects_unexplained_large_loss() {
+        let err = validate_snapshot_materialization(20_000, 0, 0, 9_999)
+            .expect_err("an unexplained loss beyond the allowance must be rejected");
+        assert!(err.to_string().contains("refused to shrink base"));
+    }
+
+    #[test]
+    fn shrink_guard_preserves_existing_small_base_and_delete_allowances() {
+        validate_snapshot_materialization(9_999, 0, 0, 0)
+            .expect("small bases retain the historical guard exemption");
+        validate_snapshot_materialization(20_000, 10, 1, 9_999)
+            .expect("explicit deletes retain the historical enlarged loss allowance");
     }
 }

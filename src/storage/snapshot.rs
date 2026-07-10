@@ -90,6 +90,35 @@ pub fn stable_next_v7_path_for(snapshot_path: &Path) -> PathBuf {
     stable_snapshot_dir_for(snapshot_path).join("stable.next.v7")
 }
 
+/// Remove recovery copies when stable snapshots are explicitly disabled.
+///
+/// The caller must persist the primary v7 snapshot first and retain its sealed
+/// WAL until this removal and directory sync both succeed.
+pub fn remove_stable_v7_recovery_copies(snapshot_path: &Path) -> anyhow::Result<()> {
+    let dir = stable_snapshot_dir_for(snapshot_path);
+    if !dir.exists() {
+        return Ok(());
+    }
+    for path in [
+        stable_v7_path_for(snapshot_path),
+        stable_prev_v7_path_for(snapshot_path),
+        stable_next_v7_path_for(snapshot_path),
+    ] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    #[cfg(unix)]
+    std::fs::File::open(&dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    if let Ok(dir_file) = std::fs::File::open(&dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
 pub fn runtime_state_path_for(snapshot_path: &Path) -> PathBuf {
     stable_snapshot_dir_for(snapshot_path).join("runtime-state.json")
 }
@@ -138,6 +167,59 @@ pub fn write_stable_v7_atomic(snapshot_path: &Path, base: &BaseIndexData) -> any
         std::fs::rename(&stable, &prev)?;
     }
     std::fs::rename(&next, &stable)?;
+    #[cfg(unix)]
+    std::fs::File::open(&dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    if let Ok(dir_file) = std::fs::File::open(&dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
+/// Installs an already-written v7 snapshot as the stable recovery snapshot.
+///
+/// The source remains untouched. The copied `stable.next.v7` is synced and
+/// validated before the existing stable snapshot is rotated to `stable.prev.v7`.
+/// A copy or validation failure therefore cannot replace the current stable
+/// snapshot.
+pub fn install_stable_v7_from_source(snapshot_path: &Path, source: &Path) -> anyhow::Result<()> {
+    let dir = stable_snapshot_dir_for(snapshot_path);
+    std::fs::create_dir_all(&dir)?;
+    let next = stable_next_v7_path_for(snapshot_path);
+    let stable = stable_v7_path_for(snapshot_path);
+    let prev = stable_prev_v7_path_for(snapshot_path);
+
+    if next.exists() {
+        std::fs::remove_file(&next)?;
+    }
+    std::fs::copy(source, &next)?;
+    std::fs::File::open(&next)?.sync_all()?;
+
+    // Validate the complete file through its mmap-backed v7 view. Avoid
+    // `try_load_v7`, which would also deserialize another full hot base while
+    // the snapshot generation being persisted is still resident.
+    match crate::storage::snapshot_v7::load_v7_from_path(&next) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = std::fs::remove_file(&next);
+            anyhow::bail!("stable.next.v7 validation failed");
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&next);
+            anyhow::bail!("stable.next.v7 validation failed: {error}");
+        }
+    }
+
+    if stable.exists() {
+        if prev.exists() {
+            std::fs::remove_file(&prev)?;
+        }
+        std::fs::rename(&stable, &prev)?;
+    }
+    std::fs::rename(&next, &stable)?;
+    #[cfg(unix)]
+    std::fs::File::open(&dir)?.sync_all()?;
+    #[cfg(not(unix))]
     if let Ok(dir_file) = std::fs::File::open(&dir) {
         let _ = dir_file.sync_all();
     }

@@ -11,6 +11,8 @@ This script is intentionally orchestration-only:
 from __future__ import annotations
 
 import argparse
+import bisect
+import hashlib
 import json
 import os
 import random
@@ -65,6 +67,33 @@ def percentile(values: list[float], pct: float) -> float:
     ordered = sorted(values)
     idx = int(round((len(ordered) - 1) * pct / 100.0))
     return float(ordered[max(0, min(idx, len(ordered) - 1))])
+
+
+def first_query_correct(record: dict[str, Any]) -> bool:
+    """Return semantic correctness only for completed first-query requests."""
+    if not first_query_transport_ok(record):
+        return False
+    if "first_query_exists" in record and "should_exist" in record:
+        return bool(record.get("first_query_exists")) == bool(record.get("should_exist"))
+    return bool(record.get("ok"))
+
+
+def first_query_transport_ok(record: dict[str, Any]) -> bool:
+    """Return whether a first-query request completed without a transport error."""
+    if "transport_ok" in record:
+        return bool(record.get("transport_ok"))
+    return not bool(record.get("error"))
+
+
+def short_uds_socket_path(run_dir: Path) -> Path:
+    """Build a stable AF_UNIX path that stays well below Linux SUN_LEN."""
+    digest = hashlib.sha256(os.fsencode(run_dir.resolve())).hexdigest()[:16]
+    return Path("/tmp") / f"fd-rdd-{digest}.sock"
+
+
+def cleanup_uds_socket(socket_path: Path) -> None:
+    """Remove a stale or stopped daemon socket without masking run teardown."""
+    socket_path.unlink(missing_ok=True)
 
 
 def http_json(base_url: str, path: str, params: dict[str, str] | None = None, timeout: float = 2.0) -> Any:
@@ -167,6 +196,54 @@ def process_sampler(pid: int) -> Any:
         status["fd_count"] = read_fd_count(pid)
         status["cpu_pct"] = round(cpu_pct, 3)
         yield status
+
+
+class ProcessSampleRunner:
+    """Sample procfs independently so slow HTTP endpoints cannot hide RSS peaks."""
+
+    def __init__(
+        self,
+        pid: int,
+        out_path: Path,
+        started_at: float,
+        interval_secs: float,
+    ) -> None:
+        self.pid = pid
+        self.out_path = out_path
+        self.started_at = started_at
+        self.interval_secs = max(0.05, interval_secs)
+        self.error = ""
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._loop,
+            daemon=True,
+            name="proc-sampler",
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def _loop(self) -> None:
+        sampler = process_sampler(self.pid)
+        try:
+            while not self._stop.is_set():
+                record = {
+                    "ts": utc_now(),
+                    "elapsed_secs": round(time.monotonic() - self.started_at, 3),
+                    **next(sampler),
+                }
+                json_line(self.out_path, record)
+                if self._stop.wait(self.interval_secs):
+                    return
+        except Exception as exc:  # noqa: BLE001 - surfaced in the run summary
+            self.error = repr(exc)
 
 
 def search_results(base_url: str, query: str, limit: int = 50) -> list[dict[str, Any]]:
@@ -518,6 +595,8 @@ class PassiveCanaryRunner:
                 "path": str(path),
                 "query": query,
                 "ok": ok,
+                "correct": exists == should_exist,
+                "transport_ok": not bool(error),
                 "first_query_exists": exists,
                 "should_exist": should_exist,
                 "latency_secs": round(latency, 3),
@@ -1295,6 +1374,8 @@ class EventStormRunner:
                     "query": event["query"],
                     "should_exist": event["should_exist"],
                     "ok": ok,
+                    "correct": exists == bool(event["should_exist"]),
+                    "transport_ok": not bool(error),
                     "first_query_exists": exists,
                     "latency_secs": round(latency, 3),
                     "query_phase": phase,
@@ -1551,7 +1632,10 @@ class HotChurnRunner:
                 "path": str(query_target),
                 "query": query_target.name,
                 "ok": ok,
+                "correct": exists,
+                "transport_ok": not bool(error),
                 "first_query_exists": exists,
+                "should_exist": True,
                 "latency_secs": round(latency, 3),
                 **({"error": error} if error else {}),
             })
@@ -1670,9 +1754,9 @@ def build_if_needed(repo: Path, binary: Path, build: str) -> None:
 
 def collect_endpoint_samples(base_url: str, out: Path, started_at: float) -> None:
     for endpoint in ENDPOINTS:
+        request_started_elapsed_secs = round(time.monotonic() - started_at, 3)
         record = {
-            "ts": utc_now(),
-            "elapsed_secs": round(time.monotonic() - started_at, 3),
+            "request_started_elapsed_secs": request_started_elapsed_secs,
             "endpoint": endpoint,
         }
         try:
@@ -1681,7 +1765,181 @@ def collect_endpoint_samples(base_url: str, out: Path, started_at: float) -> Non
         except Exception as exc:  # noqa: BLE001 - written as benchmark evidence
             record["ok"] = False
             record["error"] = repr(exc)
+        record["ts"] = utc_now()
+        record["elapsed_secs"] = round(time.monotonic() - started_at, 3)
         json_line(out, record)
+
+
+L2_TIMELINE_COMPONENTS = (
+    "estimated_bytes",
+    "arena_bytes",
+    "filekey_to_docid_bytes",
+    "trigram_bytes",
+    "parent_index_bytes",
+    "parent_path_lookup_bytes",
+)
+
+
+def classify_memory_phase(data: dict[str, Any]) -> str:
+    """Classify a /memory sample by index lifecycle state."""
+    rebuild = data.get("rebuild") if isinstance(data.get("rebuild"), dict) else {}
+    base = data.get("base") if isinstance(data.get("base"), dict) else {}
+    if bool(rebuild.get("in_progress")):
+        return "rebuild"
+    if int(base.get("hot_memory_entries", 0) or 0) > 0:
+        return "hot_base_snapshot"
+    if (
+        int(base.get("manifest_only_entries", 0) or 0) > 0
+        or int(base.get("cold_segment_count", 0) or 0) > 0
+    ):
+        return "cold_steady"
+    return "unclassified"
+
+
+def build_memory_timeline(
+    endpoint_samples: list[dict[str, Any]],
+    process_samples: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize lifecycle RSS peaks and the requested L2 component time series."""
+    memory_points: list[dict[str, Any]] = []
+    for item in endpoint_samples:
+        data = item.get("data")
+        if not (
+            item.get("ok")
+            and item.get("endpoint") == "/memory"
+            and isinstance(data, dict)
+        ):
+            continue
+        base = data.get("base") if isinstance(data.get("base"), dict) else {}
+        l2 = data.get("l2") if isinstance(data.get("l2"), dict) else {}
+        memory_points.append(
+            {
+                "elapsed_secs": float(item.get("elapsed_secs", 0.0) or 0.0),
+                "phase": classify_memory_phase(data),
+                "endpoint_rss_bytes": int(data.get("process_rss_bytes", 0) or 0),
+                "base_hot_memory_entries": int(base.get("hot_memory_entries", 0) or 0),
+                "base_manifest_only_entries": int(
+                    base.get("manifest_only_entries", 0) or 0
+                ),
+                "base_cold_mmap_bytes": int(base.get("cold_mmap_bytes", 0) or 0),
+                "non_index_private_dirty_bytes": int(
+                    data.get("non_index_private_dirty_bytes", 0) or 0
+                ),
+                **{key: int(l2.get(key, 0) or 0) for key in L2_TIMELINE_COMPONENTS},
+            }
+        )
+    memory_points.sort(key=lambda point: point["elapsed_secs"])
+    reached_cold_steady = False
+    for point in memory_points:
+        if point["phase"] == "cold_steady":
+            reached_cold_steady = True
+        elif point["phase"] == "hot_base_snapshot" and not reached_cold_steady:
+            point["phase"] = "initial_build_publish"
+
+    elapsed_points = [float(point["elapsed_secs"]) for point in memory_points]
+
+    def nearest_phase(elapsed_secs: float) -> str:
+        if not memory_points:
+            return "unclassified"
+        idx = bisect.bisect_left(elapsed_points, elapsed_secs)
+        if idx <= 0:
+            return str(memory_points[0]["phase"])
+        if idx >= len(memory_points):
+            return str(memory_points[-1]["phase"])
+        before = memory_points[idx - 1]
+        after = memory_points[idx]
+        if elapsed_secs - float(before["elapsed_secs"]) <= float(after["elapsed_secs"]) - elapsed_secs:
+            return str(before["phase"])
+        return str(after["phase"])
+
+    process_by_phase: dict[str, list[tuple[float, int]]] = {}
+    for item in process_samples:
+        elapsed = float(item.get("elapsed_secs", 0.0) or 0.0)
+        phase = nearest_phase(elapsed)
+        process_by_phase.setdefault(phase, []).append(
+            (elapsed, int(item.get("vmrss_bytes", 0) or 0))
+        )
+
+    phase_peaks: dict[str, dict[str, Any]] = {}
+    for phase in (
+        "rebuild",
+        "initial_build_publish",
+        "cold_steady",
+        "hot_base_snapshot",
+    ):
+        endpoint_rows = [point for point in memory_points if point["phase"] == phase]
+        process_rows = process_by_phase.get(phase, [])
+        endpoint_rss = [int(point["endpoint_rss_bytes"]) for point in endpoint_rows]
+        process_rss = [rss for _elapsed, rss in process_rows]
+        process_peak = max(process_rows, key=lambda row: row[1]) if process_rows else (0.0, 0)
+        endpoint_peak = (
+            max(endpoint_rows, key=lambda point: int(point["endpoint_rss_bytes"]))
+            if endpoint_rows
+            else None
+        )
+        phase_peaks[phase] = {
+            "endpoint_sample_count": len(endpoint_rows),
+            "process_sample_count": len(process_rows),
+            "endpoint_rss_bytes_p95": int(percentile(endpoint_rss, 95)),
+            "endpoint_rss_bytes_max": max(endpoint_rss) if endpoint_rss else 0,
+            "endpoint_peak_elapsed_secs": (
+                round(float(endpoint_peak["elapsed_secs"]), 3) if endpoint_peak else 0.0
+            ),
+            "process_rss_bytes_p95": int(percentile(process_rss, 95)),
+            "process_rss_bytes_max": process_peak[1],
+            "process_peak_elapsed_secs": round(process_peak[0], 3),
+        }
+
+    component_summaries: dict[str, dict[str, Any]] = {}
+    for key in L2_TIMELINE_COMPONENTS:
+        values = [int(point[key]) for point in memory_points]
+        max_point = max(memory_points, key=lambda point: int(point[key])) if memory_points else None
+        component_summaries[key] = {
+            "first": values[0] if values else 0,
+            "last": values[-1] if values else 0,
+            "p95": int(percentile(values, 95)),
+            "max": max(values) if values else 0,
+            "max_elapsed_secs": round(float(max_point["elapsed_secs"]), 3) if max_point else 0.0,
+        }
+
+    series_cap = 256
+    series = memory_points
+    if len(series) > series_cap:
+        required = {0, len(series) - 1}
+        for phase in {str(point["phase"]) for point in series}:
+            phase_indices = [
+                idx for idx, point in enumerate(series) if point["phase"] == phase
+            ]
+            required.add(phase_indices[0])
+            required.add(phase_indices[-1])
+            required.add(
+                max(
+                    phase_indices,
+                    key=lambda idx: int(series[idx]["endpoint_rss_bytes"]),
+                )
+            )
+        for idx in range(1, len(series)):
+            if series[idx - 1]["phase"] != series[idx]["phase"]:
+                required.add(idx - 1)
+                required.add(idx)
+        for key in L2_TIMELINE_COMPONENTS:
+            required.add(max(range(len(series)), key=lambda idx: int(series[idx][key])))
+
+        remaining = max(0, series_cap - len(required))
+        if remaining > 0:
+            denominator = max(1, remaining - 1)
+            for idx in range(remaining):
+                required.add(round(idx * (len(series) - 1) / denominator))
+        series = [series[idx] for idx in sorted(required)[:series_cap]]
+
+    return {
+        "phase_peaks": phase_peaks,
+        "l2": {
+            "sample_count": len(memory_points),
+            "components": component_summaries,
+            "series": series,
+        },
+    }
 
 
 def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any]:
@@ -1725,7 +1983,12 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             if not op:
                 continue
             op_rows = [item for item in rows if item.get("operation") == op]
-            latencies = [float(item.get("latency_secs", 0.0)) for item in op_rows if item.get("ok")]
+            semantic_rows = [
+                item
+                for item in op_rows
+                if first_query_correct(item)
+            ]
+            latencies = [float(item.get("latency_secs", 0.0)) for item in semantic_rows]
             passive_waits = [
                 float(item.get("passive_wait_secs", 0.0))
                 for item in op_rows
@@ -1733,8 +1996,12 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             ]
             summary = {
                 "count": len(op_rows),
-                "ok": sum(1 for item in op_rows if item.get("ok")),
-                "timeouts": sum(1 for item in op_rows if not item.get("ok")),
+                "ok": len(semantic_rows),
+                "timeouts": len(op_rows) - len(semantic_rows),
+                "transport_ok": sum(1 for item in op_rows if first_query_transport_ok(item)),
+                "transport_failures": sum(
+                    1 for item in op_rows if not first_query_transport_ok(item)
+                ),
                 "p50_secs": round(percentile(latencies, 50), 3),
                 "p95_secs": round(percentile(latencies, 95), 3),
                 "p99_secs": round(percentile(latencies, 99), 3),
@@ -1825,10 +2092,15 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
 
     def summarize_event_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         total = len(rows)
-        ok = sum(1 for item in rows if item.get("ok"))
+        ok = sum(1 for item in rows if first_query_correct(item))
+        transport_ok = sum(1 for item in rows if first_query_transport_ok(item))
         positive = [item for item in rows if item.get("should_exist")]
-        positive_ok = sum(1 for item in positive if item.get("ok"))
-        latencies = [float(item.get("latency_secs", 0.0)) for item in rows if item.get("ok")]
+        positive_ok = sum(1 for item in positive if first_query_correct(item))
+        latencies = [
+            float(item.get("latency_secs", 0.0))
+            for item in rows
+            if first_query_correct(item)
+        ]
         settles = [float(item.get("settle_secs", 0.0)) for item in rows if "settle_secs" in item]
         ages = [float(item.get("event_age_secs", 0.0)) for item in rows if "event_age_secs" in item]
         return {
@@ -1836,6 +2108,9 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "ok": ok,
             "missed": total - ok,
             "success_rate": round(ok / total, 4) if total else 0.0,
+            "transport_ok": transport_ok,
+            "transport_failures": total - transport_ok,
+            "transport_success_rate": round(transport_ok / total, 4) if total else 0.0,
             "positive_total": len(positive),
             "positive_ok": positive_ok,
             "positive_success_rate": round(positive_ok / len(positive), 4) if positive else 0.0,
@@ -1873,7 +2148,7 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         return sum(
             1
             for item in event_first_queries
-            if item.get("operation") == operation and item.get("ok")
+            if item.get("operation") == operation and first_query_correct(item)
         )
 
     inode_reuse_new_rows = [
@@ -1965,6 +2240,12 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         event_special["inode_reuse_stress_tmpfs_mounted"] = any(
             bool(item.get("tmpfs_mounted")) for item in inode_reuse_stress_rows
         )
+    if int(event_special["inode_reuse_attempts"]) <= 0:
+        event_special["inode_reuse_status"] = "not_run"
+    elif int(event_special["inode_reuse_observed"]) <= 0:
+        event_special["inode_reuse_status"] = "inconclusive"
+    else:
+        event_special["inode_reuse_status"] = "exercised"
 
     # Task 4: scale-aware metrics.
     # index_total_files / index_total_dirs from the last /status sample.
@@ -2029,6 +2310,9 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         ):
             tier_dist_storm_start = item.get("tier_counts")
             break
+
+    event_first_query_summary = summarize_event_rows(event_first_queries)
+    memory_timeline = build_memory_timeline(endpoint_samples, process_samples)
 
     summary = {
         "label": label,
@@ -2130,6 +2414,7 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
                 max(nums(memory_samples, "process_swap_bytes") or [0])
             ),
         },
+        "memory_timeline": memory_timeline,
         "health": {
             "index_health_last": health_samples[-1].get("index_health") if health_samples else "",
             "watcher_degraded_seen": any(bool(item.get("watcher_degraded")) for item in health_samples),
@@ -2152,33 +2437,20 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         },
         "event_storm": {
             "bursts": len(event_bursts),
-            "events_total": sum(int(item.get("events_total", 0) or 0) for item in event_bursts),
-            "ok": sum(int(item.get("ok", 0) or 0) for item in event_bursts),
-            "missed": sum(int(item.get("missed", 0) or 0) for item in event_bursts),
-            "success_rate": (
-                round(
-                    sum(int(item.get("ok", 0) or 0) for item in event_bursts)
-                    / sum(int(item.get("events_total", 0) or 0) for item in event_bursts),
-                    4,
-                )
-                if sum(int(item.get("events_total", 0) or 0) for item in event_bursts)
-                else 0.0
-            ),
-            "positive_total": sum(int(item.get("positive_total", 0) or 0) for item in event_bursts),
-            "positive_ok": sum(int(item.get("positive_ok", 0) or 0) for item in event_bursts),
-            "positive_success_rate": (
-                round(
-                    sum(int(item.get("positive_ok", 0) or 0) for item in event_bursts)
-                    / sum(int(item.get("positive_total", 0) or 0) for item in event_bursts),
-                    4,
-                )
-                if sum(int(item.get("positive_total", 0) or 0) for item in event_bursts)
-                else 0.0
-            ),
+            "events_total": event_first_query_summary["total"],
+            "ok": event_first_query_summary["ok"],
+            "missed": event_first_query_summary["missed"],
+            "success_rate": event_first_query_summary["success_rate"],
+            "transport_ok": event_first_query_summary["transport_ok"],
+            "transport_failures": event_first_query_summary["transport_failures"],
+            "transport_success_rate": event_first_query_summary["transport_success_rate"],
+            "positive_total": event_first_query_summary["positive_total"],
+            "positive_ok": event_first_query_summary["positive_ok"],
+            "positive_success_rate": event_first_query_summary["positive_success_rate"],
             "burst_duration_p50_secs": round(percentile(burst_durations, 50), 3),
             "burst_duration_p95_secs": round(percentile(burst_durations, 95), 3),
             "burst_duration_max_secs": round(max(burst_durations) if burst_durations else 0.0, 3),
-            "first_query": summarize_event_rows(event_first_queries),
+            "first_query": event_first_query_summary,
             "after_query": summarize_event_rows(event_after_queries),
             # Task 2: immediate vs delayed query-phase breakdown.
             "immediate_query": summarize_event_rows(event_immediate_queries),
@@ -2215,6 +2487,14 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
 
 
 def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
+    memory_timeline = summary["memory_timeline"]
+    memory_report = {
+        "phase_peaks": memory_timeline["phase_peaks"],
+        "l2": {
+            "sample_count": memory_timeline["l2"]["sample_count"],
+            "components": memory_timeline["l2"]["components"],
+        },
+    }
     report = f"""# fd-rdd M2 VM Benchmark Report
 
 ## Run
@@ -2231,7 +2511,12 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 |---|---:|
 | process CPU p95 | {summary["process"]["cpu_pct_p95"]}% |
 | process CPU max | {summary["process"]["cpu_pct_max"]}% |
+| process RSS p95 | {summary["process"]["rss_bytes_p95"]} |
 | process RSS max | {summary["process"]["rss_bytes_max"]} |
+| rebuild RSS max | {summary["memory_timeline"]["phase_peaks"]["rebuild"]["process_rss_bytes_max"]} |
+| initial build publish RSS max | {summary["memory_timeline"]["phase_peaks"]["initial_build_publish"]["process_rss_bytes_max"]} |
+| cold steady RSS max | {summary["memory_timeline"]["phase_peaks"]["cold_steady"]["process_rss_bytes_max"]} |
+| hot-base snapshot RSS max | {summary["memory_timeline"]["phase_peaks"]["hot_base_snapshot"]["process_rss_bytes_max"]} |
 | fd count max | {summary["process"]["fd_count_max"]} |
 | dirty queue max | {summary["watch_state"]["dirty_queue_len_max"]} |
 | fast scan lag p99 max ms | {summary["watch_state"]["fast_scan_coverage_lag_p99_ms_max"]} |
@@ -2249,6 +2534,7 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | passive first query success rate | {summary["passive_first_query"]["success_rate"]} |
 | passive positive first query success rate | {summary["passive_positive_first_query"]["success_rate"]} |
 | event storm success rate | {summary["event_storm"]["success_rate"]} |
+| event storm transport success rate | {summary["event_storm"]["transport_success_rate"]} |
 | event storm positive success rate | {summary["event_storm"]["positive_success_rate"]} |
 | event storm first-query p95 s | {summary["event_storm"]["first_query"]["first_query_p95_secs"]} |
 | event storm first-query age p95 s | {summary["event_storm"]["first_query"]["event_age_p95_secs"]} |
@@ -2259,6 +2545,7 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | event storm delayed-query success rate | {summary["event_storm"]["delayed_query"]["success_rate"]} |
 | hot layer query success rate | {summary["hot_layer_query"]["success_rate"]} |
 | hot layer query p95 s | {summary["hot_layer_query"]["first_query_p95_secs"]} |
+| inode reuse status | {summary["event_storm"]["special"]["inode_reuse_status"]} |
 | index total files | {summary["scale_aware"]["index_total_files"]} |
 | index total dirs | {summary["scale_aware"]["index_total_dirs"]} |
 | cold dir count (L2+L3) | {summary["scale_aware"]["cold_dir_count"]} |
@@ -2269,6 +2556,17 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | tier dist storm start (L0/L1/L2/L3) | {summary["tier_distribution"]["storm_start"]} |
 | tier dist end (L0/L1/L2/L3) | {summary["tier_distribution"]["end_of_run"]} |
 | index health last | {summary["health"]["index_health_last"]} |
+
+## Memory lifecycle and L2 timeline
+
+`rebuild` covers samples where `/memory.rebuild.in_progress` is true.
+`initial_build_publish` covers the first complete hot-base publication before the
+first mmap/manifest cold remount. `cold_steady` covers cold-base samples with no
+hot entries. `hot_base_snapshot` covers later periodic full-base materialization.
+
+```json
+{json.dumps(memory_report, ensure_ascii=False, indent=2)}
+```
 
 ## Canary
 
@@ -2384,6 +2682,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=6060)
     parser.add_argument("--duration-secs", type=int, default=3600, help="0 means until Ctrl-C")
     parser.add_argument("--sample-interval-secs", type=float, default=10.0)
+    parser.add_argument(
+        "--process-sample-interval-secs",
+        type=float,
+        default=0.5,
+        help="independent procfs RSS sampling interval; unaffected by endpoint latency",
+    )
     parser.add_argument("--snapshot-interval-secs", type=int, default=300)
     parser.add_argument("--watch-mode", choices=["tiered", "recursive", "off"], default="tiered")
     parser.add_argument(
@@ -2642,7 +2946,8 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
         print(f"Snapshot path (on disk): {snapshot_path}", flush=True)
     else:
         snapshot_path = run_dir / "index.db"
-    uds_socket = runtime_dir / "fd-rdd.sock"
+    uds_socket = short_uds_socket_path(run_dir)
+    cleanup_uds_socket(uds_socket)
     cmd = [
         str(binary),
         "--http-port",
@@ -2669,6 +2974,7 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
         "run_dir": str(run_dir),
         "config": str(cfg_path),
         "base_url": base_url,
+        "uds_socket": str(uds_socket),
         "command": cmd,
         "roots": [str(Path(root).expanduser().resolve()) for root in args.root],
         "rotating_cold_window": args.rotating_cold_window,
@@ -2693,6 +2999,7 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
         "event_storm_inode_stress_tmpfs_inodes": args.event_storm_inode_stress_tmpfs_inodes,
         "snapshot_path_disk": args.snapshot_path_disk,
         "snapshot_path": str(snapshot_path),
+        "process_sample_interval_secs": args.process_sample_interval_secs,
     }
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -2700,8 +3007,14 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
 
     log_file = (run_dir / "fd-rdd.log").open("wb")
     proc = subprocess.Popen(cmd, cwd=run_dir, env=env, stdout=log_file, stderr=subprocess.STDOUT)
-    sampler = process_sampler(proc.pid)
     started_at = time.monotonic()
+    process_samples = ProcessSampleRunner(
+        proc.pid,
+        run_dir / "process-samples.jsonl",
+        started_at,
+        args.process_sample_interval_secs,
+    )
+    process_samples.start()
     exit_code: int | None = None
     fatal_error = ""
     hot_churn: HotChurnRunner | None = None
@@ -2713,7 +3026,7 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
             {"ts": utc_now(), "event": "http_ready", "pid": proc.pid},
         )
 
-        next_sample = time.monotonic()
+        next_endpoint_sample = time.monotonic()
         next_canary = time.monotonic() + args.canary_interval_secs
         deadline = None if args.duration_secs == 0 else time.monotonic() + args.duration_secs
         canary_root = Path(args.canary_root).expanduser().resolve() if args.canary_root else None
@@ -2791,15 +3104,9 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
             now = time.monotonic()
             if deadline is not None and now >= deadline:
                 break
-            if now >= next_sample:
+            if now >= next_endpoint_sample:
                 collect_endpoint_samples(base_url, run_dir / "endpoint-samples.jsonl", started_at)
-                proc_record = {
-                    "ts": utc_now(),
-                    "elapsed_secs": round(time.monotonic() - started_at, 3),
-                    **next(sampler),
-                }
-                json_line(run_dir / "process-samples.jsonl", proc_record)
-                next_sample = now + args.sample_interval_secs
+                next_endpoint_sample = time.monotonic() + args.sample_interval_secs
             if canary_root and now >= next_canary:
                 for record in run_canary_cycle(base_url, canary_root, args.canary_timeout_secs):
                     record["ts"] = utc_now()
@@ -2829,8 +3136,21 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=10)
+        process_samples.stop()
+        if process_samples.error:
+            json_line(
+                run_dir / "events.jsonl",
+                {
+                    "ts": utc_now(),
+                    "event": "process_sampler_error",
+                    "error": process_samples.error,
+                },
+            )
+            if not fatal_error:
+                fatal_error = f"process sampler failed: {process_samples.error}"
         exit_code = proc.returncode if exit_code is None else exit_code
         log_file.close()
+        cleanup_uds_socket(uds_socket)
 
     summary = summarize(run_dir, args.run_label, exit_code)
     if fatal_error:
@@ -2857,7 +3177,8 @@ def _apply_overrides(args: argparse.Namespace, overrides: dict[str, Any]) -> arg
             "rotating-budget", "rotating-tick-secs", "rotating-ttl-secs",
             "rotating-max-cost-per-root", "rotating-max-dirs-per-tick",
             "rotating-cold-window", "no-rotating-cold-window",
-            "duration-secs", "sample-interval-secs", "snapshot-interval-secs",
+            "duration-secs", "sample-interval-secs", "process-sample-interval-secs",
+            "snapshot-interval-secs",
             "tiered-profile", "watch-mode", "max-watch-dirs",
             "l0-max-cost-per-root", "l1-scan-interval-secs", "l2-scan-interval-secs",
             "l3-scan-interval-secs", "l1-empty-scans-to-l2", "l2-empty-scans-to-l3",

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::storage::snapshot::{
-    stable_v7_path_for, write_recovery_runtime_state, write_stable_v7_atomic, RecoveryRuntimeState,
+    install_stable_v7_from_source, remove_stable_v7_recovery_copies, stable_v7_path_for,
+    write_recovery_runtime_state, write_stable_v7_atomic, RecoveryRuntimeState,
 };
 use crate::storage::snapshot_v7::{try_load_v7_cold, write_v7_snapshot_atomic};
 use crate::storage::traits::StorageBackend;
@@ -77,21 +78,37 @@ impl TieredIndex {
 
         // 写入 v7 快照（原子写：tmp + rename）
         let mut remount_path = None;
+        let mut primary_written = false;
         if let Err(e) = write_v7_snapshot_atomic(&v7_path, &base) {
             tracing::warn!("v7 snapshot write failed: {}", e);
         } else {
             tracing::info!("v7 snapshot written to {:?}", v7_path);
             remount_path = Some(v7_path.clone());
+            primary_written = true;
         }
 
-        if self
+        let stable_enabled = self
             .io_tuning
             .stable_snapshot_enabled
-            .load(Ordering::Relaxed)
-        {
-            if let Err(e) = write_stable_v7_atomic(store.path(), &base) {
+            .load(Ordering::Relaxed);
+        let mut recovery_snapshot_durable = false;
+        if stable_enabled {
+            let stable_result = if primary_written {
+                install_stable_v7_from_source(store.path(), &v7_path).or_else(|copy_error| {
+                    tracing::warn!(
+                        "stable v7 install from primary failed, falling back to encode: {}",
+                        copy_error
+                    );
+                    write_stable_v7_atomic(store.path(), &base)
+                })
+            } else {
+                write_stable_v7_atomic(store.path(), &base)
+            };
+
+            if let Err(e) = stable_result {
                 tracing::warn!("stable v7 snapshot write failed: {}", e);
             } else {
+                recovery_snapshot_durable = true;
                 remount_path = Some(stable_v7_path_for(store.path()));
                 // Once a shutdown is in progress every snapshot belongs to the
                 // clean-shutdown sequence, so mark it clean. During normal
@@ -109,6 +126,16 @@ impl TieredIndex {
                     tracing::warn!("recovery runtime state write failed: {}", e);
                 }
                 tracing::info!("stable v7 snapshot written for recovery");
+            }
+        } else if primary_written {
+            match sync_primary_snapshot_parent(&v7_path)
+                .and_then(|()| remove_stable_v7_recovery_copies(store.path()))
+            {
+                Ok(()) => recovery_snapshot_durable = true,
+                Err(error) => tracing::warn!(
+                    "failed to confirm primary durability and retire disabled stable snapshots: {}",
+                    error
+                ),
             }
         }
 
@@ -128,6 +155,12 @@ impl TieredIndex {
             }
         }
         drop(base);
+
+        if !recovery_snapshot_durable {
+            self.flush_requested.store(true, Ordering::Release);
+            maybe_trim_rss();
+            anyhow::bail!("snapshot has no durable recovery copy; sealed WAL retained for retry");
+        }
 
         self.l1.clear();
         if let Some(w) = self.wal.lock().clone() {
@@ -238,4 +271,12 @@ impl TieredIndex {
         self.last_snapshot_time.store(ts, Ordering::Relaxed);
         self.stats.record_snapshot();
     }
+}
+
+fn sync_primary_snapshot_parent(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
