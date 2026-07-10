@@ -1,4 +1,4 @@
-use roaring::RoaringTreemap;
+use roaring::RoaringBitmap;
 
 use crate::core::{FileKey, FileMeta};
 use crate::index::file_entry_v2::FileEntry;
@@ -10,7 +10,7 @@ use super::helpers::{
     intern_parent_dirs, mtime_from_ns, normalize_short_hint, query_trigrams,
     trigram_matches_short_hint,
 };
-use super::types::RebuildPathTable;
+use super::parent_path::CompactPathTable;
 use super::{DocId, PersistentIndex};
 
 impl PersistentIndex {
@@ -33,7 +33,7 @@ impl PersistentIndex {
                 .filter(|docid| !tombstones.contains(*docid))
                 .filter_map(|docid| {
                     let entry = entries.get(docid as usize)?;
-                    let path_bytes = paths.get(docid as usize)?;
+                    let path_bytes = paths.get_bytes(docid)?;
                     Some((entry, path_bytes))
                 })
                 .filter(|(_, path_bytes)| {
@@ -42,9 +42,7 @@ impl PersistentIndex {
                         .unwrap_or_else(|_| String::from_utf8_lossy(path_bytes));
                     matcher.matches(&s)
                 })
-                .map(|(entry, path_bytes)| {
-                    Self::meta_from_entry_and_path(entry, path_bytes.as_slice())
-                })
+                .map(|(entry, path_bytes)| Self::meta_from_entry_and_path(entry, path_bytes))
                 .take(limit)
                 .collect(),
             None => {
@@ -57,7 +55,7 @@ impl PersistentIndex {
                         if tombstones.contains(docid) {
                             return None;
                         }
-                        let path_bytes = paths.get(i)?;
+                        let path_bytes = paths.get_bytes(docid)?;
                         let s = std::str::from_utf8(path_bytes)
                             .map(std::borrow::Cow::Borrowed)
                             .unwrap_or_else(|_| String::from_utf8_lossy(path_bytes));
@@ -84,7 +82,7 @@ impl PersistentIndex {
             if tombstones.contains(docid) {
                 continue;
             }
-            let Some(path_bytes) = paths.get(i) else {
+            let Some(path_bytes) = paths.get_bytes(docid) else {
                 continue;
             };
             f(Self::meta_from_entry_and_path(entry, path_bytes));
@@ -103,7 +101,7 @@ impl PersistentIndex {
         }
     }
 
-    fn trigram_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringTreemap> {
+    fn trigram_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringBitmap> {
         let hint = matcher.literal_hint()?;
         let s = String::from_utf8_lossy(hint);
         let tris = query_trigrams(s.as_ref());
@@ -115,7 +113,7 @@ impl PersistentIndex {
         let mut sorted_tris = tris.clone();
         sorted_tris.sort_by_key(|t| tri_idx.get(t).map(|b| b.len()).unwrap_or(0));
 
-        let mut acc: Option<RoaringTreemap> = None;
+        let mut acc: Option<RoaringBitmap> = None;
         for tri in &sorted_tris {
             let posting = tri_idx.get(tri)?;
             match acc {
@@ -131,10 +129,10 @@ impl PersistentIndex {
         Some(acc.unwrap_or_default())
     }
 
-    fn short_hint_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringTreemap> {
+    fn short_hint_candidates(&self, matcher: &dyn Matcher) -> Option<RoaringBitmap> {
         let hint = normalize_short_hint(matcher.literal_hint()?)?;
         let tri_idx = self.trigram_index.read();
-        let mut acc = RoaringTreemap::new();
+        let mut acc = RoaringBitmap::new();
 
         for (tri, posting) in tri_idx.iter() {
             if trigram_matches_short_hint(*tri, &hint) {
@@ -151,30 +149,37 @@ impl PersistentIndex {
         let tombstones = self.tombstones.read();
         let trigram_index = self.trigram_index.read();
 
-        let mut rebuild_path_table = RebuildPathTable::new();
+        let mut rebuild_path_table = CompactPathTable::new();
         for root in &self.roots_bytes {
             if !root.is_empty() {
-                let _ = rebuild_path_table.intern(root.clone(), true);
+                let _ = rebuild_path_table.intern(root, true);
             }
         }
         let mut entry_path_idxs: Vec<u32> = Vec::with_capacity(entries_v2.len());
         let mut parent_entries: Vec<(u32, u64)> = Vec::with_capacity(entries_v2.len());
 
-        for (docid_usize, abs_bytes) in paths_v2.iter().enumerate() {
+        for docid_usize in 0..entries_v2.len() {
+            let docid = DocId::try_from(docid_usize).expect("entries fit in u32 DocId");
+            let Some(abs_bytes) = paths_v2.get_bytes(docid) else {
+                continue;
+            };
             intern_parent_dirs(&mut rebuild_path_table, abs_bytes);
-            let path_idx = rebuild_path_table.intern(abs_bytes.clone(), false);
+            let entry = &entries_v2[docid_usize];
+            let path_idx = rebuild_path_table.intern(abs_bytes, entry.kind().is_directory());
             entry_path_idxs.push(path_idx);
-            let docid = docid_usize as DocId;
             if !tombstones.contains(docid) {
                 parent_entries.push((path_idx, docid as u64));
             }
         }
 
-        let mut path_table_builder = crate::index::path_table_v2::PathTableBuilder::with_capacity(
-            rebuild_path_table.id_to_path.len(),
-        );
-        for (idx, path_bytes) in rebuild_path_table.id_to_path.iter().enumerate() {
-            path_table_builder.push(idx as u32, path_bytes);
+        let mut path_table_builder =
+            crate::index::path_table_v2::PathTableBuilder::with_capacity(rebuild_path_table.len());
+        for idx in 0..rebuild_path_table.len() {
+            let path_id = u32::try_from(idx).expect("path table fits in u32");
+            let path_bytes = rebuild_path_table
+                .path_bytes(path_id)
+                .expect("path table contains valid refs");
+            path_table_builder.push(path_id, path_bytes);
         }
         let mut entry_index =
             crate::index::file_entry_v2::FileEntryIndex::with_capacity(entries_v2.len());
@@ -201,12 +206,10 @@ impl PersistentIndex {
 
         let mut tri = crate::index::base_index::TrigramIndex::new();
         for (trigram, posting) in trigram_index.iter() {
-            let bitmap: roaring::RoaringBitmap = posting.iter().map(|v| v as u32).collect();
-            tri.insert(*trigram, bitmap);
+            tri.insert(*trigram, posting.clone());
         }
 
-        let tombstones_bitmap: roaring::RoaringBitmap =
-            tombstones.iter().map(|v| v as u32).collect();
+        let tombstones_bitmap = tombstones.clone();
 
         crate::index::base_index::BaseIndexData {
             path_table,
@@ -241,7 +244,7 @@ impl IndexLayer for PersistentIndex {
                     let Some(entry) = entries.get(docid as usize) else {
                         continue;
                     };
-                    let Some(path_bytes) = paths.get(docid as usize) else {
+                    let Some(path_bytes) = paths.get_bytes(docid) else {
                         continue;
                     };
                     let s = std::str::from_utf8(path_bytes)
@@ -259,7 +262,7 @@ impl IndexLayer for PersistentIndex {
                     if tombstones.contains(docid) {
                         continue;
                     }
-                    let Some(path_bytes) = paths.get(i) else {
+                    let Some(path_bytes) = paths.get_bytes(docid) else {
                         continue;
                     };
                     let s = std::str::from_utf8(path_bytes)
@@ -276,14 +279,14 @@ impl IndexLayer for PersistentIndex {
     }
 
     fn get_meta(&self, key: FileKey) -> Option<FileMeta> {
-        let docid = { self.filekey_to_docid.read().get(&key).copied()? };
+        let docid = self.filekey_representative(key)?;
         if self.tombstones.read().contains(docid) {
             return None;
         }
         let entries = self.entries.read();
         let paths = self.paths.read();
         let entry = entries.get(docid as usize)?;
-        let path_bytes = paths.get(docid as usize)?;
+        let path_bytes = paths.get_bytes(docid)?;
         Some(PersistentIndex::meta_from_entry_and_path(entry, path_bytes))
     }
 }

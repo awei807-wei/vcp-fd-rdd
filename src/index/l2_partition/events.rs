@@ -45,7 +45,7 @@ impl PersistentIndex {
     }
 
     fn existing_path_for_file_key(&self, fk: FileKey) -> Option<std::path::PathBuf> {
-        let docid = { self.filekey_to_docid.read().get(&fk).copied()? };
+        let docid = self.filekey_representative(fk)?;
         self.path_buf_for_docid(docid)
     }
 
@@ -197,7 +197,7 @@ impl PersistentIndex {
         let docid_opt = from_best_path
             .as_deref()
             .and_then(|p| self.lookup_docid_by_path(p))
-            .or_else(|| from_fid.and_then(|fk| self.filekey_to_docid.read().get(&fk).copied()));
+            .or_else(|| from_fid.and_then(|fk| self.filekey_representative(fk)));
 
         if let Some(docid) = docid_opt {
             if let Some(old_path) = self.path_buf_for_docid(docid) {
@@ -236,10 +236,13 @@ impl PersistentIndex {
 
             if (self.entries.read().get(docid as usize)).is_some() {
                 self.tombstones.write().remove(docid);
-                if let Some(entry) = self.entries.read().get(docid as usize) {
-                    self.filekey_to_docid
-                        .write()
-                        .insert(entry.file_key(), docid);
+                let file_key = self
+                    .entries
+                    .read()
+                    .get(docid as usize)
+                    .map(|entry| entry.file_key());
+                if let Some(file_key) = file_key {
+                    self.replace_filekey_representative(file_key, docid);
                 }
                 self.dirty.store(true, std::sync::atomic::Ordering::Release);
             }

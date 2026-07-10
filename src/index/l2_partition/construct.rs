@@ -6,6 +6,7 @@ use crate::index::file_entry_v2::FileEntry;
 use crate::util::{compose_abs_path_bytes, root_bytes_for_id};
 
 use super::helpers::{mtime_to_ns, normalize_roots_with_fallback};
+use super::path_store::PathStore;
 use super::snapshot_format::{IndexSnapshotV2, IndexSnapshotV3, IndexSnapshotV4, IndexSnapshotV5};
 use super::PersistentIndex;
 
@@ -25,11 +26,11 @@ impl PersistentIndex {
             roots,
             roots_bytes,
             entries: parking_lot::RwLock::new(Vec::new()),
-            paths: parking_lot::RwLock::new(Vec::new()),
-            filekey_to_docid: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            paths: parking_lot::RwLock::new(PathStore::new()),
+            filekey_to_docid: parking_lot::RwLock::new(Default::default()),
             path_hash_to_id: parking_lot::RwLock::new(std::collections::HashMap::new()),
             trigram_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            tombstones: parking_lot::RwLock::new(roaring::RoaringTreemap::new()),
+            tombstones: parking_lot::RwLock::new(roaring::RoaringBitmap::new()),
             dirty: std::sync::atomic::AtomicBool::new(false),
             parent_index: parking_lot::RwLock::new(None),
             parent_path_table: parking_lot::RwLock::new(None),
@@ -50,9 +51,12 @@ impl PersistentIndex {
 
         {
             let mut entries = Vec::with_capacity(snap.metas.len());
-            let mut paths = Vec::with_capacity(snap.metas.len());
+            let mut paths = PathStore::with_capacity(snap.metas.len(), snap.arena.data.len());
             for (docid_usize, meta) in snap.metas.iter().enumerate() {
-                let docid = docid_usize as u32;
+                let Ok(docid) = u32::try_from(docid_usize) else {
+                    tracing::warn!("Snapshot has too many documents for 32-bit DocId; ignoring");
+                    return idx;
+                };
                 let abs_bytes = snap
                     .arena
                     .get_bytes(meta.path_off, meta.path_len)
@@ -63,17 +67,21 @@ impl PersistentIndex {
                         )
                     })
                     .unwrap_or_default();
+                let Ok(stored_docid) = paths.push(&abs_bytes) else {
+                    tracing::warn!("Snapshot path arena exceeds runtime capacity; ignoring");
+                    return idx;
+                };
+                debug_assert_eq!(stored_docid, docid);
                 entries.push(FileEntry::from_file_key_and_kind(
                     meta.file_key,
                     docid,
                     meta.mtime_ns,
                     FileKind::File,
                 ));
-                paths.push(abs_bytes);
             }
             *idx.entries.write() = entries;
             *idx.paths.write() = paths;
-            *idx.tombstones.write() = snap.tombstones.into_iter().map(|v| v as u64).collect();
+            *idx.tombstones.write() = snap.tombstones.into_iter().collect();
             idx.dirty.store(false, std::sync::atomic::Ordering::Release);
         }
 
@@ -93,28 +101,36 @@ impl PersistentIndex {
         } = snap;
 
         let mut entries: Vec<FileEntry> = Vec::with_capacity(old_metas.len());
-        let mut paths: Vec<Vec<u8>> = Vec::with_capacity(old_metas.len());
+        let mut paths = PathStore::with_capacity(old_metas.len(), old_arena.data.len());
 
         for m in old_metas {
             let abs_path = old_arena.get_path_buf(m.path_off, m.path_len);
             let Some(abs_path) = abs_path else {
                 continue;
             };
-            let docid = entries.len() as u32;
+            let Ok(docid) = u32::try_from(entries.len()) else {
+                tracing::warn!("Snapshot has too many documents for 32-bit DocId; ignoring");
+                return idx;
+            };
             let mtime_ns = mtime_to_ns(m.mtime);
+            let abs_bytes = abs_path.as_os_str().as_encoded_bytes();
+            let Ok(stored_docid) = paths.push(abs_bytes) else {
+                tracing::warn!("Snapshot path arena exceeds runtime capacity; ignoring");
+                return idx;
+            };
+            debug_assert_eq!(stored_docid, docid);
             entries.push(FileEntry::from_file_key_and_kind(
                 m.file_key,
                 docid,
                 mtime_ns,
                 FileKind::File,
             ));
-            paths.push(abs_path.as_os_str().as_encoded_bytes().to_vec());
         }
 
         {
             *idx.entries.write() = entries;
             *idx.paths.write() = paths;
-            *idx.tombstones.write() = tombstones.into_iter().map(|v| v as u64).collect();
+            *idx.tombstones.write() = tombstones.into_iter().collect();
             idx.dirty.store(false, std::sync::atomic::Ordering::Release);
         }
 

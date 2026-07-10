@@ -15,13 +15,11 @@ impl PersistentIndex {
         let paths = self.paths.read();
         let tomb = self.tombstones.read();
 
-        let mut filekey_to_docid = self.filekey_to_docid.write();
-        let mut path_hash_to_id = self.path_hash_to_id.write();
-        let mut trigram_index = self.trigram_index.write();
-
-        filekey_to_docid.clear();
-        path_hash_to_id.clear();
-        trigram_index.clear();
+        let mut filekey_to_docid = super::filekey_index::CompactFileKeyIndex::new();
+        let mut path_hash_to_id: std::collections::HashMap<u64, OneOrManyDocId> =
+            std::collections::HashMap::new();
+        let mut trigram_index: std::collections::HashMap<super::Trigram, roaring::RoaringBitmap> =
+            std::collections::HashMap::new();
 
         for (docid_usize, entry) in entries.iter().enumerate() {
             let docid: DocId = docid_usize as DocId;
@@ -30,9 +28,9 @@ impl PersistentIndex {
                 continue;
             }
 
-            filekey_to_docid.entry(entry.file_key()).or_insert(docid);
+            filekey_to_docid.insert_if_absent(entry.file_key(), docid, &entries);
 
-            let Some(abs_bytes) = paths.get(docid_usize) else {
+            let Some(abs_bytes) = paths.get_bytes(docid) else {
                 continue;
             };
             if !abs_bytes.is_empty() {
@@ -42,12 +40,20 @@ impl PersistentIndex {
                     .and_modify(|v| v.insert(docid))
                     .or_insert(OneOrManyDocId::One(docid));
 
-                let abs_path = pathbuf_from_encoded_vec(abs_bytes.clone());
+                let abs_path = pathbuf_from_encoded_vec(abs_bytes.to_vec());
                 for_each_basename_trigram(abs_path.as_path(), |tri| {
                     trigram_index.entry(tri).or_default().insert(docid);
                 });
             }
         }
+
+        drop(tomb);
+        drop(paths);
+        drop(entries);
+
+        *self.filekey_to_docid.write() = filekey_to_docid;
+        *self.path_hash_to_id.write() = path_hash_to_id;
+        *self.trigram_index.write() = trigram_index;
     }
 
     /// 插入/更新一条文件记录。
@@ -72,9 +78,8 @@ impl PersistentIndex {
         let fkey = meta.file_key;
         let mtime_ns = mtime_to_ns(meta.mtime);
         if let Some(docid) = self.lookup_docid_by_path(meta.path.as_path()) {
-            self.update_entry_metadata(docid, mtime_ns, meta.kind);
+            self.update_existing_docid(docid, fkey, mtime_ns, meta.kind);
             self.tombstones.write().remove(docid);
-            self.filekey_to_docid.write().entry(fkey).or_insert(docid);
             self.dirty.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
@@ -94,8 +99,7 @@ impl PersistentIndex {
         let new_mtime_ns = mtime_to_ns(meta.mtime);
 
         if let Some(docid) = self.lookup_docid_by_path(meta.path.as_path()) {
-            self.update_entry_metadata(docid, new_mtime_ns, meta.kind);
-            self.filekey_to_docid.write().entry(fkey).or_insert(docid);
+            self.update_existing_docid(docid, fkey, new_mtime_ns, meta.kind);
             self.tombstones.write().remove(docid);
             self.dirty.store(true, std::sync::atomic::Ordering::Release);
             return;
@@ -103,11 +107,11 @@ impl PersistentIndex {
 
         // 先查代表 docid（只持有 mapping 的读锁）。这只用于 rename/reconcile，
         // 不能阻止 hardlink alias 以新 path 入库。
-        let existing_docid = { self.filekey_to_docid.read().get(&fkey).copied() };
+        let existing_docid = self.filekey_representative(fkey);
 
         if let Some(docid) = existing_docid {
             // 读旧路径 bytes（不持有 trigram/path_hash 锁）
-            let old_path_bytes = { self.paths.read().get(docid as usize).cloned() };
+            let old_path_bytes = { self.paths.read().get_bytes(docid).map(<[u8]>::to_vec) };
 
             let old_path_missing = if force_path_update {
                 false
@@ -159,7 +163,7 @@ impl PersistentIndex {
 
             // rename/reconcile 视为"存在且活跃"
             self.tombstones.write().remove(docid);
-            self.filekey_to_docid.write().insert(fkey, docid);
+            self.replace_filekey_representative(fkey, docid);
             self.dirty.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
@@ -180,18 +184,22 @@ impl PersistentIndex {
         mtime_ns: i64,
         kind: FileKind,
     ) -> Option<DocId> {
-        let mut entries = self.entries.write();
-        let docid: DocId = entries.len() as DocId;
-        let path_idx: u32 = docid.try_into().ok()?;
-        entries.push(FileEntry::from_file_key_and_kind(
-            file_key, path_idx, mtime_ns, kind,
-        ));
-        self.paths.write().push(abs_path_bytes.to_vec());
+        let docid = {
+            let mut entries = self.entries.write();
+            if entries.len() > super::filekey_index::MAX_DOC_ID as usize {
+                return None;
+            }
+            let docid = DocId::try_from(entries.len()).ok()?;
+            let mut paths = self.paths.write();
+            let stored_docid = paths.push(abs_path_bytes).ok()?;
+            debug_assert_eq!(stored_docid, docid);
+            entries.push(FileEntry::from_file_key_and_kind(
+                file_key, docid, mtime_ns, kind,
+            ));
+            docid
+        };
 
-        self.filekey_to_docid
-            .write()
-            .entry(file_key)
-            .or_insert(docid);
+        self.insert_filekey_if_absent(file_key, docid);
         self.tombstones.write().remove(docid);
         Some(docid)
     }
@@ -234,6 +242,35 @@ impl PersistentIndex {
             .collect()
     }
 
+    fn update_existing_docid(&self, docid: DocId, new_key: FileKey, mtime_ns: i64, kind: FileKind) {
+        let old_key = self
+            .entries
+            .read()
+            .get(docid as usize)
+            .map(|entry| entry.file_key());
+        let Some(old_key) = old_key else {
+            return;
+        };
+
+        if old_key == new_key {
+            self.update_entry_metadata(docid, mtime_ns, kind);
+            self.insert_filekey_if_absent(new_key, docid);
+            return;
+        }
+
+        self.remove_filekey_representative(old_key);
+        {
+            let mut entries = self.entries.write();
+            let Some(entry) = entries.get_mut(docid as usize) else {
+                return;
+            };
+            let path_idx = entry.path_index();
+            *entry = FileEntry::from_file_key_and_kind(new_key, path_idx, mtime_ns, kind);
+        }
+        self.rebuild_filekey_representative(old_key);
+        self.insert_filekey_if_absent(new_key, docid);
+    }
+
     fn rebuild_filekey_representative(&self, file_key: FileKey) {
         let entries = self.entries.read();
         let tombstones = self.tombstones.read();
@@ -245,13 +282,14 @@ impl PersistentIndex {
                 None
             }
         });
-        let mut map = self.filekey_to_docid.write();
+        drop(tombstones);
+        drop(entries);
         match next {
             Some(docid) => {
-                map.insert(file_key, docid);
+                self.replace_filekey_representative(file_key, docid);
             }
             None => {
-                map.remove(&file_key);
+                self.remove_filekey_representative(file_key);
             }
         }
     }

@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `BENCHMARK.md` 与 M2 方案包补充 VM workload driver 计划：driver 独立于 runner / collector，只在 sandbox root 下生成 daily、cold-canary、delete-storm、rename-storm、git-storm、watcher-drop-proxy 压力，并输出 `workload-events.jsonl` 供指标时间线对齐。
 - `scripts/m2-cold-window-vm-bench.py` 新增一体化 `--event-storm`：支持 `rw100`、`save100`、`git_clone`、`npm_install`、`subtree_rename`、`mount_storm`、`inode_reuse`、`time_skew`，并在 summary/report 中输出 first-query、after-query、workload/tier 维度与特殊正确性计数，用于快速比较 M2 对短窗口事件风暴的投入产出比。
 
+### 性能
+
+- `PersistentIndex` 运行时路径从每条路径独立分配的 `Vec<Vec<u8>>` 改为连续 `PathStore` Arena 与 8 字节 `PathRef`，保留超长内存路径和重命名语义，同时消除百万级小对象分配与对应 allocator 碎片。
+- L2 `DocId`、trigram posting 和 tombstone 收敛为 `u32` / `RoaringBitmap`；`FileKey` 代表索引改为只保存 `u32 DocId` 桶的开放寻址表，不再重复存储每个 20 字节 `FileKey`，并补齐同路径 inode generation 变化时的旧身份替换。
+- ParentIndex 构建路径表改为连续 Arena + 哈希碰撞核验，构建后常驻表只保留目录路径反查；`/memory.l2` 新增 `parent_index_bytes` 与 `parent_path_lookup_bytes`，使百万文件 VM 基准可直接归因父路径索引内存。
+
 ### 修复
 
 - M2 冷层轮转在 Ephemeral Watch 或 fast scan lease 发放失败时会降级为 scan-only 并入 `PeriodicColdScan`，不再直接取消轮转租约，避免冷目录已滞后但 `rotating_cold_window_active_dirs` 始终为 0、canary create / rename 无法追平。

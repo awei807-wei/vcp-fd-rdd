@@ -146,7 +146,7 @@ pub struct L2Stats {
     pub tombstone_count: usize,
     /// metas(Vec<CompactMeta>) capacity
     pub metas_capacity: usize,
-    /// filekey_to_docid(HashMap<FileKey,DocId>) capacity
+    /// CompactFileKeyIndex 的 u32 桶容量
     pub filekey_to_docid_capacity: usize,
     /// path_hash_to_id(HashMap<u64, OneOrManyDocId>) capacity
     pub path_hash_to_id_capacity: usize,
@@ -159,7 +159,7 @@ pub struct L2Stats {
     pub core_table_bytes: u64,
     /// metas(Vec<CompactMeta>) 估算内存（字节）
     pub metas_bytes: u64,
-    /// filekey_to_docid(HashMap<FileKey,DocId>) 估算内存（字节）
+    /// CompactFileKeyIndex 估算内存（字节）
     pub filekey_to_docid_bytes: u64,
     /// arena 估算内存（字节）
     pub arena_bytes: u64,
@@ -169,6 +169,10 @@ pub struct L2Stats {
     pub trigram_bytes: u64,
     /// RoaringBitmap serialized_size 总和（更接近压缩后数据体量；不等于真实 heap）
     pub roaring_serialized_bytes: u64,
+    /// ParentIndex 目录到直接子文件 DocId 映射估算内存（字节）
+    pub parent_index_bytes: u64,
+    /// ParentIndex 常驻目录路径反查估算内存（字节）
+    pub parent_path_lookup_bytes: u64,
     /// 总估算内存（字节）
     pub estimated_bytes: u64,
 }
@@ -713,6 +717,12 @@ impl fmt::Display for MemoryReport {
             f,
             "║   tombstones:   {:>10}                       ║",
             self.l2.tombstone_count
+        )?;
+        writeln!(
+            f,
+            "║   parent index: {:>10}  ({:>10})          ║",
+            human_bytes(self.l2.parent_index_bytes),
+            human_bytes(self.l2.parent_path_lookup_bytes)
         )?;
         writeln!(
             f,

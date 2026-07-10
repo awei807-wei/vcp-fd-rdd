@@ -20,12 +20,7 @@ impl PersistentIndex {
     /// 导出 v5 快照数据
     pub fn export_snapshot_v5(&self) -> IndexSnapshotV5 {
         let (arena, metas) = self.build_legacy_metas(false);
-        let tombstones = self
-            .tombstones
-            .read()
-            .iter()
-            .map(|v| v as u32)
-            .collect::<Vec<u32>>();
+        let tombstones = self.tombstones.read().iter().collect::<Vec<u32>>();
         self.dirty
             .store(false, std::sync::atomic::Ordering::Release);
         IndexSnapshotV5 {
@@ -86,8 +81,7 @@ impl PersistentIndex {
         // Tombstones 段：RoaringBitmap serialized bytes（v6 兼容格式；v8 后再切 Treemap）
         let tombstones = self.tombstones.read();
         let mut tombstones_bytes = Vec::new();
-        let tomb_bitmap: roaring::RoaringBitmap = tombstones.iter().map(|v| v as u32).collect();
-        tomb_bitmap
+        tombstones
             .serialize_into(&mut tombstones_bytes)
             .expect("write to vec");
         drop(tombstones);
@@ -104,8 +98,7 @@ impl PersistentIndex {
         let mut postings_blob_bytes = Vec::new();
         for (tri, posting) in tri_idx.iter() {
             let off: u32 = postings_blob_bytes.len().try_into().unwrap_or(u32::MAX);
-            let posting_bitmap: roaring::RoaringBitmap = posting.iter().map(|v| v as u32).collect();
-            posting_bitmap
+            posting
                 .serialize_into(&mut postings_blob_bytes)
                 .expect("write to vec");
             let len: u32 = postings_blob_bytes
@@ -154,10 +147,7 @@ impl PersistentIndex {
         //   docid u32
         //
         // 注意：来源为 filekey_to_docid（天然排除 tombstone）。
-        let mut pairs: Vec<(crate::core::FileKey, DocId)> = {
-            let m = self.filekey_to_docid.read();
-            m.iter().map(|(k, v)| (*k, *v)).collect()
-        };
+        let mut pairs = self.filekey_pairs();
         pairs.sort_unstable_by_key(|(k, _)| (k.dev, k.ino, k.generation));
 
         let mut filekey_map_bytes = Vec::new();
@@ -170,7 +160,10 @@ impl PersistentIndex {
             filekey_map_bytes.extend_from_slice(&FKM_FLAG_RKYV.to_le_bytes());
             let entries: Vec<FileKeyEntry> = pairs
                 .into_iter()
-                .map(|(key, doc_id)| FileKeyEntry { key, doc_id })
+                .map(|(key, doc_id)| FileKeyEntry {
+                    key,
+                    doc_id: u64::from(doc_id),
+                })
                 .collect();
             let bytes = rkyv::to_bytes::<_, 1024>(&entries).expect("rkyv to_bytes");
             filekey_map_bytes.extend_from_slice(bytes.as_ref());
@@ -185,7 +178,7 @@ impl PersistentIndex {
                 filekey_map_bytes.extend_from_slice(&k.dev.to_le_bytes());
                 filekey_map_bytes.extend_from_slice(&k.ino.to_le_bytes());
                 filekey_map_bytes.extend_from_slice(&k.generation.to_le_bytes());
-                filekey_map_bytes.extend_from_slice(&(docid as u32).to_le_bytes());
+                filekey_map_bytes.extend_from_slice(&docid.to_le_bytes());
             }
         }
 
@@ -278,8 +271,8 @@ impl PersistentIndex {
                 continue;
             }
             let path = paths
-                .get(docid)
-                .map(|bytes| pathbuf_from_encoded_vec(bytes.clone()))
+                .get_bytes(docid as DocId)
+                .map(|bytes| pathbuf_from_encoded_vec(bytes.to_vec()))
                 .unwrap_or_default();
             let (root_id, rel_bytes) = self.split_root_relative_bytes(path.as_path());
             let (path_off, path_len) = arena.push_bytes(&rel_bytes).unwrap_or((0, 0));

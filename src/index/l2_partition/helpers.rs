@@ -102,10 +102,13 @@ pub(super) fn normalize_roots_with_fallback(
     out
 }
 
-pub(super) fn intern_parent_dirs(path_table: &mut super::types::RebuildPathTable, path: &[u8]) {
+pub(super) fn intern_parent_dirs(
+    path_table: &mut super::parent_path::CompactPathTable,
+    path: &[u8],
+) {
     let mut end = match path.iter().rposition(|&b| b == b'/') {
         Some(0) => {
-            let _ = path_table.intern(b"/".to_vec(), true);
+            let _ = path_table.intern(b"/", true);
             return;
         }
         Some(pos) => pos,
@@ -114,10 +117,10 @@ pub(super) fn intern_parent_dirs(path_table: &mut super::types::RebuildPathTable
 
     loop {
         if end == 0 {
-            let _ = path_table.intern(b"/".to_vec(), true);
+            let _ = path_table.intern(b"/", true);
             break;
         }
-        let _ = path_table.intern(path[..end].to_vec(), true);
+        let _ = path_table.intern(&path[..end], true);
         end = match path[..end].iter().rposition(|&b| b == b'/') {
             Some(0) => 0,
             Some(pos) => pos,

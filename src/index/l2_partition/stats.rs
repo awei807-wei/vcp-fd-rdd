@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
-use roaring::RoaringTreemap;
+use roaring::RoaringBitmap;
 
-use crate::core::FileKey;
 use crate::index::file_entry_v2::FileEntry;
 use crate::stats::L2Stats;
 
@@ -30,8 +29,11 @@ impl PersistentIndex {
         let path_hash_to_id = self.path_hash_to_id.read();
         let trigram_index = self.trigram_index.read();
         let tombstones = self.tombstones.read();
+        let parent_index = self.parent_index.read();
+        let parent_path_table = self.parent_path_table.read();
 
         let total_docs = entries.len();
+        debug_assert_eq!(paths.len(), total_docs);
         let tombstone_count = tombstones.len() as usize;
         let file_count = total_docs.saturating_sub(tombstone_count);
 
@@ -56,17 +58,11 @@ impl PersistentIndex {
         let metas_bytes = entries.capacity() as u64 * size_of::<FileEntry>() as u64
             + size_of::<Vec<FileEntry>>() as u64;
 
-        // mapping: HashMap<FileKey, DocId>
-        let map_entry_bytes = size_of::<(FileKey, DocId)>() as u64;
-        let filekey_to_docid_bytes = filekey_to_docid.len() as u64 * (map_entry_bytes + 1)
-            + size_of::<HashMap<FileKey, DocId>>() as u64;
+        // mapping: open-addressed u32 DocId buckets; FileKey lives only in entries.
+        let filekey_to_docid_bytes = filekey_to_docid.allocated_bytes() as u64;
 
-        // paths: Vec<Vec<u8>>
-        let mut arena_bytes = paths.capacity() as u64 * size_of::<Vec<u8>>() as u64
-            + size_of::<Vec<Vec<u8>>>() as u64;
-        for path in paths.iter() {
-            arena_bytes += path.capacity() as u64 + size_of::<Vec<u8>>() as u64;
-        }
+        // paths: one contiguous byte arena + one 8-byte PathRef per DocId.
+        let arena_bytes = paths.allocated_bytes() as u64 + size_of_val(&*paths) as u64;
 
         // path hash 反查：HashMap<u64, OneOrManyDocId> + Many 的 Vec<DocId> 堆分配
         let path_entry_bytes = size_of::<(u64, OneOrManyDocId)>() as u64;
@@ -81,19 +77,32 @@ impl PersistentIndex {
             + size_of::<HashMap<u64, OneOrManyDocId>>() as u64
             + path_many_bytes;
 
-        // trigram：HashMap<Trigram, RoaringTreemap> 的 entry + Roaring 的压缩存储量（serialized_size）
-        let trigram_entry_bytes = size_of::<(Trigram, RoaringTreemap)>() as u64;
+        // trigram：HashMap<Trigram, RoaringBitmap> 的 entry + Roaring 的压缩存储量（serialized_size）
+        let trigram_entry_bytes = size_of::<(Trigram, RoaringBitmap)>() as u64;
         let trigram_map_bytes = trigram_index.capacity() as u64 * (trigram_entry_bytes + 1)
-            + size_of::<HashMap<Trigram, RoaringTreemap>>() as u64;
+            + size_of::<HashMap<Trigram, RoaringBitmap>>() as u64;
         let trigram_bytes = trigram_map_bytes + trigram_heap_bytes;
 
-        // tombstones：RoaringTreemap
-        let tomb_bytes = size_of::<RoaringTreemap>() as u64 + tombstones.serialized_size() as u64;
+        // tombstones：RoaringBitmap
+        let tomb_bytes = size_of::<RoaringBitmap>() as u64 + tombstones.serialized_size() as u64;
         let roaring_serialized_bytes = trigram_heap_bytes + tombstones.serialized_size() as u64;
+        let parent_index_bytes = parent_index
+            .as_ref()
+            .map(|index| index.allocated_bytes() as u64)
+            .unwrap_or(0);
+        let parent_path_lookup_bytes = parent_path_table
+            .as_ref()
+            .map(|lookup| lookup.allocated_bytes() as u64)
+            .unwrap_or(0);
 
         let core_table_bytes = metas_bytes + filekey_to_docid_bytes;
-        let estimated_bytes =
-            core_table_bytes + arena_bytes + path_to_id_bytes + trigram_bytes + tomb_bytes;
+        let estimated_bytes = core_table_bytes
+            + arena_bytes
+            + path_to_id_bytes
+            + trigram_bytes
+            + tomb_bytes
+            + parent_index_bytes
+            + parent_path_lookup_bytes;
 
         L2Stats {
             file_count,
@@ -102,10 +111,10 @@ impl PersistentIndex {
             trigram_postings_total,
             tombstone_count,
             metas_capacity: entries.capacity(),
-            filekey_to_docid_capacity: filekey_to_docid.len(),
+            filekey_to_docid_capacity: filekey_to_docid.capacity(),
             path_hash_to_id_capacity: path_hash_to_id.len(),
             trigram_index_capacity: trigram_index.capacity(),
-            arena_capacity: paths.iter().map(|p| p.capacity()).sum(),
+            arena_capacity: paths.arena_capacity(),
 
             core_table_bytes,
             metas_bytes,
@@ -114,6 +123,8 @@ impl PersistentIndex {
             path_to_id_bytes,
             trigram_bytes,
             roaring_serialized_bytes,
+            parent_index_bytes,
+            parent_path_lookup_bytes,
             estimated_bytes,
         }
     }

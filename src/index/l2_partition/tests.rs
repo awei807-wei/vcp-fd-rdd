@@ -1,8 +1,145 @@
 use super::*;
-use crate::core::{FileKey, FileMeta};
+use crate::core::{FileKey, FileKind, FileMeta};
 use crate::index::IndexLayer;
 use crate::query::matcher::create_matcher;
 use std::path::PathBuf;
+
+#[test]
+fn runtime_docid_is_32_bit() {
+    assert_eq!(std::mem::size_of::<DocId>(), 4);
+}
+
+#[test]
+fn runtime_paths_use_one_contiguous_arena() {
+    let idx = PersistentIndex::new();
+    for ino in 0..128_u64 {
+        idx.upsert(FileMeta {
+            file_key: FileKey {
+                dev: 1,
+                ino,
+                generation: 0,
+            },
+            path: PathBuf::from(format!("/tmp/compact-path-{ino:04}.txt")),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+            kind: Default::default(),
+        });
+    }
+
+    let stats = idx.memory_stats();
+    let path_ref_bytes = stats.file_count as u64 * 8;
+    assert!(
+        stats.arena_bytes <= stats.arena_capacity as u64 + path_ref_bytes + 64,
+        "runtime path storage should be one arena plus compact refs: {stats:?}"
+    );
+}
+
+#[test]
+fn runtime_filekey_index_uses_compact_docid_buckets() {
+    let idx = PersistentIndex::new();
+    for ino in 0..128_u64 {
+        idx.upsert(FileMeta {
+            file_key: FileKey {
+                dev: 7,
+                ino,
+                generation: 0,
+            },
+            path: PathBuf::from(format!("/tmp/filekey-{ino:04}.txt")),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+            kind: Default::default(),
+        });
+    }
+
+    let stats = idx.memory_stats();
+    let bucket_bytes = stats.filekey_to_docid_capacity as u64 * 4;
+    assert!(
+        stats.filekey_to_docid_bytes <= bucket_bytes + 64,
+        "FileKey index should store only compact DocId buckets: {stats:?}"
+    );
+}
+
+#[test]
+fn parent_lookup_retains_directories_but_not_file_paths() {
+    let idx = PersistentIndex::new();
+    let dir_key = FileKey {
+        dev: 9,
+        ino: 1,
+        generation: 0,
+    };
+    let file_key = FileKey {
+        dev: 9,
+        ino: 2,
+        generation: 0,
+    };
+    idx.upsert(FileMeta {
+        file_key: dir_key,
+        path: PathBuf::from("/tmp/compact-parent"),
+        size: 0,
+        mtime: None,
+        ctime: None,
+        atime: None,
+        kind: FileKind::Directory,
+    });
+    idx.upsert(FileMeta {
+        file_key,
+        path: PathBuf::from("/tmp/compact-parent/file.txt"),
+        size: 1,
+        mtime: None,
+        ctime: None,
+        atime: None,
+        kind: FileKind::File,
+    });
+
+    idx.rebuild_parent_index();
+
+    {
+        let lookup = idx.parent_path_table.read();
+        let lookup = lookup.as_ref().expect("parent lookup should be built");
+        assert!(lookup.lookup(b"/tmp/compact-parent").is_some());
+        assert_eq!(lookup.lookup(b"/tmp/compact-parent/file.txt"), None);
+    }
+    assert_eq!(idx.parent_candidates("/tmp/compact-parent"), vec![file_key]);
+}
+
+#[test]
+fn same_path_with_new_filekey_replaces_stale_identity() {
+    let idx = PersistentIndex::new();
+    let old_key = FileKey {
+        dev: 11,
+        ino: 100,
+        generation: 1,
+    };
+    let new_key = FileKey {
+        dev: 11,
+        ino: 100,
+        generation: 2,
+    };
+    let path = PathBuf::from("/tmp/inode-reused.txt");
+
+    for file_key in [old_key, new_key] {
+        idx.upsert(FileMeta {
+            file_key,
+            path: path.clone(),
+            size: 1,
+            mtime: None,
+            ctime: None,
+            atime: None,
+            kind: FileKind::File,
+        });
+    }
+
+    assert!(idx.get_meta(old_key).is_none());
+    let meta = idx
+        .get_meta(new_key)
+        .expect("new identity should be indexed");
+    assert_eq!(meta.file_key, new_key);
+    assert_eq!(meta.path, path);
+}
 
 #[test]
 fn roaring_posting_basic_query() {

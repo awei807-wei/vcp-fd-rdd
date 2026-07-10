@@ -5,7 +5,8 @@ use crate::core::FileKey;
 use crate::util::pathbuf_from_encoded_vec;
 
 use super::dedupe::{physical_dedupe_stats_from_groups, HardlinkGroup, PhysicalDedupeStats};
-use super::types::RebuildPathTable;
+use super::helpers::intern_parent_dirs;
+use super::parent_path::{CompactPathTable, ParentPathLookup};
 use super::{DocId, PersistentIndex};
 
 impl PersistentIndex {
@@ -37,32 +38,41 @@ impl PersistentIndex {
 
     /// 构建/重建 ParentIndex
     pub fn rebuild_parent_index(&self) {
-        let mut path_table = RebuildPathTable::new();
-        let mut entries: Vec<(u32, u64)> = Vec::new();
+        let (new_index, parent_lookup) = {
+            let mut path_table = CompactPathTable::new();
+            let mut parent_entries: Vec<(u32, u64)> = Vec::new();
+            let indexed_entries = self.entries.read();
+            let paths = self.paths.read();
+            let tombstones = self.tombstones.read();
 
-        let paths = self.paths.read();
-        let tombstones = self.tombstones.read();
-
-        for (i, abs) in paths.iter().enumerate() {
-            let doc_id = i as DocId;
-            if tombstones.contains(doc_id) {
-                continue;
+            for (i, entry) in indexed_entries.iter().enumerate() {
+                let doc_id = DocId::try_from(i).expect("paths fit in u32 DocId");
+                if tombstones.contains(doc_id) {
+                    continue;
+                }
+                let Some(abs) = paths.get_bytes(doc_id) else {
+                    continue;
+                };
+                intern_parent_dirs(&mut path_table, abs);
+                let path_idx = path_table.intern(abs, entry.kind().is_directory());
+                parent_entries.push((path_idx, doc_id as u64));
             }
-            let path_idx = path_table.intern(abs.to_vec(), false);
-            entries.push((path_idx, doc_id as u64));
-        }
 
-        // Also intern root directories so parent lookup terminates correctly
-        for root in &self.roots_bytes {
-            if !root.is_empty() {
-                let _ = path_table.intern(root.clone(), true);
+            for root in &self.roots_bytes {
+                if !root.is_empty() {
+                    let _ = path_table.intern(root, true);
+                }
             }
-        }
 
-        let new_index =
-            crate::index::parent_index::ParentIndex::build_from_entries(&entries, &path_table);
+            let new_index = crate::index::parent_index::ParentIndex::build_from_entries(
+                &parent_entries,
+                &path_table,
+            );
+            let parent_lookup = ParentPathLookup::from_table(&path_table);
+            (new_index, parent_lookup)
+        };
         *self.parent_index.write() = Some(new_index);
-        *self.parent_path_table.write() = Some(path_table);
+        *self.parent_path_table.write() = Some(parent_lookup);
     }
 
     /// 使用 ParentIndex 的删除对齐
@@ -84,11 +94,11 @@ impl PersistentIndex {
             let mut result = Vec::new();
             let paths = self.paths.read();
             for doc_id in to_check {
-                let Some(path_bytes) = paths.get(doc_id as usize) else {
+                let Some(path_bytes) = paths.get_bytes(doc_id) else {
                     continue;
                 };
-                let path = pathbuf_from_encoded_vec(path_bytes.clone());
-                result.push((doc_id as u64, path));
+                let path = pathbuf_from_encoded_vec(path_bytes.to_vec());
+                result.push((doc_id, path));
             }
             result
         } else {
@@ -142,10 +152,10 @@ impl PersistentIndex {
             if !entry.kind().is_file() {
                 continue;
             }
-            let Some(path_bytes) = paths.get(docid_usize) else {
+            let Some(path_bytes) = paths.get_bytes(docid) else {
                 continue;
             };
-            let path = pathbuf_from_encoded_vec(path_bytes.clone());
+            let path = pathbuf_from_encoded_vec(path_bytes.to_vec());
             if normalized_prefix
                 .as_ref()
                 .is_some_and(|prefix| !path.starts_with(prefix))
