@@ -32,6 +32,15 @@ M2 `Rotating Cold Freshness Window` 不能只用“正常情况下能搜到”�
 
 现有指标可以复用：daemon 已经每 30 秒写 `reports/metrics/metrics_YYYY-MM-DD_HH.json`，顶层兼容 `/watch-state`，嵌套包含 `runtime`、`memory`、`health`、`diagnostics`。`scripts/m2-cold-window-vm-bench.py` 负责隔离启动 fd-rdd、周期采集 HTTP 端点和 `/proc/<pid>`，并把内建 metrics 一并保存在单次 run 目录。脚本输出同时区分 active canary 与 passive canary：active canary 创建后立刻轮询搜索，可能测到 query miss / fast scan 触发的补偿；passive canary 先写入、等待 settle 后只做首次查询，用来衡量后台主动追平。
 
+### 一键 A/B
+
+```bash
+python3 scripts/m2-cold-window-ab.py a  # 开启 M2
+python3 scripts/m2-cold-window-ab.py b  # 关闭 M2
+```
+
+驱动只接受 `a`/`b`，固定重建 `$HOME/fd-rdd-m2-roots` 专用 fixture，并把输出写入 `/tmp/fd-rdd-m2-runs`。两组除 treatment 开关外使用相同的一小时 event storm、canary、扫描预算和 seed。运行中会提前拒绝开关错配、没有 L2/L3 或 A 无 M2 活动，结束后再校验 runner 的 `ab_comparable`、完整时长、burst 和 summary/manifest/process/endpoint 产物；失败均返回非零。使用 `--dry-run` 可只打印固定命令，不修改环境。
+
 ### 总不变量
 
 | 类别 | 不变量 |
