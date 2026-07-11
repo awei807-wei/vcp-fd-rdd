@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- 修复 realistic fixture 的总量失真：区段改为最大余数法精确分配，`Misc` 从错误的 16.3% 收敛为 6.3%，`.git`/`node_modules` 脚手架计入 `Projects` 配额；completed manifest 现在同时校验计划总数、各区段实际数和请求总数完全一致。
 - full rebuild 发布改为 fail-closed generation 边界：扫描期间的 overflow、目录 rename/子树失效会保留 delta 与 sealed WAL 并重试，普通文件精确 delete 仍可在边界内重放；snapshot 验证、stable 安装、cold remount 或 quarantine sidecar 任一步失败都不得清理恢复证据。
 - M2 VM benchmark 新增参数、初始状态、执行三层指纹和 `ab_comparable` 门禁；正式 A/B 必须使用本轮 `cargo build --release --locked` 且来源 SHA 可证明的二进制、原子 completed verified fixture manifest、干净工作区与完整采样，legacy fixture 标记只展示、不再进入可比结果。
 - benchmark manifest 改为原子生命周期状态机，并以独立 `/proc` sampler 精确覆盖 SIGTERM 后最终快照窗口；`--workload-seed` 固定 mixed workload，runner 报告 owned snapshot 状态及六项 L2 时间序列。

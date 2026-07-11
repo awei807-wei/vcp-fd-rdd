@@ -35,7 +35,7 @@ GiB = 1024 * 1024 * 1024
 DEFAULT_TARGET = 1_000_000
 FIXTURE_MANIFEST_VERSION = 1
 
-# 各区段的默认比例（按 1M 目标缩放，--total-files 改变时整体等比缩放）
+# 各区段的默认比例（总和必须为 1；按 --total-files 精确分配）
 # 字段: (name, weight, dirs_per_million, files_per_dir, kind)
 SECTIONS = [
     {
@@ -103,7 +103,7 @@ SECTIONS = [
     },
     {
         "name": "Misc",
-        "weight": 0.163,       # ~163,000 filler
+        "weight": 0.063,       # 63,000 filler
         "dirs_per_million": 1000,
         "files_per_dir": 163,
         "kind": "misc",
@@ -351,18 +351,61 @@ def _make_node_modules(proj_root: Path, rng: random.Random, i: int) -> int:
     return count
 
 
+GIT_SCAFFOLD_FILES = 13
+NODE_MODULE_SCAFFOLD_FILES = 12
+
+
+def _generate_project_scaffolding(
+    plan: SectionPlan,
+    rel_dirs: list[list[str]],
+    rng: random.Random,
+) -> int:
+    """Generate project metadata within, never in addition to, the section budget."""
+    if plan.kind != "projects" or plan.target_files <= 0:
+        return 0
+
+    files_created = 0
+    project_roots_seen: set[Path] = set()
+    for d_idx, rel in enumerate(rel_dirs):
+        proj_root = plan.root / rel[0]
+        if proj_root in project_roots_seen:
+            continue
+        project_roots_seen.add(proj_root)
+
+        if files_created + GIT_SCAFFOLD_FILES > plan.target_files:
+            break
+        git_files = _make_git_dir(proj_root, rng, d_idx)
+        if git_files != GIT_SCAFFOLD_FILES:
+            raise RuntimeError(
+                f"project git scaffold count changed: {git_files} != {GIT_SCAFFOLD_FILES}"
+            )
+        files_created += git_files
+
+        if (
+            d_idx % 2 == 0
+            and files_created + NODE_MODULE_SCAFFOLD_FILES <= plan.target_files
+        ):
+            node_files = _make_node_modules(proj_root, rng, d_idx)
+            if node_files != NODE_MODULE_SCAFFOLD_FILES:
+                raise RuntimeError(
+                    "project node_modules scaffold count changed: "
+                    f"{node_files} != {NODE_MODULE_SCAFFOLD_FILES}"
+                )
+            files_created += node_files
+    return files_created
+
+
 def _generate_section(plan: SectionPlan, progress_every: int = 10_000) -> GenResult:
     rng = random.Random(plan.seed)
     exts = _exts_for_kind(plan.kind)
     rel_dirs = _rel_dirs_for_kind(plan.kind, rng, plan.num_dirs)
-    files_created = 0
-    dirs_created = 0
     start = time.time()
+    files_created = _generate_project_scaffolding(plan, rel_dirs, rng)
+    dirs_created = 0
 
     # 每个 section 内均匀分配文件
     per_dir = plan.files_per_dir
-    remaining = plan.target_files
-    project_roots_seen: set[Path] = set()
+    remaining = plan.target_files - files_created
 
     for d_idx, rel in enumerate(rel_dirs):
         if remaining <= 0:
@@ -396,19 +439,6 @@ def _generate_section(plan: SectionPlan, progress_every: int = 10_000) -> GenRes
                     f"dirs={dirs_created} rate={rate:.0f}/s",
                     flush=True,
                 )
-
-        # 为 projects kind 额外注入 .git / node_modules（每个 project 根一次）
-        if plan.kind == "projects":
-            # 取 project 顶层名作为 project root
-            proj_root = plan.root / rel[0]
-            if proj_root not in project_roots_seen:
-                project_roots_seen.add(proj_root)
-                try:
-                    files_created += _make_git_dir(proj_root, rng, d_idx)
-                    if (d_idx % 2) == 0:
-                        files_created += _make_node_modules(proj_root, rng, d_idx)
-                except OSError:
-                    pass
 
     # 处理 remaining > 0（dirs 不足以装下 target_files 的情况）：追加扁平目录
     extra_bucket = 0
@@ -482,11 +512,32 @@ def _validate_root(root: Path) -> None:
         raise SystemExit("[error] 拒绝使用根路径 / 。")
 
 
+def _allocate_section_targets(total_files: int) -> list[int]:
+    weights = [float(section["weight"]) for section in SECTIONS]
+    weight_sum = sum(weights)
+    if abs(weight_sum - 1.0) > 1e-9:
+        raise ValueError(f"section weights must sum to 1.0, got {weight_sum:.12f}")
+
+    raw_targets = [weight * total_files for weight in weights]
+    targets = [int(raw) for raw in raw_targets]
+    undistributed = total_files - sum(targets)
+    by_fraction = sorted(
+        range(len(SECTIONS)),
+        key=lambda index: (raw_targets[index] - targets[index], -index),
+        reverse=True,
+    )
+    for index in by_fraction[:undistributed]:
+        targets[index] += 1
+    if sum(targets) != total_files:
+        raise AssertionError("section target allocation did not preserve the requested total")
+    return targets
+
+
 def _build_plans(test_root: Path, total_files: int, seed: int) -> list[SectionPlan]:
     scale = total_files / DEFAULT_TARGET
     plans: list[SectionPlan] = []
-    for idx, sec in enumerate(SECTIONS):
-        target = max(0, int(round(sec["weight"] * total_files)))
+    targets = _allocate_section_targets(total_files)
+    for idx, (sec, target) in enumerate(zip(SECTIONS, targets, strict=True)):
         num_dirs = max(1, int(round(sec["dirs_per_million"] * scale)))
         cfg_fpd = sec["files_per_dir"]
         # 若按 scale 算出的单目录文件数远超配置特征值，扩大 dirs 数量以保持单目录规模合理
@@ -555,23 +606,30 @@ def _write_completed_fixture_manifest(
     generation_started_clean: bool,
 ) -> bool:
     result_by_name = {result.name: result for result in results}
-    completed = generation_started_clean and len(result_by_name) == len(plans) and all(
-        result_by_name.get(plan.name) is not None
-        and result_by_name[plan.name].files_created == plan.target_files
-        for plan in plans
+    planned_file_count = sum(plan.target_files for plan in plans)
+    actual_file_count = sum(result.files_created for result in results)
+    completed = (
+        generation_started_clean
+        and planned_file_count == requested_total_files
+        and actual_file_count == requested_total_files
+        and len(result_by_name) == len(plans)
+        and all(
+            result_by_name.get(plan.name) is not None
+            and result_by_name[plan.name].files_created == plan.target_files
+            for plan in plans
+        )
     )
     manifest_path = test_root / ".fd-rdd-m2-fixture.json"
     if not completed:
         manifest_path.unlink(missing_ok=True)
         return False
 
-    actual_file_count = sum(result.files_created for result in results)
     actual_dir_count = sum(result.dirs_created for result in results)
     _atomic_write_json(
         manifest_path,
         {
             "schema_version": FIXTURE_MANIFEST_VERSION,
-            "layout_version": "m2-realistic-v1",
+            "layout_version": "m2-realistic-v2",
             "completed": True,
             "seed": seed,
             "requested_total_files": requested_total_files,
