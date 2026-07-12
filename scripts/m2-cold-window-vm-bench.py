@@ -912,6 +912,9 @@ def safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in value).strip("-")
 
 
+EVENT_STORM_DIR_PREFIX = "fd-rdd-m2-event-storm-"
+
+
 EVENT_STORM_KIND_ALIASES = {
     "rw100": "rw100",
     "save100": "save100",
@@ -1852,7 +1855,7 @@ class EventStormRunner:
         return records
 
     def burst_root(self, root: Path, kind: str) -> Path:
-        return root / f"fd-rdd-m2-event-storm-{safe_name(kind)}-{self.run_id}-{self.cycle:03d}"
+        return root / f"{EVENT_STORM_DIR_PREFIX}{safe_name(kind)}-{self.run_id}-{self.cycle:03d}"
 
     def select_root(self, requested_tier: str) -> Path:
         if requested_tier:
@@ -1860,33 +1863,76 @@ class EventStormRunner:
                 dump = debug_tiered_watch(self.base_url)
                 dirs = dump.get("dirs")
                 if isinstance(dirs, list):
+                    candidates_by_path: dict[str, Path] = {}
+                    requested_tier = requested_tier.upper()
+                    for item in dirs:
+                        if not isinstance(item, dict):
+                            continue
+                        if str(item.get("watch_tier", "")).upper() != requested_tier:
+                            continue
+                        raw_path = item.get("path")
+                        if not isinstance(raw_path, str) or not raw_path:
+                            continue
+                        anchor = self._stable_fixture_anchor(Path(raw_path))
+                        if anchor is not None:
+                            candidates_by_path[str(anchor)] = anchor
                     candidates = [
-                        Path(str(item.get("path")))
-                        for item in dirs
-                        if isinstance(item, dict)
-                        and str(item.get("watch_tier", "")).upper() == requested_tier
-                        and self.within_configured_roots(Path(str(item.get("path"))))
+                        candidates_by_path[path]
+                        for path in sorted(candidates_by_path)
                     ]
-                    candidates = sorted(set(candidates))
                     if candidates:
                         return candidates[(self.cycle - 1) % len(candidates)]
             except Exception:
                 pass
         return self.roots[(self.cycle - 1) % len(self.roots)]
 
-    def within_configured_roots(self, path: Path) -> bool:
+    @staticmethod
+    def _has_event_storm_component(relative_path: Path) -> bool:
+        return any(
+            part.startswith(EVENT_STORM_DIR_PREFIX)
+            for part in relative_path.parts
+        )
+
+    def _stable_fixture_anchor(self, path: Path) -> Path | None:
+        """Return a canonical, existing fixture directory safe for storm writes."""
+
+        lexical_path = Path(os.path.abspath(os.fspath(path)))
         try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path
+            resolved_path = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        if not resolved_path.is_dir():
+            return None
+
+        within_configured_root = False
         for root in self.roots:
             try:
-                resolved.relative_to(root)
-                return True
-            except ValueError:
-                if resolved == root:
-                    return True
-        return False
+                lexical_root = Path(os.path.abspath(os.fspath(root)))
+                resolved_root = root.resolve(strict=True)
+                resolved_relative = resolved_path.relative_to(resolved_root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+
+            lexical_relative: Path | None = None
+            for candidate_root in (lexical_root, resolved_root):
+                try:
+                    lexical_relative = lexical_path.relative_to(candidate_root)
+                    break
+                except ValueError:
+                    continue
+
+            if (
+                lexical_relative is not None
+                and self._has_event_storm_component(lexical_relative)
+            ):
+                return None
+            if self._has_event_storm_component(resolved_relative):
+                return None
+            within_configured_root = True
+        return resolved_path if within_configured_root else None
+
+    def within_configured_roots(self, path: Path) -> bool:
+        return self._stable_fixture_anchor(path) is not None
 
     def expected_record(
         self,
@@ -1935,7 +1981,7 @@ class EventStormRunner:
         # never the indexed root itself. ignore_errors so cleanup never crashes.
         try:
             for child in list(Path(self.active["root"]).iterdir()):
-                if child.name.startswith("fd-rdd-m2-event-storm-"):
+                if child.name.startswith(EVENT_STORM_DIR_PREFIX):
                     shutil.rmtree(child, ignore_errors=True)
         except Exception:
             pass

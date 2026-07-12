@@ -153,6 +153,8 @@ python3 scripts/m2-cold-window-vm-bench.py \
   --event-storm-settle-secs 120
 ```
 
+event storm 按 `/debug/tiered-watch` 选择指定 L0-L3 的稳定 fixture 目录，但会排除路径任一组件以 `fd-rdd-m2-event-storm-` 开头的目录及其后代；词法路径与 symlink 解析后的真实路径都必须留在配置 root 内。没有安全的目标层候选时才回退到本轮显式 root，避免上一 burst 成为下一 burst 的父目录并形成递归 workload。
+
 ### A/B 判定标准
 
 正式内存 A/B 的两腿必须分别从同一个已关机、只读的 VM/磁盘基线快照恢复；fixture 的 completed verified manifest 只证明生成时完整，不能证明当前目录树或 page cache 未被上一腿污染。报告目录应放在快照外并在每腿结束后立即导出。正式结果使用同一候选版 runner、`--build always`、相同参数指纹和初始状态指纹；顺序执行的 `--sweep-config` 只用于探索，不能单独作为初始构建峰值的正式 A/B。
@@ -166,6 +168,7 @@ python3 scripts/m2-cold-window-vm-bench.py \
 | 队列预算 | `dirty_queue_len` 操作后可回落；`rotating_cold_window_budget_blocked` / `ephemeral_watch_budget_blocked` 不能持续单调增长且无对应回落。 |
 | watcher | `watch_failures` 和 `overflow_drops` 不应持续增长，除非测试明确在验证 overflow recovery。 |
 | event storm | `first_query.success_rate` 不低于 baseline，`special.subtree_rename_*`、`mount_storm_old_hidden_ok`、`inode_reuse_*`、`time_skew_backdated_visible_ok` 不能暴露正确性退化；真实挂载断联和系统回拨还需独立 VM driver 验证。 |
+| 生命周期完整性 | `ab_comparable=true`；最终快照、fast-scan registry 与 clean-shutdown marker 全部成功。被 delete/rename 证据覆盖的 transient Live 可安全收敛，无法解释的缺失仍必须 fail-closed。 |
 
 ### 推荐指标补齐
 

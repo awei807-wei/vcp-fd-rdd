@@ -163,6 +163,22 @@ impl DeltaBuffer {
         self.subtree_invalidations.iter().cloned().collect()
     }
 
+    /// Return the most specific delete/rename source that covers `path`.
+    ///
+    /// Snapshot capture uses this only after a Live record can no longer be
+    /// resolved from either the filesystem or L2. Coverage is the evidence
+    /// that the Live record is a stale pre-invalidation fact rather than an
+    /// unexplained missing upsert; callers must still fail closed when this
+    /// returns `None`.
+    pub(crate) fn invalidation_covering_path(&self, path: &std::path::Path) -> Option<&[u8]> {
+        let path = path.as_os_str().as_encoded_bytes();
+        self.subtree_invalidations
+            .iter()
+            .filter(|prefix| encoded_path_is_same_or_descendant(path, prefix.as_slice()))
+            .max_by_key(|prefix| prefix.len())
+            .map(Vec::as_slice)
+    }
+
     pub fn clear_subtree_invalidations(&mut self) {
         self.subtree_invalidations.clear();
     }
@@ -317,6 +333,23 @@ impl DeltaBuffer {
     }
 }
 
+fn encoded_path_is_same_or_descendant(path: &[u8], prefix: &[u8]) -> bool {
+    if path == prefix {
+        return true;
+    }
+    if prefix.is_empty() || !path.starts_with(prefix) {
+        return false;
+    }
+    if prefix
+        .last()
+        .is_some_and(|byte| std::path::is_separator(char::from(*byte)))
+    {
+        return true;
+    }
+    path.get(prefix.len())
+        .is_some_and(|byte| std::path::is_separator(char::from(*byte)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +402,47 @@ mod tests {
         db.apply_events(&[ev]);
         assert!(db.is_deleted(b"/tmp/old"));
         assert!(db.is_live(b"/tmp/new"));
+    }
+
+    #[test]
+    fn stale_live_after_rename_keeps_invalidation_evidence() {
+        let mut db = DeltaBuffer::with_capacity(1024);
+        let rename = EventRecord {
+            seq: 1,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            event_type: EventType::Rename {
+                from: FileIdentifier::Path(PathBuf::from("/tmp/old")),
+                from_path_hint: None,
+            },
+            id: FileIdentifier::Path(PathBuf::from("/tmp/new")),
+            path_hint: None,
+        };
+        db.apply_events(&[rename]);
+        db.apply_events(&[make_event(2, EventType::Modify, "/tmp/old")]);
+
+        assert!(db.is_live(b"/tmp/old"));
+        assert_eq!(
+            db.invalidation_covering_path(std::path::Path::new("/tmp/old")),
+            Some(b"/tmp/old".as_slice())
+        );
+        assert!(db
+            .invalidation_covering_path(std::path::Path::new("/tmp/old-child"))
+            .is_none());
+    }
+
+    #[test]
+    fn parent_invalidation_covers_stale_descendant_only() {
+        let mut db = DeltaBuffer::with_capacity(1024);
+        db.apply_events(&[make_event(1, EventType::Delete, "/tmp/old-tree")]);
+        db.apply_events(&[make_event(2, EventType::Modify, "/tmp/old-tree/child.txt")]);
+
+        assert_eq!(
+            db.invalidation_covering_path(std::path::Path::new("/tmp/old-tree/child.txt")),
+            Some(b"/tmp/old-tree".as_slice())
+        );
+        assert!(db
+            .invalidation_covering_path(std::path::Path::new("/tmp/other-tree/child.txt"))
+            .is_none());
     }
 
     #[test]

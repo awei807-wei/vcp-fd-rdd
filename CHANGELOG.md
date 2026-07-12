@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- M2 event storm 的 tier 目标选择不再复用当前或历史 `fd-rdd-m2-event-storm-*` 目录及其后代；候选同时校验词法路径、真实路径和配置 root，避免 workload 递归嵌套或经 symlink 逃逸。
+- 快照遇到已被精确或祖先 delete/rename 失效证据覆盖的 transient Live upsert 时，会将其收敛为删除并继续持久化最终事实；没有失效证据的 unresolved upsert 仍保持 fail-closed，不再让原子保存的旧 `.tmp` 或子树 rename 旧路径触发无意义 rebuild。
+- fd-rdd 关机现在先关闭周期快照与 rebuild 准入，最终快照失败会保留 `Final snapshot failed` 日志并以错误退出；仅在最终快照、fast-scan registry 和 runtime state 全部持久化成功后写入 clean-shutdown，cooldown/retry 线程不能越过关机边界启动 rebuild。
 - 修复 realistic fixture 的总量失真：区段改为最大余数法精确分配，`Misc` 从错误的 16.3% 收敛为 6.3%，`.git`/`node_modules` 脚手架计入 `Projects` 配额；completed manifest 现在同时校验计划总数、各区段实际数和请求总数完全一致。
 - full rebuild 发布改为 fail-closed generation 边界：扫描期间的 overflow、目录 rename/子树失效会保留 delta 与 sealed WAL 并重试，普通文件精确 delete 仍可在边界内重放；snapshot 验证、stable 安装、cold remount 或 quarantine sidecar 任一步失败都不得清理恢复证据。
 - M2 VM benchmark 新增参数、初始状态、执行三层指纹和 `ab_comparable` 门禁；正式 A/B 必须使用本轮 `cargo build --release --locked` 且来源 SHA 可证明的二进制、原子 completed verified fixture manifest、干净工作区与完整采样，legacy fixture 标记只展示、不再进入可比结果。

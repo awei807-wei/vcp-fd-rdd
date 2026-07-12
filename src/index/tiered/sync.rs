@@ -389,6 +389,12 @@ impl TieredIndex {
 
     pub(super) fn reserve_rebuild_with_cooldown(&self, reason: &'static str) -> RebuildAdmission {
         let mut st = self.rebuild_state.lock();
+        if self.is_shutting_down() {
+            st.requested = false;
+            st.scheduled = false;
+            tracing::debug!("Rebuild request rejected during shutdown ({})", reason);
+            return RebuildAdmission::Coalesced;
+        }
         if self.rebuild_snapshot_pending.load(Ordering::Acquire) {
             tracing::debug!(
                 "Rebuild request coalesced into owned generation awaiting snapshot ({})",

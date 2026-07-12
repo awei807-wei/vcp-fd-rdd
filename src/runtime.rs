@@ -301,7 +301,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     // 11) 优雅退出：SIGINT/SIGTERM → 最终快照
     shutdown_signal().await?;
-    handle_shutdown(&index, &store, &tiered_runtime, &cfg).await;
+    handle_shutdown(&index, &store, &tiered_runtime, &cfg).await?;
 
     Ok(())
 }
@@ -507,13 +507,15 @@ fn run_startup_repair(
         );
     }
     index.enqueue_startup_deferred_repair();
-    mark_runtime_state(
+    if let Err(error) = mark_runtime_state(
         store.path(),
         false,
         &index.recovery_status().report.snapshot_source,
         "running",
         root_case_policies.to_vec(),
-    );
+    ) {
+        tracing::warn!("failed to mark runtime state as running: {error}");
+    }
     index.spawn_quarantine_verify_worker(quarantine_sidecar_path_for(store.path()));
 
     // 若没有可信快照，或启动 repair 判断差异过大，后台全量构建。
@@ -1021,10 +1023,19 @@ async fn handle_shutdown(
     store: &Arc<SnapshotStore>,
     tiered_runtime: &Option<Arc<TieredWatchRuntime>>,
     cfg: &Config,
-) {
+) -> anyhow::Result<()> {
+    index.begin_shutdown();
     info!("Shutting down, writing final snapshot...");
-    if let Err(e) = index.snapshot_now(store.clone()).await {
-        tracing::error!("Final snapshot failed: {}", e);
+    mark_runtime_state(
+        store.path(),
+        false,
+        &index.recovery_status().report.snapshot_source,
+        "shutdown-in-progress",
+        index.root_case_policy_diagnostics(),
+    )?;
+    if let Err(error) = index.snapshot_now(store.clone()).await {
+        tracing::error!("Final snapshot failed: {error:#}");
+        return Err(anyhow::anyhow!("final snapshot failed: {error:#}"));
     }
     if let Some(runtime) = tiered_runtime.as_ref() {
         let registry_wal_checkpoint = read_recovery_runtime_state(store.path())
@@ -1036,16 +1047,18 @@ async fn handle_shutdown(
         } else {
             recovery_report.snapshot_source
         };
-        match runtime.persist_fast_scan_registry(
-            store.path(),
-            &cfg.tiered_watch,
-            &registry_snapshot_source,
-            registry_wal_checkpoint,
-            true,
-        ) {
-            Ok(entries) => tracing::info!("persisted hotset fast scan registry entries={entries}"),
-            Err(e) => tracing::warn!("failed to persist hotset fast scan registry: {}", e),
-        }
+        let entries = runtime
+            .persist_fast_scan_registry(
+                store.path(),
+                &cfg.tiered_watch,
+                &registry_snapshot_source,
+                registry_wal_checkpoint,
+                true,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("final fast-scan registry persistence failed: {error:#}")
+            })?;
+        tracing::info!("persisted hotset fast scan registry entries={entries}");
     }
     mark_runtime_state(
         store.path(),
@@ -1053,17 +1066,22 @@ async fn handle_shutdown(
         &index.recovery_status().report.snapshot_source,
         "clean-shutdown",
         index.root_case_policy_diagnostics(),
-    );
+    )?;
     info!("Goodbye.");
+    Ok(())
 }
+
 fn mark_runtime_state(
     snapshot_path: &std::path::Path,
     clean_shutdown: bool,
     startup_source: &str,
     recovery_mode: &str,
     root_case_policies: Vec<crate::diagnostics::RootCasePolicyDiagnostics>,
-) {
-    let previous = read_recovery_runtime_state(snapshot_path).unwrap_or_default();
+) -> anyhow::Result<()> {
+    let previous = read_recovery_runtime_state(snapshot_path).unwrap_or_else(|error| {
+        tracing::warn!("failed to read previous recovery runtime state; replacing it: {error}");
+        RecoveryRuntimeState::default()
+    });
     let state = RecoveryRuntimeState {
         last_clean_shutdown: clean_shutdown,
         last_snapshot_unix_secs: unix_secs(),
@@ -1072,9 +1090,7 @@ fn mark_runtime_state(
         last_recovery_mode: recovery_mode.to_string(),
         root_case_policies,
     };
-    if let Err(e) = write_recovery_runtime_state(snapshot_path, &state) {
-        tracing::warn!("failed to write recovery runtime state: {}", e);
-    }
+    write_recovery_runtime_state(snapshot_path, &state)
 }
 
 fn apply_watch_plan_static_fields(report: &mut WatchStateReport, plan: &WatchStateReport) {
@@ -2052,6 +2068,96 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("fd-rdd-main-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn handle_shutdown_failure_returns_error_and_keeps_unclean_state() -> anyhow::Result<()> {
+        let root = temp_root("shutdown-failure");
+        let content_root = root.join("content");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&content_root)?;
+        std::fs::create_dir_all(&state_root)?;
+
+        let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+        let index = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+        mark_runtime_state(store.path(), true, "stable", "previous-clean", Vec::new())?;
+
+        let missing = content_root.join("missing-without-delete.txt");
+        std::fs::write(&missing, b"transient")?;
+        index.apply_events(&[crate::core::EventRecord {
+            seq: 1,
+            timestamp: std::time::SystemTime::now(),
+            event_type: crate::core::EventType::Create,
+            id: crate::core::FileIdentifier::Path(missing.clone()),
+            path_hint: Some(missing.clone()),
+        }]);
+        std::fs::remove_file(&missing)?;
+
+        let error = handle_shutdown(&index, &store, &None, &Config::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("final snapshot failed"));
+        assert!(error.to_string().contains("snapshot_upsert_unresolved"));
+        assert!(index.is_shutting_down());
+        assert!(!index.rebuild_in_progress());
+
+        let state = read_recovery_runtime_state(store.path())?;
+        assert!(!state.last_clean_shutdown);
+        assert_eq!(state.last_recovery_mode, "shutdown-in-progress");
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_shutdown_commits_clean_state_after_final_snapshot() -> anyhow::Result<()> {
+        let root = temp_root("shutdown-success");
+        let content_root = root.join("content");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&content_root)?;
+        std::fs::create_dir_all(&state_root)?;
+
+        let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+        let index = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+        let path = content_root.join("durable.txt");
+        std::fs::write(&path, b"durable")?;
+        index.apply_events(&[crate::core::EventRecord {
+            seq: 1,
+            timestamp: std::time::SystemTime::now(),
+            event_type: crate::core::EventType::Create,
+            id: crate::core::FileIdentifier::Path(path.clone()),
+            path_hint: Some(path),
+        }]);
+
+        handle_shutdown(&index, &store, &None, &Config::default()).await?;
+
+        let state = read_recovery_runtime_state(store.path())?;
+        assert!(state.last_clean_shutdown);
+        assert_eq!(state.last_recovery_mode, "clean-shutdown");
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn mark_runtime_state_replaces_corrupt_previous_state() -> anyhow::Result<()> {
+        use crate::storage::snapshot::runtime_state_path_for;
+
+        let root = temp_root("replace-corrupt-runtime-state");
+        std::fs::create_dir_all(&root)?;
+        let snapshot_path = root.join("index.db");
+        let runtime_state_path = runtime_state_path_for(&snapshot_path);
+        std::fs::create_dir_all(runtime_state_path.parent().expect("state parent"))?;
+        std::fs::write(&runtime_state_path, b"not-json")?;
+
+        mark_runtime_state(&snapshot_path, false, "none", "running", Vec::new())?;
+
+        let state = read_recovery_runtime_state(&snapshot_path)?;
+        assert!(!state.last_clean_shutdown);
+        assert_eq!(state.last_recovery_mode, "running");
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]

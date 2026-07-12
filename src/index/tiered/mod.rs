@@ -309,9 +309,9 @@ pub struct TieredIndex {
     pub(self) flush_requested: AtomicBool,
     pub(self) flush_notify: Notify,
     /// Set once a termination signal has been received. From this point the
-    /// periodic snapshot loop exits and any snapshot writes the clean-shutdown
-    /// marker as `true`, so a late background snapshot cannot race the final
-    /// shutdown marker back to `false`.
+    /// periodic snapshot loop exits and rebuild admission is closed. Snapshot
+    /// publication always leaves the runtime marker unclean; the runtime owns
+    /// the sole clean-shutdown commit after every required persistence step.
     pub(self) shutting_down: AtomicBool,
     pub(self) auto_flush_overlay_paths: AtomicU64,
     pub(self) auto_flush_overlay_bytes: AtomicU64,
@@ -373,10 +373,14 @@ impl TieredIndex {
     }
 
     /// Mark the index as shutting down. Call this once on a termination signal,
-    /// before the final snapshot, so the periodic snapshot loop stops and the
-    /// clean-shutdown marker can no longer be raced back to `false`.
+    /// before the final snapshot, so periodic snapshots stop and delayed
+    /// rebuild requests cannot begin after the shutdown boundary.
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        let mut rebuild = self.rebuild_state.lock();
+        rebuild.requested = false;
+        rebuild.scheduled = false;
+        drop(rebuild);
         // Wake the snapshot loop so it observes the flag and exits promptly
         // instead of sleeping out the rest of its interval.
         self.flush_notify.notify_one();

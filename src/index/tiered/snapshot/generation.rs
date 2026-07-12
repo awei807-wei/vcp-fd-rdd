@@ -86,14 +86,35 @@ fn capture_snapshot_input(idx: &TieredIndex) -> anyhow::Result<SnapshotInput> {
         .map(<[u8]>::to_vec)
         .collect::<Vec<_>>();
     let mut upserts = Vec::with_capacity(db.live_records().count());
+    let mut stale_upserts = 0usize;
     for event in db.live_records() {
-        let meta = idx.overlay_meta_for_event(event).ok_or_else(|| {
-            anyhow::anyhow!(
-                "snapshot_upsert_unresolved: no filesystem or L2 metadata for {:?}",
-                event.best_path()
-            )
-        })?;
-        upserts.push(meta);
+        if let Some(meta) = idx.overlay_meta_for_event(event) {
+            upserts.push(meta);
+            continue;
+        }
+
+        if let Some(path) = event.best_path() {
+            if let Some(invalidation) = db.invalidation_covering_path(path) {
+                stale_upserts += 1;
+                tracing::debug!(
+                    path = %path.display(),
+                    invalidation = ?invalidation,
+                    "snapshot discarded unresolved Live record covered by delete/rename"
+                );
+                continue;
+            }
+        }
+
+        anyhow::bail!(
+            "snapshot_upsert_unresolved: no filesystem or L2 metadata for {:?}",
+            event.best_path()
+        );
+    }
+    if stale_upserts > 0 {
+        tracing::debug!(
+            stale_upserts,
+            "snapshot converged stale Live records using delete/rename evidence"
+        );
     }
     let plan = ColdDeltaPlan::new(deleted_paths, upserts);
     if let Some(generation) = idx.pending_snapshot_generation.lock().take() {
@@ -240,8 +261,12 @@ fn write_snapshot_runtime_state(
     snapshot_path: &std::path::Path,
     wal_seal_id: u64,
 ) -> anyhow::Result<()> {
+    // A durable generation is necessary for a clean shutdown, but it is not
+    // the commit point: runtime-owned persistence (for example the fast-scan
+    // registry) must succeed first. `handle_shutdown` writes the sole clean
+    // marker after every required step completes.
     let state = RecoveryRuntimeState {
-        last_clean_shutdown: idx.is_shutting_down(),
+        last_clean_shutdown: false,
         last_snapshot_unix_secs: unix_secs(),
         last_wal_seal_id: wal_seal_id,
         last_startup_source: idx.recovery_status().report.snapshot_source,

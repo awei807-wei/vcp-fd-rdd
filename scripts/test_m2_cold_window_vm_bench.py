@@ -853,6 +853,113 @@ class ProcessSampleRunnerTests(unittest.TestCase):
 
 
 class EventStormFixtureTests(unittest.TestCase):
+    @staticmethod
+    def event_storm_runner(roots: list[Path]) -> BENCH.EventStormRunner:
+        return BENCH.EventStormRunner(
+            base_url="http://127.0.0.1:1",
+            roots=roots,
+            out_path=roots[0] / "events.jsonl",
+            started_at=time.monotonic(),
+            start_delay_secs=0,
+            interval_secs=1,
+            settle_secs=0,
+            timeout_secs=0,
+            ops_per_burst=10,
+            duration_budget_secs=10,
+            time_skew_secs=3600,
+            kinds=["rw100"],
+            target_tiers=["L0", "L1", "L2", "L3"],
+        )
+
+    def test_select_root_never_reuses_event_storm_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.cycle = 1
+            current_storm = runner.burst_root(root, "rw100")
+            current_descendant = current_storm / "nested"
+            current_descendant.mkdir(parents=True)
+            historical_descendant = (
+                root
+                / "fd-rdd-m2-event-storm-save100-previous-run-001"
+                / "nested"
+            )
+            historical_descendant.mkdir(parents=True)
+            runner.cycle = 2
+
+            with mock.patch.object(
+                BENCH,
+                "debug_tiered_watch",
+                return_value={
+                    "dirs": [
+                        {"path": str(current_storm), "watch_tier": "L2"},
+                        {"path": str(current_descendant), "watch_tier": "L2"},
+                        {"path": str(historical_descendant), "watch_tier": "L2"},
+                    ]
+                },
+            ):
+                selected = runner.select_root("L2")
+
+            self.assertEqual(selected, root)
+            self.assertNotEqual(selected, current_storm)
+            self.assertNotEqual(selected, current_descendant)
+            self.assertNotEqual(selected, historical_descendant)
+
+    def test_select_root_accepts_stable_tier_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            stable = root / "fixture-fd-rdd-m2-event-storm-anchor"
+            stable.mkdir()
+            runner = self.event_storm_runner([root])
+            runner.cycle = 1
+
+            with mock.patch.object(
+                BENCH,
+                "debug_tiered_watch",
+                return_value={
+                    "dirs": [
+                        {"path": str(stable), "watch_tier": "L1"},
+                        {"path": str(root), "watch_tier": "L3"},
+                    ]
+                },
+            ):
+                selected = runner.select_root("L1")
+
+            self.assertEqual(selected, stable)
+
+    def test_select_root_rejects_symlink_escape_and_falls_back_by_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            first_root = base / "first"
+            second_root = base / "second"
+            outside = base / "outside"
+            first_root.mkdir()
+            second_root.mkdir()
+            outside.mkdir()
+            escape = first_root / "safe-looking-link"
+            try:
+                escape.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+            runner = self.event_storm_runner([first_root, second_root])
+            runner.cycle = 2
+
+            with mock.patch.object(
+                BENCH,
+                "debug_tiered_watch",
+                return_value={
+                    "dirs": [
+                        {"path": str(escape), "watch_tier": "L3"},
+                        {"path": str(first_root), "watch_tier": "L2"},
+                    ]
+                },
+            ):
+                selected_once = runner.select_root("L3")
+                selected_twice = runner.select_root("L3")
+
+            self.assertEqual(selected_once, second_root)
+            self.assertEqual(selected_twice, second_root)
+
     def test_npm_node_modules_are_hidden_and_package_root_has_visible_probe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

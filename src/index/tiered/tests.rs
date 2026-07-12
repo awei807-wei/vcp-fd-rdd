@@ -2822,6 +2822,152 @@ async fn unsupported_directory_rename_retains_delta_and_sealed_wal() -> anyhow::
 }
 
 #[tokio::test]
+async fn snapshot_converges_stale_atomic_save_tmp_after_rename() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("snapshot-stale-atomic-save-tmp");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    let tmp_path = content_root.join("report.txt.save_0022.tmp");
+    let final_path = content_root.join("report.txt");
+
+    std::fs::write(&tmp_path, b"new contents")?;
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, tmp_path.clone()),
+        mk_event(2, EventType::Modify, tmp_path.clone()),
+    ]);
+    std::fs::rename(&tmp_path, &final_path)?;
+    idx.apply_events(&[mk_event(
+        3,
+        EventType::Rename {
+            from: FileIdentifier::Path(tmp_path.clone()),
+            from_path_hint: Some(tmp_path.clone()),
+        },
+        final_path.clone(),
+    )]);
+
+    // A queued pre-rename modify can arrive after the rename event. The L2 and
+    // filesystem correctly have no tmp path, but last-event-wins leaves a Live
+    // delta record for it.
+    idx.apply_events(&[mk_event(4, EventType::Modify, tmp_path.clone())]);
+    let stale_event = {
+        let db = idx.delta_buffer.lock();
+        assert!(db.is_live(tmp_path.as_os_str().as_encoded_bytes()));
+        let stale_event = db
+            .live_records()
+            .find(|event| event.best_path() == Some(tmp_path.as_path()))
+            .cloned()
+            .expect("stale tmp Live record");
+        stale_event
+    };
+    assert!(idx.overlay_meta_for_event(&stale_event).is_none());
+
+    idx.snapshot_now(store.clone()).await?;
+
+    let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    assert!(reloaded
+        .query("report.txt")
+        .iter()
+        .any(|meta| meta.path == final_path));
+    assert!(reloaded.query("save_0022").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_converges_stale_child_after_parent_path_disappears() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("snapshot-stale-renamed-subdir-child");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let old_dir = content_root.join("old-tree");
+    let new_dir = content_root.join("new-tree");
+    let old_child = old_dir.join("child.txt");
+    let new_child = new_dir.join("child.txt");
+    std::fs::create_dir_all(&old_dir)?;
+    std::fs::create_dir_all(&state_root)?;
+    std::fs::write(&old_child, b"child")?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, old_child.clone())]);
+    idx.snapshot_now(store.clone()).await?;
+
+    std::fs::rename(&old_dir, &new_dir)?;
+    idx.apply_events(&[
+        mk_event(2, EventType::Delete, old_dir.clone()),
+        mk_event(3, EventType::Create, new_child.clone()),
+        mk_event(4, EventType::Modify, old_child.clone()),
+    ]);
+    let stale_event = {
+        let db = idx.delta_buffer.lock();
+        assert!(db.is_live(old_child.as_os_str().as_encoded_bytes()));
+        let stale_event = db
+            .live_records()
+            .find(|event| event.best_path() == Some(old_child.as_path()))
+            .cloned()
+            .expect("stale child Live record");
+        stale_event
+    };
+    assert!(idx.overlay_meta_for_event(&stale_event).is_none());
+
+    idx.snapshot_now(store.clone()).await?;
+
+    let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    assert!(reloaded
+        .query("new-tree")
+        .iter()
+        .any(|meta| meta.path == new_child));
+    assert!(reloaded.query("old-tree").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_snapshot_unexplained_upsert_fails_closed_without_rebuild() -> anyhow::Result<()> {
+    use crate::storage::snapshot::read_recovery_runtime_state;
+
+    let root = unique_tmp_dir("shutdown-unresolved-upsert");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.attach_wal(store.as_ref())?;
+    let unexplained = content_root.join("unexplained-missing.txt");
+    std::fs::write(&unexplained, b"transient")?;
+    idx.apply_events(&[mk_event(1, EventType::Create, unexplained.clone())]);
+    std::fs::remove_file(&unexplained)?;
+
+    idx.begin_shutdown();
+    let error = idx.snapshot_now(store.clone()).await.unwrap_err();
+    assert!(error.to_string().contains("snapshot_upsert_unresolved"));
+    assert!(idx
+        .delta_buffer
+        .lock()
+        .is_live(unexplained.as_os_str().as_encoded_bytes()));
+    {
+        let rebuild = idx.rebuild_state.lock();
+        assert!(!rebuild.in_progress);
+        assert!(!rebuild.requested);
+        assert!(!rebuild.scheduled);
+        assert!(rebuild.last_started_at.is_none());
+    }
+    assert!(!idx.rebuild_snapshot_pending.load(Ordering::Acquire));
+    assert_eq!(store.open_wal()?.replay_since_seal(0)?.events_replayed, 1);
+    assert!(!read_recovery_runtime_state(store.path())?.last_clean_shutdown);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn v7_load_mounts_manifest_only_cold_segment_and_queries_on_demand() -> anyhow::Result<()> {
     let root = unique_tmp_dir("v7-cold-manifest");
     let content_root = root.join("content");
@@ -4260,7 +4406,7 @@ fn materialize_snapshot_preserves_overlay_hardlink_aliases() {
 }
 
 #[tokio::test]
-async fn snapshot_marks_clean_shutdown_only_after_begin_shutdown() -> anyhow::Result<()> {
+async fn snapshot_does_not_commit_clean_shutdown_marker() -> anyhow::Result<()> {
     use crate::storage::snapshot::read_recovery_runtime_state;
 
     let root = unique_tmp_dir("clean-shutdown-marker");
@@ -4283,16 +4429,17 @@ async fn snapshot_marks_clean_shutdown_only_after_begin_shutdown() -> anyhow::Re
         "running snapshot must keep last_clean_shutdown=false"
     );
 
-    // After begin_shutdown the (final) snapshot must mark the shutdown clean.
+    // begin_shutdown only quiesces background work. A successful final
+    // snapshot is still not the runtime's clean-shutdown commit point.
     idx.apply_events(&[mk_event(2, EventType::Create, root.join("a.txt"))]);
     idx.refresh_base();
     idx.begin_shutdown();
     assert!(idx.is_shutting_down());
     idx.snapshot_now(store.clone()).await?;
-    let shutting = read_recovery_runtime_state(store.path())?;
+    let shutting_down = read_recovery_runtime_state(store.path())?;
     assert!(
-        shutting.last_clean_shutdown,
-        "snapshot during shutdown must set last_clean_shutdown=true"
+        !shutting_down.last_clean_shutdown,
+        "snapshot during shutdown must remain unclean until runtime persistence succeeds"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -4317,6 +4464,25 @@ async fn snapshot_loop_exits_promptly_on_begin_shutdown() {
         joined.is_ok(),
         "snapshot loop did not exit after begin_shutdown"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn begin_shutdown_rejects_delayed_rebuild_admission() {
+    let root = unique_tmp_dir("shutdown-rejects-rebuild");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+
+    idx.begin_shutdown();
+    assert!(matches!(
+        idx.reserve_rebuild_with_cooldown("test delayed rebuild"),
+        RebuildAdmission::Coalesced
+    ));
+    let rebuild = idx.rebuild_state.lock();
+    assert!(!rebuild.in_progress);
+    assert!(!rebuild.requested);
+    assert!(!rebuild.scheduled);
 
     let _ = std::fs::remove_dir_all(&root);
 }
