@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -20,34 +22,126 @@ VARIANTS = {
 }
 
 
+@dataclass(frozen=True)
+class BenchmarkProfile:
+    """单腿 benchmark 中除 treatment 外必须冻结的协议参数。"""
+
+    build: str
+    duration_secs: int
+    event_root_names: tuple[str, ...]
+    passive_root_name: str
+    event_kinds: str
+    target_tiers: str
+    event_start_delay_secs: int
+    event_interval_secs: int
+    event_settle_secs: int
+    immediate_query: bool
+    active_canary: bool
+    fixed_root_schedule: bool
+    deterministic_event_plan: bool
+    max_bursts: int = 0
+    visibility_probes_per_burst: int = 0
+    visibility_poll_interval_secs: float = 1.0
+
+
+PROFILES = {
+    "standard": BenchmarkProfile(
+        build="always",
+        duration_secs=3600,
+        event_root_names=("cold-a", "cold-b", "hot"),
+        passive_root_name="cold-a",
+        event_kinds=(
+            "rw100,save100,git_clone,npm_install,subtree_rename,"
+            "mount_storm,inode_reuse,time_skew"
+        ),
+        target_tiers="L0,L1,L2,L3",
+        event_start_delay_secs=180,
+        event_interval_secs=10,
+        event_settle_secs=60,
+        immediate_query=True,
+        active_canary=True,
+        fixed_root_schedule=False,
+        deterministic_event_plan=False,
+    ),
+    "falsification": BenchmarkProfile(
+        build="never",
+        duration_secs=1200,
+        event_root_names=("cold-a",),
+        passive_root_name="cold-b",
+        event_kinds="save100,git_clone,subtree_rename",
+        target_tiers="L3",
+        event_start_delay_secs=240,
+        event_interval_secs=10,
+        event_settle_secs=120,
+        immediate_query=False,
+        active_canary=False,
+        fixed_root_schedule=True,
+        deterministic_event_plan=True,
+        max_bursts=6,
+        visibility_probes_per_burst=8,
+        visibility_poll_interval_secs=1.0,
+    ),
+}
+
+
 def treatment_args(variant: str) -> list[str]:
     return [VARIANTS[variant][1]]
 
 
-def build_command(
-    variant: str, run_dir: Path, roots: dict[str, Path]
+def _run_label(run_dir: Path) -> str:
+    digest = hashlib.sha256(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:12]
+    return f"{run_dir.name[:48]}-{digest}"
+
+
+def _base_args(
+    run_dir: Path,
+    roots: dict[str, Path],
+    profile: BenchmarkProfile,
+    binary: Path,
 ) -> list[str]:
     cold_roots = f"{roots['cold-a']},{roots['cold-b']}"
-    command = [
+    return [
         sys.executable,
         str(BENCH_RUNNER),
-        "--repo", str(REPO_ROOT),
-        "--binary", str(BINARY),
-        "--build", "always",
-        "--run-label", run_dir.name,
-        "--run-dir", str(run_dir),
-        "--root", str(roots["cold-a"]),
-        "--root", str(roots["cold-b"]),
-        "--root", str(roots["hot"]),
-        "--hot-roots", str(roots["hot"]),
-        "--cold-roots", cold_roots,
-        "--watch-mode", "tiered",
-        "--runtime-profile", "default",
-        "--tiered-profile", "balanced",
-        "--duration-secs", "3600",
-        "--sample-interval-secs", "10",
-        "--process-sample-interval-secs", "0.5",
-        "--snapshot-interval-secs", "300",
+        "--repo",
+        str(REPO_ROOT),
+        "--binary",
+        str(binary),
+        "--build",
+        profile.build,
+        "--run-label",
+        _run_label(run_dir),
+        "--run-dir",
+        str(run_dir),
+        "--root",
+        str(roots["cold-a"]),
+        "--root",
+        str(roots["cold-b"]),
+        "--root",
+        str(roots["hot"]),
+        "--hot-roots",
+        str(roots["hot"]),
+        "--cold-roots",
+        cold_roots,
+        "--watch-mode",
+        "tiered",
+        "--runtime-profile",
+        "default",
+        "--tiered-profile",
+        "balanced",
+        "--duration-secs",
+        str(profile.duration_secs),
+        "--sample-interval-secs",
+        "10",
+        "--process-sample-interval-secs",
+        "0.5",
+        "--snapshot-interval-secs",
+        "300",
+    ]
+
+
+def _tiered_args() -> list[str]:
+    return [
         "--rotating-budget", "128",
         "--rotating-tick-secs", "30",
         "--rotating-ttl-secs", "180",
@@ -62,31 +156,108 @@ def build_command(
         "--l2-empty-scans-to-l3", "2",
         "--fast-scan",
         "--proc-sampler",
-        "--canary-root", str(roots["hot"]),
-        "--canary-interval-secs", "120",
-        "--canary-timeout-secs", "90",
-        "--passive-canary-root", str(roots["cold-a"]),
-        "--passive-canary-start-delay-secs", "180",
-        "--passive-canary-interval-secs", "180",
-        "--passive-canary-settle-secs", "120",
-        "--passive-canary-timeout-secs", "0",
-        "--event-storm",
-        "--event-storm-root", str(roots["cold-a"]),
-        "--event-storm-root", str(roots["cold-b"]),
-        "--event-storm-root", str(roots["hot"]),
-        "--event-storm-kind",
-        "rw100,save100,git_clone,npm_install,subtree_rename,mount_storm,inode_reuse,time_skew",
-        "--event-storm-target-tier", "L0,L1,L2,L3",
-        "--event-storm-ops", "100",
-        "--event-storm-duration-budget-secs", "1",
-        "--event-storm-start-delay-secs", "180",
-        "--event-storm-interval-secs", "180",
-        "--event-storm-settle-secs", "120",
-        "--event-storm-immediate-query",
-        "--immediate-query-settle-secs", "5",
-        "--snapshot-path-disk",
-        "--workload-seed", str(WORKLOAD_SEED),
-        "--shutdown-timeout-secs", "300",
     ]
+
+
+def _canary_args(
+    roots: dict[str, Path],
+    profile: BenchmarkProfile,
+) -> list[str]:
+    args: list[str] = []
+    if profile.active_canary:
+        args.extend(
+            (
+                "--canary-root",
+                str(roots["hot"]),
+                "--canary-interval-secs",
+                "120",
+                "--canary-timeout-secs",
+                "90",
+            )
+        )
+    args.extend(
+        (
+            "--passive-canary-root",
+            str(roots[profile.passive_root_name]),
+            "--passive-canary-start-delay-secs",
+            "180",
+            "--passive-canary-interval-secs",
+            "180",
+            "--passive-canary-settle-secs",
+            "120",
+            "--passive-canary-timeout-secs",
+            "0",
+        )
+    )
+    return args
+
+
+def _event_storm_args(
+    roots: dict[str, Path],
+    profile: BenchmarkProfile,
+) -> list[str]:
+    args = ["--event-storm"]
+    for root_name in profile.event_root_names:
+        args.extend(("--event-storm-root", str(roots[root_name])))
+    args.extend(
+        [
+            "--event-storm-kind", profile.event_kinds,
+            "--event-storm-target-tier", profile.target_tiers,
+            "--event-storm-ops", "100",
+            "--event-storm-duration-budget-secs", "1",
+            "--event-storm-start-delay-secs", str(profile.event_start_delay_secs),
+            "--event-storm-interval-secs", str(profile.event_interval_secs),
+            "--event-storm-settle-secs", str(profile.event_settle_secs),
+        ]
+    )
+    if profile.immediate_query:
+        args.extend(("--event-storm-immediate-query", "--immediate-query-settle-secs", "5"))
+    if profile.max_bursts > 0:
+        args.extend(("--event-storm-max-bursts", str(profile.max_bursts)))
+    if profile.visibility_probes_per_burst > 0:
+        args.extend(
+            (
+                "--event-storm-visibility-probes-per-burst",
+                str(profile.visibility_probes_per_burst),
+                "--event-storm-visibility-poll-interval-secs",
+                f"{profile.visibility_poll_interval_secs:g}",
+            )
+        )
+    if profile.fixed_root_schedule:
+        args.append("--event-storm-fixed-root-schedule")
+    if profile.deterministic_event_plan:
+        args.append("--event-storm-deterministic-plan")
+    return args
+
+
+def build_command(
+    variant: str,
+    run_dir: Path,
+    roots: dict[str, Path],
+    profile: str = "standard",
+    artifact_provenance_receipt: Path | None = None,
+    binary: Path = BINARY,
+) -> list[str]:
+    selected = PROFILES[profile]
+    command = _base_args(run_dir, roots, selected, binary)
+    if artifact_provenance_receipt is not None:
+        command.extend(
+            (
+                "--artifact-provenance-receipt",
+                str(artifact_provenance_receipt),
+            )
+        )
+    command.extend(_tiered_args())
+    command.extend(_canary_args(roots, selected))
+    command.extend(_event_storm_args(roots, selected))
+    command.extend(
+        (
+            "--snapshot-path-disk",
+            "--workload-seed",
+            str(WORKLOAD_SEED),
+            "--shutdown-timeout-secs",
+            "300",
+        )
+    )
     command.extend(treatment_args(variant))
     return command

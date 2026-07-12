@@ -10,12 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### 原型
 
 - 新增 M2 Rotating Cold Freshness Window 原型：默认关闭，通过 `tiered_watch.rotating_cold_window_*` 配置在独立窗口预算内轮转 L2/L3 冷目录；小成本目录走 Ephemeral Watch，中等成本目录走 `RotatingColdWindow` fast scan lease，大成本目录只入 `PeriodicColdScan` 分片补扫，正式 L0/L1/L2/L3 tier 不交换、不抢占 hotset。
-- `/watch-state` 与 `/debug/tiered-watch` 新增冷层轮转观测字段，暴露 active dirs、cycle progress、动作计数、budget blocked、cold freshness age p50/p95/p99 和单目录轮转动作/到期/分数，用于判断机制可实施性。
+- `/watch-state` 与 `/debug/tiered-watch` 新增冷层轮转观测字段，暴露 active dirs、cycle progress、动作计数、budget blocked、cold freshness age p50/p95/p99，以及单目录本轮已触达、当前动作、到期和分数，用于判断机制可实施性并给 burst 提供目标级归因证据。
 - 新增 `scripts/m2-cold-window-vm-bench.py` 和 `helloagents/wiki/m2-cold-window-vm-benchmark.md`：在 VM 中隔离启动 fd-rdd、复用内建 metrics JSONL、周期采集端点和进程指标，并提供 M2 冷层轮转 A/B 场景、通过标准与报告模板。
-- 新增 `scripts/m2-cold-window-ab.py` 一键 A/B 驱动：固定并安全重建 600 个冷目录 fixture，以 `--build always` 调用现有 VM runner，固化一小时 event storm/canary 参数；运行中先校验 treatment、L2/L3 与 M2 活动，结束后再校验 runner 可比性、burst 和六项必需产物，任一失败均非零退出。
+- 新增 `scripts/m2-cold-window-ab.py` 一键 A/B 驱动：固定并安全重建 600 个冷目录 fixture，以 `--build always` 调用现有 VM runner，固化一小时 event storm/canary 参数；60 秒 settle 与 10 秒轮间隔保证完整覆盖 4 个 tier × 8 类 workload 的 32 个组合。运行中先校验 treatment、L2/L3 与 M2 活动，结束后要求 summary/manifest 均可比较、fd-rdd 退出码为 0，并校验 burst 和六项必需产物，任一失败均非零退出。
 - `scripts/m2-cold-window-vm-bench.py` 新增 passive canary：先写入文件、等待 settle 后做首次查询，分离后台主动追平与 query miss / fast scan 触发补偿；报告同步输出 active/passive canary、passive first-query 成功率、轮转 action 计数和 scan interval 参数。
 - `BENCHMARK.md` 与 M2 方案包补充 VM workload driver 计划：driver 独立于 runner / collector，只在 sandbox root 下生成 daily、cold-canary、delete-storm、rename-storm、git-storm、watcher-drop-proxy 压力，并输出 `workload-events.jsonl` 供指标时间线对齐。
-- `scripts/m2-cold-window-vm-bench.py` 新增一体化 `--event-storm`：支持 `rw100`、`save100`、`git_clone`、`npm_install`、`subtree_rename`、`mount_storm`、`inode_reuse`、`time_skew`，并在 summary/report 中输出 first-query、after-query、workload/tier 维度与特殊正确性计数，用于快速比较 M2 对短窗口事件风暴的投入产出比。
+- `scripts/m2-cold-window-vm-bench.py` 新增一体化 `--event-storm`：支持 `rw100`、`save100`、`git_clone`、`npm_install`、`subtree_rename`、`mount_storm`、`inode_reuse`、`inode_reuse_stress`、`time_skew`，并在 summary/report 中输出 first-query、after-query、workload/tier 维度与特殊正确性计数，用于快速比较 M2 对短窗口事件风暴的投入产出比。
+- 新增 `scripts/m2-cold-window-falsification.py` 快速证伪套件：以 deterministic `2×AB + 2×BA` 运行八腿 L3 配对实验，支持同一 run-dir 断点续跑，并对 Git/binary/fixture/协议指纹、806 个唯一路径主断言、38 个 visibility probe、目标实时租约与写入后扫描/事件因果证据、35 秒恢复 SLA、跨 burst/workload 收益复现、95% 采样覆盖、snapshot、水位线、DirtyQueue 和成本执行 fail-closed 门禁。
+- M2 benchmark 新增 burst 上限、唯一路径有界 visibility probe、`/proc` I/O syscall/bytes 与 minor/major fault 采样；summary/report 同时提供完整运行和从 `burst_started` 开始的事件风暴诊断窗口，快速门禁以完整运行成本为准，不再漏掉预热、首个 burst 生成与 shutdown quiesce 成本。
+- M2 A/B fixture manifest 新增完整内容 SHA256；快速套件跨腿核对初始状态、fixture 内容和除 treatment 外的协议指纹，避免仅凭文件数或相似参数声明可比。
+- M2 快速套件新增可复核的 schema v3 `build-provenance.json`：使用 suite 私有 target dir 和 Cargo JSON compiler-artifact 绑定真实 binary，只允许在构建前后 Git HEAD 不变且工作区均 clean 时生成；八腿分别重算 clean worktree、Git/Cargo.lock/binary 身份，再执行腿私有只读副本，阻断并发 Cargo 替换窗口。磁盘 snapshot label 同时加入完整 run-dir 哈希，避免不同 block 的同名 attempt 交叉复用状态。
+- M2 A/B wrapper 新增 fixture/run-dir 全生命周期独占锁和原子 `ab-wrapper-result.json`；运行中状态改写到 run-dir 同级 sidecar，并记录独立 benchmark 进程组，避免预创建目录触发 `run_dir_preexisting` 或超时后遗留孤儿 daemon。快速套件断点续跑只复用明确通过 wrapper 门禁且 variant/profile 匹配、daemon 退出码为 0、启动时间相邻的完整 block；半块、跨会话、失败、中断、信号终止、旧 schema 或缺失终态均 fail-closed。suite/wrapper 收到 SIGTERM 时会屏蔽清理阶段的重复信号并沿进程链清理、保留续跑证据。
+- M2 快速 profile 关闭会阻塞工作负载节奏的 active canary，保留 passive canary 作为关机对账输入；suite 固定目录和保序确定性事件计划，持续执行等负载 visibility polling，并新增目标目录 M2 触达、visibility 传输、精确 `2×AB + 2×BA`、逐块成本异常和完整运行 CPU/read/write/syscall、RSS、fault、单位找回路径成本门禁。唯一主收益端点收敛为 A 相对 B 多找回至少 5% 的正向主断言路径；持久化静默阶段至多允许一次可归因且最终 `ready=true` 的安全 rebuild，其成本不从 A/B 中剔除。
 
 ### 性能
 
@@ -29,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- 补齐 `unbounded_summary_uses_walkbuilder_filter` 的 `.git/` fixture 前置条件，使测试与 `ignore` crate 仅在 Git 仓库启用 `.gitignore` 的真实语义一致，消除确定性误报。
 - M2 benchmark 新增最终持久化静默屏障：可信 `/scan` 对账后同步 POST `/snapshot`，若目录 rename/mount storm 触发 `subtree move completeness is unproven`，daemon 在 shutdown 前执行完整 rebuild，runner 重试到 durable generation `ready=true` 后才发送 SIGTERM；`shutdown_snapshot_quiesce` 单独记录 rebuild、尝试次数、耗时和 CPU/RSS，失败或缺失继续拒绝 A/B。
 - M2 benchmark 在时长结束后、SIGTERM 前新增可审计的关机静默对账：runner 同步 POST `/scan` 到 passive/active canary、event-storm parent/active burst 与 mixed hot roots，手动扫描复用完整目录读取、fingerprint、`event_seq` 与 freeze gate 的可信负事实逻辑并返回 `stable/deleted`；持续不稳定、记录缺失或失败都会拒绝 A/B，避免未完成 create→rename→delete 或 active burst 的 Live 路径击穿最终快照，同时保留 snapshot fail-closed。
 - M2 冷层完整扫描新增可信负事实对账：仅在目录完整可读、目录 identity/mtime/ctime/nlink 未变化、`event_seq` 未前进且未命中离线 freeze gate 时，将 Base/L2 直接子项和 Delta 深层路径的缺失项折叠为直接子树 Delete；`read_dir` 失败不再把挂载断联误判为整目录删除。

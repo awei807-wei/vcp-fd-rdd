@@ -39,7 +39,35 @@ python3 scripts/m2-cold-window-ab.py a  # 开启 M2
 python3 scripts/m2-cold-window-ab.py b  # 关闭 M2
 ```
 
-驱动只接受 `a`/`b`，固定重建 `$HOME/fd-rdd-m2-roots` 专用 fixture，并把输出写入 `/tmp/fd-rdd-m2-runs`。两组除 treatment 开关外使用相同的一小时 event storm、canary、扫描预算和 seed。运行中会提前拒绝开关错配、没有 L2/L3 或 A 无 M2 活动，结束后再校验 runner 的 `ab_comparable`、完整时长、burst 和 summary/manifest/process/endpoint 产物；失败均返回非零。wrapper 会把底层 runner 的 stdout/stderr 同步显示并持久化为 run 目录同级的 `<run-name>.runner.log`；失败输出会直接汇总 run 目录、manifest/summary 关键状态、缺失/空产物、最近错误事件，以及 runner/daemon 各最多 20 行关键日志，避免只有“底层 benchmark 退出码 1”而无法定位。使用 `--dry-run` 可只打印固定命令，不修改环境。
+驱动只接受 `a`/`b`，固定重建 `$HOME/fd-rdd-m2-roots` 专用 fixture，并把输出写入 `/tmp/fd-rdd-m2-runs`。两组除 treatment 开关外使用相同的一小时 event storm、canary、扫描预算和 seed；event storm 在 180 秒后开始，以 60 秒 settle 和 10 秒轮间隔完整执行 4 个 tier × 8 类 workload 的 32 个组合。fixture 从重建到 daemon 清理完成始终持有非阻塞独占锁；第二个并发 wrapper 会在改动目录前直接失败。运行中会提前拒绝开关错配、没有 L2/L3 或 A 无 M2 活动，结束后要求 summary 与 manifest 都明确 `ab_comparable=true`，再校验完整时长、burst 和 summary/manifest/process/endpoint 产物；fd-rdd 必须以 0 退出，失败均返回非零。wrapper 会把底层 runner 的 stdout/stderr 同步显示并持久化为 run 目录同级的 `<run-name>.runner.log`，并在 run 目录原子写入 `ab-wrapper-result.json`；只有明确的 `passed` 终态才可被快速 suite 续跑复用，失败、中断、运行中或缺失终态都必须新建 attempt。失败输出会直接汇总 run 目录、manifest/summary 关键状态、缺失/空产物、最近错误事件，以及 runner/daemon 各最多 20 行关键日志，避免只有“底层 benchmark 退出码 1”而无法定位。使用 `--dry-run` 可只打印固定命令，不修改环境。
+
+### M2 快速证伪配对套件
+
+在执行 12-run 规模矩阵前先运行：
+
+```bash
+python3 scripts/m2-cold-window-falsification.py
+```
+
+套件固定运行 4 个配对 block（`2×AB + 2×BA`，共 8 腿），每腿 1200 秒，只向
+`cold-a` 的 L3 注入两轮 `save100`、`git_clone`、`subtree_rename`。每腿必须精确形成
+6 个 physical burst、806 个唯一路径主断言和 38 个有界可见性探针。它跨腿校验
+Git/binary/fixture/保序事件计划/协议指纹，并验证四块 order/position 精确满足 `2×AB + 2×BA`。
+完整运行的配对 CPU service time、I/O、RSS、fault、查询轮询负载、最终状态断言、目标目录实时 M2 租约与写入后扫描/事件证据、
+snapshot、水位线和 DirtyQueue 进入 fail-closed 门禁。唯一主收益端点是 A 相对 B 多找回至少 5% 的
+正向主断言路径，且收益至少分布在 3 个 burst 和 2 类 workload；visibility 仅作正确性/SLA 诊断，A 的总体与各 workload p95 均须 ≤35 秒；至少 3/4 block 复现主收益。CPU、read bytes/read
+syscall 的中位和每块比值均不超过 1.10，write bytes/write syscall 的中位和每块比值均不超过 1.25，
+才允许进入规模矩阵；报告同时给出每找回一个正向路径的增量成本。通过不等于生产发布。完整阈值、
+续跑方式和产物说明见 `helloagents/wiki/m2-cold-window-vm-benchmark.md`。suite 首次启动只构建一次并写出
+schema v3 `build-provenance.json`；Cargo 在 suite 私有 target dir 构建并由 JSON compiler-artifact 消息证明
+产物身份，构建前后必须是同一 Git HEAD 且工作区均为 clean。八腿虽然使用 `--build never`，但每腿都会
+重新核对 clean worktree、Git、Cargo.lock 和 binary SHA256，再复制为腿私有只读执行文件。旧 schema、
+回执缺失、被篡改或与当前 checkout 不符时直接拒绝运行。falsification profile 关闭会反复阻塞等待的
+active canary，只保留 passive canary 作为关机可信对账输入；正确性收益由 806 个唯一主断言和 38 个有界
+visibility probe 判断。每腿的磁盘 snapshot label 还包含完整 run-dir 哈希，避免不同 block 都叫
+`attempt-01` 时误复用前一腿快照。hard waterline 一经观测即拒绝样本；结构移动在持久化静默阶段允许至多
+一次可归因的安全 rebuild，但必须最终 `ready=true`、日志无 ERROR，且完整成本仍计入 A/B。
+每腿 process 采样还必须覆盖至少 95% 的 1200 秒窗口、最大间隔不超过 3 秒且单调计数器不回退。同一 block 的两腿启动间隔不得超过 30 分钟；中断后只复用完整且相邻的整块，不能把跨会话腿拼成配对结果。suite、wrapper 和 benchmark 分别拥有独立进程组，超时清理按运行中 sidecar 记录的已验证 benchmark 进程组执行，避免孤儿 daemon 污染续跑。
 
 第二轮 A 在 `save100` cleanup 后发现 Delta Live 路径既不在文件系统也不在 L2，且缺少 delete/rename 失效证据，最终快照按 fail-closed 拒绝样本。该结果不应通过“任意 ENOENT 都当删除”绕过；修复边界是：event-storm cleanup 只操作当前 burst 并留下结构化记录，冷层完整扫描只有在目录可读、扫描完整且 apply sequence 未前进时，才能把 Base/L2/Delta Live 相对当前目录集合的缺失项转换为直接子路径 Delete。扫描错误、未完成或 stale batch 不得产生负事实。
 
@@ -92,17 +120,9 @@ python3 scripts/m2-cold-window-ab.py b  # 关闭 M2
 
 ### VM workload driver 设计
 
-`m2-cold-window-vm-bench.py` 保持为 **runner + collector**；另增独立 workload driver，避免把“启动采集”和“制造压力”混在一起。计划命令形态：
-
-```bash
-python3 scripts/m2-cold-window-workload.py \
-  --root "$HOME/fd-rdd-vm-workload" \
-  --scenario daily,cold-canary,delete-storm,rename-storm,git-storm,subtree-rename,mount-storm,inode-reuse,time-skew \
-  --duration-secs 3600 \
-  --rate normal \
-  --seed 42 \
-  --events-jsonl workload-events.jsonl
-```
+`m2-cold-window-vm-bench.py` 保持为 **runner + collector**。下面的独立 workload driver 是后续规划，
+当前仓库尚未实现 `scripts/m2-cold-window-workload.py`；现阶段可执行入口是快速证伪 suite，或 runner
+内置的 `--event-storm`。规划中的接口会接收 sandbox root、scenario、duration、rate、seed 和 events JSONL 输出路径；它不是当前可执行命令。
 
 设计原则：
 
@@ -145,19 +165,25 @@ python3 scripts/m2-cold-window-workload.py \
 轻量一体化 event storm 命令形态：
 
 ```bash
+TEST_ROOT="$HOME/fd-rdd-m2-roots"
 python3 scripts/m2-cold-window-vm-bench.py \
   --root "$TEST_ROOT/cold-a" \
   --root "$TEST_ROOT/cold-b" \
   --root "$TEST_ROOT/hot" \
   --binary "./target/release/fd-rdd" \
-  --build never \
+  --build always \
   --event-storm \
-  --event-storm-kind rw100,save100,git_clone,npm_install,subtree_rename,mount_storm,inode_reuse,time_skew \
+  --duration-secs 3600 \
+  --event-storm-kind rw100,save100,git_clone,npm_install,subtree_rename,mount_storm,inode_reuse,inode_reuse_stress,time_skew \
   --event-storm-target-tier L0,L1,L2,L3 \
   --event-storm-ops 100 \
   --event-storm-duration-budget-secs 1 \
-  --event-storm-settle-secs 120
+  --event-storm-max-bursts 36 \
+  --event-storm-interval-secs 10 \
+  --event-storm-settle-secs 60
 ```
+
+该命令只用于单腿探索，不能替代带 schema v3 构建回执、平衡顺序和 suite 门禁的正式快速证伪入口。
 
 event storm 按 `/debug/tiered-watch` 选择指定 L0-L3 的稳定 fixture 目录，但会排除路径任一组件以 `fd-rdd-m2-event-storm-` 开头的目录及其后代；词法路径与 symlink 解析后的真实路径都必须留在配置 root 内。没有安全的目标层候选时才回退到本轮显式 root，避免上一 burst 成为下一 burst 的父目录并形成递归 workload。
 

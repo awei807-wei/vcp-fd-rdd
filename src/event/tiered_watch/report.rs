@@ -691,6 +691,7 @@ impl TieredWatchRuntime {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let rotating_seen_paths = self.rotating_cold_window_seen.read().clone();
 
         for (path, state) in dirs.iter() {
             if let Some(ref prefix) = filter {
@@ -750,6 +751,7 @@ impl TieredWatchRuntime {
                 last_budget_blocked_unix_secs,
                 high_priority_scan,
                 ephemeral_watch: ephemeral_paths.contains(path),
+                rotating_cold_window_seen: rotating_seen_paths.contains(path),
                 rotating_cold_window: rotating.is_some(),
                 rotating_cold_window_action: rotating
                     .map(|(action, _, _, _, _)| action.clone())

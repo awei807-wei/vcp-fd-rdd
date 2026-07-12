@@ -351,6 +351,7 @@ pub struct TieredWatchDebugDir {
     pub last_budget_blocked_unix_secs: u64,
     pub high_priority_scan: bool,
     pub ephemeral_watch: bool,
+    pub rotating_cold_window_seen: bool,
     pub rotating_cold_window: bool,
     pub rotating_cold_window_action: String,
     pub rotating_cold_window_expires_unix_secs: u64,

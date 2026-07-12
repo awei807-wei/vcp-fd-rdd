@@ -309,6 +309,7 @@ fn unbounded_summary_misses_on_change() {
 fn unbounded_summary_uses_walkbuilder_filter() {
     let root = unique_tmp_dir("p3-walkbuilder-filter");
     std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::write(root.join("visible.txt"), b"v").unwrap();
     std::fs::write(root.join(".gitignore"), b"*.log\n").unwrap();
     std::fs::write(root.join("ignored.log"), b"ignored").unwrap();

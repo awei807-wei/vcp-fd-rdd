@@ -174,6 +174,192 @@ class SummarySemanticsTests(unittest.TestCase):
                 special = summary["event_storm"]["special"]
                 self.assertEqual(special["inode_reuse_status"], expected)
 
+    def test_visibility_summary_counts_one_result_per_unique_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            write_jsonl(
+                run_dir / "event-storm-samples.jsonl",
+                [
+                    {
+                        "event_kind": "burst_started",
+                        "elapsed_secs": 0.8,
+                    },
+                    {
+                        "event_kind": "burst_written",
+                        "selected_kind": "save100",
+                        "events_total": 2,
+                        "duration_secs": 0.01,
+                    },
+                    {"event_kind": "burst_checked", "events_total": 2, "ok": 2},
+                    {"event_kind": "burst_checked", "events_total": 2, "ok": 2},
+                    {
+                        "event_kind": "visibility_probe",
+                        "workload": "save100",
+                        "path": "/fixture/a.txt",
+                        "visible": True,
+                        "latency_secs": 1.25,
+                        "transport_failures": 0,
+                    },
+                    {
+                        "event_kind": "visibility_probe",
+                        "workload": "save100",
+                        "path": "/fixture/b.txt",
+                        "visible": False,
+                        "latency_secs": 120.0,
+                        "transport_failures": 1,
+                    },
+                ],
+            )
+
+            summary = BENCH.summarize(run_dir, "visibility", 0)
+
+            self.assertEqual(summary["event_storm"]["bursts"], 1)
+            self.assertEqual(summary["event_storm"]["checks"], 2)
+            self.assertEqual(
+                summary["event_storm"]["visibility"],
+                {
+                    "total": 2,
+                    "visible": 1,
+                    "timeouts": 1,
+                    "success_rate": 0.5,
+                    "latency_p50_secs": 1.25,
+                    "latency_p95_secs": 1.25,
+                    "latency_max_secs": 1.25,
+                    "transport_failures": 1,
+                    "by_workload": {
+                        "save100": {
+                            "total": 2,
+                            "visible": 1,
+                            "success_rate": 0.5,
+                        }
+                    },
+                },
+            )
+
+    def test_process_and_waterline_summary_exposes_paired_cost_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            write_jsonl(
+                run_dir / "process-samples.jsonl",
+                [
+                    {
+                        "elapsed_secs": 0.0,
+                        "cpu_pct": 0.0,
+                        "cpu_ticks": 1000,
+                        "read_bytes": 100,
+                        "write_bytes": 200,
+                        "read_syscalls": 10,
+                        "write_syscalls": 20,
+                        "minor_faults": 1000,
+                        "major_faults": 2,
+                    },
+                    {
+                        "elapsed_secs": 1.0,
+                        "cpu_pct": 0.0,
+                        "cpu_ticks": 1050,
+                        "read_bytes": 150,
+                        "write_bytes": 300,
+                        "read_syscalls": 15,
+                        "write_syscalls": 30,
+                        "minor_faults": 1004,
+                        "major_faults": 2,
+                    },
+                    {
+                        "elapsed_secs": 3.0,
+                        "cpu_pct": 0.0,
+                        "cpu_ticks": 1100,
+                        "read_bytes": 250,
+                        "write_bytes": 500,
+                        "read_syscalls": 30,
+                        "write_syscalls": 50,
+                        "minor_faults": 1010,
+                        "major_faults": 3,
+                    },
+                ],
+            )
+            write_jsonl(
+                run_dir / "endpoint-samples.jsonl",
+                [
+                    {
+                        "ok": True,
+                        "endpoint": "/watch-state",
+                        "data": {
+                            "dirty_queue_len": 2,
+                            "waterline_soft_degraded": True,
+                            "waterline_hard_degraded": False,
+                            "waterline_effective_rotating_budget": 64,
+                        },
+                    },
+                    {
+                        "ok": True,
+                        "endpoint": "/watch-state",
+                        "data": {
+                            "dirty_queue_len": 0,
+                            "waterline_soft_degraded": False,
+                            "waterline_hard_degraded": False,
+                            "waterline_effective_rotating_budget": 128,
+                        },
+                    },
+                ],
+            )
+            write_jsonl(
+                run_dir / "event-storm-samples.jsonl",
+                [
+                    {
+                        "event_kind": "burst_started",
+                        "elapsed_secs": 0.8,
+                    },
+                    {
+                        "event_kind": "burst_written",
+                        "elapsed_secs": 1.0,
+                        "events_total": 1,
+                        "duration_secs": 0.01,
+                    }
+                ],
+            )
+
+            with mock.patch.object(BENCH.os, "sysconf", return_value=100):
+                summary = BENCH.summarize(run_dir, "paired-cost", 0)
+
+            process = summary["process"]
+            self.assertEqual(process["cpu_core_seconds"], 1.0)
+            self.assertEqual(process["read_bytes_delta"], 150)
+            self.assertEqual(process["write_bytes_delta"], 300)
+            self.assertEqual(process["read_syscalls_delta"], 20)
+            self.assertEqual(process["write_syscalls_delta"], 30)
+            self.assertEqual(process["minor_faults_delta"], 10)
+            self.assertEqual(process["major_faults_delta"], 1)
+            event_window = summary["process_after_first_burst"]
+            self.assertEqual(event_window["sample_count"], 3)
+            self.assertEqual(event_window["cpu_core_seconds"], 1.0)
+            self.assertEqual(event_window["read_bytes_delta"], 150)
+            self.assertEqual(event_window["minor_faults_delta"], 10)
+            storm_window = summary["process_after_event_storm_start"]
+            self.assertEqual(storm_window["sample_count"], 3)
+            self.assertEqual(storm_window["cpu_core_seconds"], 1.0)
+            watch = summary["watch_state"]
+            self.assertEqual(watch["dirty_queue_len_last"], 0)
+            self.assertEqual(watch["waterline_soft_degraded_samples"], 1)
+            self.assertEqual(watch["waterline_soft_degraded_ratio"], 0.5)
+            self.assertFalse(watch["waterline_soft_degraded_last"])
+            self.assertEqual(watch["waterline_hard_degraded_samples"], 0)
+            self.assertEqual(watch["waterline_effective_rotating_budget_last"], 128)
+
+            BENCH.write_report(run_dir, summary)
+            report = (run_dir / "REPORT.md").read_text(encoding="utf-8")
+            for metric in (
+                "process CPU core seconds",
+                "process read bytes delta",
+                "process minor faults delta",
+                "event-storm-window CPU core seconds",
+                "after-first-burst CPU core seconds",
+                "dirty queue last",
+                "waterline soft degraded ratio",
+                "waterline effective rotating budget last",
+                "event storm visibility success rate",
+            ):
+                self.assertIn(metric, report)
+
     def test_memory_timeline_reports_phase_peaks_and_l2_components(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
@@ -524,7 +710,11 @@ class PassiveCanaryShutdownTests(unittest.TestCase):
             "binary_sha256": "a" * 64,
             "git_sha": "b" * 40,
             "git_dirty": False,
-            "artifact_provenance": {"verified": True},
+            "artifact_provenance": {
+                "verified": True,
+                "validated_binary_sha256": "a" * 64,
+                "execution_binary_sha256": "a" * 64,
+            },
             "run_dir_preexisting": False,
             "collection_errors": [],
         }
@@ -545,7 +735,7 @@ class PassiveCanaryShutdownTests(unittest.TestCase):
             run_dir,
             requested_duration_secs=10,
             actual_duration_secs=10.0,
-            exit_code=-BENCH.signal.SIGTERM,
+            exit_code=0,
             fatal_error="",
             process_sampler_error="",
             completion_reason="duration_elapsed",
@@ -961,7 +1151,11 @@ class ManifestAuditTests(unittest.TestCase):
             "binary_sha256": "a" * 64,
             "git_sha": "b" * 40,
             "git_dirty": False,
-            "artifact_provenance": {"verified": True},
+            "artifact_provenance": {
+                "verified": True,
+                "validated_binary_sha256": "a" * 64,
+                "execution_binary_sha256": "a" * 64,
+            },
             "run_dir_preexisting": False,
             "collection_errors": [],
         }
@@ -1148,7 +1342,11 @@ class ManifestAuditTests(unittest.TestCase):
             "binary_sha256": "a" * 64,
             "git_sha": "b" * 40,
             "git_dirty": False,
-            "artifact_provenance": {"verified": True},
+            "artifact_provenance": {
+                "verified": True,
+                "validated_binary_sha256": "a" * 64,
+                "execution_binary_sha256": "a" * 64,
+            },
             "run_dir_preexisting": False,
             "collection_errors": [],
         }
@@ -1193,25 +1391,207 @@ class ManifestAuditTests(unittest.TestCase):
             self.assertFalse(provenance["verified"])
             self.assertFalse(provenance["built_this_run"])
 
+    def test_never_build_accepts_a_matching_external_build_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            binary = repo / "target" / "release" / "fd-rdd"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"candidate")
+            cargo_lock = repo / "Cargo.lock"
+            cargo_lock.write_text("lock", encoding="utf-8")
+            receipt = repo / "build-provenance.json"
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema": 3,
+                        "build_succeeded": True,
+                        "source_git_sha": "a" * 40,
+                        "pre_build_git_sha": "a" * 40,
+                        "post_build_git_sha": "a" * 40,
+                        "build_worktree_clean": True,
+                        "cargo_lock_sha256": BENCH.sha256_file(cargo_lock),
+                        "binary_sha256": BENCH.sha256_file(binary),
+                        "binary": str(binary.resolve()),
+                        "compiler_artifact": str(binary.resolve()),
+                        "cargo_args": [
+                            *BENCH.BUILD_CARGO_ARGS,
+                            "--target-dir",
+                            str(binary.parent.parent.resolve()),
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                BENCH, "git_worktree_dirty", return_value=False
+            ):
+                provenance = BENCH.build_if_needed(
+                    repo,
+                    binary,
+                    "never",
+                    "a" * 40,
+                    receipt,
+                )
+
+            self.assertTrue(provenance["verified"])
+            self.assertFalse(provenance["built_this_run"])
+            self.assertEqual(provenance["receipt_validation_errors"], [])
+            self.assertEqual(provenance["receipt_path"], str(receipt.resolve()))
+
+    def test_never_build_rejects_a_receipt_when_current_worktree_is_dirty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            binary = repo / "target" / "release" / "fd-rdd"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"candidate")
+            cargo_lock = repo / "Cargo.lock"
+            cargo_lock.write_text("lock", encoding="utf-8")
+            receipt = repo / "build-provenance.json"
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema": 3,
+                        "build_succeeded": True,
+                        "source_git_sha": "a" * 40,
+                        "pre_build_git_sha": "a" * 40,
+                        "post_build_git_sha": "a" * 40,
+                        "build_worktree_clean": True,
+                        "cargo_lock_sha256": BENCH.sha256_file(cargo_lock),
+                        "binary_sha256": BENCH.sha256_file(binary),
+                        "binary": str(binary.resolve()),
+                        "compiler_artifact": str(binary.resolve()),
+                        "cargo_args": [
+                            *BENCH.BUILD_CARGO_ARGS,
+                            "--target-dir",
+                            str(binary.parent.parent.resolve()),
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(BENCH, "git_worktree_dirty", return_value=True):
+                provenance = BENCH.build_if_needed(
+                    repo,
+                    binary,
+                    "never",
+                    "a" * 40,
+                    receipt,
+                )
+
+            self.assertFalse(provenance["verified"])
+            self.assertIn(
+                "current_worktree_dirty", provenance["receipt_validation_errors"]
+            )
+
+    def test_never_build_rejects_a_receipt_after_binary_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            binary = repo / "target" / "release" / "fd-rdd"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"candidate")
+            cargo_lock = repo / "Cargo.lock"
+            cargo_lock.write_text("lock", encoding="utf-8")
+            receipt = repo / "build-provenance.json"
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema": 3,
+                        "build_succeeded": True,
+                        "source_git_sha": "a" * 40,
+                        "pre_build_git_sha": "a" * 40,
+                        "post_build_git_sha": "a" * 40,
+                        "build_worktree_clean": True,
+                        "cargo_lock_sha256": BENCH.sha256_file(cargo_lock),
+                        "binary_sha256": BENCH.sha256_file(binary),
+                        "binary": str(binary.resolve()),
+                        "compiler_artifact": str(binary.resolve()),
+                        "cargo_args": [
+                            *BENCH.BUILD_CARGO_ARGS,
+                            "--target-dir",
+                            str(binary.parent.parent.resolve()),
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            binary.write_bytes(b"changed")
+
+            provenance = BENCH.build_if_needed(
+                repo,
+                binary,
+                "never",
+                "a" * 40,
+                receipt,
+            )
+
+            self.assertFalse(provenance["verified"])
+            self.assertIn("binary_sha256_mismatch", provenance["receipt_validation_errors"])
+
     def test_always_build_records_source_to_artifact_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
             BENCH.subprocess, "run"
-        ) as run, mock.patch.object(BENCH, "git_head_sha", return_value="a" * 40):
+        ) as run, mock.patch.object(
+            BENCH, "git_head_sha", return_value="a" * 40
+        ), mock.patch.object(
+            BENCH, "git_worktree_dirty", return_value=False
+        ):
             repo = Path(tmp)
             binary = repo / "target" / "release" / "fd-rdd"
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"candidate")
             (repo / "Cargo.lock").write_text("lock", encoding="utf-8")
+            run.return_value.stdout = json.dumps(
+                {
+                    "reason": "compiler-artifact",
+                    "target": {"name": "fd-rdd", "kind": ["bin"]},
+                    "executable": str(binary.resolve()),
+                }
+            )
 
             provenance = BENCH.build_if_needed(repo, binary, "always", "a" * 40)
 
             self.assertTrue(provenance["verified"])
             self.assertTrue(provenance["built_this_run"])
             run.assert_called_once_with(
-                ["cargo", "build", "--release", "--locked"],
+                BENCH.BUILD_CARGO_ARGS,
                 cwd=repo,
                 check=True,
+                stdout=BENCH.subprocess.PIPE,
+                text=True,
             )
+
+    def test_stage_execution_binary_rejects_a_receipt_hash_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "source" / "fd-rdd"
+            binary.parent.mkdir()
+            binary.write_bytes(b"candidate")
+
+            with self.assertRaisesRegex(
+                RuntimeError, "artifact_binary_identity_changed_before_staging"
+            ):
+                BENCH.stage_execution_binary(binary, root / "run", "0" * 64)
+
+    def test_stage_execution_binary_creates_a_private_read_only_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "source" / "fd-rdd"
+            binary.parent.mkdir()
+            binary.write_bytes(b"candidate")
+            expected = BENCH.sha256_file(binary)
+
+            staged, staged_sha = BENCH.stage_execution_binary(
+                binary,
+                root / "run",
+                expected,
+            )
+
+            self.assertEqual(staged, root / "run" / "artifact" / "fd-rdd")
+            self.assertEqual(staged_sha, expected)
+            self.assertEqual(BENCH.sha256_file(staged), expected)
+            self.assertEqual(staged.stat().st_mode & 0o777, 0o500)
 
     def test_atomic_manifest_update_leaves_no_partial_next_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1295,6 +1675,21 @@ class UdsPathTests(unittest.TestCase):
 
 
 class ProcessSampleRunnerTests(unittest.TestCase):
+    def test_process_sampler_includes_io_and_fault_counters(self) -> None:
+        sample = next(BENCH.process_sampler(os.getpid()))
+
+        for key in (
+            "read_bytes",
+            "write_bytes",
+            "read_syscalls",
+            "write_syscalls",
+            "cpu_ticks",
+            "minor_faults",
+            "major_faults",
+        ):
+            self.assertIn(key, sample)
+            self.assertGreaterEqual(sample[key], 0)
+
     def test_process_sampler_runs_independently(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out_path = Path(tmp) / "process-samples.jsonl"
@@ -1413,6 +1808,247 @@ class EventStormFixtureTests(unittest.TestCase):
             self.assertNotEqual(selected, current_storm)
             self.assertNotEqual(selected, current_descendant)
             self.assertNotEqual(selected, historical_descendant)
+
+    def test_max_bursts_stops_new_cycles_without_interrupting_active_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.max_bursts = 1
+            runner.cycle = 1
+            runner.next_start_at = time.monotonic() - 1
+
+            with mock.patch.object(runner, "start_cycle") as start_cycle:
+                runner.tick(time.monotonic())
+
+            start_cycle.assert_not_called()
+
+    def test_fixed_root_schedule_ignores_treatment_tier_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            first = root / "d001"
+            second = root / "d002"
+            first.mkdir()
+            second.mkdir()
+            runner = self.event_storm_runner([root])
+            runner.fixed_root_schedule = True
+
+            with mock.patch.object(
+                BENCH,
+                "debug_tiered_watch",
+                side_effect=AssertionError("fixed schedule must not inspect tier state"),
+            ):
+                runner.cycle = 1
+                selected_first = runner.select_root("L3")
+                runner.cycle = 2
+                selected_second = runner.select_root("L3")
+
+            self.assertEqual(selected_first, first)
+            self.assertEqual(selected_second, second)
+
+    def test_target_m2_evidence_is_bound_to_the_exact_selected_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            with mock.patch.object(
+                BENCH,
+                "debug_tiered_watch",
+                return_value={
+                    "dirs": [
+                        {
+                            "path": str(root),
+                            "rotating_cold_window_seen": True,
+                            "rotating_cold_window": True,
+                            "rotating_cold_window_action": "scan_only",
+                            "rotating_cold_window_cycle_id": 7,
+                            "rotating_cold_window_expires_unix_secs": 200,
+                            "last_scan": 101,
+                            "last_event": 102,
+                        },
+                        {
+                            "path": str(root / "child"),
+                            "rotating_cold_window_seen": False,
+                        },
+                    ]
+                },
+            ), mock.patch.object(BENCH.time, "time", return_value=150.25):
+                evidence = runner.m2_evidence_for_root(root)
+
+            self.assertEqual(
+                evidence,
+                {
+                    "target_m2_debug_ok": True,
+                    "target_m2_seen": True,
+                    "target_m2_active": True,
+                    "target_m2_action": "scan_only",
+                    "target_m2_cycle_id": 7,
+                    "target_m2_expires_unix_secs": 200,
+                    "target_m2_last_scan_unix_secs": 101,
+                    "target_m2_last_event_unix_secs": 102,
+                    "target_m2_observed_unix_secs": 150,
+                },
+            )
+
+    def test_rotation_aligned_fixed_schedule_targets_active_ttl_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            dirs = [root / f"d{index:03d}" for index in range(1, 301)]
+            for path in dirs:
+                path.mkdir()
+            runner = self.event_storm_runner([root])
+            runner.fixed_root_schedule = True
+            runner.start_delay_secs = 240
+            runner.settle_secs = 120
+            runner.interval_secs = 10
+            runner.rotating_tick_secs = 30
+            runner.rotating_ttl_secs = 180
+            runner.rotating_dirs_per_tick = 8
+
+            runner.cycle = 1
+            first = runner.select_root("L3")
+            runner.cycle = 2
+            second = runner.select_root("L3")
+
+            self.assertEqual(first, root / "d041")
+            self.assertEqual(second, root / "d073")
+
+    def test_process_sampling_diagnostics_detect_coverage_gaps_and_regressions(self) -> None:
+        samples = [
+            {"elapsed_secs": 0.5, "cpu_ticks": 10, "read_bytes": 100},
+            {"elapsed_secs": 1.0, "cpu_ticks": 20, "read_bytes": 90},
+            {"elapsed_secs": 10.0, "cpu_ticks": 30, "read_bytes": 120},
+        ]
+
+        result = BENCH.process_sampling_diagnostics(samples, 10.0)
+
+        self.assertEqual(result["sample_coverage_ratio"], 0.95)
+        self.assertEqual(result["sample_max_gap_secs"], 9.0)
+        self.assertEqual(result["counter_regressions"], 1)
+
+    def test_fixed_falsification_generators_match_806_assertions_and_38_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.ops_per_burst = 100
+            runner.duration_budget_secs = 60
+            runner.visibility_probes_per_burst = 8
+            rows_and_roots: list[tuple[list[dict[str, object]], Path]] = []
+            for cycle, (kind, writer) in enumerate(
+                (
+                    ("save100", runner.write_save100),
+                    ("git-clone", runner.write_git_clone_fixture),
+                    ("subtree-rename", runner.write_subtree_rename_avalanche),
+                ),
+                1,
+            ):
+                runner.cycle = cycle
+                runner.current_burst_started_at = time.monotonic()
+                rows = writer(root, "L3")
+                rows_and_roots.append((rows, runner.burst_root(root, kind)))
+
+            counts = [len(rows) for rows, _ in rows_and_roots]
+            probes = [
+                len(runner.select_visibility_probes(rows))
+                for rows, _ in rows_and_roots
+            ]
+            self.assertEqual(counts, [200, 3, 200])
+            self.assertEqual(probes, [8, 3, 8])
+            self.assertEqual(sum(counts) * 2, 806)
+            self.assertEqual(sum(probes) * 2, 38)
+
+    def test_visibility_timestamp_is_taken_after_the_search_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            probe = {
+                "event": {
+                    "path": str(root / "a.txt"),
+                    "query": "a.txt",
+                    "burst_elapsed_secs": 0.0,
+                },
+                "polls": 0,
+                "transport_failures": 0,
+                "visible_at": None,
+                "visible_query_latency": 0.0,
+            }
+            runner.active = {
+                "root": root,
+                "started_at": 1.0,
+                "visibility_probes": [probe],
+                "visibility_next_poll_at": 0.0,
+            }
+            with mock.patch.object(
+                BENCH,
+                "check_search_state_once",
+                return_value=(True, True, 0.25, ""),
+            ), mock.patch.object(
+                BENCH.time, "monotonic", return_value=12.5
+            ):
+                runner.poll_visibility(10.0)
+
+            self.assertEqual(probe["visible_at"], 12.5)
+            with mock.patch.object(runner, "tier_for_root", return_value="L3"), mock.patch.object(
+                runner, "emit"
+            ) as emit:
+                runner.finalize_visibility_probes(20.0)
+            record = emit.call_args.args[0]
+            self.assertEqual(record["latency_secs"], 11.5)
+            self.assertEqual(record["query_latency_secs"], 0.25)
+
+    def test_deterministic_plan_seed_reuses_logical_paths_across_legs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            kwargs = {
+                "base_url": "http://127.0.0.1:1",
+                "roots": [root],
+                "out_path": root / "events.jsonl",
+                "started_at": time.monotonic(),
+                "start_delay_secs": 0,
+                "interval_secs": 1,
+                "settle_secs": 0,
+                "timeout_secs": 0,
+                "ops_per_burst": 2,
+                "duration_budget_secs": 10,
+                "time_skew_secs": 3600,
+                "kinds": ["save100"],
+                "target_tiers": ["L3"],
+                "deterministic_plan_seed": 42,
+            }
+            first = BENCH.EventStormRunner(**kwargs)
+            second = BENCH.EventStormRunner(**kwargs)
+            first.cycle = second.cycle = 1
+            first.current_burst_started_at = second.current_burst_started_at = (
+                time.monotonic()
+            )
+
+            first_rows = first.write_save100(root, "L3")
+            first.cleanup_burst_root(
+                first.burst_root(root, "save100"),
+                root,
+                "save100",
+                phase="test",
+            )
+            second_rows = second.write_save100(root, "L3")
+
+            self.assertEqual(
+                [(row["path"], row["query"]) for row in first_rows],
+                [(row["path"], row["query"]) for row in second_rows],
+            )
+
+    def test_repeated_bursts_use_unique_query_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.ops_per_burst = 2
+            runner.current_burst_started_at = time.monotonic()
+            runner.cycle = 1
+            first = runner.write_save100(root, "L3")
+            runner.cycle = 2
+            second = runner.write_save100(root, "L3")
+
+            first_queries = {str(row["query"]) for row in first}
+            second_queries = {str(row["query"]) for row in second}
+            self.assertTrue(first_queries.isdisjoint(second_queries))
+            self.assertTrue(all(runner.query_token in query for query in first_queries))
 
     def test_select_root_accepts_stable_tier_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1573,6 +2209,130 @@ class EventStormFixtureTests(unittest.TestCase):
             self.assertEqual(len(cleanup), 1)
             self.assertFalse(cleanup[0]["ok"])
             self.assertIn("PermissionError", cleanup[0]["error"])
+
+    def test_visibility_probes_emit_once_when_paths_become_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = BENCH.EventStormRunner(
+                base_url="http://127.0.0.1:1",
+                roots=[root],
+                out_path=root / "events.jsonl",
+                started_at=time.monotonic(),
+                start_delay_secs=0,
+                interval_secs=1,
+                settle_secs=120,
+                timeout_secs=0,
+                ops_per_burst=10,
+                duration_budget_secs=10,
+                time_skew_secs=3600,
+                kinds=["git_clone"],
+                target_tiers=["L3"],
+                visibility_probes_per_burst=2,
+                visibility_poll_interval_secs=1,
+            )
+            events = [
+                {
+                    "event_kind": "expected",
+                    "operation": "clone_file_visible",
+                    "workload": "git_clone",
+                    "path": str(root / f"file-{index}.txt"),
+                    "query": f"file-{index}.txt",
+                    "should_exist": True,
+                    "tier_before": "L3",
+                    "write_elapsed_secs": 0.0,
+                    "burst_elapsed_secs": 0.0,
+                }
+                for index in range(3)
+            ]
+            with mock.patch.object(runner, "select_root", return_value=root), mock.patch.object(
+                runner, "tier_for_root", return_value="L3"
+            ), mock.patch.object(
+                runner, "write_git_clone_fixture", return_value=events
+            ):
+                runner.start_cycle(time.monotonic())
+
+            assert runner.active is not None
+            with mock.patch.object(
+                BENCH,
+                "check_search_state_once",
+                side_effect=[
+                    (True, True, 0.01, ""),
+                    (True, True, 0.01, ""),
+                    (False, False, 0.02, "connection reset"),
+                    (False, False, 0.02, "connection reset"),
+                ],
+            ):
+                runner.tick(float(runner.active["visibility_next_poll_at"]))
+                runner.tick(float(runner.active["visibility_next_poll_at"]))
+            runner.finalize_visibility_probes(time.monotonic())
+
+            rows = [
+                json.loads(line)
+                for line in (root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            probes = [row for row in rows if row.get("event_kind") == "visibility_probe"]
+            self.assertEqual(len(probes), 2)
+            self.assertEqual(len({row["path"] for row in probes}), 2)
+            self.assertTrue(all(row["visible"] for row in probes))
+            self.assertTrue(all(row["transport_failures"] == 1 for row in probes))
+
+    def test_visibility_probe_timeout_is_finalized_before_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = BENCH.EventStormRunner(
+                base_url="http://127.0.0.1:1",
+                roots=[root],
+                out_path=root / "events.jsonl",
+                started_at=time.monotonic(),
+                start_delay_secs=0,
+                interval_secs=1,
+                settle_secs=120,
+                timeout_secs=0,
+                ops_per_burst=10,
+                duration_budget_secs=10,
+                time_skew_secs=3600,
+                kinds=["git_clone"],
+                target_tiers=["L3"],
+                visibility_probes_per_burst=1,
+                visibility_poll_interval_secs=1,
+            )
+            runner.active = {
+                "cycle": 1,
+                "root": root,
+                "burst_root": root / f"{BENCH.EVENT_STORM_DIR_PREFIX}{runner.run_id}-001",
+                "selected_kind": "git_clone",
+                "stage": "delayed_query",
+                "started_at": time.monotonic() - 120,
+                "events": [],
+                "visibility_probes": [
+                    {
+                        "event": {
+                            "workload": "git_clone",
+                            "path": str(root / "missing.txt"),
+                            "query": "missing.txt",
+                            "tier_before": "L3",
+                            "burst_elapsed_secs": 0.0,
+                        },
+                        "polls": 3,
+                        "transport_failures": 0,
+                        "last_error": "",
+                        "completed": False,
+                    }
+                ],
+            }
+            with mock.patch.object(runner, "run_query_pass"), mock.patch.object(
+                runner, "cleanup_burst_root"
+            ):
+                runner.process_due(time.monotonic())
+
+            rows = [
+                json.loads(line)
+                for line in (root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            probes = [row for row in rows if row.get("event_kind") == "visibility_probe"]
+            self.assertEqual(len(probes), 1)
+            self.assertFalse(probes[0]["visible"])
+            self.assertTrue(probes[0]["timeout"])
 
     def test_hot_churn_randomness_is_reproducible_from_workload_seed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

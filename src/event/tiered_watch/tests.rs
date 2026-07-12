@@ -1811,6 +1811,15 @@ fn rotating_cold_window_downgrade_keeps_lease_as_scan_only() {
         .last_scan_unix_secs
         .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
 
+    let before = rt.debug_dump(Some("/tmp/cold-downgrade"));
+    let before_dir = before.dirs.first().expect("cold dir should be present");
+    assert!(!before_dir.rotating_cold_window_seen);
+    assert!(!before_dir.rotating_cold_window);
+    assert!(before_dir.rotating_cold_window_action.is_empty());
+    assert_eq!(before_dir.rotating_cold_window_expires_unix_secs, 0);
+    assert_eq!(before_dir.rotating_cold_window_cycle_id, 0);
+    assert_eq!(before_dir.rotating_cold_window_score, 0);
+
     let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
         enabled: true,
         budget: 8,
@@ -1835,8 +1844,28 @@ fn rotating_cold_window_downgrade_keeps_lease_as_scan_only() {
 
     let dump = rt.debug_dump(Some("/tmp/cold-downgrade"));
     let dir = dump.dirs.first().expect("cold dir should be present");
+    assert!(dir.rotating_cold_window_seen);
     assert!(dir.rotating_cold_window);
     assert_eq!(dir.rotating_cold_window_action, "scan_only");
+    assert!(dir.rotating_cold_window_expires_unix_secs >= unix_secs());
+    assert_eq!(dir.rotating_cold_window_cycle_id, tick.cycle_id);
+    assert!(dir.rotating_cold_window_score > 0);
+
+    let encoded = serde_json::to_value(&dump).expect("debug dump should serialize");
+    let encoded_dir = &encoded["dirs"][0];
+    assert_eq!(encoded_dir["rotating_cold_window_seen"], true);
+    assert_eq!(encoded_dir["rotating_cold_window"], true);
+    assert_eq!(encoded_dir["rotating_cold_window_action"], "scan_only");
+    assert!(encoded_dir["rotating_cold_window_expires_unix_secs"]
+        .as_u64()
+        .is_some_and(|value| value >= unix_secs()));
+    assert_eq!(
+        encoded_dir["rotating_cold_window_cycle_id"].as_u64(),
+        Some(tick.cycle_id)
+    );
+    assert!(encoded_dir["rotating_cold_window_score"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
 }
 
 #[test]

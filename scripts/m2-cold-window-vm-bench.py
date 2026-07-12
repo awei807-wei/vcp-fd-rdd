@@ -30,6 +30,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from m2_cold_window_build_receipt import (
+    CARGO_ARGS as BUILD_CARGO_ARGS,
+    compiler_artifact_path,
+    load_build_receipt,
+    validate_build_receipt,
+)
+
 
 ENDPOINTS = ["/health", "/status", "/metrics", "/memory", "/watch-state"]
 
@@ -52,6 +59,7 @@ AB_PARAMETER_FINGERPRINT_IGNORED_ARGS = frozenset(
         "run_dir",
         "port",
         "sweep_config",
+        "artifact_provenance_receipt",
     }
 )
 
@@ -273,6 +281,7 @@ def _fixture_json_declaration(root: Path) -> dict[str, Any] | None:
         "file_count": file_count,
         "seed": data.get("seed"),
         "layout_version": data.get("layout_version", data.get("schema_version", "")),
+        "content_sha256": data.get("content_sha256", ""),
         "declaration_sha256": hashlib.sha256(raw).hexdigest(),
         "path": str(path),
     }
@@ -347,6 +356,7 @@ def load_fixture_identity(roots: list[Path]) -> dict[str, Any]:
             "file_count": item["file_count"],
             "seed": item.get("seed"),
             "layout_version": item.get("layout_version", ""),
+            "content_sha256": item.get("content_sha256", ""),
             "declaration_sha256": item["declaration_sha256"],
         }
         for item in declarations
@@ -373,7 +383,7 @@ def sha256_file(path: Path) -> str:
         with path.open("rb") as f:
             while chunk := f.read(1024 * 1024):
                 digest.update(chunk)
-    except OSError:
+    except FileNotFoundError:
         return ""
     return digest.hexdigest()
 
@@ -478,7 +488,7 @@ def _log_contains(path: Path, needle: str) -> bool:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
             return any(needle in line for line in f)
-    except OSError:
+    except FileNotFoundError:
         return False
 
 
@@ -681,6 +691,13 @@ def evaluate_ab_comparability(
     provenance = initial_state.get("artifact_provenance")
     if not isinstance(provenance, dict) or not provenance.get("verified"):
         reasons.append("artifact_provenance_unverified")
+    elif (
+        provenance.get("validated_binary_sha256")
+        != initial_state.get("binary_sha256")
+        or provenance.get("execution_binary_sha256")
+        != initial_state.get("binary_sha256")
+    ):
+        reasons.append("artifact_binary_identity_changed")
     if initial_state.get("collection_errors"):
         reasons.append("initial_state_collection_failed")
     if initial_state.get("run_dir_preexisting"):
@@ -694,7 +711,7 @@ def evaluate_ab_comparability(
             reasons.append("run_interrupted")
         elif not execution_state.get("duration_completed"):
             reasons.append("duration_not_completed")
-        if execution_state.get("exit_code") not in (0, -signal.SIGTERM):
+        if execution_state.get("exit_code") != 0:
             reasons.append("daemon_exit_failed")
         if execution_state.get("fatal_error"):
             reasons.append("runner_fatal_error")
@@ -1065,19 +1082,47 @@ def read_proc_status(pid: int) -> dict[str, int]:
     return out
 
 
-def read_proc_ticks(pid: int) -> int | None:
+def read_proc_stat(pid: int) -> dict[str, int]:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except FileNotFoundError:
-        return None
+        return {}
     rparen = stat.rfind(")")
     if rparen < 0:
-        return None
+        return {}
     parts = stat[rparen + 2 :].split()
     if len(parts) < 15:
-        return None
-    # After state, utime/stime are fields 14/15 in procfs, indices 11/12 here.
-    return int(parts[11]) + int(parts[12])
+        return {}
+    # parts[0] is procfs field 3 (state).
+    return {
+        "minor_faults": int(parts[7]),
+        "major_faults": int(parts[9]),
+        "ticks": int(parts[11]) + int(parts[12]),
+    }
+
+
+def read_proc_ticks(pid: int) -> int | None:
+    return read_proc_stat(pid).get("ticks")
+
+
+def read_proc_io(pid: int) -> dict[str, int]:
+    try:
+        text = Path(f"/proc/{pid}/io").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    aliases = {
+        "read_bytes": "read_bytes",
+        "write_bytes": "write_bytes",
+        "syscr": "read_syscalls",
+        "syscw": "write_syscalls",
+    }
+    result: dict[str, int] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition(":")
+        output_key = aliases.get(key)
+        if separator and output_key:
+            result[output_key] = int(value.strip())
+    return result
 
 
 def read_fd_count(pid: int) -> int:
@@ -1093,7 +1138,8 @@ def process_sampler(pid: int) -> Any:
     previous_at: float | None = None
     while True:
         now = time.monotonic()
-        ticks = read_proc_ticks(pid)
+        proc_stat = read_proc_stat(pid)
+        ticks = proc_stat.get("ticks")
         cpu_pct = 0.0
         if (
             ticks is not None
@@ -1106,6 +1152,16 @@ def process_sampler(pid: int) -> Any:
         previous_at = now
 
         status = read_proc_status(pid)
+        status.update(read_proc_io(pid))
+        if ticks is not None:
+            status["cpu_ticks"] = ticks
+        status.update(
+            {
+                key: proc_stat[key]
+                for key in ("minor_faults", "major_faults")
+                if key in proc_stat
+            }
+        )
         status["fd_count"] = read_fd_count(pid)
         status["cpu_pct"] = round(cpu_pct, 3)
         yield status
@@ -1675,6 +1731,14 @@ class EventStormRunner:
         inode_stress_tmpfs_inodes: int = 200,
         immediate_query_enabled: bool = False,
         immediate_query_settle_secs: float = 5.0,
+        max_bursts: int = 0,
+        visibility_probes_per_burst: int = 0,
+        visibility_poll_interval_secs: float = 1.0,
+        fixed_root_schedule: bool = False,
+        deterministic_plan_seed: int | None = None,
+        rotating_tick_secs: float = 0.0,
+        rotating_ttl_secs: float = 0.0,
+        rotating_dirs_per_tick: int = 0,
     ) -> None:
         self.base_url = base_url
         self.roots = roots
@@ -1700,6 +1764,13 @@ class EventStormRunner:
         # pass at the normal settle_secs. Both are reported separately.
         self.immediate_query_enabled = bool(immediate_query_enabled)
         self.immediate_query_settle_secs = max(0.0, immediate_query_settle_secs)
+        self.max_bursts = max(0, max_bursts)
+        self.visibility_probes_per_burst = max(0, visibility_probes_per_burst)
+        self.visibility_poll_interval_secs = max(0.2, visibility_poll_interval_secs)
+        self.fixed_root_schedule = bool(fixed_root_schedule)
+        self.rotating_tick_secs = max(0.0, rotating_tick_secs)
+        self.rotating_ttl_secs = max(0.0, rotating_ttl_secs)
+        self.rotating_dirs_per_tick = max(0, rotating_dirs_per_tick)
         self.kinds = normalize_event_storm_kinds(kinds)
         self.target_tiers = [tier.upper() for tier in target_tiers]
         tiers = self.target_tiers or [""]
@@ -1708,23 +1779,34 @@ class EventStormRunner:
         # Run-unique id (timestamp + pid) folded into burst paths so concurrent or
         # repeated runs (A vs B legs, re-runs on shared storm roots) never collide
         # on fixture directories -- the root cause of OSError(39, 'Directory not empty').
-        self.run_id = f"{time.time_ns()}-{os.getpid()}"
+        self.run_id = (
+            f"seed-{deterministic_plan_seed}"
+            if deterministic_plan_seed is not None
+            else f"{time.time_ns()}-{os.getpid()}"
+        )
+        self.query_token = hashlib.sha256(self.run_id.encode("utf-8")).hexdigest()[:8]
         self.next_start_at = time.monotonic() + self.start_delay_secs
         self.active: dict[str, Any] | None = None
         self.current_burst_started_at = 0.0
+        self.mutation_seq = 0
         self.cycle = 0
 
     def tick(self, now: float) -> None:
         if self.active is None:
             if now >= self.next_start_at:
+                if self.max_bursts > 0 and self.cycle >= self.max_bursts:
+                    return
                 self.start_cycle(now)
             return
+        self.poll_visibility(now)
         if now < float(self.active["due_at"]):
             return
         self.process_due(now)
 
     def start_cycle(self, now: float) -> None:
         if not self.roots:
+            return
+        if self.max_bursts > 0 and self.cycle >= self.max_bursts:
             return
         self.cycle += 1
         # Task 3: on the very first burst, capture and report tier distribution
@@ -1736,9 +1818,22 @@ class EventStormRunner:
         root.mkdir(parents=True, exist_ok=True)
         burst_root = self.burst_root(root, self.burst_directory_kind(selected_kind))
         tier_before = self.tier_for_root(root)
+        target_m2_evidence = self.m2_evidence_for_root(root)
         events: list[dict[str, Any]] = []
         cycle_started = time.monotonic()
         self.current_burst_started_at = cycle_started
+        self.emit(
+            {
+                "event_kind": "burst_started",
+                "operation": "burst_started",
+                "root": str(root),
+                "requested_tier": requested_tier,
+                "selected_kind": selected_kind,
+                "tier_before": tier_before,
+                "fixed_root_schedule": self.fixed_root_schedule,
+                **target_m2_evidence,
+            }
+        )
         try:
             if selected_kind == "rw100":
                 events.extend(self.write_rw100(root, tier_before))
@@ -1794,6 +1889,7 @@ class EventStormRunner:
             self.next_start_at = time.monotonic() + self.interval_secs
             return
         generation_secs = time.monotonic() - cycle_started
+        mutation_completed_unix_secs = int(time.time())
         # Task 2: when immediate-query mode is enabled, the first due point is
         # the immediate settle (e.g. 5s); after that pass we reschedule to the
         # normal settle_secs for the delayed pass. Otherwise a single pass at
@@ -1818,6 +1914,10 @@ class EventStormRunner:
             "stage": "immediate_query" if use_immediate else "delayed_query",
             "delayed_due_at": delayed_due,
             "immediate_done": False,
+            "visibility_probes": self.select_visibility_probes(events),
+            "visibility_next_poll_at": time.monotonic(),
+            "target_m2_before": target_m2_evidence,
+            "mutation_completed_unix_secs": mutation_completed_unix_secs,
         }
         self.emit(
             {
@@ -1831,11 +1931,122 @@ class EventStormRunner:
                 "duration_secs": round(generation_secs, 3),
                 "duration_budget_secs": self.duration_budget_secs,
                 "within_budget": generation_secs <= self.duration_budget_secs,
+                "mutation_completed_unix_secs": mutation_completed_unix_secs,
                 "kinds": self.kinds,
+                **target_m2_evidence,
             }
         )
         for event in events:
             self.emit(event)
+
+    def select_visibility_probes(
+        self,
+        events: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        positives = [event for event in events if bool(event.get("should_exist"))]
+        count = min(self.visibility_probes_per_burst, len(positives))
+        if count <= 0:
+            return []
+        if count == 1:
+            selected = [positives[0]]
+        elif count == len(positives):
+            selected = positives
+        else:
+            indexes = {
+                round(index * (len(positives) - 1) / (count - 1))
+                for index in range(count)
+            }
+            selected = [positives[index] for index in sorted(indexes)]
+        return [
+            {
+                "event": event,
+                "polls": 0,
+                "transport_failures": 0,
+                "last_error": "",
+                "visible_at": None,
+                "visible_query_latency": 0.0,
+            }
+            for event in selected
+        ]
+
+    def poll_visibility(self, now: float) -> None:
+        assert self.active is not None
+        probes = list(self.active.get("visibility_probes", []))
+        if not probes or now < float(self.active.get("visibility_next_poll_at", 0.0)):
+            return
+        self.active["visibility_next_poll_at"] = now + self.visibility_poll_interval_secs
+        for probe in probes:
+            event = probe["event"]
+            ok, exists, query_latency, error = check_search_state_once(
+                self.base_url,
+                str(event["query"]),
+                Path(event["path"]),
+                True,
+            )
+            completed_at = time.monotonic()
+            probe["polls"] = int(probe.get("polls", 0)) + 1
+            if error:
+                probe["transport_failures"] = int(
+                    probe.get("transport_failures", 0)
+                ) + 1
+                probe["last_error"] = error
+            if ok and exists and probe.get("visible_at") is None:
+                probe["visible_at"] = completed_at
+                probe["visible_query_latency"] = query_latency
+
+    def emit_visibility_result(
+        self,
+        probe: dict[str, Any],
+        now: float,
+        *,
+        visible: bool,
+        timeout: bool,
+        query_latency: float = 0.0,
+    ) -> None:
+        assert self.active is not None
+        event = probe["event"]
+        event_age = max(
+            0.0,
+            now
+            - float(self.active["started_at"])
+            - float(event.get("burst_elapsed_secs", 0.0)),
+        )
+        tier_after = self.tier_for_root(Path(self.active["root"]))
+        self.emit(
+            {
+                "event_kind": "visibility_probe",
+                "operation": str(event.get("operation", "")) + "_visibility",
+                "workload": event.get("workload", ""),
+                "path": event.get("path", ""),
+                "query": event.get("query", ""),
+                "visible": visible,
+                "timeout": timeout,
+                "ok": visible,
+                "latency_secs": round(event_age, 3),
+                "query_latency_secs": round(query_latency, 3),
+                "polls": int(probe.get("polls", 0)),
+                "transport_failures": int(probe.get("transport_failures", 0)),
+                "requested_tier": self.active.get("requested_tier", ""),
+                "tier_before": event.get("tier_before", ""),
+                "tier_after": tier_after,
+                **(
+                    {"last_error": str(probe.get("last_error", ""))}
+                    if probe.get("last_error")
+                    else {}
+                ),
+            }
+        )
+    def finalize_visibility_probes(self, now: float) -> None:
+        assert self.active is not None
+        for probe in list(self.active.get("visibility_probes", [])):
+            visible_at = probe.get("visible_at")
+            self.emit_visibility_result(
+                probe,
+                float(visible_at) if visible_at is not None else now,
+                visible=visible_at is not None,
+                timeout=visible_at is None,
+                query_latency=float(probe.get("visible_query_latency", 0.0) or 0.0),
+            )
 
     def write_rw100(self, root: Path, tier_before: str) -> list[dict[str, Any]]:
         burst_root = self.burst_root(root, "rw100")
@@ -1862,8 +2073,9 @@ class EventStormRunner:
         deadline = time.monotonic() + self.duration_budget_secs
         count = self.file_count if self.file_count > 0 else self.ops_per_burst
         for i in range(count):
-            final = burst_root / f"save_{i:04d}.txt"
-            tmp = burst_root / f".save_{i:04d}.tmp"
+            name = f"m2v_{self.query_token}_{self.cycle:03d}_save_{i:04d}"
+            final = burst_root / f"{name}.txt"
+            tmp = burst_root / f".{name}.tmp"
             marker = f"fd_rdd_m2_storm_save_{self.cycle}_{i:04d}"
             tmp.write_text(f"{utc_now()} {marker}\n", encoding="utf-8")
             tmp.rename(final)
@@ -1885,9 +2097,18 @@ class EventStormRunner:
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
         files = [
-            (repo_root / "README.md", "fd_rdd_m2_storm_git_readme"),
-            (repo_root / "src" / "main.rs", "fd_rdd_m2_storm_git_main"),
-            (repo_root / "tests" / "smoke.rs", "fd_rdd_m2_storm_git_smoke"),
+            (
+                repo_root / f"m2v_{self.query_token}_{self.cycle:03d}_README.md",
+                "fd_rdd_m2_storm_git_readme",
+            ),
+            (
+                repo_root / "src" / f"m2v_{self.query_token}_{self.cycle:03d}_main.rs",
+                "fd_rdd_m2_storm_git_main",
+            ),
+            (
+                repo_root / "tests" / f"m2v_{self.query_token}_{self.cycle:03d}_smoke.rs",
+                "fd_rdd_m2_storm_git_smoke",
+            ),
         ]
         for path, marker in files:
             path.write_text(f"{utc_now()} {marker}\n", encoding="utf-8")
@@ -1964,7 +2185,9 @@ class EventStormRunner:
             for level in range(depth):
                 parent = parent / f"level{level + 1}_{(i // (10 ** level)) % 10:02d}"
             parent.mkdir(parents=True, exist_ok=True)
-            old_path = parent / f"deep_{self.cycle:03d}_{i:04d}.txt"
+            old_path = parent / (
+                f"m2v_{self.query_token}_{self.cycle:03d}_deep_{i:04d}.txt"
+            )
             old_path.write_text(
                 f"{utc_now()} fd_rdd_m2_storm_subtree_rename_{self.cycle}_{i:04d}\n",
                 encoding="utf-8",
@@ -2294,6 +2517,18 @@ class EventStormRunner:
         }.get(kind, kind)
 
     def select_root(self, requested_tier: str) -> Path:
+        if self.fixed_root_schedule:
+            candidates = [
+                child
+                for root in sorted(self.roots)
+                for child in sorted(root.iterdir())
+                if child.is_dir()
+                and not child.is_symlink()
+                and self._stable_fixture_anchor(child) == child.resolve()
+            ]
+            if not candidates:
+                raise RuntimeError("fixed event-storm root schedule has no directory")
+            return candidates[self.fixed_root_schedule_index(len(candidates))]
         if requested_tier:
             try:
                 dump = debug_tiered_watch(self.base_url)
@@ -2321,6 +2556,25 @@ class EventStormRunner:
             except Exception:
                 pass
         return self.roots[(self.cycle - 1) % len(self.roots)]
+
+    def fixed_root_schedule_index(self, candidate_count: int) -> int:
+        """Choose a deterministic root expected to hold an active rotation lease.
+
+        Falsification legs use the same index in A and B.  The two-tick lag gives
+        the A daemon time to apply the lease while keeping it well inside TTL.
+        """
+        if candidate_count <= 0:
+            raise ValueError("candidate_count must be positive")
+        if self.rotating_tick_secs <= 0 or self.rotating_dirs_per_tick <= 0:
+            return (self.cycle - 1) % candidate_count
+        planned_elapsed = self.start_delay_secs + max(0, self.cycle - 1) * (
+            self.settle_secs + self.interval_secs
+        )
+        completed_ticks = int(planned_elapsed // self.rotating_tick_secs)
+        ttl_ticks = int(self.rotating_ttl_secs // self.rotating_tick_secs)
+        lag_ticks = min(2, max(1, ttl_ticks - 1))
+        target_tick = max(1, completed_ticks - lag_ticks)
+        return ((target_tick - 1) * self.rotating_dirs_per_tick) % candidate_count
 
     @staticmethod
     def _has_event_storm_component(relative_path: Path) -> bool:
@@ -2380,6 +2634,7 @@ class EventStormRunner:
         tier_before: str,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self.mutation_seq += 1
         record = {
             "event_kind": "expected",
             "operation": operation,
@@ -2390,6 +2645,7 @@ class EventStormRunner:
             "tier_before": tier_before,
             "write_elapsed_secs": round(time.monotonic() - self.started_at, 3),
             "burst_elapsed_secs": round(time.monotonic() - self.current_burst_started_at, 3),
+            "mutation_seq": self.mutation_seq,
         }
         if extra:
             record.update(extra)
@@ -2411,6 +2667,7 @@ class EventStormRunner:
             return
         # delayed_query (default, backwards compatible)
         self.run_query_pass(now, phase="delayed")
+        self.finalize_visibility_probes(now)
         self.cleanup_burst_root(
             Path(self.active["burst_root"]),
             Path(self.active["root"]),
@@ -2493,6 +2750,10 @@ class EventStormRunner:
         events = list(self.active["events"])
         root = Path(self.active["root"])
         tier_after = self.tier_for_root(root)
+        target_m2_after = {
+            key.replace("target_m2_", "target_m2_after_", 1): value
+            for key, value in self.m2_evidence_for_root(root).items()
+        }
         ok_count = 0
         positive_total = 0
         positive_ok = 0
@@ -2600,6 +2861,14 @@ class EventStormRunner:
                 "requested_tier": self.active.get("requested_tier", ""),
                 "tier_before": self.active.get("tier_before", ""),
                 "tier_after": tier_after,
+                "mutation_completed_unix_secs": int(
+                    self.active.get("mutation_completed_unix_secs", 0) or 0
+                ),
+                **target_m2_after,
+                "visibility_poll_count": sum(
+                    int(probe.get("polls", 0) or 0)
+                    for probe in self.active.get("visibility_probes", [])
+                ),
             }
         )
 
@@ -2662,6 +2931,56 @@ class EventStormRunner:
             return str(candidates[0].get("watch_tier", "")) if candidates else ""
         except Exception:
             return ""
+
+    def m2_evidence_for_root(self, root: Path) -> dict[str, Any]:
+        """Capture target-specific M2 evidence before mutating the selected root."""
+        try:
+            dump = debug_tiered_watch(self.base_url, root)
+            dirs = dump.get("dirs")
+            if not isinstance(dirs, list):
+                raise RuntimeError("debug tiered-watch response has no dirs array")
+            root_str = str(root)
+            item = next(
+                (
+                    candidate
+                    for candidate in dirs
+                    if isinstance(candidate, dict)
+                    and candidate.get("path") == root_str
+                ),
+                None,
+            )
+            if item is None:
+                raise RuntimeError("selected root missing from debug tiered-watch")
+            return {
+                "target_m2_debug_ok": True,
+                "target_m2_seen": bool(item.get("rotating_cold_window_seen")),
+                "target_m2_active": bool(item.get("rotating_cold_window")),
+                "target_m2_action": str(
+                    item.get("rotating_cold_window_action", "")
+                ),
+                "target_m2_cycle_id": int(
+                    item.get("rotating_cold_window_cycle_id", 0) or 0
+                ),
+                "target_m2_expires_unix_secs": int(
+                    item.get("rotating_cold_window_expires_unix_secs", 0) or 0
+                ),
+                "target_m2_last_scan_unix_secs": int(item.get("last_scan", 0) or 0),
+                "target_m2_last_event_unix_secs": int(item.get("last_event", 0) or 0),
+                "target_m2_observed_unix_secs": int(time.time()),
+            }
+        except Exception as exc:  # noqa: BLE001 - evidence failure must gate the leg
+            return {
+                "target_m2_debug_ok": False,
+                "target_m2_seen": False,
+                "target_m2_active": False,
+                "target_m2_action": "",
+                "target_m2_cycle_id": 0,
+                "target_m2_expires_unix_secs": 0,
+                "target_m2_last_scan_unix_secs": 0,
+                "target_m2_last_event_unix_secs": 0,
+                "target_m2_observed_unix_secs": int(time.time()),
+                "target_m2_debug_error": repr(exc),
+            }
 
     def emit(self, record: dict[str, Any]) -> None:
         record.setdefault("ok", True)
@@ -2922,6 +3241,7 @@ def build_if_needed(
     binary: Path,
     build: str,
     source_git_sha: str,
+    artifact_provenance_receipt: Path | None = None,
 ) -> dict[str, Any]:
     cargo_lock = repo / "Cargo.lock"
     provenance: dict[str, Any] = {
@@ -2930,21 +3250,100 @@ def build_if_needed(
         "built_this_run": False,
         "source_git_sha": source_git_sha,
         "cargo_lock_sha256": sha256_file(cargo_lock),
-        "cargo_args": ["cargo", "build", "--release", "--locked"],
+        "cargo_args": list(BUILD_CARGO_ARGS),
     }
     if build == "never" or (build == "auto" and binary.exists()):
+        if artifact_provenance_receipt is not None:
+            receipt_path = artifact_provenance_receipt.expanduser().resolve()
+            errors = validate_build_receipt(
+                receipt_path,
+                repo,
+                binary,
+                source_git_sha,
+            )
+            current_dirty = git_worktree_dirty(repo)
+            if current_dirty is not False:
+                errors.append(
+                    "current_worktree_dirty"
+                    if current_dirty
+                    else "current_worktree_state_unavailable"
+                )
+            receipt = load_build_receipt(receipt_path)
+            provenance.update(
+                {
+                    "verified": not errors,
+                    "receipt_path": str(receipt_path),
+                    "receipt_sha256": sha256_file(receipt_path),
+                    "receipt_validation_errors": errors,
+                    "current_worktree_dirty": current_dirty,
+                    "validated_binary_sha256": str(
+                        receipt.get("binary_sha256", "")
+                    )
+                    if not errors
+                    else "",
+                    "compiler_artifact": str(
+                        receipt.get("compiler_artifact", "")
+                    ),
+                    "cargo_args": list(receipt.get("cargo_args", []) or []),
+                }
+            )
         return provenance
-    subprocess.run(provenance["cargo_args"], cwd=repo, check=True)
+    pre_build_dirty = git_worktree_dirty(repo)
+    pre_build_lock_sha = sha256_file(cargo_lock)
+    result = subprocess.run(
+        provenance["cargo_args"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    artifact = compiler_artifact_path(result.stdout or "")
     post_build_sha = git_head_sha(repo)
+    post_build_dirty = git_worktree_dirty(repo)
+    post_build_lock_sha = sha256_file(cargo_lock)
+    binary_sha256 = sha256_file(binary)
     provenance["built_this_run"] = True
+    provenance["pre_build_git_dirty"] = pre_build_dirty
     provenance["post_build_git_sha"] = post_build_sha
+    provenance["post_build_git_dirty"] = post_build_dirty
+    provenance["post_build_cargo_lock_sha256"] = post_build_lock_sha
+    provenance["compiler_artifact"] = str(artifact or "")
+    provenance["validated_binary_sha256"] = binary_sha256
     provenance["verified"] = bool(
         source_git_sha
         and post_build_sha == source_git_sha
-        and binary.exists()
-        and provenance["cargo_lock_sha256"]
+        and pre_build_dirty is False
+        and post_build_dirty is False
+        and pre_build_lock_sha
+        and post_build_lock_sha == pre_build_lock_sha
+        and artifact == binary.resolve()
+        and binary_sha256
     )
     return provenance
+
+
+def stage_execution_binary(
+    source_binary: Path,
+    run_dir: Path,
+    expected_sha256: str,
+) -> tuple[Path, str]:
+    """把已验证 artifact 固定为腿私有只读副本，隔离并发 Cargo 替换。"""
+    source_binary = source_binary.resolve()
+    source_before = sha256_file(source_binary)
+    if not source_before or (expected_sha256 and source_before != expected_sha256):
+        raise RuntimeError("artifact_binary_identity_changed_before_staging")
+    artifact_dir = run_dir / "artifact"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    staged = artifact_dir / "fd-rdd"
+    temporary = artifact_dir / ".fd-rdd.next"
+    shutil.copyfile(source_binary, temporary)
+    temporary.chmod(0o500)
+    temporary.replace(staged)
+    source_after = sha256_file(source_binary)
+    staged_sha256 = sha256_file(staged)
+    if source_after != source_before or staged_sha256 != source_before:
+        raise RuntimeError("artifact_binary_identity_changed_during_staging")
+    return staged, staged_sha256
 
 
 def collect_endpoint_samples(base_url: str, out: Path, started_at: float) -> None:
@@ -3169,6 +3568,158 @@ def build_memory_timeline(
     }
 
 
+def summarize_visibility_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    unique: dict[str, dict[str, Any]] = {}
+    for index, row in enumerate(rows):
+        path = str(row.get("path", ""))
+        unique.setdefault(path or f"<missing-path-{index}>", row)
+    selected = list(unique.values())
+    visible = [row for row in selected if bool(row.get("visible"))]
+    latencies = [float(row.get("latency_secs", 0.0) or 0.0) for row in visible]
+    by_workload: dict[str, dict[str, Any]] = {}
+    for workload in sorted({str(row.get("workload", "")) for row in selected}):
+        if not workload:
+            continue
+        workload_rows = [row for row in selected if row.get("workload") == workload]
+        workload_visible = sum(1 for row in workload_rows if bool(row.get("visible")))
+        by_workload[workload] = {
+            "total": len(workload_rows),
+            "visible": workload_visible,
+            "success_rate": round(workload_visible / len(workload_rows), 4),
+        }
+    return {
+        "total": len(selected),
+        "visible": len(visible),
+        "timeouts": len(selected) - len(visible),
+        "success_rate": round(len(visible) / len(selected), 4) if selected else 0.0,
+        "latency_p50_secs": round(percentile(latencies, 50), 3),
+        "latency_p95_secs": round(percentile(latencies, 95), 3),
+        "latency_max_secs": round(max(latencies) if latencies else 0.0, 3),
+        "transport_failures": sum(
+            int(row.get("transport_failures", 0) or 0) for row in selected
+        ),
+        "by_workload": by_workload,
+    }
+
+
+def process_counter_delta(samples: list[dict[str, Any]], key: str) -> int:
+    values = [int(sample[key]) for sample in samples if key in sample]
+    return max(0, values[-1] - values[0]) if len(values) >= 2 else 0
+
+
+PROCESS_MONOTONIC_COUNTERS = (
+    "cpu_ticks",
+    "read_bytes",
+    "write_bytes",
+    "read_syscalls",
+    "write_syscalls",
+    "minor_faults",
+    "major_faults",
+)
+
+
+def process_sampling_diagnostics(
+    samples: list[dict[str, Any]],
+    requested_duration_secs: float,
+) -> dict[str, Any]:
+    elapsed = [
+        float(sample.get("elapsed_secs", 0.0) or 0.0)
+        for sample in samples
+        if "elapsed_secs" in sample
+    ]
+    gaps = [
+        current - previous
+        for previous, current in zip(elapsed, elapsed[1:])
+        if current >= previous
+    ]
+    regressions = 0
+    for key in PROCESS_MONOTONIC_COUNTERS:
+        values = [int(sample[key]) for sample in samples if key in sample]
+        regressions += sum(
+            1 for previous, current in zip(values, values[1:]) if current < previous
+        )
+    coverage_secs = max(0.0, elapsed[-1] - elapsed[0]) if len(elapsed) >= 2 else 0.0
+    requested = max(0.0, float(requested_duration_secs))
+    return {
+        "sample_first_elapsed_secs": round(elapsed[0], 3) if elapsed else 0.0,
+        "sample_last_elapsed_secs": round(elapsed[-1], 3) if elapsed else 0.0,
+        "sample_coverage_secs": round(coverage_secs, 3),
+        "sample_coverage_ratio": round(
+            min(1.0, coverage_secs / requested) if requested > 0 else 0.0,
+            4,
+        ),
+        "sample_max_gap_secs": round(max(gaps) if gaps else 0.0, 3),
+        "counter_regressions": regressions,
+    }
+
+
+def integrate_cpu_core_seconds(samples: list[dict[str, Any]]) -> float:
+    ticks = [int(sample["cpu_ticks"]) for sample in samples if "cpu_ticks" in sample]
+    if len(ticks) >= 2:
+        try:
+            ticks_per_sec = float(
+                os.sysconf(os.sysconf_names.get("SC_CLK_TCK", "SC_CLK_TCK"))
+            )
+        except (OSError, TypeError, ValueError):
+            ticks_per_sec = 0.0
+        if ticks_per_sec > 0:
+            return round(max(0, ticks[-1] - ticks[0]) / ticks_per_sec, 3)
+
+    total = 0.0
+    previous_elapsed: float | None = None
+    for sample in samples:
+        elapsed = float(sample.get("elapsed_secs", 0.0) or 0.0)
+        if previous_elapsed is not None and elapsed >= previous_elapsed:
+            total += (
+                float(sample.get("cpu_pct", 0.0) or 0.0)
+                / 100.0
+                * (elapsed - previous_elapsed)
+            )
+        previous_elapsed = elapsed
+    return round(total, 3)
+
+
+def summarize_process_after(
+    samples: list[dict[str, Any]],
+    start_elapsed_secs: float | None,
+) -> dict[str, Any]:
+    selected: list[dict[str, Any]] = []
+    if start_elapsed_secs is not None:
+        first_index = next(
+            (
+                index
+                for index, sample in enumerate(samples)
+                if float(sample.get("elapsed_secs", 0.0) or 0.0)
+                >= start_elapsed_secs
+            ),
+            len(samples),
+        )
+        selected = samples[max(0, first_index - 1) :]
+    rss = [int(sample.get("vmrss_bytes", 0) or 0) for sample in selected]
+    result: dict[str, Any] = {
+        "sample_count": len(selected),
+        "start_elapsed_secs": round(start_elapsed_secs or 0.0, 3),
+        "end_elapsed_secs": round(
+            float(selected[-1].get("elapsed_secs", 0.0) or 0.0), 3
+        )
+        if selected
+        else 0.0,
+        "cpu_core_seconds": integrate_cpu_core_seconds(selected),
+        "rss_bytes_p95": int(percentile(rss, 95)),
+        "rss_bytes_max": max(rss) if rss else 0,
+    }
+    for key in (
+        "read_bytes",
+        "write_bytes",
+        "read_syscalls",
+        "write_syscalls",
+        "minor_faults",
+        "major_faults",
+    ):
+        result[f"{key}_delta"] = process_counter_delta(selected, key)
+    return result
+
+
 def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any]:
     manifest: dict[str, Any] = {}
     manifest_path = run_dir / "manifest.json"
@@ -3367,9 +3918,39 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
     event_written = [
         item for item in event_storm_samples if item.get("event_kind") == "burst_written"
     ]
+    event_started = [
+        item for item in event_storm_samples if item.get("event_kind") == "burst_started"
+    ]
     event_cleanups = [
         item for item in event_storm_samples if item.get("event_kind") == "burst_cleanup"
     ]
+    event_visibility = [
+        item for item in event_storm_samples if item.get("event_kind") == "visibility_probe"
+    ]
+    first_burst_elapsed = min(
+        (
+            float(item.get("elapsed_secs", 0.0) or 0.0)
+            for item in event_written
+            if "elapsed_secs" in item
+        ),
+        default=None,
+    )
+    process_after_first_burst = summarize_process_after(
+        process_samples,
+        first_burst_elapsed,
+    )
+    first_event_storm_elapsed = min(
+        (
+            float(item.get("elapsed_secs", 0.0) or 0.0)
+            for item in event_started
+            if "elapsed_secs" in item
+        ),
+        default=None,
+    )
+    process_after_event_storm_start = summarize_process_after(
+        process_samples,
+        first_event_storm_elapsed,
+    )
     # Task 2: split first-query rows by query_phase (immediate vs delayed).
     event_immediate_queries = [
         item for item in event_first_queries if item.get("query_phase") == "immediate"
@@ -3708,17 +4289,77 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "shutdown_snapshot_quiesce": len(snapshot_quiesce_rows),
             "event_storm": len(event_storm_samples),
             "event_storm_first_query": len(event_first_queries),
+            "event_storm_visibility": len(event_visibility),
         },
         "process": {
+            "sample_count": len(process_samples),
+            **process_sampling_diagnostics(
+                process_samples,
+                float(manifest.get("duration_secs", 0) or 0),
+            ),
             "cpu_pct_p50": round(percentile(cpu, 50), 3),
             "cpu_pct_p95": round(percentile(cpu, 95), 3),
             "cpu_pct_max": round(max(cpu) if cpu else 0.0, 3),
+            "cpu_core_seconds": integrate_cpu_core_seconds(process_samples),
             "rss_bytes_p95": int(percentile(rss, 95)),
             "rss_bytes_max": max(rss) if rss else 0,
             "fd_count_max": max(fds) if fds else 0,
+            "read_bytes_delta": process_counter_delta(process_samples, "read_bytes"),
+            "write_bytes_delta": process_counter_delta(process_samples, "write_bytes"),
+            "read_syscalls_delta": process_counter_delta(
+                process_samples, "read_syscalls"
+            ),
+            "write_syscalls_delta": process_counter_delta(
+                process_samples, "write_syscalls"
+            ),
+            "minor_faults_delta": process_counter_delta(
+                process_samples, "minor_faults"
+            ),
+            "major_faults_delta": process_counter_delta(
+                process_samples, "major_faults"
+            ),
         },
+        "process_after_first_burst": process_after_first_burst,
+        "process_after_event_storm_start": process_after_event_storm_start,
         "watch_state": {
             "dirty_queue_len_max": int(max(nums(watch_samples, "dirty_queue_len") or [0])),
+            "dirty_queue_len_last": int(
+                nums(watch_samples[-1:], "dirty_queue_len")[0]
+                if watch_samples
+                else 0
+            ),
+            "waterline_soft_degraded_samples": sum(
+                1 for sample in watch_samples if bool(sample.get("waterline_soft_degraded"))
+            ),
+            "waterline_soft_degraded_ratio": round(
+                sum(
+                    1
+                    for sample in watch_samples
+                    if bool(sample.get("waterline_soft_degraded"))
+                )
+                / len(watch_samples),
+                4,
+            )
+            if watch_samples
+            else 0.0,
+            "waterline_soft_degraded_last": bool(
+                watch_samples[-1].get("waterline_soft_degraded", False)
+            )
+            if watch_samples
+            else False,
+            "waterline_hard_degraded_samples": sum(
+                1 for sample in watch_samples if bool(sample.get("waterline_hard_degraded"))
+            ),
+            "waterline_hard_degraded_last": bool(
+                watch_samples[-1].get("waterline_hard_degraded", False)
+            )
+            if watch_samples
+            else False,
+            "waterline_effective_rotating_budget_last": int(
+                nums(watch_samples[-1:], "waterline_effective_rotating_budget")[0]
+                if watch_samples
+                else 0
+            ),
             "fast_scan_coverage_lag_p99_ms_max": int(
                 max(nums(watch_samples, "fast_scan_coverage_lag_p99_ms") or [0])
             ),
@@ -3928,7 +4569,8 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "operations": passive_positive_first_query,
         },
         "event_storm": {
-            "bursts": len(event_bursts),
+            "bursts": len(event_written),
+            "checks": len(event_bursts),
             "events_total": event_first_query_summary["total"],
             "ok": event_first_query_summary["ok"],
             "missed": event_first_query_summary["missed"],
@@ -3947,6 +4589,7 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             # Task 2: immediate vs delayed query-phase breakdown.
             "immediate_query": summarize_event_rows(event_immediate_queries),
             "delayed_query": summarize_event_rows(event_delayed_queries),
+            "visibility": summarize_visibility_rows(event_visibility),
             "cleanup": event_cleanup_summary,
             "by_workload": event_by_workload,
             "by_tier_before": event_by_tier,
@@ -4016,6 +4659,32 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 |---|---:|
 | process CPU p95 | {summary["process"]["cpu_pct_p95"]}% |
 | process CPU max | {summary["process"]["cpu_pct_max"]}% |
+| process CPU core seconds | {summary["process"]["cpu_core_seconds"]} |
+| process sample coverage ratio | {summary["process"]["sample_coverage_ratio"]} |
+| process sample max gap seconds | {summary["process"]["sample_max_gap_secs"]} |
+| process counter regressions | {summary["process"]["counter_regressions"]} |
+| process read bytes delta | {summary["process"]["read_bytes_delta"]} |
+| process write bytes delta | {summary["process"]["write_bytes_delta"]} |
+| process read syscalls delta | {summary["process"]["read_syscalls_delta"]} |
+| process write syscalls delta | {summary["process"]["write_syscalls_delta"]} |
+| process minor faults delta | {summary["process"]["minor_faults_delta"]} |
+| process major faults delta | {summary["process"]["major_faults_delta"]} |
+| event-storm-window samples | {summary["process_after_event_storm_start"]["sample_count"]} |
+| event-storm-window CPU core seconds | {summary["process_after_event_storm_start"]["cpu_core_seconds"]} |
+| event-storm-window read bytes delta | {summary["process_after_event_storm_start"]["read_bytes_delta"]} |
+| event-storm-window write bytes delta | {summary["process_after_event_storm_start"]["write_bytes_delta"]} |
+| event-storm-window read syscalls delta | {summary["process_after_event_storm_start"]["read_syscalls_delta"]} |
+| event-storm-window write syscalls delta | {summary["process_after_event_storm_start"]["write_syscalls_delta"]} |
+| event-storm-window minor faults delta | {summary["process_after_event_storm_start"]["minor_faults_delta"]} |
+| event-storm-window major faults delta | {summary["process_after_event_storm_start"]["major_faults_delta"]} |
+| event-storm-window RSS p95 | {summary["process_after_event_storm_start"]["rss_bytes_p95"]} |
+| after-first-burst samples | {summary["process_after_first_burst"]["sample_count"]} |
+| after-first-burst CPU core seconds | {summary["process_after_first_burst"]["cpu_core_seconds"]} |
+| after-first-burst read bytes delta | {summary["process_after_first_burst"]["read_bytes_delta"]} |
+| after-first-burst write bytes delta | {summary["process_after_first_burst"]["write_bytes_delta"]} |
+| after-first-burst minor faults delta | {summary["process_after_first_burst"]["minor_faults_delta"]} |
+| after-first-burst major faults delta | {summary["process_after_first_burst"]["major_faults_delta"]} |
+| after-first-burst RSS p95 | {summary["process_after_first_burst"]["rss_bytes_p95"]} |
 | process RSS p95 | {summary["process"]["rss_bytes_p95"]} |
 | process RSS max | {summary["process"]["rss_bytes_max"]} |
 | rebuild RSS max | {summary["memory_timeline"]["phase_peaks"]["rebuild"]["process_rss_bytes_max"]} |
@@ -4025,6 +4694,13 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | final snapshot window RSS max | {summary["memory_timeline"]["phase_peaks"]["final_snapshot_window"]["process_rss_bytes_max"]} |
 | fd count max | {summary["process"]["fd_count_max"]} |
 | dirty queue max | {summary["watch_state"]["dirty_queue_len_max"]} |
+| dirty queue last | {summary["watch_state"]["dirty_queue_len_last"]} |
+| waterline soft degraded samples | {summary["watch_state"]["waterline_soft_degraded_samples"]} |
+| waterline soft degraded ratio | {summary["watch_state"]["waterline_soft_degraded_ratio"]} |
+| waterline soft degraded last | {summary["watch_state"]["waterline_soft_degraded_last"]} |
+| waterline hard degraded samples | {summary["watch_state"]["waterline_hard_degraded_samples"]} |
+| waterline hard degraded last | {summary["watch_state"]["waterline_hard_degraded_last"]} |
+| waterline effective rotating budget last | {summary["watch_state"]["waterline_effective_rotating_budget_last"]} |
 | fast scan lag p99 max ms | {summary["watch_state"]["fast_scan_coverage_lag_p99_ms_max"]} |
 | cold freshness age p95 first s | {summary["watch_state"]["cold_freshness_age_p95_secs_first"]} |
 | cold freshness age p95 last s | {summary["watch_state"]["cold_freshness_age_p95_secs_last"]} |
@@ -4062,6 +4738,9 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | event storm immediate-query success rate | {summary["event_storm"]["immediate_query"]["success_rate"]} |
 | event storm immediate-query p95 s | {summary["event_storm"]["immediate_query"]["first_query_p95_secs"]} |
 | event storm delayed-query success rate | {summary["event_storm"]["delayed_query"]["success_rate"]} |
+| event storm visibility success rate | {summary["event_storm"]["visibility"]["success_rate"]} |
+| event storm visibility p95 s | {summary["event_storm"]["visibility"]["latency_p95_secs"]} |
+| event storm visibility timeouts | {summary["event_storm"]["visibility"]["timeouts"]} |
 | event storm cleanup count | {summary["event_storm"]["cleanup"]["count"]} |
 | event storm cleanup failures | {summary["event_storm"]["cleanup"]["failures"]} |
 | event storm cleanup entries estimated | {summary["event_storm"]["cleanup"]["entries_estimated_total"]} |
@@ -4211,6 +4890,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo", default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--binary", default="target/release/fd-rdd")
     parser.add_argument("--build", choices=["auto", "always", "never"], default="auto")
+    parser.add_argument(
+        "--artifact-provenance-receipt",
+        default="",
+        help="JSON receipt proving that a --build never artifact came from this checkout",
+    )
     parser.add_argument("--run-label", default="rotating")
     parser.add_argument("--run-dir", default="")
     parser.add_argument("--port", type=int, default=6060)
@@ -4292,7 +4976,7 @@ def parse_args() -> argparse.Namespace:
         default="rw100,save100,git_clone,npm_install",
         help=(
             "comma-separated: rw100,save100,git_clone,npm_install,subtree_rename,"
-            "mount_storm,inode_reuse,time_skew"
+            "mount_storm,inode_reuse,inode_reuse_stress,time_skew"
         ),
     )
     parser.add_argument(
@@ -4307,6 +4991,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event-storm-interval-secs", type=float, default=300.0)
     parser.add_argument("--event-storm-settle-secs", type=float, default=120.0)
     parser.add_argument("--event-storm-timeout-secs", type=float, default=0.0)
+    parser.add_argument(
+        "--event-storm-max-bursts",
+        type=int,
+        default=0,
+        help="stop scheduling new bursts after this count; 0 keeps running until shutdown",
+    )
     parser.add_argument("--event-storm-ops", type=int, default=100,
                         help="ops per burst. Default 100; 500-1000 recommended for stress testing.")
     parser.add_argument("--event-storm-duration-budget-secs", type=float, default=1.0)
@@ -4384,6 +5074,28 @@ def parse_args() -> argparse.Namespace:
         help="after each burst, do TWO query passes: an immediate pass at "
              "--immediate-query-settle-secs and a delayed pass at "
              "--event-storm-settle-secs. Reports both in summary.",
+    )
+    parser.add_argument(
+        "--event-storm-visibility-probes-per-burst",
+        type=int,
+        default=0,
+        help="number of deterministic positive paths continuously polled per burst; 0 disables",
+    )
+    parser.add_argument(
+        "--event-storm-visibility-poll-interval-secs",
+        type=float,
+        default=1.0,
+        help="poll interval for non-blocking write-to-visible probes (default 1s)",
+    )
+    parser.add_argument(
+        "--event-storm-fixed-root-schedule",
+        action="store_true",
+        help="select deterministic fixture child directories instead of post-treatment tiers",
+    )
+    parser.add_argument(
+        "--event-storm-deterministic-plan",
+        action="store_true",
+        help="derive event-storm paths from --workload-seed for paired A/B identity",
     )
     parser.add_argument(
         "--mixed-workload",
@@ -4574,17 +5286,38 @@ def _run_single_prepared(
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
     _update_manifest(manifest_path, manifest, failure_stage="build")
-    binary = Path(args.binary)
-    if not binary.is_absolute():
-        binary = repo / binary
+    source_binary = Path(args.binary)
+    if not source_binary.is_absolute():
+        source_binary = repo / source_binary
+    source_binary = source_binary.resolve()
     artifact_provenance = build_if_needed(
         repo,
-        binary,
+        source_binary,
         args.build,
         str(manifest.get("git_sha", "")),
+        (
+            Path(args.artifact_provenance_receipt)
+            if args.artifact_provenance_receipt
+            else None
+        ),
     )
-    if not binary.exists():
-        raise SystemExit(f"binary not found: {binary}")
+    if not source_binary.exists():
+        raise SystemExit(f"binary not found: {source_binary}")
+    if (
+        artifact_provenance.get("verified") is not True
+        and (args.artifact_provenance_receipt or args.build == "always")
+    ):
+        errors = artifact_provenance.get("receipt_validation_errors", [])
+        detail = ",".join(str(error) for error in errors) or "unverified build"
+        raise RuntimeError(f"artifact_provenance_unverified: {detail}")
+    binary, execution_binary_sha256 = stage_execution_binary(
+        source_binary,
+        run_dir,
+        str(artifact_provenance.get("validated_binary_sha256", "")),
+    )
+    artifact_provenance["source_binary"] = str(source_binary)
+    artifact_provenance["execution_binary"] = str(binary)
+    artifact_provenance["execution_binary_sha256"] = execution_binary_sha256
     if not port_is_free(args.port):
         raise SystemExit(f"127.0.0.1:{args.port} is already in use")
 
@@ -4730,6 +5463,8 @@ def _run_single_prepared(
         shutdown_signal_elapsed_secs=None,
     )
 
+    if sha256_file(binary) != initial_state["binary_sha256"]:
+        raise RuntimeError("artifact_binary_identity_changed_before_exec")
     proc, log_file, process_samples, started_at = _start_daemon_process(
         cmd,
         run_dir=run_dir,
@@ -4806,6 +5541,22 @@ def _run_single_prepared(
                 inode_stress_tmpfs_inodes=args.event_storm_inode_stress_tmpfs_inodes,
                 immediate_query_enabled=args.event_storm_immediate_query,
                 immediate_query_settle_secs=args.immediate_query_settle_secs,
+                max_bursts=args.event_storm_max_bursts,
+                visibility_probes_per_burst=(
+                    args.event_storm_visibility_probes_per_burst
+                ),
+                visibility_poll_interval_secs=(
+                    args.event_storm_visibility_poll_interval_secs
+                ),
+                fixed_root_schedule=args.event_storm_fixed_root_schedule,
+                deterministic_plan_seed=(
+                    args.workload_seed
+                    if args.event_storm_deterministic_plan
+                    else None
+                ),
+                rotating_tick_secs=args.rotating_tick_secs,
+                rotating_ttl_secs=args.rotating_ttl_secs,
+                rotating_dirs_per_tick=args.rotating_max_dirs_per_tick,
             )
             if args.event_storm
             else None
@@ -5005,7 +5756,7 @@ def _run_single_prepared(
     terminal_failed = bool(
         fatal_error
         or cleanup_errors
-        or exit_code not in (0, -signal.SIGTERM)
+        or exit_code != 0
         or completion_reason == "runtime_error"
         or not execution_state["duration_completed"]
     )
@@ -5205,7 +5956,13 @@ def main() -> int:
     summary = run_single(args)
     exit_code = summary.get("fd_rdd_exit_code")
     fatal = summary.get("fatal_error", "")
-    return 0 if not fatal and exit_code in (0, -signal.SIGTERM) else 1
+    return (
+        0
+        if not fatal
+        and exit_code == 0
+        and summary.get("ab_comparable") is True
+        else 1
+    )
 
 
 if __name__ == "__main__":
