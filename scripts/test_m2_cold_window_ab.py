@@ -408,6 +408,11 @@ class FailureDiagnosticTests(unittest.TestCase):
                             "passive_shutdown_reconcile_ok": 0,
                             "passive_shutdown_reconcile_failures": 1,
                             "passive_shutdown_reconcile_failed": True,
+                            "shutdown_snapshot_quiesce_required": True,
+                            "shutdown_snapshot_quiesce_count": 1,
+                            "shutdown_snapshot_quiesce_ok": 0,
+                            "shutdown_snapshot_quiesce_failures": 1,
+                            "shutdown_snapshot_quiesce_failed": True,
                             "event_storm_cleanup_failures": 2,
                             "final_snapshot_failed": True,
                         },
@@ -425,6 +430,13 @@ class FailureDiagnosticTests(unittest.TestCase):
                             "count": 1,
                             "ok": 0,
                             "failures": 1,
+                        },
+                        "shutdown_snapshot_quiesce": {
+                            "count": 1,
+                            "ok": 0,
+                            "failures": 1,
+                            "ready": False,
+                            "last_daemon_error": "direct_v7_unsupported",
                         },
                     }
                 ),
@@ -455,6 +467,9 @@ class FailureDiagnosticTests(unittest.TestCase):
             self.assertIn("final_snapshot_failed", rendered)
             self.assertIn("passive_shutdown_reconcile_failures=1", rendered)
             self.assertIn("passive_shutdown_reconcile_failed=True", rendered)
+            self.assertIn("shutdown_snapshot_quiesce_failures=1", rendered)
+            self.assertIn("shutdown_snapshot_quiesce_failed=True", rendered)
+            self.assertIn("direct_v7_unsupported", rendered)
             self.assertIn("event_storm_cleanup_failures=2", rendered)
             self.assertIn("event loop failed", rendered)
             self.assertIn("snapshot_upsert_unresolved", rendered)

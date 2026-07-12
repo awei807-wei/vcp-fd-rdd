@@ -8,6 +8,7 @@ use crate::query::{execute_query_with_metadata_result, QueryMode, SortColumn, So
 use crate::security::{effective_http_policy, http_policy_label, HttpPolicy, RunningIdentity};
 use crate::stats::{EventPipelineStats, MemoryReport, StatsReport, WatchStateReport};
 use crate::storage::recovery_audit::RecoveryAuditReport;
+use crate::storage::snapshot::SnapshotStore;
 use crate::util::maybe_trim_rss;
 use axum::{
     extract::{Query, State},
@@ -173,6 +174,15 @@ pub struct ScanResponse {
     pub stable: bool,
     pub elapsed_ms: u64,
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SnapshotResponse {
+    pub ready: bool,
+    pub written: bool,
+    pub is_rebuilding: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub indexed_count: usize,
@@ -325,6 +335,7 @@ impl Default for QueryServerConfig {
 #[derive(Clone)]
 struct QueryServerState {
     index: Arc<TieredIndex>,
+    snapshot_store: Option<Arc<SnapshotStore>>,
     config: QueryServerConfig,
     start_time: Instant,
     health_provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync>,
@@ -338,6 +349,7 @@ struct QueryServerState {
 
 pub struct QueryServer {
     pub index: Arc<TieredIndex>,
+    snapshot_store: Option<Arc<SnapshotStore>>,
     config: QueryServerConfig,
     health_provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync>,
     stats_provider: Arc<dyn Fn() -> EventPipelineStats + Send + Sync>,
@@ -352,6 +364,7 @@ impl QueryServer {
     pub fn new(index: Arc<TieredIndex>) -> Self {
         Self {
             index,
+            snapshot_store: None,
             config: QueryServerConfig::default(),
             health_provider: Arc::new(HealthTelemetry::default),
             stats_provider: Arc::new(EventPipelineStats::default),
@@ -368,6 +381,12 @@ impl QueryServer {
         provider: Arc<dyn Fn() -> HealthTelemetry + Send + Sync>,
     ) -> Self {
         self.health_provider = provider;
+        self
+    }
+
+    /// Configure the durable store used by the explicit snapshot barrier.
+    pub fn with_snapshot_store(mut self, store: Arc<SnapshotStore>) -> Self {
+        self.snapshot_store = Some(store);
         self
     }
 
@@ -411,6 +430,7 @@ impl QueryServer {
     fn into_state(self) -> QueryServerState {
         QueryServerState {
             index: self.index,
+            snapshot_store: self.snapshot_store,
             config: self.config,
             start_time: Instant::now(),
             health_provider: self.health_provider,
@@ -428,8 +448,17 @@ impl QueryServer {
             tracing::warn!("HTTP query server disabled by security policy");
             return Ok(());
         }
+        let app = self.into_router();
+
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+        tracing::info!("HTTP Query Server listening on port {}", port);
+        axum::serve(listener, app).await?;
+        Ok(())
+    }
+
+    fn into_router(self) -> Router {
         let state = self.into_state();
-        let app = Router::new()
+        Router::new()
             .route("/search", get(search_handler))
             .route("/status", get(status_handler))
             .route("/health", get(health_handler))
@@ -438,13 +467,9 @@ impl QueryServer {
             .route("/trim", get(trim_handler).post(trim_handler))
             .route("/metrics", get(metrics_handler))
             .route("/scan", post(scan_handler))
+            .route("/snapshot", post(snapshot_handler))
             .route("/debug/tiered-watch", get(debug_tiered_watch_handler))
-            .with_state(state);
-
-        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-        tracing::info!("HTTP Query Server listening on port {}", port);
-        axum::serve(listener, app).await?;
-        Ok(())
+            .with_state(state)
     }
 }
 
@@ -954,6 +979,33 @@ async fn scan_handler(
     }))
 }
 
+async fn snapshot_handler(State(state): State<QueryServerState>) -> Json<SnapshotResponse> {
+    let index = state.index.clone();
+    let Some(store) = state.snapshot_store.clone() else {
+        return Json(SnapshotResponse {
+            ready: false,
+            written: false,
+            is_rebuilding: index.rebuild_in_progress(),
+            error: Some("snapshot store is not configured".to_string()),
+        });
+    };
+
+    match index.snapshot_now(store).await {
+        Ok(()) => Json(SnapshotResponse {
+            ready: true,
+            written: true,
+            is_rebuilding: index.rebuild_in_progress(),
+            error: None,
+        }),
+        Err(error) => Json(SnapshotResponse {
+            ready: false,
+            written: false,
+            is_rebuilding: index.rebuild_in_progress(),
+            error: Some(format!("{error:#}")),
+        }),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct DebugTieredWatchParams {
     pub root: Option<String>,
@@ -972,6 +1024,99 @@ mod tests {
     use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta};
     use crate::index::tiered::QueryResultMeta;
     use std::time::SystemTime;
+
+    struct SnapshotRenameFixture {
+        root: PathBuf,
+        content_root: PathBuf,
+        moved_child: PathBuf,
+        store: Arc<SnapshotStore>,
+        index: Arc<TieredIndex>,
+    }
+
+    fn test_event(seq: u64, event_type: EventType, path: PathBuf) -> EventRecord {
+        EventRecord {
+            seq,
+            timestamp: SystemTime::now(),
+            event_type,
+            id: FileIdentifier::Path(path.clone()),
+            path_hint: Some(path),
+        }
+    }
+
+    async fn prepare_snapshot_rename_fixture() -> anyhow::Result<SnapshotRenameFixture> {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fd-rdd-snapshot-http-{nanos}"));
+        let content_root = root.join("content");
+        let state_root = root.join("state");
+        let old_dir = content_root.join("old-tree");
+        let old_child = old_dir.join("child.txt");
+        std::fs::create_dir_all(&old_dir)?;
+        std::fs::create_dir_all(&state_root)?;
+        std::fs::write(&old_child, b"child")?;
+
+        let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+        let index = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+        index.attach_wal(store.as_ref())?;
+        index.apply_events(&[
+            test_event(1, EventType::Create, old_dir.clone()),
+            test_event(2, EventType::Create, old_child),
+        ]);
+        index.snapshot_now(store.clone()).await?;
+
+        let moved_dir = content_root.join("moved-tree");
+        let moved_child = moved_dir.join("child.txt");
+        std::fs::rename(&old_dir, &moved_dir)?;
+        index.apply_events(&[test_event(
+            3,
+            EventType::Rename {
+                from: FileIdentifier::Path(old_dir.clone()),
+                from_path_hint: Some(old_dir),
+            },
+            moved_dir,
+        )]);
+
+        Ok(SnapshotRenameFixture {
+            root,
+            content_root,
+            moved_child,
+            store,
+            index,
+        })
+    }
+
+    async fn post_snapshot(
+        client: &reqwest::Client,
+        endpoint: &str,
+    ) -> anyhow::Result<SnapshotResponse> {
+        let response = client.post(endpoint).send().await?;
+        anyhow::ensure!(
+            response.status().as_u16() == StatusCode::OK.as_u16(),
+            "snapshot endpoint returned {}",
+            response.status()
+        );
+        Ok(response.json::<SnapshotResponse>().await?)
+    }
+
+    async fn wait_for_snapshot_ready(
+        client: &reqwest::Client,
+        endpoint: &str,
+    ) -> anyhow::Result<SnapshotResponse> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = post_snapshot(client, endpoint).await?;
+            if response.ready {
+                return Ok(response);
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "snapshot barrier did not become ready after rebuild: {:?}",
+                response.error
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
 
     #[test]
     fn normalize_search_limit_clamps_to_server_bounds() {
@@ -1039,6 +1184,38 @@ mod tests {
         assert_eq!(value["elapsed_ms"], 11);
     }
 
+    #[test]
+    fn snapshot_response_serializes_explicit_null_error() {
+        let value = serde_json::to_value(SnapshotResponse {
+            ready: true,
+            written: true,
+            is_rebuilding: false,
+            error: None,
+        })
+        .unwrap();
+
+        assert_eq!(value["ready"], true);
+        assert_eq!(value["written"], true);
+        assert_eq!(value["is_rebuilding"], false);
+        assert!(value["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn snapshot_handler_without_store_returns_retryable_json() {
+        let index = Arc::new(TieredIndex::empty(Vec::new()));
+        let state = QueryServer::new(index).into_state();
+        let Json(response) = snapshot_handler(State(state)).await;
+
+        assert!(!response.ready);
+        assert!(!response.written);
+        assert!(!response.is_rebuilding);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("snapshot store is not configured")
+        );
+        assert_eq!(Json(response).into_response().status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn scan_handler_returns_stable_negative_reconciliation_status() {
         let nanos = SystemTime::now()
@@ -1079,6 +1256,52 @@ mod tests {
         assert_eq!(value["deleted"], 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_http_barrier_recovers_directory_rename_before_shutdown() -> anyhow::Result<()>
+    {
+        let fixture = prepare_snapshot_rename_fixture().await?;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let app = QueryServer::new(fixture.index.clone())
+            .with_snapshot_store(fixture.store.clone())
+            .with_http_policy(HttpPolicy::LocalhostDebug)
+            .into_router();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let endpoint = format!("http://{address}/snapshot");
+        let client = reqwest::Client::new();
+
+        let first = post_snapshot(&client, &endpoint).await?;
+        assert!(!first.ready);
+        assert!(!first.written);
+        assert!(first
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("subtree move completeness is unproven")));
+
+        let ready = wait_for_snapshot_ready(&client, &endpoint).await?;
+        assert!(ready.written);
+        assert!(!ready.is_rebuilding);
+        assert!(ready.error.is_none());
+
+        server.abort();
+        let _ = server.await;
+        let reloaded =
+            TieredIndex::load_or_empty(fixture.store.as_ref(), vec![fixture.content_root.clone()])
+                .await?;
+        assert!(reloaded
+            .query("child.txt")
+            .iter()
+            .any(|meta| meta.path == fixture.moved_child));
+        drop(reloaded);
+
+        fixture.index.begin_shutdown();
+        fixture.index.snapshot_now(fixture.store.clone()).await?;
+
+        let _ = std::fs::remove_dir_all(&fixture.root);
+        Ok(())
     }
 
     #[test]

@@ -45,6 +45,8 @@ python3 scripts/m2-cold-window-ab.py b  # 关闭 M2
 
 第三轮 A 的 event-storm 写入和 cleanup 均成功，但关机时仍在 passive canary 的 `create -> rename -> delete` 生命周期中；`*_create.txt` 已离开文件系统，L2/WAL 的 Live 事实却尚未经过下一次可信目录对账，SIGTERM 后的最终快照因此继续 fail-closed。runner 现在在停止新 workload 后、发送 SIGTERM 前，对 passive/active canary root、event-storm roots、仍 active 的 burst root 和 mixed hot roots 同步调用 `/scan`；手动 `/scan` 会复用与冷层扫描相同的完整 `read_dir`、目录 fingerprint、`event_seq` 和 freeze-gate 校验来补齐负事实，并返回 `stable/deleted`。不稳定结果会在静默窗口内有界重试，不能把 HTTP 200 误算为收敛。该收尾动作发生在 passive first-query 指标采集之后，不改变 M2 的收益测量；结果会记录为 `passive_shutdown_reconcile`，缺失、失败或持续不稳定直接使样本不可比较。
 
+第四轮 A 已证明上述负事实收敛有效：`passive_shutdown_reconcile` 删除 7 条且 `stable=true`，但最终快照转而命中 `direct_v7_unsupported: subtree move completeness is unproven`。这是 `subtree_rename` / mount storm 的安全降级要求，不是幽灵路径。runner 因此在 `/scan` 后、SIGTERM 前追加 POST `/snapshot` 持久化屏障：第一次直接快照若要求 rebuild，daemon 在运行态启动完整扫描，runner 有界重试直到 rebuild generation 真正写入并返回 `ready=true`。该阶段单独记录为 `shutdown_snapshot_quiesce`，包含 rebuild 是否发生、尝试次数、耗时以及窗口内 CPU/RSS；缺失、失败或超时继续拒绝 A/B，不能通过清除结构完整性标志绕过。定向验证先把旧目录写入冷基座再整体 rename，首次 `/snapshot` 确认返回同一 `direct_v7_unsupported`，full rebuild 发布后连续两次 `ready=true`；正式 runner smoke 最终 `fd_rdd_exit_code=0` 且无 `Final snapshot failed`。
+
 ### 总不变量
 
 | 类别 | 不变量 |

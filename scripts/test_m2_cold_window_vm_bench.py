@@ -534,6 +534,7 @@ class PassiveCanaryShutdownTests(unittest.TestCase):
         run_dir: Path,
         *,
         passive_canary_enabled: bool,
+        shutdown_snapshot_quiesce_required: bool = False,
     ) -> dict[str, object]:
         write_jsonl(run_dir / "process-samples.jsonl", [{"vmrss_bytes": 1}])
         write_jsonl(
@@ -551,6 +552,9 @@ class PassiveCanaryShutdownTests(unittest.TestCase):
             cleanup_errors=[],
             shutdown_signal_elapsed_secs=10.0,
             passive_canary_enabled=passive_canary_enabled,
+            shutdown_snapshot_quiesce_required=(
+                shutdown_snapshot_quiesce_required
+            ),
         )
 
     def test_shutdown_reconcile_posts_owned_paths_and_retries_until_stable(self) -> None:
@@ -751,6 +755,175 @@ class PassiveCanaryShutdownTests(unittest.TestCase):
             self.assertEqual(normal["passive_shutdown_reconcile_failures"], 0)
             self.assertFalse(normal["passive_shutdown_reconcile_missing"])
             self.assertFalse(normal["passive_shutdown_reconcile_failed"])
+
+    def test_snapshot_quiesce_retries_rebuild_until_durable_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            responses = [
+                self.scan_response(
+                    {
+                        "ready": False,
+                        "written": False,
+                        "is_rebuilding": True,
+                        "error": (
+                            "direct_v7_unsupported: subtree move completeness "
+                            "is unproven; rebuild required"
+                        ),
+                    }
+                ),
+                self.scan_response(
+                    {
+                        "ready": True,
+                        "written": True,
+                        "is_rebuilding": False,
+                        "error": None,
+                    }
+                ),
+                self.scan_response(
+                    {
+                        "ready": True,
+                        "written": False,
+                        "is_rebuilding": False,
+                        "error": None,
+                    }
+                ),
+            ]
+            with mock.patch.object(
+                BENCH.urllib.request,
+                "urlopen",
+                side_effect=responses,
+            ) as urlopen, mock.patch.object(BENCH.time, "sleep") as sleep:
+                record = BENCH.record_shutdown_snapshot_quiesce(
+                    "http://127.0.0.1:6060",
+                    run_dir / "shutdown-samples.jsonl",
+                    started_at=time.monotonic() - 10.0,
+                    timeout_secs=30.0,
+                )
+
+            self.assertTrue(record["ok"])
+            self.assertTrue(record["ready"])
+            self.assertTrue(record["written"])
+            self.assertTrue(record["rebuild_observed"])
+            self.assertEqual(record["attempts"], 3)
+            self.assertEqual(record["not_ready_responses"], 1)
+            self.assertEqual(record["ready_confirmations"], 2)
+            self.assertIn("subtree move completeness", record["last_daemon_error"])
+            self.assertGreaterEqual(record["elapsed_secs"], 10.0)
+            self.assertGreaterEqual(
+                record["elapsed_secs"], record["started_elapsed_secs"]
+            )
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(urlopen.call_count, 3)
+            for call in urlopen.call_args_list:
+                request = call.args[0]
+                self.assertEqual(request.get_method(), "POST")
+                self.assertEqual(
+                    request.full_url,
+                    "http://127.0.0.1:6060/snapshot",
+                )
+                self.assertEqual(json.loads(request.data.decode("utf-8")), {})
+
+            self.assertEqual(
+                BENCH.read_jsonl(run_dir / "shutdown-samples.jsonl"),
+                [record],
+            )
+            execution = self.build_execution(
+                run_dir,
+                passive_canary_enabled=False,
+                shutdown_snapshot_quiesce_required=True,
+            )
+            comparable, reasons = BENCH.evaluate_ab_comparability(
+                self.clean_initial_state(), execution
+            )
+            self.assertTrue(comparable)
+            self.assertEqual(reasons, [])
+            self.assertEqual(execution["shutdown_snapshot_quiesce_count"], 1)
+            self.assertEqual(execution["shutdown_snapshot_quiesce_ok"], 1)
+
+    def test_snapshot_quiesce_failure_and_missing_record_gate_ab(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            with mock.patch.object(
+                BENCH,
+                "post_json",
+                side_effect=OSError("snapshot endpoint unavailable"),
+            ):
+                record = BENCH.record_shutdown_snapshot_quiesce(
+                    "http://127.0.0.1:6060",
+                    run_dir / "shutdown-samples.jsonl",
+                    started_at=time.monotonic(),
+                    timeout_secs=1.0,
+                )
+            self.assertFalse(record["ok"])
+            self.assertFalse(record["ready"])
+            self.assertIn("snapshot endpoint unavailable", record["error"])
+
+            failed = self.build_execution(
+                run_dir,
+                passive_canary_enabled=False,
+                shutdown_snapshot_quiesce_required=True,
+            )
+            comparable, reasons = BENCH.evaluate_ab_comparability(
+                self.clean_initial_state(), failed
+            )
+            self.assertFalse(comparable)
+            self.assertEqual(reasons, ["shutdown_snapshot_quiesce_failed"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            missing = self.build_execution(
+                run_dir,
+                passive_canary_enabled=False,
+                shutdown_snapshot_quiesce_required=True,
+            )
+            comparable, reasons = BENCH.evaluate_ab_comparability(
+                self.clean_initial_state(), missing
+            )
+            self.assertFalse(comparable)
+            self.assertEqual(reasons, ["shutdown_snapshot_quiesce_missing"])
+
+    def test_snapshot_quiesce_summary_captures_rebuild_cost_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            write_jsonl(
+                run_dir / "shutdown-samples.jsonl",
+                [
+                    {
+                        "operation": "shutdown_snapshot_quiesce",
+                        "ok": True,
+                        "ready": True,
+                        "written": True,
+                        "rebuild_observed": True,
+                        "attempts": 3,
+                        "not_ready_responses": 2,
+                        "started_elapsed_secs": 100.0,
+                        "elapsed_secs": 104.0,
+                        "latency_secs": 4.0,
+                    }
+                ],
+            )
+            write_jsonl(
+                run_dir / "process-samples.jsonl",
+                [
+                    {"elapsed_secs": 99.0, "cpu_pct": 1.0, "vmrss_bytes": 10},
+                    {"elapsed_secs": 101.0, "cpu_pct": 25.0, "vmrss_bytes": 30},
+                    {"elapsed_secs": 103.0, "cpu_pct": 50.0, "vmrss_bytes": 40},
+                    {"elapsed_secs": 105.0, "cpu_pct": 2.0, "vmrss_bytes": 20},
+                ],
+            )
+
+            summary = BENCH.summarize(run_dir, "snapshot-quiesce", 0)
+            quiesce = summary["shutdown_snapshot_quiesce"]
+            self.assertEqual(quiesce["count"], 1)
+            self.assertEqual(quiesce["ok"], 1)
+            self.assertTrue(quiesce["ready"])
+            self.assertTrue(quiesce["written"])
+            self.assertTrue(quiesce["rebuild_observed"])
+            self.assertEqual(quiesce["attempts_max"], 3)
+            self.assertEqual(quiesce["latency_max_secs"], 4.0)
+            self.assertEqual(quiesce["process_sample_count"], 2)
+            self.assertEqual(quiesce["cpu_pct_max"], 50.0)
+            self.assertEqual(quiesce["rss_bytes_max"], 40)
 
 
 class ManifestAuditTests(unittest.TestCase):

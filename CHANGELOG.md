@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- M2 benchmark 新增最终持久化静默屏障：可信 `/scan` 对账后同步 POST `/snapshot`，若目录 rename/mount storm 触发 `subtree move completeness is unproven`，daemon 在 shutdown 前执行完整 rebuild，runner 重试到 durable generation `ready=true` 后才发送 SIGTERM；`shutdown_snapshot_quiesce` 单独记录 rebuild、尝试次数、耗时和 CPU/RSS，失败或缺失继续拒绝 A/B。
 - M2 benchmark 在时长结束后、SIGTERM 前新增可审计的关机静默对账：runner 同步 POST `/scan` 到 passive/active canary、event-storm parent/active burst 与 mixed hot roots，手动扫描复用完整目录读取、fingerprint、`event_seq` 与 freeze gate 的可信负事实逻辑并返回 `stable/deleted`；持续不稳定、记录缺失或失败都会拒绝 A/B，避免未完成 create→rename→delete 或 active burst 的 Live 路径击穿最终快照，同时保留 snapshot fail-closed。
 - M2 冷层完整扫描新增可信负事实对账：仅在目录完整可读、目录 identity/mtime/ctime/nlink 未变化、`event_seq` 未前进且未命中离线 freeze gate 时，将 Base/L2 直接子项和 Delta 深层路径的缺失项折叠为直接子树 Delete；`read_dir` 失败不再把挂载断联误判为整目录删除。
 - M2 event storm cleanup 改为只删除当前 burst root，记录目标、条目估算、耗时和错误；cleanup 失败纳入 execution fingerprint、A/B comparability 门禁、失败诊断与 `REPORT.md`，不再允许清理异常污染正式对照。

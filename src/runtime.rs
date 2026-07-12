@@ -931,6 +931,7 @@ fn serve_queries(
 ) {
     // 6) 启动 HTTP 查询服务
     let query_server = QueryServer::new(index.clone())
+        .with_snapshot_store(store.clone())
         .with_health_provider(health_provider.clone())
         .with_stats_provider(stats_provider.clone())
         .with_watch_state_provider(watch_state_provider.clone())

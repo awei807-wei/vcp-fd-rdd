@@ -35,10 +35,12 @@ ENDPOINTS = ["/health", "/status", "/metrics", "/memory", "/watch-state"]
 
 AB_PARAMETER_FINGERPRINT_SCHEMA = 2
 INITIAL_STATE_FINGERPRINT_SCHEMA = 1
-EXECUTION_FINGERPRINT_SCHEMA = 2
+EXECUTION_FINGERPRINT_SCHEMA = 3
 PASSIVE_SHUTDOWN_RECONCILE_TIMEOUT_SECS = 30.0
 PASSIVE_SHUTDOWN_RECONCILE_MAX_ATTEMPTS = 3
 PASSIVE_SHUTDOWN_RECONCILE_RETRY_INTERVAL_SECS = 0.1
+SHUTDOWN_SNAPSHOT_QUIESCE_RETRY_INTERVAL_SECS = 0.25
+SHUTDOWN_SNAPSHOT_READY_CONFIRMATIONS = 2
 AB_PARAMETER_FINGERPRINT_IGNORED_ARGS = frozenset(
     {
         # A/B legs intentionally differ in checkout/artifact identity and output
@@ -494,6 +496,7 @@ def build_execution_state(
     event_storm_enabled: bool = False,
     mixed_workload_enabled: bool = False,
     passive_canary_enabled: bool = False,
+    shutdown_snapshot_quiesce_required: bool = False,
 ) -> dict[str, Any]:
     """Summarize realized workload and harness health after one benchmark leg."""
     event_rows = read_jsonl(run_dir / "event-storm-samples.jsonl")
@@ -501,6 +504,7 @@ def build_execution_state(
     endpoint_rows = read_jsonl(run_dir / "endpoint-samples.jsonl")
     process_rows = read_jsonl(run_dir / "process-samples.jsonl")
     canary_rows = read_jsonl(run_dir / "canary-samples.jsonl")
+    shutdown_rows = read_jsonl(run_dir / "shutdown-samples.jsonl")
     passive_shutdown_reconcile_rows = [
         row
         for row in canary_rows
@@ -514,6 +518,17 @@ def build_execution_state(
     passive_shutdown_reconcile_failures = (
         len(passive_shutdown_reconcile_rows) - passive_shutdown_reconcile_ok
     )
+    snapshot_quiesce_rows = [
+        row
+        for row in shutdown_rows
+        if row.get("operation") == "shutdown_snapshot_quiesce"
+    ]
+    snapshot_quiesce_ok = sum(
+        1
+        for row in snapshot_quiesce_rows
+        if row.get("ok") is True and row.get("ready") is True
+    )
+    snapshot_quiesce_failures = len(snapshot_quiesce_rows) - snapshot_quiesce_ok
     burst_rows = [row for row in event_rows if row.get("event_kind") == "burst_written"]
     burst_write_failures = sum(
         1 for row in event_rows if row.get("event_kind") == "burst_write_failed"
@@ -569,6 +584,20 @@ def build_execution_state(
             passive_canary_enabled
             and bool(passive_shutdown_reconcile_rows)
             and passive_shutdown_reconcile_failures > 0
+        ),
+        "shutdown_snapshot_quiesce_required": (
+            shutdown_snapshot_quiesce_required
+        ),
+        "shutdown_snapshot_quiesce_count": len(snapshot_quiesce_rows),
+        "shutdown_snapshot_quiesce_ok": snapshot_quiesce_ok,
+        "shutdown_snapshot_quiesce_failures": snapshot_quiesce_failures,
+        "shutdown_snapshot_quiesce_missing": (
+            shutdown_snapshot_quiesce_required and not snapshot_quiesce_rows
+        ),
+        "shutdown_snapshot_quiesce_failed": (
+            shutdown_snapshot_quiesce_required
+            and bool(snapshot_quiesce_rows)
+            and snapshot_quiesce_failures > 0
         ),
         "event_storm_bursts": len(burst_rows),
         "event_storm_enabled": event_storm_enabled,
@@ -688,6 +717,20 @@ def evaluate_ab_comparability(
                 reasons.append("passive_shutdown_reconcile_missing")
             elif reconcile_ok != reconcile_count or reconcile_failures > 0:
                 reasons.append("passive_shutdown_reconcile_failed")
+        if execution_state.get("shutdown_snapshot_quiesce_required"):
+            quiesce_count = int(
+                execution_state.get("shutdown_snapshot_quiesce_count", 0) or 0
+            )
+            quiesce_ok = int(
+                execution_state.get("shutdown_snapshot_quiesce_ok", 0) or 0
+            )
+            quiesce_failures = int(
+                execution_state.get("shutdown_snapshot_quiesce_failures", 0) or 0
+            )
+            if quiesce_count <= 0:
+                reasons.append("shutdown_snapshot_quiesce_missing")
+            elif quiesce_ok != quiesce_count or quiesce_failures > 0:
+                reasons.append("shutdown_snapshot_quiesce_failed")
         if int(execution_state.get("event_storm_write_failures", 0) or 0) > 0:
             reasons.append("event_storm_write_failed")
         if int(execution_state.get("event_storm_cleanup_failures", 0) or 0) > 0:
@@ -861,6 +904,121 @@ def stable_scan_audit(
     audit["http_latency_secs"] = round(http_latency_secs, 3)
     audit["latency_secs"] = round(time.monotonic() - started_at, 3)
     return audit
+
+
+def snapshot_response_metrics(response: Any) -> tuple[bool, bool, bool, str | None]:
+    """Validate the durable-quiescence fields returned by POST /snapshot."""
+    if not isinstance(response, dict):
+        raise ValueError(f"POST /snapshot returned non-object JSON: {response!r}")
+    ready = response.get("ready")
+    written = response.get("written")
+    is_rebuilding = response.get("is_rebuilding")
+    error = response.get("error")
+    for field, value in (
+        ("ready", ready),
+        ("written", written),
+        ("is_rebuilding", is_rebuilding),
+    ):
+        if not isinstance(value, bool):
+            raise ValueError(f"POST /snapshot returned invalid {field}: {value!r}")
+    if error is not None and not isinstance(error, str):
+        raise ValueError(f"POST /snapshot returned invalid error: {error!r}")
+    return ready, written, is_rebuilding, error
+
+
+def stable_snapshot_audit(
+    base_url: str,
+    timeout_secs: float,
+) -> dict[str, Any]:
+    """Retry POST /snapshot until direct persistence or rebuild fully converges."""
+    started_at = time.monotonic()
+    deadline = started_at + max(0.001, timeout_secs)
+    http_latency_secs = 0.0
+    audit: dict[str, Any] = {
+        "ok": False,
+        "ready": False,
+        "written": False,
+        "attempts": 0,
+        "not_ready_responses": 0,
+        "ready_confirmations": 0,
+        "is_rebuilding_last": False,
+        "rebuild_observed": False,
+        "last_daemon_error": "",
+    }
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("POST /snapshot quiescence deadline expired")
+            audit["attempts"] = int(audit["attempts"]) + 1
+            request_started_at = time.monotonic()
+            try:
+                response = post_json(
+                    base_url,
+                    "/snapshot",
+                    {},
+                    timeout=remaining,
+                )
+            finally:
+                http_latency_secs += time.monotonic() - request_started_at
+            ready, written, is_rebuilding, daemon_error = snapshot_response_metrics(
+                response
+            )
+            audit["ready"] = ready
+            audit["written"] = bool(audit["written"]) or written
+            audit["is_rebuilding_last"] = is_rebuilding
+            audit["rebuild_observed"] = (
+                bool(audit["rebuild_observed"])
+                or is_rebuilding
+                or bool(daemon_error and "rebuild" in daemon_error.lower())
+            )
+            if daemon_error:
+                audit["last_daemon_error"] = daemon_error
+            if ready:
+                audit["ready_confirmations"] = int(audit["ready_confirmations"]) + 1
+                if (
+                    int(audit["ready_confirmations"])
+                    >= SHUTDOWN_SNAPSHOT_READY_CONFIRMATIONS
+                ):
+                    audit["ok"] = True
+                    break
+            else:
+                audit["ready_confirmations"] = 0
+                audit["not_ready_responses"] = (
+                    int(audit["not_ready_responses"]) + 1
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("POST /snapshot remained unready until deadline")
+            time.sleep(
+                min(SHUTDOWN_SNAPSHOT_QUIESCE_RETRY_INTERVAL_SECS, remaining)
+            )
+    except Exception as exc:  # noqa: BLE001 - preserve exact durability evidence
+        audit["error"] = repr(exc)
+    audit["http_latency_secs"] = round(http_latency_secs, 3)
+    audit["latency_secs"] = round(time.monotonic() - started_at, 3)
+    return audit
+
+
+def record_shutdown_snapshot_quiesce(
+    base_url: str,
+    out_path: Path,
+    *,
+    started_at: float,
+    timeout_secs: float,
+) -> dict[str, Any]:
+    """Persist and audit the final non-shutdown snapshot/rebuild barrier."""
+    record_started_at = time.monotonic()
+    record: dict[str, Any] = {
+        "operation": "shutdown_snapshot_quiesce",
+        "timeout_secs": timeout_secs,
+        "started_elapsed_secs": round(record_started_at - started_at, 3),
+    }
+    record.update(stable_snapshot_audit(base_url, timeout_secs))
+    record["ts"] = utc_now()
+    record["elapsed_secs"] = round(time.monotonic() - started_at, 3)
+    json_line(out_path, record)
+    return record
 
 
 def wait_for_http(base_url: str, timeout_secs: float) -> None:
@@ -3024,6 +3182,7 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
     process_samples = read_jsonl(run_dir / "process-samples.jsonl")
     endpoint_samples = read_jsonl(run_dir / "endpoint-samples.jsonl")
     canary_samples = read_jsonl(run_dir / "canary-samples.jsonl")
+    shutdown_samples = read_jsonl(run_dir / "shutdown-samples.jsonl")
     event_storm_samples = read_jsonl(run_dir / "event-storm-samples.jsonl")
     hot_churn_samples = read_jsonl(run_dir / "hot-churn-samples.jsonl")
 
@@ -3118,6 +3277,45 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
     passive_shutdown_reconcile_failures = (
         len(passive_shutdown_reconcile_rows) - passive_shutdown_reconcile_ok
     )
+    snapshot_quiesce_rows = [
+        item
+        for item in shutdown_samples
+        if item.get("operation") == "shutdown_snapshot_quiesce"
+    ]
+    snapshot_quiesce_ok = sum(
+        1
+        for item in snapshot_quiesce_rows
+        if item.get("ok") is True and item.get("ready") is True
+    )
+    snapshot_quiesce_failures = len(snapshot_quiesce_rows) - snapshot_quiesce_ok
+    quiesce_start = min(
+        (
+            float(item.get("started_elapsed_secs", 0.0) or 0.0)
+            for item in snapshot_quiesce_rows
+        ),
+        default=0.0,
+    )
+    quiesce_end = max(
+        (
+            float(item.get("elapsed_secs", 0.0) or 0.0)
+            for item in snapshot_quiesce_rows
+        ),
+        default=0.0,
+    )
+    quiesce_process_samples = [
+        item
+        for item in process_samples
+        if snapshot_quiesce_rows
+        and quiesce_start <= float(item.get("elapsed_secs", -1.0) or -1.0) <= quiesce_end
+    ]
+    quiesce_cpu = [
+        float(item.get("cpu_pct", 0.0) or 0.0)
+        for item in quiesce_process_samples
+    ]
+    quiesce_rss = [
+        int(item.get("vmrss_bytes", 0) or 0)
+        for item in quiesce_process_samples
+    ]
     passive_first_query_ops = [
         "passive_create_first_query",
         "passive_rename_new_first_query",
@@ -3507,6 +3705,7 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "passive_shutdown_reconcile": len(
                 passive_shutdown_reconcile_rows
             ),
+            "shutdown_snapshot_quiesce": len(snapshot_quiesce_rows),
             "event_storm": len(event_storm_samples),
             "event_storm_first_query": len(event_first_queries),
         },
@@ -3654,6 +3853,68 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
                 3,
             ),
         },
+        "shutdown_snapshot_quiesce": {
+            "count": len(snapshot_quiesce_rows),
+            "ok": snapshot_quiesce_ok,
+            "failures": snapshot_quiesce_failures,
+            "ready": bool(snapshot_quiesce_rows)
+            and snapshot_quiesce_failures == 0,
+            "written": any(
+                item.get("written") is True for item in snapshot_quiesce_rows
+            ),
+            "rebuild_observed": any(
+                item.get("rebuild_observed") is True
+                for item in snapshot_quiesce_rows
+            ),
+            "attempts_max": max(
+                (
+                    int(item.get("attempts", 0) or 0)
+                    for item in snapshot_quiesce_rows
+                ),
+                default=0,
+            ),
+            "ready_confirmations_max": max(
+                (
+                    int(item.get("ready_confirmations", 0) or 0)
+                    for item in snapshot_quiesce_rows
+                ),
+                default=0,
+            ),
+            "not_ready_responses_total": sum(
+                int(item.get("not_ready_responses", 0) or 0)
+                for item in snapshot_quiesce_rows
+            ),
+            "last_daemon_error": next(
+                (
+                    str(item.get("last_daemon_error", ""))
+                    for item in reversed(snapshot_quiesce_rows)
+                    if item.get("last_daemon_error")
+                ),
+                "",
+            ),
+            "error": next(
+                (
+                    str(item.get("error", ""))
+                    for item in reversed(snapshot_quiesce_rows)
+                    if item.get("error")
+                ),
+                "",
+            ),
+            "latency_max_secs": round(
+                max(
+                    (
+                        float(item.get("latency_secs", 0.0) or 0.0)
+                        for item in snapshot_quiesce_rows
+                    ),
+                    default=0.0,
+                ),
+                3,
+            ),
+            "process_sample_count": len(quiesce_process_samples),
+            "cpu_pct_p95": round(percentile(quiesce_cpu, 95), 3),
+            "cpu_pct_max": round(max(quiesce_cpu) if quiesce_cpu else 0.0, 3),
+            "rss_bytes_max": max(quiesce_rss) if quiesce_rss else 0,
+        },
         "passive_first_query": {
             "total": passive_first_query_total,
             "ok": passive_first_query_ok,
@@ -3784,6 +4045,13 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | shutdown reconcile changed total | {summary["passive_shutdown_reconcile"]["changed_total"]} |
 | shutdown reconcile deleted total | {summary["passive_shutdown_reconcile"]["deleted_total"]} |
 | shutdown reconcile max s | {summary["passive_shutdown_reconcile"]["latency_max_secs"]} |
+| snapshot quiesce ready | {summary["shutdown_snapshot_quiesce"]["ready"]} |
+| snapshot quiesce rebuild observed | {summary["shutdown_snapshot_quiesce"]["rebuild_observed"]} |
+| snapshot quiesce attempts max | {summary["shutdown_snapshot_quiesce"]["attempts_max"]} |
+| snapshot quiesce max s | {summary["shutdown_snapshot_quiesce"]["latency_max_secs"]} |
+| snapshot quiesce CPU p95 | {summary["shutdown_snapshot_quiesce"]["cpu_pct_p95"]}% |
+| snapshot quiesce CPU max | {summary["shutdown_snapshot_quiesce"]["cpu_pct_max"]}% |
+| snapshot quiesce RSS max | {summary["shutdown_snapshot_quiesce"]["rss_bytes_max"]} |
 | event storm success rate | {summary["event_storm"]["success_rate"]} |
 | event storm transport success rate | {summary["event_storm"]["transport_success_rate"]} |
 | event storm positive success rate | {summary["event_storm"]["positive_success_rate"]} |
@@ -4165,7 +4433,8 @@ def parse_args() -> argparse.Namespace:
         "--shutdown-timeout-secs",
         type=float,
         default=300.0,
-        help="maximum seconds to wait for the final snapshot after SIGTERM",
+        help="maximum seconds for the pre-SIGTERM snapshot/rebuild barrier, "
+        "and separately for the final snapshot after SIGTERM",
     )
     return parser.parse_args()
 
@@ -4632,6 +4901,17 @@ def _run_single_prepared(
                     cleanup_errors.append(
                         f"passive_shutdown_reconcile_record: {exc!r}"
                     )
+            try:
+                record_shutdown_snapshot_quiesce(
+                    base_url,
+                    run_dir / "shutdown-samples.jsonl",
+                    started_at=started_at,
+                    timeout_secs=max(1.0, float(args.shutdown_timeout_secs)),
+                )
+            except BaseException as exc:  # keep SIGTERM reachable on every failure
+                cleanup_errors.append(
+                    f"shutdown_snapshot_quiesce_record: {exc!r}"
+                )
             signal_elapsed = round(time.monotonic() - started_at, 6)
             try:
                 proc.send_signal(signal.SIGTERM)
@@ -4719,6 +4999,7 @@ def _run_single_prepared(
         event_storm_enabled=args.event_storm,
         mixed_workload_enabled=args.mixed_workload,
         passive_canary_enabled=bool(args.passive_canary_root),
+        shutdown_snapshot_quiesce_required=True,
     )
     comparable, reasons = evaluate_ab_comparability(initial_state, execution_state)
     terminal_failed = bool(
@@ -4757,6 +5038,15 @@ def _run_single_prepared(
         ],
         passive_shutdown_reconcile_failures=execution_state[
             "passive_shutdown_reconcile_failures"
+        ],
+        shutdown_snapshot_quiesce_count=execution_state[
+            "shutdown_snapshot_quiesce_count"
+        ],
+        shutdown_snapshot_quiesce_ok=execution_state[
+            "shutdown_snapshot_quiesce_ok"
+        ],
+        shutdown_snapshot_quiesce_failures=execution_state[
+            "shutdown_snapshot_quiesce_failures"
         ],
         execution=execution_state,
         execution_fingerprint_schema=EXECUTION_FINGERPRINT_SCHEMA,
