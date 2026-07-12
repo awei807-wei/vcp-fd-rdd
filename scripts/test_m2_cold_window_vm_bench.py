@@ -449,6 +449,310 @@ class SummarySemanticsTests(unittest.TestCase):
             )
 
 
+class PassiveCanaryShutdownTests(unittest.TestCase):
+    @staticmethod
+    def make_runner(run_dir: Path) -> BENCH.PassiveCanaryRunner:
+        root = run_dir / "passive"
+        root.mkdir()
+        return BENCH.PassiveCanaryRunner(
+            base_url="http://127.0.0.1:6060",
+            root=root,
+            out_path=run_dir / "canary-samples.jsonl",
+            started_at=90.0,
+            interval_secs=180.0,
+            settle_secs=90.0,
+            timeout_secs=0.0,
+            start_delay_secs=60.0,
+        )
+
+    @staticmethod
+    def scan_response(payload: dict[str, object]) -> mock.MagicMock:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(payload).encode("utf-8")
+        return response
+
+    @classmethod
+    def unstable_then_stable_responses(cls) -> list[mock.MagicMock]:
+        return [
+            cls.scan_response(
+                {
+                    "scanned": 3,
+                    "changed": 2,
+                    "deleted": 1,
+                    "elapsed_ms": 17,
+                    "stable": False,
+                }
+            ),
+            cls.scan_response(
+                {
+                    "scanned": 4,
+                    "changed": 1,
+                    "deleted": 2,
+                    "elapsed_ms": 11,
+                    "stable": True,
+                }
+            ),
+        ]
+
+    def assert_post_paths(
+        self,
+        urlopen: mock.MagicMock,
+        expected_paths: list[str],
+    ) -> None:
+        first_request = urlopen.call_args_list[0].args[0]
+        self.assertEqual(first_request.get_method(), "POST")
+        self.assertEqual(first_request.full_url, "http://127.0.0.1:6060/scan")
+        self.assertEqual(urlopen.call_count, 2)
+        for call in urlopen.call_args_list:
+            request = call.args[0]
+            self.assertEqual(
+                json.loads(request.data.decode("utf-8")),
+                {"paths": expected_paths},
+            )
+            self.assertGreater(call.kwargs["timeout"], 0)
+            self.assertLessEqual(
+                call.kwargs["timeout"],
+                BENCH.PASSIVE_SHUTDOWN_RECONCILE_TIMEOUT_SECS,
+            )
+
+    @staticmethod
+    def clean_initial_state() -> dict[str, object]:
+        return {
+            "fixture": {"trusted": True, "count_verified": True},
+            "snapshot": {"fresh": True},
+            "binary_sha256": "a" * 64,
+            "git_sha": "b" * 40,
+            "git_dirty": False,
+            "artifact_provenance": {"verified": True},
+            "run_dir_preexisting": False,
+            "collection_errors": [],
+        }
+
+    @staticmethod
+    def build_execution(
+        run_dir: Path,
+        *,
+        passive_canary_enabled: bool,
+    ) -> dict[str, object]:
+        write_jsonl(run_dir / "process-samples.jsonl", [{"vmrss_bytes": 1}])
+        write_jsonl(
+            run_dir / "endpoint-samples.jsonl",
+            [{"endpoint": "/memory", "ok": True, "data": {}}],
+        )
+        return BENCH.build_execution_state(
+            run_dir,
+            requested_duration_secs=10,
+            actual_duration_secs=10.0,
+            exit_code=-BENCH.signal.SIGTERM,
+            fatal_error="",
+            process_sampler_error="",
+            completion_reason="duration_elapsed",
+            cleanup_errors=[],
+            shutdown_signal_elapsed_secs=10.0,
+            passive_canary_enabled=passive_canary_enabled,
+        )
+
+    def test_shutdown_reconcile_posts_owned_paths_and_retries_until_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            runner = self.make_runner(run_dir)
+            runner.active = {"cycle": 7, "stage": "check_delete"}
+            active_root = run_dir / "active-canary"
+            burst_root = run_dir / "event-root" / "active-burst"
+            event_root = burst_root.parent
+            hot_root = run_dir / "hot-root"
+            event_storm = mock.Mock()
+            event_storm.active = {"burst_root": burst_root}
+            event_storm.roots = [event_root]
+            paths = BENCH.benchmark_shutdown_reconcile_paths(
+                runner.root,
+                active_root,
+                event_storm,
+                True,
+                [hot_root, active_root],
+            )
+            with mock.patch.object(
+                BENCH.urllib.request,
+                "urlopen",
+                side_effect=self.unstable_then_stable_responses(),
+            ) as urlopen, mock.patch.object(BENCH.time, "sleep") as sleep:
+                record = runner.reconcile_shutdown(paths)
+
+            expected_paths = [
+                str(runner.root),
+                str(active_root),
+                str(burst_root),
+                str(event_root),
+                str(hot_root),
+            ]
+            self.assert_post_paths(urlopen, expected_paths)
+            sleep.assert_called_once()
+            self.assertTrue(record["ok"])
+            self.assertTrue(record["stable"])
+            self.assertEqual(record["attempts"], 2)
+            self.assertEqual(record["paths"], expected_paths)
+            self.assertEqual(record["scanned"], 7)
+            self.assertEqual(record["changed"], 3)
+            self.assertEqual(record["deleted"], 3)
+            self.assertEqual(record["daemon_elapsed_ms"], 28)
+            self.assertEqual(record["active_cycle"], 7)
+            self.assertEqual(record["active_stage"], "check_delete")
+
+            rows = BENCH.read_jsonl(run_dir / "canary-samples.jsonl")
+            self.assertEqual(rows, [record])
+            summary = BENCH.summarize(run_dir, "reconcile-success", 0)
+            self.assertEqual(
+                summary["sample_counts"]["passive_shutdown_reconcile"],
+                1,
+            )
+            self.assertEqual(
+                summary["passive_shutdown_reconcile"],
+                {
+                    "count": 1,
+                    "ok": 1,
+                    "failures": 0,
+                    "stable": True,
+                    "attempts_max": 2,
+                    "paths_max": 5,
+                    "scanned_total": 7,
+                    "changed_total": 3,
+                    "deleted_total": 3,
+                    "latency_max_secs": record["latency_secs"],
+                },
+            )
+
+    def test_persistently_unstable_reconcile_is_recorded_and_gates_comparability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            runner = self.make_runner(run_dir)
+            unstable = {
+                "scanned": 2,
+                "changed": 1,
+                "deleted": 1,
+                "elapsed_ms": 3,
+                "stable": False,
+            }
+            with mock.patch.object(
+                BENCH,
+                "post_json",
+                side_effect=[unstable.copy(), unstable.copy(), unstable.copy()],
+            ), mock.patch.object(BENCH.time, "sleep"):
+                record = runner.reconcile_shutdown()
+
+            self.assertFalse(record["ok"])
+            self.assertFalse(record["stable"])
+            self.assertEqual(record["attempts"], 3)
+            self.assertEqual(record["scanned"], 6)
+            self.assertEqual(record["changed"], 3)
+            self.assertEqual(record["deleted"], 3)
+            self.assertEqual(
+                record["error"],
+                "RuntimeError('POST /scan remained unstable after 3 attempts')",
+            )
+            self.assertIsNone(record["active_cycle"])
+            self.assertIsNone(record["active_stage"])
+
+            execution = self.build_execution(
+                run_dir,
+                passive_canary_enabled=True,
+            )
+            self.assertEqual(execution["passive_shutdown_reconcile_count"], 1)
+            self.assertEqual(execution["passive_shutdown_reconcile_ok"], 0)
+            self.assertEqual(execution["passive_shutdown_reconcile_failures"], 1)
+            self.assertTrue(execution["passive_shutdown_reconcile_failed"])
+            comparable, reasons = BENCH.evaluate_ab_comparability(
+                self.clean_initial_state(),
+                execution,
+            )
+            self.assertFalse(comparable)
+            self.assertEqual(reasons, ["passive_shutdown_reconcile_failed"])
+
+    def test_shutdown_reconcile_paths_are_deduplicated_and_capped(self) -> None:
+        base = Path("/fixture")
+        event_storm = mock.Mock()
+        event_storm.active = {"burst_root": base / "active-burst"}
+        event_storm.roots = [base / f"event-{idx}" for idx in range(8)]
+
+        paths = BENCH.benchmark_shutdown_reconcile_paths(
+            base / "passive",
+            base / "active",
+            event_storm,
+            True,
+            [base / "active", *[base / f"hot-{idx}" for idx in range(8)]],
+        )
+
+        self.assertEqual(len(paths), 10)
+        self.assertEqual(
+            paths[:3],
+            [base / "passive", base / "active", base / "active-burst"],
+        )
+        self.assertEqual(len({str(path) for path in paths}), 10)
+
+    def test_passive_mutations_emit_success_audit_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            runner = self.make_runner(run_dir)
+            created = runner.root / "probe_create.txt"
+            renamed = runner.root / "probe_rename.txt"
+            created.write_text("probe", encoding="utf-8")
+            runner.active = {
+                "cycle": 4,
+                "stage": "check_create",
+                "created": created,
+                "renamed": renamed,
+                "stage_started_at": time.monotonic(),
+                "due_at": time.monotonic(),
+            }
+
+            with mock.patch.object(runner, "record_first_query"), mock.patch.object(
+                runner,
+                "record_after_query_if_needed",
+            ):
+                runner.process_due(time.monotonic())
+                runner.process_due(time.monotonic())
+
+            rows = BENCH.read_jsonl(run_dir / "canary-samples.jsonl")
+            rename = next(
+                row for row in rows if row["operation"] == "passive_rename_applied"
+            )
+            delete = next(
+                row for row in rows if row["operation"] == "passive_delete_applied"
+            )
+            self.assertEqual(rename["old_path"], str(created))
+            self.assertEqual(rename["new_path"], str(renamed))
+            self.assertTrue(rename["ok"])
+            self.assertEqual(delete["path"], str(renamed))
+            self.assertTrue(delete["ok"])
+            self.assertFalse(created.exists())
+            self.assertFalse(renamed.exists())
+
+    def test_execution_state_requires_reconcile_only_for_passive_canary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            missing = self.build_execution(run_dir, passive_canary_enabled=True)
+            comparable, reasons = BENCH.evaluate_ab_comparability(
+                self.clean_initial_state(),
+                missing,
+            )
+            self.assertFalse(comparable)
+            self.assertEqual(reasons, ["passive_shutdown_reconcile_missing"])
+            self.assertTrue(missing["passive_shutdown_reconcile_missing"])
+
+            normal = self.build_execution(run_dir, passive_canary_enabled=False)
+            comparable, reasons = BENCH.evaluate_ab_comparability(
+                self.clean_initial_state(),
+                normal,
+            )
+            self.assertTrue(comparable)
+            self.assertEqual(reasons, [])
+            self.assertEqual(normal["passive_shutdown_reconcile_count"], 0)
+            self.assertEqual(normal["passive_shutdown_reconcile_ok"], 0)
+            self.assertEqual(normal["passive_shutdown_reconcile_failures"], 0)
+            self.assertFalse(normal["passive_shutdown_reconcile_missing"])
+            self.assertFalse(normal["passive_shutdown_reconcile_failed"])
+
+
 class ManifestAuditTests(unittest.TestCase):
     def test_fixture_identity_reads_existing_marker_without_walking_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

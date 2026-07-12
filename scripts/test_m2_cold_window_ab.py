@@ -403,6 +403,11 @@ class FailureDiagnosticTests(unittest.TestCase):
                         "execution": {
                             "completion_reason": "duration_elapsed",
                             "exit_code": 1,
+                            "passive_canary_enabled": True,
+                            "passive_shutdown_reconcile_count": 1,
+                            "passive_shutdown_reconcile_ok": 0,
+                            "passive_shutdown_reconcile_failures": 1,
+                            "passive_shutdown_reconcile_failed": True,
                             "event_storm_cleanup_failures": 2,
                             "final_snapshot_failed": True,
                         },
@@ -416,6 +421,11 @@ class FailureDiagnosticTests(unittest.TestCase):
                         "fd_rdd_exit_code": 1,
                         "fatal_error": "summary failure",
                         "ab_comparability_reasons": ["final_snapshot_failed"],
+                        "passive_shutdown_reconcile": {
+                            "count": 1,
+                            "ok": 0,
+                            "failures": 1,
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -443,6 +453,8 @@ class FailureDiagnosticTests(unittest.TestCase):
             self.assertIn("runner exploded", rendered)
             self.assertIn("daemon_shutdown_timeout", rendered)
             self.assertIn("final_snapshot_failed", rendered)
+            self.assertIn("passive_shutdown_reconcile_failures=1", rendered)
+            self.assertIn("passive_shutdown_reconcile_failed=True", rendered)
             self.assertIn("event_storm_cleanup_failures=2", rendered)
             self.assertIn("event loop failed", rendered)
             self.assertIn("snapshot_upsert_unresolved", rendered)

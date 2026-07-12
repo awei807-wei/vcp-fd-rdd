@@ -126,6 +126,13 @@ struct SlicedScanOutcome {
     dropped_stale_batch: bool,
 }
 
+#[derive(Debug)]
+struct ImmediateScanReconcileOutcome {
+    outcome: ScanOutcome,
+    deleted: usize,
+    stable: bool,
+}
+
 #[derive(Clone, Debug)]
 struct DirChildEntry {
     path: PathBuf,
@@ -1707,7 +1714,7 @@ impl TieredIndex {
         }
     }
 
-    /// Reconcile missing direct children after a complete periodic repair scan.
+    /// Reconcile missing direct children after a complete trusted directory scan.
     ///
     /// The sliced DIR cookie is intentionally not reused as deletion evidence. A
     /// fresh, error-free direct-child `read_dir` snapshot is required. Base/L2
@@ -1738,7 +1745,7 @@ impl TieredIndex {
             Ok(entries) => entries,
             Err(err) => {
                 tracing::debug!(
-                    "periodic negative alignment skipped unreadable dir {}: {}",
+                    "negative alignment skipped unreadable dir {}: {}",
                     dir.display(),
                     err
                 );
@@ -1751,7 +1758,7 @@ impl TieredIndex {
                 Ok(entry) => entry,
                 Err(err) => {
                     tracing::debug!(
-                        "periodic negative alignment abandoned incomplete readdir for {}: {}",
+                        "negative alignment abandoned incomplete readdir for {}: {}",
                         dir.display(),
                         err
                     );
@@ -1814,9 +1821,7 @@ impl TieredIndex {
         self.io_governor.before_io();
         let _snapshot_boundary = self.snapshot_event_gate.lock();
         if self.event_seq.load(Ordering::Relaxed) != scan_started_seq {
-            tracing::debug!(
-                "discarded stale periodic negative alignment after newer apply seq advanced"
-            );
+            tracing::debug!("discarded stale negative alignment after newer apply seq advanced");
             return (0, true);
         }
         let after_fingerprint = std::fs::symlink_metadata(dir)
@@ -1825,7 +1830,7 @@ impl TieredIndex {
             .and_then(|meta| directory_read_fingerprint(dir, &meta));
         if after_fingerprint != Some(before_fingerprint) {
             tracing::debug!(
-                "periodic negative alignment abandoned changed directory for {}",
+                "negative alignment abandoned changed directory for {}",
                 dir.display()
             );
             return (0, true);
@@ -1892,7 +1897,37 @@ impl TieredIndex {
         project_markers: &[String],
     ) -> ScanOutcome {
         let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
-        self.scan_dirs_with_depth_and_project_markers(&dirs, Some(1), 10_000, project_markers)
+        self.scan_dirs_immediate_reconciled_with_project_markers(&dirs, project_markers)
+            .outcome
+    }
+
+    fn scan_dirs_immediate_reconciled_with_project_markers(
+        &self,
+        dirs: &[&PathBuf],
+        project_markers: &[String],
+    ) -> ImmediateScanReconcileOutcome {
+        // Negative reconciliation is intentionally restricted to explicit shallow
+        // immediate scans. Startup and generic deep scans remain upsert-only.
+        let started = Instant::now();
+        let mut outcome =
+            self.scan_dirs_with_depth_and_project_markers(dirs, Some(1), 10_000, project_markers);
+        let mut deleted = 0usize;
+        let mut stable = true;
+
+        for dir in dirs {
+            let alignment_started_seq = self.event_seq.load(Ordering::Relaxed);
+            let (dir_deleted, dropped_stale) =
+                self.align_missing_indexed_direct_children(dir.as_path(), alignment_started_seq);
+            deleted = deleted.saturating_add(dir_deleted);
+            stable &= !dropped_stale;
+        }
+        outcome.changed = outcome.changed.saturating_add(deleted);
+        outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+        ImmediateScanReconcileOutcome {
+            outcome,
+            deleted,
+            stable,
+        }
     }
 
     fn directory_manifest_summary(
@@ -2108,14 +2143,22 @@ impl TieredIndex {
     /// 限制：最多 10 个目录，每目录最多 10000 条目。
     /// 返回 (scanned_files, elapsed_ms)。
     pub fn scan_dirs_immediate(&self, dirs: &[PathBuf]) -> (usize, u64) {
-        let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
-        let outcome = self.scan_dirs_with_depth(&dirs, Some(1), 10_000);
+        let (outcome, _, _) = self.scan_dirs_immediate_reconcile_outcome(dirs);
         (outcome.scanned, outcome.elapsed_ms)
     }
 
     pub fn scan_dirs_immediate_outcome(&self, dirs: &[PathBuf]) -> ScanOutcome {
+        self.scan_dirs_immediate_reconcile_outcome(dirs).0
+    }
+
+    /// Explicit shallow scan result used by the manual `/scan` endpoint.
+    pub(crate) fn scan_dirs_immediate_reconcile_outcome(
+        &self,
+        dirs: &[PathBuf],
+    ) -> (ScanOutcome, usize, bool) {
         let dirs: Vec<&PathBuf> = dirs.iter().take(10).collect();
-        self.scan_dirs_with_depth(&dirs, Some(1), 10_000)
+        let reconciled = self.scan_dirs_immediate_reconciled_with_project_markers(&dirs, &[]);
+        (reconciled.outcome, reconciled.deleted, reconciled.stable)
     }
 
     /// 深度即时扫描指定目录并更新索引（递归，不走 debounce/channel）。

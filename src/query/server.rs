@@ -168,6 +168,9 @@ pub struct ScanParams {
 #[derive(Serialize)]
 pub struct ScanResponse {
     pub scanned: usize,
+    pub changed: usize,
+    pub deleted: usize,
+    pub stable: bool,
     pub elapsed_ms: u64,
 }
 #[derive(Serialize)]
@@ -405,12 +408,8 @@ impl QueryServer {
         self
     }
 
-    pub async fn run(self, port: u16) -> anyhow::Result<()> {
-        if self.http_policy == HttpPolicy::Disabled {
-            tracing::warn!("HTTP query server disabled by security policy");
-            return Ok(());
-        }
-        let state = QueryServerState {
+    fn into_state(self) -> QueryServerState {
+        QueryServerState {
             index: self.index,
             config: self.config,
             start_time: Instant::now(),
@@ -421,7 +420,15 @@ impl QueryServer {
             fast_scan_lease_provider: self.fast_scan_lease_provider,
             scan_reject_count: self.scan_reject_count,
             http_policy: self.http_policy,
-        };
+        }
+    }
+
+    pub async fn run(self, port: u16) -> anyhow::Result<()> {
+        if self.http_policy == HttpPolicy::Disabled {
+            tracing::warn!("HTTP query server disabled by security policy");
+            return Ok(());
+        }
+        let state = self.into_state();
         let app = Router::new()
             .route("/search", get(search_handler))
             .route("/status", get(status_handler))
@@ -933,14 +940,17 @@ async fn scan_handler(
     }
 
     let index = state.index.clone();
-    let (scanned, elapsed_ms) =
-        tokio::task::spawn_blocking(move || index.scan_dirs_immediate(&dirs))
+    let (outcome, deleted, stable) =
+        tokio::task::spawn_blocking(move || index.scan_dirs_immediate_reconcile_outcome(&dirs))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(ScanResponse {
-        scanned,
-        elapsed_ms,
+        scanned: outcome.scanned,
+        changed: outcome.changed,
+        deleted,
+        stable,
+        elapsed_ms: outcome.elapsed_ms,
     }))
 }
 
@@ -959,7 +969,7 @@ async fn debug_tiered_watch_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{FileKey, FileKind, FileMeta};
+    use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta};
     use crate::index::tiered::QueryResultMeta;
     use std::time::SystemTime;
 
@@ -1009,6 +1019,66 @@ mod tests {
         assert_eq!(value["validated"], true);
         assert_eq!(value["reason"], "hardlink_same_file_key");
         assert_eq!(value["confidence"], 1.0);
+    }
+
+    #[test]
+    fn scan_response_serializes_reconciliation_fields() {
+        let value = serde_json::to_value(ScanResponse {
+            scanned: 7,
+            changed: 3,
+            deleted: 2,
+            stable: false,
+            elapsed_ms: 11,
+        })
+        .unwrap();
+
+        assert_eq!(value["scanned"], 7);
+        assert_eq!(value["changed"], 3);
+        assert_eq!(value["deleted"], 2);
+        assert_eq!(value["stable"], false);
+        assert_eq!(value["elapsed_ms"], 11);
+    }
+
+    #[tokio::test]
+    async fn scan_handler_returns_stable_negative_reconciliation_status() {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fd-rdd-scan-handler-{nanos}"));
+        let stale_path = root.join("deleted-before-scan.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&stale_path, b"transient").unwrap();
+
+        let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+        index.apply_events(&[EventRecord {
+            seq: 1,
+            timestamp: SystemTime::now(),
+            event_type: EventType::Create,
+            id: FileIdentifier::Path(stale_path.clone()),
+            path_hint: Some(stale_path.clone()),
+        }]);
+        std::fs::remove_file(&stale_path).unwrap();
+
+        let state = QueryServer::new(index).into_state();
+        let Json(response) = scan_handler(
+            State(state),
+            Json(ScanParams {
+                paths: vec![root.to_string_lossy().into_owned()],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.scanned, 0);
+        assert_eq!(response.changed, 1);
+        assert_eq!(response.deleted, 1);
+        assert!(response.stable);
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["stable"], true);
+        assert_eq!(value["deleted"], 1);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

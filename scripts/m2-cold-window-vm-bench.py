@@ -35,7 +35,10 @@ ENDPOINTS = ["/health", "/status", "/metrics", "/memory", "/watch-state"]
 
 AB_PARAMETER_FINGERPRINT_SCHEMA = 2
 INITIAL_STATE_FINGERPRINT_SCHEMA = 1
-EXECUTION_FINGERPRINT_SCHEMA = 1
+EXECUTION_FINGERPRINT_SCHEMA = 2
+PASSIVE_SHUTDOWN_RECONCILE_TIMEOUT_SECS = 30.0
+PASSIVE_SHUTDOWN_RECONCILE_MAX_ATTEMPTS = 3
+PASSIVE_SHUTDOWN_RECONCILE_RETRY_INTERVAL_SECS = 0.1
 AB_PARAMETER_FINGERPRINT_IGNORED_ARGS = frozenset(
     {
         # A/B legs intentionally differ in checkout/artifact identity and output
@@ -490,12 +493,27 @@ def build_execution_state(
     shutdown_signal_elapsed_secs: float | None = None,
     event_storm_enabled: bool = False,
     mixed_workload_enabled: bool = False,
+    passive_canary_enabled: bool = False,
 ) -> dict[str, Any]:
     """Summarize realized workload and harness health after one benchmark leg."""
     event_rows = read_jsonl(run_dir / "event-storm-samples.jsonl")
     hot_rows = read_jsonl(run_dir / "hot-churn-samples.jsonl")
     endpoint_rows = read_jsonl(run_dir / "endpoint-samples.jsonl")
     process_rows = read_jsonl(run_dir / "process-samples.jsonl")
+    canary_rows = read_jsonl(run_dir / "canary-samples.jsonl")
+    passive_shutdown_reconcile_rows = [
+        row
+        for row in canary_rows
+        if row.get("operation") == "passive_shutdown_reconcile"
+    ]
+    passive_shutdown_reconcile_ok = sum(
+        1
+        for row in passive_shutdown_reconcile_rows
+        if row.get("ok") is True and row.get("stable") is True
+    )
+    passive_shutdown_reconcile_failures = (
+        len(passive_shutdown_reconcile_rows) - passive_shutdown_reconcile_ok
+    )
     burst_rows = [row for row in event_rows if row.get("event_kind") == "burst_written"]
     burst_write_failures = sum(
         1 for row in event_rows if row.get("event_kind") == "burst_write_failed"
@@ -536,6 +554,22 @@ def build_execution_state(
         "process_sampler_error": process_sampler_error,
         "cleanup_errors": list(cleanup_errors),
         "shutdown_signal_elapsed_secs": shutdown_signal_elapsed_secs,
+        "passive_canary_enabled": passive_canary_enabled,
+        "passive_shutdown_reconcile_count": len(
+            passive_shutdown_reconcile_rows
+        ),
+        "passive_shutdown_reconcile_ok": passive_shutdown_reconcile_ok,
+        "passive_shutdown_reconcile_failures": (
+            passive_shutdown_reconcile_failures
+        ),
+        "passive_shutdown_reconcile_missing": (
+            passive_canary_enabled and not passive_shutdown_reconcile_rows
+        ),
+        "passive_shutdown_reconcile_failed": (
+            passive_canary_enabled
+            and bool(passive_shutdown_reconcile_rows)
+            and passive_shutdown_reconcile_failures > 0
+        ),
         "event_storm_bursts": len(burst_rows),
         "event_storm_enabled": event_storm_enabled,
         "event_storm_events_written": sum(
@@ -639,6 +673,21 @@ def evaluate_ab_comparability(
             reasons.append("process_sampler_failed")
         if execution_state.get("cleanup_errors"):
             reasons.append("cleanup_failed")
+        if execution_state.get("passive_canary_enabled"):
+            reconcile_count = int(
+                execution_state.get("passive_shutdown_reconcile_count", 0) or 0
+            )
+            reconcile_ok = int(
+                execution_state.get("passive_shutdown_reconcile_ok", 0) or 0
+            )
+            reconcile_failures = int(
+                execution_state.get("passive_shutdown_reconcile_failures", 0)
+                or 0
+            )
+            if reconcile_count <= 0:
+                reasons.append("passive_shutdown_reconcile_missing")
+            elif reconcile_ok != reconcile_count or reconcile_failures > 0:
+                reasons.append("passive_shutdown_reconcile_failed")
         if int(execution_state.get("event_storm_write_failures", 0) or 0) > 0:
             reasons.append("event_storm_write_failed")
         if int(execution_state.get("event_storm_cleanup_failures", 0) or 0) > 0:
@@ -680,6 +729,138 @@ def http_json(base_url: str, path: str, params: dict[str, str] | None = None, ti
     if not raw:
         return None
     return json.loads(raw.decode("utf-8"))
+
+
+def post_json(
+    base_url: str,
+    path: str,
+    payload: dict[str, Any],
+    timeout: float = 2.0,
+) -> Any:
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    req = urllib.request.Request(
+        base_url + path,
+        data=encoded,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    if not raw:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def bounded_unique_paths(paths: list[Path], limit: int = 10) -> list[Path]:
+    """Keep first-seen paths in request order, capped at the /scan API limit."""
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+        if len(unique) >= limit:
+            break
+    return unique
+
+
+def scan_response_metrics(
+    response: Any,
+) -> tuple[int, int, int, int | float, bool]:
+    """Validate the fields needed to audit a successful synchronous /scan."""
+    if not isinstance(response, dict):
+        raise ValueError(f"POST /scan returned non-object JSON: {response!r}")
+    scanned = response.get("scanned")
+    changed = response.get("changed")
+    deleted = response.get("deleted")
+    daemon_elapsed_ms = response.get("elapsed_ms")
+    stable = response.get("stable")
+    for field, value in (
+        ("scanned", scanned),
+        ("changed", changed),
+        ("deleted", deleted),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"POST /scan returned invalid {field}: {value!r}")
+    if (
+        not isinstance(daemon_elapsed_ms, (int, float))
+        or isinstance(daemon_elapsed_ms, bool)
+    ):
+        raise ValueError(
+            f"POST /scan returned invalid elapsed_ms: {daemon_elapsed_ms!r}"
+        )
+    if not isinstance(stable, bool):
+        raise ValueError(f"POST /scan returned invalid stable: {stable!r}")
+    return scanned, changed, deleted, daemon_elapsed_ms, stable
+
+
+def stable_scan_audit(
+    base_url: str,
+    paths: list[str],
+    timeout_secs: float,
+) -> dict[str, Any]:
+    """Retry synchronous /scan until the daemon reports a stable pass."""
+    started_at = time.monotonic()
+    deadline = started_at + max(0.001, timeout_secs)
+    http_latency_secs = 0.0
+    audit: dict[str, Any] = {
+        "ok": False,
+        "attempts": 0,
+        "scanned": None,
+        "changed": None,
+        "deleted": None,
+        "daemon_elapsed_ms": None,
+        "stable": None,
+    }
+    try:
+        for attempt in range(1, PASSIVE_SHUTDOWN_RECONCILE_MAX_ATTEMPTS + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"POST /scan timed out before attempt {attempt}")
+            audit["attempts"] = attempt
+            request_started_at = time.monotonic()
+            try:
+                response = post_json(
+                    base_url,
+                    "/scan",
+                    {"paths": paths},
+                    timeout=remaining,
+                )
+            finally:
+                http_latency_secs += time.monotonic() - request_started_at
+            scanned, changed, deleted, elapsed_ms, stable = scan_response_metrics(
+                response
+            )
+            audit["scanned"] = int(audit["scanned"] or 0) + scanned
+            audit["changed"] = int(audit["changed"] or 0) + changed
+            audit["deleted"] = int(audit["deleted"] or 0) + deleted
+            audit["daemon_elapsed_ms"] = (
+                float(audit["daemon_elapsed_ms"] or 0) + elapsed_ms
+            )
+            audit["stable"] = stable
+            if stable:
+                audit["ok"] = True
+                break
+            if attempt >= PASSIVE_SHUTDOWN_RECONCILE_MAX_ATTEMPTS:
+                raise RuntimeError(f"POST /scan remained unstable after {attempt} attempts")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"POST /scan timed out after {attempt} attempts")
+            time.sleep(
+                min(PASSIVE_SHUTDOWN_RECONCILE_RETRY_INTERVAL_SECS, remaining)
+            )
+    except Exception as exc:  # noqa: BLE001 - preserve exact shutdown evidence
+        audit["error"] = repr(exc)
+    audit["http_latency_secs"] = round(http_latency_secs, 3)
+    audit["latency_secs"] = round(time.monotonic() - started_at, 3)
+    return audit
 
 
 def wait_for_http(base_url: str, timeout_secs: float) -> None:
@@ -1114,6 +1295,14 @@ class PassiveCanaryRunner:
             renamed = Path(self.active["renamed"])
             try:
                 created.rename(renamed)
+                self.emit(
+                    {
+                        "operation": "passive_rename_applied",
+                        "old_path": str(created),
+                        "new_path": str(renamed),
+                        "ok": True,
+                    }
+                )
                 self.active["stage"] = "check_rename"
                 self.active["stage_started_at"] = time.monotonic()
                 self.active["due_at"] = time.monotonic() + self.settle_secs
@@ -1152,6 +1341,13 @@ class PassiveCanaryRunner:
             )
             try:
                 renamed.unlink(missing_ok=True)
+                self.emit(
+                    {
+                        "operation": "passive_delete_applied",
+                        "path": str(renamed),
+                        "ok": True,
+                    }
+                )
                 self.active["stage"] = "check_delete"
                 self.active["stage_started_at"] = time.monotonic()
                 self.active["due_at"] = time.monotonic() + self.settle_secs
@@ -1241,6 +1437,47 @@ class PassiveCanaryRunner:
                 "polls": polls,
             }
         )
+
+    def reconcile_shutdown(self, paths: list[Path] | None = None) -> dict[str, Any]:
+        """Synchronously reconcile passive canary state before daemon shutdown."""
+        active_cycle = (
+            int(self.active["cycle"])
+            if self.active is not None and "cycle" in self.active
+            else None
+        )
+        active_stage = (
+            str(self.active["stage"])
+            if self.active is not None and "stage" in self.active
+            else None
+        )
+        timeout_secs = max(
+            PASSIVE_SHUTDOWN_RECONCILE_TIMEOUT_SECS,
+            self.timeout_secs,
+        )
+        reconcile_paths = bounded_unique_paths([self.root, *(paths or [])])
+        record: dict[str, Any] = {
+            "operation": "passive_shutdown_reconcile",
+            "root": str(self.root),
+            "paths": [str(path) for path in reconcile_paths],
+            "active_cycle": active_cycle,
+            "active_stage": active_stage,
+            "timeout_secs": timeout_secs,
+        }
+        record.update(
+            stable_scan_audit(
+                self.base_url,
+                record["paths"],
+                timeout_secs,
+            )
+        )
+        self.emit_shutdown_record(record)
+        return record
+
+    def emit_shutdown_record(self, record: dict[str, Any]) -> None:
+        record["canary_kind"] = "passive"
+        record["ts"] = utc_now()
+        record["elapsed_secs"] = round(time.monotonic() - self.started_at, 3)
+        json_line(self.out_path, record)
 
     def emit(self, record: dict[str, Any]) -> None:
         assert self.active is not None
@@ -2409,6 +2646,27 @@ class HotChurnRunner:
         json_line(self.out_path, record)
 
 
+def benchmark_shutdown_reconcile_paths(
+    passive_root: Path,
+    active_canary_root: Path | None,
+    event_storm: EventStormRunner | None,
+    mixed_workload_enabled: bool,
+    hot_roots: list[Path],
+) -> list[Path]:
+    """Collect benchmark-owned parents that may still need negative facts."""
+    candidates = [passive_root]
+    if active_canary_root is not None:
+        candidates.append(active_canary_root)
+    if event_storm is not None:
+        active = event_storm.active
+        if isinstance(active, dict) and active.get("burst_root") is not None:
+            candidates.append(Path(active["burst_root"]))
+        candidates.extend(event_storm.roots)
+    if mixed_workload_enabled:
+        candidates.extend(hot_roots)
+    return bounded_unique_paths(candidates)
+
+
 def resolve_root_paths(csv_value: str) -> list[Path]:
     """Resolve a comma-separated list of root paths, skipping empties."""
     return [Path(p).expanduser().resolve() for p in split_csv(csv_value)]
@@ -2847,6 +3105,19 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
     passive_canary_count = sum(
         1 for item in canary_samples if item.get("canary_kind") == "passive"
     )
+    passive_shutdown_reconcile_rows = [
+        item
+        for item in canary_samples
+        if item.get("operation") == "passive_shutdown_reconcile"
+    ]
+    passive_shutdown_reconcile_ok = sum(
+        1
+        for item in passive_shutdown_reconcile_rows
+        if item.get("ok") is True and item.get("stable") is True
+    )
+    passive_shutdown_reconcile_failures = (
+        len(passive_shutdown_reconcile_rows) - passive_shutdown_reconcile_ok
+    )
     passive_first_query_ops = [
         "passive_create_first_query",
         "passive_rename_new_first_query",
@@ -3233,6 +3504,9 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "canary": len(canary_samples),
             "canary_active": active_canary_count,
             "canary_passive": passive_canary_count,
+            "passive_shutdown_reconcile": len(
+                passive_shutdown_reconcile_rows
+            ),
             "event_storm": len(event_storm_samples),
             "event_storm_first_query": len(event_first_queries),
         },
@@ -3329,6 +3603,57 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         "canary": canary_by_op,
         "canary_active": active_canary_by_op,
         "canary_passive": passive_canary_by_op,
+        "passive_shutdown_reconcile": {
+            "count": len(passive_shutdown_reconcile_rows),
+            "ok": passive_shutdown_reconcile_ok,
+            "failures": passive_shutdown_reconcile_failures,
+            "stable": bool(passive_shutdown_reconcile_rows)
+            and passive_shutdown_reconcile_failures == 0,
+            "attempts_max": max(
+                (
+                    int(item.get("attempts", 0) or 0)
+                    for item in passive_shutdown_reconcile_rows
+                ),
+                default=0,
+            ),
+            "paths_max": max(
+                (
+                    len(item.get("paths", []))
+                    for item in passive_shutdown_reconcile_rows
+                    if isinstance(item.get("paths"), list)
+                ),
+                default=0,
+            ),
+            "scanned_total": sum(
+                int(item.get("scanned", 0) or 0)
+                for item in passive_shutdown_reconcile_rows
+                if isinstance(item.get("scanned"), (int, float))
+                and not isinstance(item.get("scanned"), bool)
+            ),
+            "changed_total": sum(
+                int(item.get("changed", 0) or 0)
+                for item in passive_shutdown_reconcile_rows
+                if isinstance(item.get("changed"), (int, float))
+                and not isinstance(item.get("changed"), bool)
+            ),
+            "deleted_total": sum(
+                int(item.get("deleted", 0) or 0)
+                for item in passive_shutdown_reconcile_rows
+                if isinstance(item.get("deleted"), (int, float))
+                and not isinstance(item.get("deleted"), bool)
+            ),
+            "latency_max_secs": round(
+                max(
+                    (
+                        float(item.get("latency_secs", 0.0) or 0.0)
+                        for item in passive_shutdown_reconcile_rows
+                        if isinstance(item.get("latency_secs"), (int, float))
+                    ),
+                    default=0.0,
+                ),
+                3,
+            ),
+        },
         "passive_first_query": {
             "total": passive_first_query_total,
             "ok": passive_first_query_ok,
@@ -3453,6 +3778,12 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | proc sampler triggered watches last | {summary["watch_state"]["proc_sampler_triggered_watches_last"]} |
 | passive first query success rate | {summary["passive_first_query"]["success_rate"]} |
 | passive positive first query success rate | {summary["passive_positive_first_query"]["success_rate"]} |
+| shutdown reconcile stable | {summary["passive_shutdown_reconcile"]["stable"]} |
+| shutdown reconcile attempts max | {summary["passive_shutdown_reconcile"]["attempts_max"]} |
+| shutdown reconcile paths max | {summary["passive_shutdown_reconcile"]["paths_max"]} |
+| shutdown reconcile changed total | {summary["passive_shutdown_reconcile"]["changed_total"]} |
+| shutdown reconcile deleted total | {summary["passive_shutdown_reconcile"]["deleted_total"]} |
+| shutdown reconcile max s | {summary["passive_shutdown_reconcile"]["latency_max_secs"]} |
 | event storm success rate | {summary["event_storm"]["success_rate"]} |
 | event storm transport success rate | {summary["event_storm"]["transport_success_rate"]} |
 | event storm positive success rate | {summary["event_storm"]["positive_success_rate"]} |
@@ -4142,7 +4473,28 @@ def _run_single_prepared(
     cleanup_errors: list[str] = []
     shutdown_signal_elapsed_secs: float | None = None
     hot_churn: HotChurnRunner | None = None
+    event_storm: EventStormRunner | None = None
+    passive_canary: PassiveCanaryRunner | None = None
+    canary_root = (
+        Path(args.canary_root).expanduser().resolve()
+        if args.canary_root
+        else None
+    )
     try:
+        passive_canary = (
+            PassiveCanaryRunner(
+                base_url=base_url,
+                root=Path(args.passive_canary_root).expanduser().resolve(),
+                out_path=run_dir / "canary-samples.jsonl",
+                started_at=started_at,
+                interval_secs=args.passive_canary_interval_secs,
+                settle_secs=args.passive_canary_settle_secs,
+                timeout_secs=args.passive_canary_timeout_secs,
+                start_delay_secs=args.passive_canary_start_delay_secs,
+            )
+            if args.passive_canary_root
+            else None
+        )
         _update_manifest(
             manifest_path,
             manifest,
@@ -4160,25 +4512,6 @@ def _run_single_prepared(
         next_canary = time.monotonic() + args.canary_interval_secs
         deadline = (
             None if args.duration_secs == 0 else time.monotonic() + args.duration_secs
-        )
-        canary_root = (
-            Path(args.canary_root).expanduser().resolve()
-            if args.canary_root
-            else None
-        )
-        passive_canary = (
-            PassiveCanaryRunner(
-                base_url=base_url,
-                root=Path(args.passive_canary_root).expanduser().resolve(),
-                out_path=run_dir / "canary-samples.jsonl",
-                started_at=started_at,
-                interval_secs=args.passive_canary_interval_secs,
-                settle_secs=args.passive_canary_settle_secs,
-                timeout_secs=args.passive_canary_timeout_secs,
-                start_delay_secs=args.passive_canary_start_delay_secs,
-            )
-            if args.passive_canary_root
-            else None
         )
         event_storm = (
             EventStormRunner(
@@ -4285,6 +4618,20 @@ def _run_single_prepared(
             except Exception as exc:  # noqa: BLE001 - continue daemon cleanup
                 cleanup_errors.append(f"hot_churn_stop: {exc!r}")
         if proc.poll() is None:
+            if passive_canary is not None:
+                try:
+                    reconcile_paths = benchmark_shutdown_reconcile_paths(
+                        passive_canary.root,
+                        canary_root,
+                        event_storm,
+                        args.mixed_workload,
+                        hot_roots,
+                    )
+                    passive_canary.reconcile_shutdown(reconcile_paths)
+                except BaseException as exc:  # keep SIGTERM reachable on every failure
+                    cleanup_errors.append(
+                        f"passive_shutdown_reconcile_record: {exc!r}"
+                    )
             signal_elapsed = round(time.monotonic() - started_at, 6)
             try:
                 proc.send_signal(signal.SIGTERM)
@@ -4371,6 +4718,7 @@ def _run_single_prepared(
         shutdown_signal_elapsed_secs=shutdown_signal_elapsed_secs,
         event_storm_enabled=args.event_storm,
         mixed_workload_enabled=args.mixed_workload,
+        passive_canary_enabled=bool(args.passive_canary_root),
     )
     comparable, reasons = evaluate_ab_comparability(initial_state, execution_state)
     terminal_failed = bool(
@@ -4401,6 +4749,15 @@ def _run_single_prepared(
         fatal_error=fatal_error,
         cleanup_errors=cleanup_errors,
         shutdown_signal_elapsed_secs=shutdown_signal_elapsed_secs,
+        passive_shutdown_reconcile_count=execution_state[
+            "passive_shutdown_reconcile_count"
+        ],
+        passive_shutdown_reconcile_ok=execution_state[
+            "passive_shutdown_reconcile_ok"
+        ],
+        passive_shutdown_reconcile_failures=execution_state[
+            "passive_shutdown_reconcile_failures"
+        ],
         execution=execution_state,
         execution_fingerprint_schema=EXECUTION_FINGERPRINT_SCHEMA,
         execution_fingerprint=execution_state["fingerprint"],

@@ -43,6 +43,8 @@ python3 scripts/m2-cold-window-ab.py b  # 关闭 M2
 
 第二轮 A 在 `save100` cleanup 后发现 Delta Live 路径既不在文件系统也不在 L2，且缺少 delete/rename 失效证据，最终快照按 fail-closed 拒绝样本。该结果不应通过“任意 ENOENT 都当删除”绕过；修复边界是：event-storm cleanup 只操作当前 burst 并留下结构化记录，冷层完整扫描只有在目录可读、扫描完整且 apply sequence 未前进时，才能把 Base/L2/Delta Live 相对当前目录集合的缺失项转换为直接子路径 Delete。扫描错误、未完成或 stale batch 不得产生负事实。
 
+第三轮 A 的 event-storm 写入和 cleanup 均成功，但关机时仍在 passive canary 的 `create -> rename -> delete` 生命周期中；`*_create.txt` 已离开文件系统，L2/WAL 的 Live 事实却尚未经过下一次可信目录对账，SIGTERM 后的最终快照因此继续 fail-closed。runner 现在在停止新 workload 后、发送 SIGTERM 前，对 passive/active canary root、event-storm roots、仍 active 的 burst root 和 mixed hot roots 同步调用 `/scan`；手动 `/scan` 会复用与冷层扫描相同的完整 `read_dir`、目录 fingerprint、`event_seq` 和 freeze-gate 校验来补齐负事实，并返回 `stable/deleted`。不稳定结果会在静默窗口内有界重试，不能把 HTTP 200 误算为收敛。该收尾动作发生在 passive first-query 指标采集之后，不改变 M2 的收益测量；结果会记录为 `passive_shutdown_reconcile`，缺失、失败或持续不稳定直接使样本不可比较。
+
 ### 总不变量
 
 | 类别 | 不变量 |

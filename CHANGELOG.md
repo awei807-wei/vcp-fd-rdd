@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- M2 benchmark 在时长结束后、SIGTERM 前新增可审计的关机静默对账：runner 同步 POST `/scan` 到 passive/active canary、event-storm parent/active burst 与 mixed hot roots，手动扫描复用完整目录读取、fingerprint、`event_seq` 与 freeze gate 的可信负事实逻辑并返回 `stable/deleted`；持续不稳定、记录缺失或失败都会拒绝 A/B，避免未完成 create→rename→delete 或 active burst 的 Live 路径击穿最终快照，同时保留 snapshot fail-closed。
 - M2 冷层完整扫描新增可信负事实对账：仅在目录完整可读、目录 identity/mtime/ctime/nlink 未变化、`event_seq` 未前进且未命中离线 freeze gate 时，将 Base/L2 直接子项和 Delta 深层路径的缺失项折叠为直接子树 Delete；`read_dir` 失败不再把挂载断联误判为整目录删除。
 - M2 event storm cleanup 改为只删除当前 burst root，记录目标、条目估算、耗时和错误；cleanup 失败纳入 execution fingerprint、A/B comparability 门禁、失败诊断与 `REPORT.md`，不再允许清理异常污染正式对照。
 - M2 一键 A/B 驱动在底层 runner 非零退出、预检早退或收尾门禁失败时，不再只打印退出码；runner stdout/stderr 会同步落入 run 目录同级日志，停止流程异常不会遮蔽原始错误，门禁会有界汇总 manifest/summary 状态、缺失/空产物、最近关键事件及 runner/daemon 错误尾部，并输出完整现场路径。

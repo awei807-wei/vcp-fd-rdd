@@ -1199,6 +1199,78 @@ async fn periodic_cold_scan_converges_missing_deep_delta_subtree() -> anyhow::Re
     Ok(())
 }
 
+#[tokio::test]
+async fn manual_immediate_scan_reconciles_missing_delta_path_before_snapshot() -> anyhow::Result<()>
+{
+    let root = unique_tmp_dir("manual-immediate-negative-delta");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let stale_path = content_root.join("passive-canary-deleted.txt");
+    std::fs::create_dir_all(&content_root)?;
+    std::fs::create_dir_all(&state_root)?;
+    std::fs::write(&stale_path, b"passive canary")?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.attach_wal(store.as_ref())?;
+    idx.apply_events(&[mk_event(1, EventType::Create, stale_path.clone())]);
+    std::fs::remove_file(&stale_path)?;
+
+    let (outcome, deleted, stable) =
+        idx.scan_dirs_immediate_reconcile_outcome(std::slice::from_ref(&content_root));
+    assert_eq!(
+        outcome.scanned, 0,
+        "negative reconciliation must not change scanned"
+    );
+    assert_eq!(outcome.changed, 1);
+    assert_eq!(deleted, 1);
+    assert!(stable);
+    assert!(idx
+        .delta_buffer
+        .lock()
+        .is_deleted(stale_path.as_os_str().as_encoded_bytes()));
+
+    idx.begin_shutdown();
+    idx.snapshot_now(store.clone()).await?;
+    let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    assert_eq!(reloaded.file_count(), 0);
+    assert!(reloaded.query("passive-canary-deleted").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn manual_immediate_scan_fails_closed_when_directory_is_unavailable() {
+    let root = unique_tmp_dir("manual-immediate-multi-dir-fail-closed");
+    let stable_root = root.join("stable");
+    let unavailable_root = root.join("unavailable");
+    let stale_path = unavailable_root.join("must-remain-live.txt");
+    std::fs::create_dir_all(&stable_root).unwrap();
+    std::fs::create_dir_all(&unavailable_root).unwrap();
+    std::fs::write(&stale_path, b"still unproven").unwrap();
+
+    let idx = TieredIndex::empty(vec![stable_root.clone(), unavailable_root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, stale_path.clone())]);
+    std::fs::remove_dir_all(&unavailable_root).unwrap();
+
+    let (outcome, deleted, stable) =
+        idx.scan_dirs_immediate_reconcile_outcome(&[stable_root, unavailable_root]);
+    assert_eq!(outcome.scanned, 0);
+    assert_eq!(outcome.changed, 0);
+    assert_eq!(deleted, 0);
+    assert!(
+        !stable,
+        "every directory must reconcile for a stable result"
+    );
+    let db = idx.delta_buffer.lock();
+    assert!(db.is_live(stale_path.as_os_str().as_encoded_bytes()));
+    assert!(!db.is_deleted(stale_path.as_os_str().as_encoded_bytes()));
+    drop(db);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn periodic_negative_alignment_discards_stale_event_seq() {
     let root = unique_tmp_dir("periodic-negative-stale-seq");
