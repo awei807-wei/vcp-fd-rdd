@@ -109,6 +109,13 @@ class SummarySemanticsTests(unittest.TestCase):
                         "ok": 2,
                         "missed": 1,
                     },
+                    {
+                        "event_kind": "burst_cleanup",
+                        "cleanup_target": "/fixture/current-burst",
+                        "entries_estimated": 7,
+                        "duration_secs": 0.025,
+                        "ok": True,
+                    },
                 ],
             )
 
@@ -121,6 +128,17 @@ class SummarySemanticsTests(unittest.TestCase):
             self.assertEqual(first_query["transport_failures"], 1)
             self.assertEqual(summary["event_storm"]["ok"], 1)
             self.assertEqual(summary["event_storm"]["missed"], 2)
+            self.assertEqual(
+                summary["event_storm"]["cleanup"],
+                {
+                    "count": 1,
+                    "ok": 1,
+                    "failures": 0,
+                    "entries_estimated_total": 7,
+                    "duration_p95_secs": 0.025,
+                    "duration_max_secs": 0.025,
+                },
+            )
 
     def test_inode_reuse_status_distinguishes_not_run_inconclusive_and_exercised(self) -> None:
         cases = [
@@ -226,7 +244,9 @@ class SummarySemanticsTests(unittest.TestCase):
             self.assertEqual(l2["series"][2]["base_manifest_only_entries"], 100)
             self.assertEqual(l2["series"][2]["base_cold_mmap_bytes"], 2100)
             self.assertEqual(l2["series"][3]["non_index_private_dirty_bytes"], 3200)
-            self.assertIn("final snapshot window RSS max", (run_dir / "REPORT.md").read_text(encoding="utf-8"))
+            report = (run_dir / "REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("final snapshot window RSS max", report)
+            self.assertIn("event storm cleanup failures", report)
 
     def test_owned_snapshot_state_is_initial_build_publish(self) -> None:
         sample = memory_sample(
@@ -598,6 +618,12 @@ class ManifestAuditTests(unittest.TestCase):
                 [
                     {"event_kind": "burst_written", "events_total": 10},
                     {"event_kind": "burst_write_failed", "ok": False},
+                    {
+                        "event_kind": "burst_cleanup",
+                        "entries_estimated": 12,
+                        "duration_secs": 0.25,
+                        "ok": False,
+                    },
                 ],
             )
             execution = BENCH.build_execution_state(
@@ -627,6 +653,11 @@ class ManifestAuditTests(unittest.TestCase):
             self.assertIn("snapshot_preexisting", reasons)
             self.assertIn("run_interrupted", reasons)
             self.assertIn("event_storm_write_failed", reasons)
+            self.assertIn("event_storm_cleanup_failed", reasons)
+            self.assertEqual(execution["event_storm_cleanups"], 1)
+            self.assertEqual(execution["event_storm_cleanup_failures"], 1)
+            self.assertEqual(execution["event_storm_cleanup_entries_estimated"], 12)
+            self.assertEqual(execution["event_storm_cleanup_duration_secs"], 0.25)
             self.assertTrue(execution["fingerprint"])
 
     def test_comparability_accepts_clean_fixed_duration_run(self) -> None:
@@ -656,6 +687,7 @@ class ManifestAuditTests(unittest.TestCase):
             "event_storm_enabled": True,
             "event_storm_bursts": 8,
             "event_storm_write_failures": 0,
+            "event_storm_cleanup_failures": 0,
             "unsupported_workloads": 0,
             "mixed_workload_enabled": True,
             "hot_churn_batches": 100,
@@ -995,6 +1027,75 @@ class EventStormFixtureTests(unittest.TestCase):
             ]
             self.assertEqual(len(package_root_rows), 1)
             self.assertTrue(package_root_rows[0]["should_exist"])
+
+    def test_delayed_cleanup_removes_only_current_burst_and_emits_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.cycle = 3
+            current = runner.burst_root(root, "rw100")
+            sibling = root / "fd-rdd-m2-event-storm-save100-older-run-001"
+            (current / "deep").mkdir(parents=True)
+            (current / "deep" / "a.txt").write_text("a", encoding="utf-8")
+            sibling.mkdir()
+            (sibling / "keep.txt").write_text("keep", encoding="utf-8")
+            runner.active = {
+                "cycle": runner.cycle,
+                "root": root,
+                "burst_root": current,
+                "events": [],
+                "stage": "delayed_query",
+                "started_at": time.monotonic(),
+            }
+
+            with mock.patch.object(runner, "run_query_pass"):
+                runner.process_due(time.monotonic())
+
+            self.assertFalse(current.exists())
+            self.assertTrue((sibling / "keep.txt").exists())
+            rows = [
+                json.loads(line)
+                for line in (root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            cleanup = [row for row in rows if row.get("event_kind") == "burst_cleanup"]
+            self.assertEqual(len(cleanup), 1)
+            self.assertEqual(cleanup[0]["cleanup_target"], str(current))
+            self.assertEqual(cleanup[0]["entries_estimated"], 2)
+            self.assertTrue(cleanup[0]["ok"])
+            self.assertGreaterEqual(cleanup[0]["duration_secs"], 0.0)
+
+    def test_delayed_cleanup_records_failure_without_hiding_next_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.cycle = 4
+            current = runner.burst_root(root, "rw100")
+            current.mkdir()
+            runner.active = {
+                "cycle": runner.cycle,
+                "root": root,
+                "burst_root": current,
+                "events": [],
+                "stage": "delayed_query",
+                "started_at": time.monotonic(),
+            }
+
+            with mock.patch.object(runner, "run_query_pass"), mock.patch.object(
+                BENCH.shutil,
+                "rmtree",
+                side_effect=PermissionError("fixture busy"),
+            ):
+                runner.process_due(time.monotonic())
+
+            self.assertIsNone(runner.active)
+            rows = [
+                json.loads(line)
+                for line in (root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            cleanup = [row for row in rows if row.get("event_kind") == "burst_cleanup"]
+            self.assertEqual(len(cleanup), 1)
+            self.assertFalse(cleanup[0]["ok"])
+            self.assertIn("PermissionError", cleanup[0]["error"])
 
     def test_hot_churn_randomness_is_reproducible_from_workload_seed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

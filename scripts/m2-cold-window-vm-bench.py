@@ -500,6 +500,10 @@ def build_execution_state(
     burst_write_failures = sum(
         1 for row in event_rows if row.get("event_kind") == "burst_write_failed"
     )
+    cleanup_rows = [
+        row for row in event_rows if row.get("event_kind") == "burst_cleanup"
+    ]
+    cleanup_failures = sum(1 for row in cleanup_rows if row.get("ok") is not True)
     unsupported_workloads = sum(
         1 for row in event_rows if row.get("event_kind") == "unsupported_workload"
     )
@@ -543,6 +547,21 @@ def build_execution_state(
             1 for row in event_rows if row.get("event_kind") == "first_query"
         ),
         "event_storm_write_failures": burst_write_failures,
+        "event_storm_cleanups": len(cleanup_rows),
+        "event_storm_cleanup_failures": cleanup_failures,
+        "event_storm_cleanup_entries_estimated": sum(
+            int(row.get("entries_estimated", 0) or 0)
+            for row in cleanup_rows
+            if isinstance(row.get("entries_estimated"), (int, float))
+        ),
+        "event_storm_cleanup_duration_secs": round(
+            sum(
+                float(row.get("duration_secs", 0.0) or 0.0)
+                for row in cleanup_rows
+                if isinstance(row.get("duration_secs"), (int, float))
+            ),
+            3,
+        ),
         "unsupported_workloads": unsupported_workloads,
         "hot_churn_batches": sum(
             1 for row in hot_rows if row.get("event_kind") == "hot_churn_batch"
@@ -622,6 +641,8 @@ def evaluate_ab_comparability(
             reasons.append("cleanup_failed")
         if int(execution_state.get("event_storm_write_failures", 0) or 0) > 0:
             reasons.append("event_storm_write_failed")
+        if int(execution_state.get("event_storm_cleanup_failures", 0) or 0) > 0:
+            reasons.append("event_storm_cleanup_failed")
         if (
             execution_state.get("event_storm_enabled")
             and int(execution_state.get("event_storm_bursts", 0) or 0) <= 0
@@ -1318,6 +1339,7 @@ class EventStormRunner:
         requested_tier, selected_kind = self.work_items[(self.cycle - 1) % len(self.work_items)]
         root = self.select_root(requested_tier)
         root.mkdir(parents=True, exist_ok=True)
+        burst_root = self.burst_root(root, self.burst_directory_kind(selected_kind))
         tier_before = self.tier_for_root(root)
         events: list[dict[str, Any]] = []
         cycle_started = time.monotonic()
@@ -1367,6 +1389,12 @@ class EventStormRunner:
                     "error": repr(exc),
                 }
             )
+            self.cleanup_burst_root(
+                burst_root,
+                root,
+                selected_kind,
+                phase="burst_write_failed",
+            )
             self.active = None
             self.next_start_at = time.monotonic() + self.interval_secs
             return
@@ -1385,6 +1413,7 @@ class EventStormRunner:
         self.active = {
             "cycle": self.cycle,
             "root": root,
+            "burst_root": burst_root,
             "requested_tier": requested_tier,
             "selected_kind": selected_kind,
             "tier_before": tier_before,
@@ -1857,6 +1886,18 @@ class EventStormRunner:
     def burst_root(self, root: Path, kind: str) -> Path:
         return root / f"{EVENT_STORM_DIR_PREFIX}{safe_name(kind)}-{self.run_id}-{self.cycle:03d}"
 
+    @staticmethod
+    def burst_directory_kind(kind: str) -> str:
+        return {
+            "git_clone": "git-clone",
+            "npm_install": "npm-install",
+            "subtree_rename": "subtree-rename",
+            "mount_storm": "mount-storm",
+            "inode_reuse": "inode-reuse",
+            "inode_reuse_stress": "inode-reuse-stress",
+            "time_skew": "time-skew",
+        }.get(kind, kind)
+
     def select_root(self, requested_tier: str) -> Path:
         if requested_tier:
             try:
@@ -1975,18 +2016,76 @@ class EventStormRunner:
             return
         # delayed_query (default, backwards compatible)
         self.run_query_pass(now, phase="delayed")
-        # Fix E: best-effort teardown of the just-checked storm fixtures so the
-        # storm root does not grow unbounded and cannot poison a later re-run.
-        # Only removes per-burst subdirs (prefixed fd-rdd-m2-event-storm-),
-        # never the indexed root itself. ignore_errors so cleanup never crashes.
-        try:
-            for child in list(Path(self.active["root"]).iterdir()):
-                if child.name.startswith(EVENT_STORM_DIR_PREFIX):
-                    shutil.rmtree(child, ignore_errors=True)
-        except Exception:
-            pass
+        self.cleanup_burst_root(
+            Path(self.active["burst_root"]),
+            Path(self.active["root"]),
+            str(self.active.get("selected_kind", "unknown")),
+            phase="delayed_query",
+        )
         self.active = None
         self.next_start_at = time.monotonic() + self.interval_secs
+
+    @staticmethod
+    def estimate_tree_entries(root: Path) -> tuple[int | None, str]:
+        if not root.exists():
+            return 0, ""
+        count = 0
+        pending = [root]
+        try:
+            while pending:
+                current = pending.pop()
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        count += 1
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+        except OSError as exc:
+            return None, repr(exc)
+        return count, ""
+
+    def cleanup_burst_root(
+        self,
+        burst_root: Path,
+        selected_root: Path,
+        workload: str,
+        phase: str,
+    ) -> None:
+        started = time.monotonic()
+        entries_estimated, estimate_error = self.estimate_tree_entries(burst_root)
+        error = ""
+        removed = False
+        try:
+            if burst_root.parent != selected_root:
+                raise ValueError("event-storm cleanup target escaped selected root")
+            if not burst_root.name.startswith(EVENT_STORM_DIR_PREFIX):
+                raise ValueError("event-storm cleanup target lacks fixture prefix")
+            if self.run_id not in burst_root.name:
+                raise ValueError("event-storm cleanup target belongs to another run")
+            if burst_root.is_symlink():
+                raise ValueError("event-storm cleanup target is a symlink")
+            if burst_root.exists():
+                shutil.rmtree(burst_root)
+            removed = not burst_root.exists()
+            if not removed:
+                raise OSError("event-storm cleanup target still exists")
+        except Exception as exc:  # noqa: BLE001 - cleanup failure is benchmark evidence
+            error = repr(exc)
+        self.emit(
+            {
+                "event_kind": "burst_cleanup",
+                "operation": "burst_cleanup",
+                "workload": workload,
+                "root": str(selected_root),
+                "cleanup_target": str(burst_root),
+                "cleanup_phase": phase,
+                "entries_estimated": entries_estimated,
+                "duration_secs": round(time.monotonic() - started, 3),
+                "removed": removed,
+                "ok": not error,
+                **({"estimate_error": estimate_error} if estimate_error else {}),
+                **({"error": error} if error else {}),
+            }
+        )
 
     def run_query_pass(self, now: float, phase: str) -> None:
         """Run a single query pass over the active burst's expected events.
@@ -2799,6 +2898,9 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
     event_written = [
         item for item in event_storm_samples if item.get("event_kind") == "burst_written"
     ]
+    event_cleanups = [
+        item for item in event_storm_samples if item.get("event_kind") == "burst_cleanup"
+    ]
     # Task 2: split first-query rows by query_phase (immediate vs delayed).
     event_immediate_queries = [
         item for item in event_first_queries if item.get("query_phase") == "immediate"
@@ -2859,6 +2961,24 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         )
         for tier in sorted({str(item.get("tier_before", "")) for item in event_first_queries})
         if tier
+    }
+    cleanup_durations = [
+        float(item.get("duration_secs", 0.0))
+        for item in event_cleanups
+        if isinstance(item.get("duration_secs"), (int, float))
+    ]
+    cleanup_entries = [
+        int(item["entries_estimated"])
+        for item in event_cleanups
+        if isinstance(item.get("entries_estimated"), (int, float))
+    ]
+    event_cleanup_summary = {
+        "count": len(event_cleanups),
+        "ok": sum(1 for item in event_cleanups if item.get("ok") is True),
+        "failures": sum(1 for item in event_cleanups if item.get("ok") is not True),
+        "entries_estimated_total": sum(cleanup_entries),
+        "duration_p95_secs": round(percentile(cleanup_durations, 95), 3),
+        "duration_max_secs": round(max(cleanup_durations) if cleanup_durations else 0.0, 3),
     }
     burst_durations = [float(item.get("duration_secs", 0.0)) for item in event_written]
 
@@ -3241,6 +3361,7 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             # Task 2: immediate vs delayed query-phase breakdown.
             "immediate_query": summarize_event_rows(event_immediate_queries),
             "delayed_query": summarize_event_rows(event_delayed_queries),
+            "cleanup": event_cleanup_summary,
             "by_workload": event_by_workload,
             "by_tier_before": event_by_tier,
             "special": event_special,
@@ -3342,6 +3463,10 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | event storm immediate-query success rate | {summary["event_storm"]["immediate_query"]["success_rate"]} |
 | event storm immediate-query p95 s | {summary["event_storm"]["immediate_query"]["first_query_p95_secs"]} |
 | event storm delayed-query success rate | {summary["event_storm"]["delayed_query"]["success_rate"]} |
+| event storm cleanup count | {summary["event_storm"]["cleanup"]["count"]} |
+| event storm cleanup failures | {summary["event_storm"]["cleanup"]["failures"]} |
+| event storm cleanup entries estimated | {summary["event_storm"]["cleanup"]["entries_estimated_total"]} |
+| event storm cleanup p95 s | {summary["event_storm"]["cleanup"]["duration_p95_secs"]} |
 | hot layer query success rate | {summary["hot_layer_query"]["success_rate"]} |
 | hot layer query p95 s | {summary["hot_layer_query"]["first_query_p95_secs"]} |
 | inode reuse status | {summary["event_storm"]["special"]["inode_reuse_status"]} |

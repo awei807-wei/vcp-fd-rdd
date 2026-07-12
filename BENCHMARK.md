@@ -41,6 +41,8 @@ python3 scripts/m2-cold-window-ab.py b  # 关闭 M2
 
 驱动只接受 `a`/`b`，固定重建 `$HOME/fd-rdd-m2-roots` 专用 fixture，并把输出写入 `/tmp/fd-rdd-m2-runs`。两组除 treatment 开关外使用相同的一小时 event storm、canary、扫描预算和 seed。运行中会提前拒绝开关错配、没有 L2/L3 或 A 无 M2 活动，结束后再校验 runner 的 `ab_comparable`、完整时长、burst 和 summary/manifest/process/endpoint 产物；失败均返回非零。wrapper 会把底层 runner 的 stdout/stderr 同步显示并持久化为 run 目录同级的 `<run-name>.runner.log`；失败输出会直接汇总 run 目录、manifest/summary 关键状态、缺失/空产物、最近错误事件，以及 runner/daemon 各最多 20 行关键日志，避免只有“底层 benchmark 退出码 1”而无法定位。使用 `--dry-run` 可只打印固定命令，不修改环境。
 
+第二轮 A 在 `save100` cleanup 后发现 Delta Live 路径既不在文件系统也不在 L2，且缺少 delete/rename 失效证据，最终快照按 fail-closed 拒绝样本。该结果不应通过“任意 ENOENT 都当删除”绕过；修复边界是：event-storm cleanup 只操作当前 burst 并留下结构化记录，冷层完整扫描只有在目录可读、扫描完整且 apply sequence 未前进时，才能把 Base/L2/Delta Live 相对当前目录集合的缺失项转换为直接子路径 Delete。扫描错误、未完成或 stale batch 不得产生负事实。
+
 ### 总不变量
 
 | 类别 | 不变量 |

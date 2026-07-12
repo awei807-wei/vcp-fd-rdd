@@ -29,8 +29,8 @@ const REPAIR_SLICE_MAX_MS: u64 = 20;
 ///
 /// 将候选 `(doc_id, path)` 条目按 parent dir 分组，每个 dirty 目录做一次
 /// `std::fs::read_dir` 构建 `HashSet<OsString>`，与索引文件名做差集：文件名不在
-/// readdir 结果中即视为已删除。`read_dir` 失败（目录不存在/不可读）时该目录下所有
-/// 索引条目都标记删除。
+/// readdir 结果中即视为已删除。`read_dir` 或迭代失败时放弃该目录的负事实，避免将
+/// 挂载点断联、权限抖动或部分读取误判为整目录删除。
 ///
 /// 内存权衡：`HashSet<OsString>` 在每个 parent dir 处理完后立即 drop，不跨目录累积。
 /// 30 万文件目录的 HashSet 峰值约 20-30MB，远小于逐文件 stat 的 15-60s 开销。
@@ -55,25 +55,45 @@ pub(super) fn readdir_delete_alignment(
         if let Some(gov) = io_governor {
             gov.before_io();
         }
-        let current_names: Option<HashSet<OsString>> = match std::fs::read_dir(&parent_dir) {
-            Ok(entries) => Some(
-                entries
-                    .filter_map(|e| e.ok().map(|e| e.file_name()))
-                    .collect(),
-            ),
-            Err(_) => None, // 目录不存在或不可读 → 全部标记删除
+        let entries = match std::fs::read_dir(&parent_dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::debug!(
+                    "delete alignment skipped unreadable dir {}: {}",
+                    parent_dir.display(),
+                    err
+                );
+                continue;
+            }
         };
+        let mut current_names = HashSet::new();
+        let mut complete = true;
+        for entry in entries {
+            match entry {
+                Ok(entry) => {
+                    current_names.insert(entry.file_name());
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        "delete alignment abandoned incomplete readdir for {}: {}",
+                        parent_dir.display(),
+                        err
+                    );
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            continue;
+        }
 
         for (_doc_id, path) in files {
-            let should_delete = match &current_names {
-                None => true, // 目录不可读，索引中所有文件视为已删除
-                Some(names) => {
-                    // 文件名不在 readdir 结果中 = 被删除；OsString 直接比对，支持非 UTF-8。
-                    path.file_name()
-                        .map(|name| !names.contains(name))
-                        .unwrap_or(false)
-                }
-            };
+            // 文件名不在完整 readdir 结果中 = 被删除；OsString 直接比对，支持非 UTF-8。
+            let should_delete = path
+                .file_name()
+                .map(|name| !current_names.contains(name))
+                .unwrap_or(false);
             if should_delete {
                 deleted.push(path);
             }
@@ -1634,7 +1654,15 @@ impl TieredIndex {
         }
 
         let completed = slice.completed;
-        if completed && !stale_low_priority_scan {
+        let mut dropped_stale_batch = stale_low_priority_scan;
+        if completed && !dropped_stale_batch {
+            let alignment_started_seq = self.event_seq.load(Ordering::Relaxed);
+            let (deleted, dropped_stale) =
+                self.align_missing_indexed_direct_children(dir, alignment_started_seq);
+            changed = changed.saturating_add(deleted);
+            dropped_stale_batch |= dropped_stale;
+        }
+        if completed && !dropped_stale_batch {
             if let Some((summary, true)) = self.directory_manifest_summary_bounded(
                 dir,
                 project_markers,
@@ -1675,8 +1703,155 @@ impl TieredIndex {
                 });
                 Some(DirtyRepairCursor::new(dir.clone(), offset))
             },
-            dropped_stale_batch: stale_low_priority_scan,
+            dropped_stale_batch,
         }
+    }
+
+    /// Reconcile missing direct children after a complete periodic repair scan.
+    ///
+    /// The sliced DIR cookie is intentionally not reused as deletion evidence. A
+    /// fresh, error-free direct-child `read_dir` snapshot is required. Base/L2
+    /// direct-child candidates and deep live Delta paths are projected
+    /// to the first child below `dir`, so one subtree delete can invalidate all
+    /// stale descendants. The apply boundary rechecks both `event_seq` and the
+    /// directory fingerprint while holding the same gate as watcher events.
+    pub(super) fn align_missing_indexed_direct_children(
+        &self,
+        dir: &Path,
+        scan_started_seq: u64,
+    ) -> (usize, bool) {
+        if self.path_is_frozen(dir) {
+            return (0, true);
+        }
+
+        self.io_governor.before_io();
+        let before_meta = match std::fs::symlink_metadata(dir) {
+            Ok(meta) if meta.is_dir() => meta,
+            _ => return (0, true),
+        };
+        let Some(before_fingerprint) = directory_read_fingerprint(dir, &before_meta) else {
+            return (0, true);
+        };
+
+        self.io_governor.before_io();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::debug!(
+                    "periodic negative alignment skipped unreadable dir {}: {}",
+                    dir.display(),
+                    err
+                );
+                return (0, true);
+            }
+        };
+        let mut current_names = HashSet::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::debug!(
+                        "periodic negative alignment abandoned incomplete readdir for {}: {}",
+                        dir.display(),
+                        err
+                    );
+                    return (0, true);
+                }
+            };
+            current_names.insert(entry.file_name());
+        }
+
+        let dirty_dirs = HashSet::from([dir.to_path_buf()]);
+        let mut indexed_children = self
+            .base
+            .load_full()
+            .delete_alignment_with_parent_index(&dirty_dirs)
+            .into_iter()
+            .filter_map(|(_, path)| first_direct_child(dir, path.as_path()))
+            .collect::<Vec<_>>();
+        indexed_children.extend(
+            self.l2
+                .load_full()
+                .delete_alignment_with_parent_index(&dirty_dirs)
+                .into_iter()
+                .filter_map(|(_, path)| first_direct_child(dir, path.as_path())),
+        );
+        {
+            let db = self.delta_buffer.lock();
+            indexed_children.extend(
+                db.live_records()
+                    .filter_map(EventRecord::best_path)
+                    .filter_map(|path| first_direct_child(dir, path)),
+            );
+        }
+        let mut missing_children = indexed_children
+            .into_iter()
+            .filter(|child| {
+                child
+                    .file_name()
+                    .is_some_and(|name| !current_names.contains(name))
+            })
+            .map(|path| super::normalize_path(path.as_path()))
+            .collect::<Vec<_>>();
+        missing_children.sort();
+        missing_children.dedup();
+        if missing_children.is_empty() {
+            return (0, false);
+        }
+
+        let delete_events = missing_children
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| EventRecord {
+                seq: index as u64 + 1,
+                timestamp: std::time::SystemTime::now(),
+                event_type: EventType::Delete,
+                id: FileIdentifier::Path(path),
+                path_hint: None,
+            })
+            .collect::<Vec<_>>();
+
+        self.io_governor.before_io();
+        let _snapshot_boundary = self.snapshot_event_gate.lock();
+        if self.event_seq.load(Ordering::Relaxed) != scan_started_seq {
+            tracing::debug!(
+                "discarded stale periodic negative alignment after newer apply seq advanced"
+            );
+            return (0, true);
+        }
+        let after_fingerprint = std::fs::symlink_metadata(dir)
+            .ok()
+            .filter(|meta| meta.is_dir())
+            .and_then(|meta| directory_read_fingerprint(dir, &meta));
+        if after_fingerprint != Some(before_fingerprint) {
+            tracing::debug!(
+                "periodic negative alignment abandoned changed directory for {}",
+                dir.display()
+            );
+            return (0, true);
+        }
+        let mut freeze_gate = self.recovery_quarantine.freeze_gate.lock();
+        if delete_events
+            .iter()
+            .any(|event| freeze_gate.should_block_event(event))
+        {
+            for event in &delete_events {
+                if freeze_gate.should_block_event(event) {
+                    freeze_gate.note_blocked();
+                }
+            }
+            return (0, true);
+        }
+        drop(freeze_gate);
+
+        let Some(batch) = self.begin_apply_batch(delete_events.as_slice(), true, None) else {
+            return (0, false);
+        };
+        batch.l2.apply_events(delete_events.as_slice());
+        self.event_seq
+            .fetch_add(batch.event_count as u64, Ordering::Relaxed);
+        self.stats.record_events_applied(batch.event_count as u64);
+        (batch.event_count, false)
     }
 
     fn repair_slice_path_allowed(
@@ -2058,4 +2233,58 @@ impl TieredIndex {
         }
         count
     }
+}
+
+fn first_direct_child(root: &Path, path: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(root).ok()?;
+    let std::path::Component::Normal(name) = relative.components().next()? else {
+        return None;
+    };
+    Some(root.join(name))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryReadFingerprint {
+    file_key: FileKey,
+    mtime_ns: i128,
+    ctime_ns: i128,
+    nlink: u64,
+}
+
+#[cfg(unix)]
+fn directory_read_fingerprint(
+    path: &Path,
+    meta: &std::fs::Metadata,
+) -> Option<DirectoryReadFingerprint> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(DirectoryReadFingerprint {
+        file_key: FileKey::from_path_and_metadata(path, meta)?,
+        mtime_ns: i128::from(meta.mtime())
+            .saturating_mul(1_000_000_000)
+            .saturating_add(i128::from(meta.mtime_nsec())),
+        ctime_ns: i128::from(meta.ctime())
+            .saturating_mul(1_000_000_000)
+            .saturating_add(i128::from(meta.ctime_nsec())),
+        nlink: meta.nlink(),
+    })
+}
+
+#[cfg(not(unix))]
+fn directory_read_fingerprint(
+    path: &Path,
+    meta: &std::fs::Metadata,
+) -> Option<DirectoryReadFingerprint> {
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().min(i128::MAX as u128) as i128)
+        .unwrap_or(0);
+    Some(DirectoryReadFingerprint {
+        file_key: FileKey::from_path_and_metadata(path, meta)?,
+        mtime_ns,
+        ctime_ns: mtime_ns,
+        nlink: 0,
+    })
 }

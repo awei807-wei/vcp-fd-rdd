@@ -1160,6 +1160,147 @@ fn sliced_repair_cursor_resumes_after_first_chunk() {
 }
 
 #[tokio::test]
+async fn periodic_cold_scan_converges_missing_deep_delta_subtree() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("periodic-negative-deep-delta");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let burst_root = content_root.join("storm-burst");
+    let stale_path = burst_root.join("nested").join("save_0010.txt");
+    std::fs::create_dir_all(stale_path.parent().unwrap())?;
+    std::fs::create_dir_all(&state_root)?;
+    std::fs::write(&stale_path, b"atomic save")?;
+
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, stale_path.clone())]);
+    std::fs::remove_dir_all(&burst_root)?;
+
+    let reports = mtime_precheck_run_cold_scan_to_completion(
+        idx.as_ref(),
+        &content_root,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].outcomes[0].outcome.changed, 1);
+    {
+        let db = idx.delta_buffer.lock();
+        assert!(db.is_deleted(burst_root.as_os_str().as_encoded_bytes()));
+        assert_eq!(
+            db.invalidation_covering_path(&stale_path),
+            Some(burst_root.as_os_str().as_encoded_bytes())
+        );
+    }
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    idx.snapshot_now(store.clone()).await?;
+    let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    assert!(reloaded.query("save_0010").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn periodic_negative_alignment_discards_stale_event_seq() {
+    let root = unique_tmp_dir("periodic-negative-stale-seq");
+    let burst_root = root.join("storm-burst");
+    let stale_path = burst_root.join("deep").join("stale.txt");
+    std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+    std::fs::write(&stale_path, b"stale").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, stale_path.clone())]);
+    std::fs::remove_dir_all(&burst_root).unwrap();
+    let scan_started_seq = idx.event_seq.load(Ordering::Relaxed);
+    idx.event_seq.fetch_add(1, Ordering::Relaxed);
+
+    let (deleted, dropped_stale) =
+        idx.align_missing_indexed_direct_children(&root, scan_started_seq);
+    assert_eq!(deleted, 0);
+    assert!(dropped_stale);
+    let db = idx.delta_buffer.lock();
+    assert!(db.is_live(stale_path.as_os_str().as_encoded_bytes()));
+    assert!(!db.is_deleted(burst_root.as_os_str().as_encoded_bytes()));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn periodic_negative_alignment_respects_offline_freeze_gate() {
+    let root = unique_tmp_dir("periodic-negative-freeze");
+    let burst_root = root.join("offline-burst");
+    let stale_path = burst_root.join("deep").join("stale.txt");
+    std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+    std::fs::write(&stale_path, b"stale").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, stale_path.clone())]);
+    std::fs::remove_dir_all(&burst_root).unwrap();
+    idx.install_freeze_gate(FreezeGate::from_roots(vec![root.clone()]));
+
+    let scan_started_seq = idx.event_seq.load(Ordering::Relaxed);
+    let (deleted, dropped_stale) =
+        idx.align_missing_indexed_direct_children(&root, scan_started_seq);
+    assert_eq!(deleted, 0);
+    assert!(dropped_stale);
+    let db = idx.delta_buffer.lock();
+    assert!(db.is_live(stale_path.as_os_str().as_encoded_bytes()));
+    assert!(!db.is_deleted(burst_root.as_os_str().as_encoded_bytes()));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn periodic_negative_alignment_covers_base_direct_children() {
+    let root = unique_tmp_dir("periodic-negative-base");
+    std::fs::create_dir_all(&root).unwrap();
+    let stale_path = root.join("base_stale.txt");
+    std::fs::write(&stale_path, b"base").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
+    idx.refresh_base();
+    std::fs::remove_file(&stale_path).unwrap();
+
+    let scan_started_seq = idx.event_seq.load(Ordering::Relaxed);
+    let (deleted, dropped_stale) =
+        idx.align_missing_indexed_direct_children(&root, scan_started_seq);
+    assert_eq!(deleted, 1);
+    assert!(!dropped_stale);
+    assert!(idx
+        .delta_buffer
+        .lock()
+        .is_deleted(stale_path.as_os_str().as_encoded_bytes()));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn periodic_negative_alignment_covers_l2_direct_children() {
+    let root = unique_tmp_dir("periodic-negative-l2");
+    std::fs::create_dir_all(&root).unwrap();
+    let stale_path = root.join("l2_stale.txt");
+    std::fs::write(&stale_path, b"l2").unwrap();
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, stale_path.clone())]);
+    idx.delta_buffer.lock().reset_complete_generation();
+    idx.l2.load_full().rebuild_parent_index();
+    std::fs::remove_file(&stale_path).unwrap();
+
+    let scan_started_seq = idx.event_seq.load(Ordering::Relaxed);
+    let (deleted, dropped_stale) =
+        idx.align_missing_indexed_direct_children(&root, scan_started_seq);
+    assert_eq!(deleted, 1);
+    assert!(!dropped_stale);
+    assert!(idx
+        .delta_buffer
+        .lock()
+        .is_deleted(stale_path.as_os_str().as_encoded_bytes()));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn quarantine_sidecar_restore_installs_freeze_gate_before_events() -> anyhow::Result<()> {
     let root = unique_tmp_dir("quarantine-restore");
     let content_root = root.join("content");
@@ -4572,7 +4713,7 @@ fn delete_alignment_keeps_existing_files() {
 
 #[test]
 fn delete_alignment_dir_gone() {
-    // 目录不存在 → read_dir 失败 → 该目录下所有索引条目标记删除
+    // 目录不存在可能是挂载断联，read_dir 失败不能成为可信删除证据。
     let dir = unique_tmp_dir("p2-dir-gone");
     // 故意不创建 dir，read_dir 必然失败
     let a = dir.join("a.txt");
@@ -4580,9 +4721,7 @@ fn delete_alignment_dir_gone() {
     let to_delete = vec![(0u64, a.clone()), (1u64, b.clone())];
 
     let set = deleted_set(super::sync::readdir_delete_alignment(to_delete, None));
-    assert_eq!(set.len(), 2, "all entries under a gone dir must be deleted");
-    assert!(set.contains(&a));
-    assert!(set.contains(&b));
+    assert!(set.is_empty(), "unreadable dir must fail closed");
 }
 
 #[test]

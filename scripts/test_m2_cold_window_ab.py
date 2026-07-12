@@ -400,6 +400,12 @@ class FailureDiagnosticTests(unittest.TestCase):
                         "fatal_error": "runner exploded",
                         "cleanup_errors": ["daemon_shutdown_timeout"],
                         "ab_comparability_reasons": ["daemon_exit_failed"],
+                        "execution": {
+                            "completion_reason": "duration_elapsed",
+                            "exit_code": 1,
+                            "event_storm_cleanup_failures": 2,
+                            "final_snapshot_failed": True,
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -437,6 +443,7 @@ class FailureDiagnosticTests(unittest.TestCase):
             self.assertIn("runner exploded", rendered)
             self.assertIn("daemon_shutdown_timeout", rendered)
             self.assertIn("final_snapshot_failed", rendered)
+            self.assertIn("event_storm_cleanup_failures=2", rendered)
             self.assertIn("event loop failed", rendered)
             self.assertIn("snapshot_upsert_unresolved", rendered)
             self.assertIn(str(run_dir / "fd-rdd.log"), rendered)

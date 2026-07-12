@@ -104,6 +104,7 @@ def _manifest_diagnostics(run_dir: Path) -> list[str]:
                 "cleanup_errors",
                 "final_snapshot_failed",
                 "event_storm_write_failures",
+                "event_storm_cleanup_failures",
                 "unsupported_workloads",
                 "endpoint_sample_failures",
             ),
