@@ -25,13 +25,22 @@ from m2_cold_window_ab_command import (
     VARIANTS,
     WORKLOAD_SEED,
     build_command,
-    treatment_args,
+)
+from m2_cold_window_ab_diagnostics import (
+    exception_reasons,
+    extend_failure_reasons,
+    render_failure_report,
+    runner_log_path,
+)
+from m2_cold_window_ab_process import (
+    RunnerOutputCapture,
+    start_runner_process,
+    stop_benchmark,
 )
 
 METRICS_START_TIMEOUT_SECS = 900.0
 M2_PREFLIGHT_TIMEOUT_SECS = 300.0
 PREFLIGHT_POLL_SECS = 2.0
-GRACEFUL_STOP_TIMEOUT_SECS = 330.0
 
 REQUIRED_ARTIFACTS = (
     "summary.json",
@@ -250,21 +259,6 @@ def wait_for_preflight(
     raise GateError([f"底层 benchmark 在预检完成前退出，退出码 {process.returncode}"])
 
 
-def stop_benchmark(process: subprocess.Popen[Any]) -> None:
-    if process.poll() is not None:
-        return
-    process.send_signal(signal.SIGINT)
-    try:
-        process.wait(timeout=GRACEFUL_STOP_TIMEOUT_SECS)
-    except subprocess.TimeoutExpired:
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-
-
 def _validate_run_metadata(run_dir: Path, reasons: list[str]) -> None:
     summary_path = run_dir / "summary.json"
     if summary_path.is_file() and summary_path.stat().st_size > 0:
@@ -275,7 +269,9 @@ def _validate_run_metadata(run_dir: Path, reasons: list[str]) -> None:
                     f"summary 记录 fd-rdd 退出码异常：{summary.get('fd_rdd_exit_code')!r}"
                 )
             if summary.get("ab_comparable") is not True:
-                detail = ", ".join(summary.get("ab_comparability_reasons", []) or [])
+                raw_detail = summary.get("ab_comparability_reasons", []) or []
+                detail_items = raw_detail if isinstance(raw_detail, list) else [raw_detail]
+                detail = ", ".join(str(item) for item in detail_items)
                 reasons.append(f"runner 判定本轮不可做 A/B 比较：{detail or '原因缺失'}")
         except GateError as exc:
             reasons.extend(exc.reasons)
@@ -361,24 +357,37 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     process: subprocess.Popen[Any] | None = None
+    capture: RunnerOutputCapture | None = None
     try:
         roots = rebuild_fixture()
         RUN_ROOT.mkdir(parents=True, exist_ok=True)
         command = build_command(args.variant, run_dir, roots)
-        process = subprocess.Popen(command, cwd=REPO_ROOT)
+        process, capture = start_runner_process(
+            command, REPO_ROOT, runner_log_path(run_dir)
+        )
         wait_for_preflight(process, run_dir, args.variant)
         return_code = process.wait()
+        capture_errors = capture.join(timeout=10)
+        if capture_errors:
+            raise GateError(["runner 输出采集失败", *capture_errors])
         if return_code != 0:
             raise GateError([f"底层 benchmark 失败，退出码 {return_code}"])
         validate_run(run_dir, args.variant)
-    except (GateError, OSError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001 - every gate failure needs evidence
+        cleanup_reasons: list[str] = []
         if process is not None:
-            stop_benchmark(process)
-        print(f"M2 A/B 门禁失败：{exc}", file=sys.stderr)
+            cleanup_reasons.extend(stop_benchmark(process))
+        if capture is not None:
+            cleanup_reasons.extend(capture.join(timeout=10))
+        reasons = exception_reasons(exc)
+        reasons.extend(reason for reason in cleanup_reasons if reason not in reasons)
+        render_failure_report(extend_failure_reasons(reasons, run_dir), sys.stderr)
         return 1
     except KeyboardInterrupt:
         if process is not None:
             stop_benchmark(process)
+        if capture is not None:
+            capture.join(timeout=10)
         print("M2 A/B 测试已由用户中断", file=sys.stderr)
         return 130
 

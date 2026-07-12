@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- M2 一键 A/B 驱动在底层 runner 非零退出、预检早退或收尾门禁失败时，不再只打印退出码；runner stdout/stderr 会同步落入 run 目录同级日志，停止流程异常不会遮蔽原始错误，门禁会有界汇总 manifest/summary 状态、缺失/空产物、最近关键事件及 runner/daemon 错误尾部，并输出完整现场路径。
 - M2 event storm 的 tier 目标选择不再复用当前或历史 `fd-rdd-m2-event-storm-*` 目录及其后代；候选同时校验词法路径、真实路径和配置 root，避免 workload 递归嵌套或经 symlink 逃逸。
 - 快照遇到已被精确或祖先 delete/rename 失效证据覆盖的 transient Live upsert 时，会将其收敛为删除并继续持久化最终事实；没有失效证据的 unresolved upsert 仍保持 fail-closed，不再让原子保存的旧 `.tmp` 或子树 rename 旧路径触发无意义 rebuild。
 - fd-rdd 关机现在先关闭周期快照与 rebuild 准入，最终快照失败会保留 `Final snapshot failed` 日志并以错误退出；仅在最终快照、fast-scan registry 和 runtime state 全部持久化成功后写入 clean-shutdown，cooldown/retry 线程不能越过关机边界启动 rebuild。

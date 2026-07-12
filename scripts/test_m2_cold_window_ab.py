@@ -8,10 +8,13 @@ import importlib.util
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import m2_cold_window_ab_diagnostics as ab_diagnostics
 
 
 SCRIPT = Path(__file__).with_name("m2-cold-window-ab.py")
@@ -166,9 +169,22 @@ class MetricsGateTests(unittest.TestCase):
         process = mock.Mock()
         process.poll.return_value = None
         process.wait.return_value = 0
-        ab.stop_benchmark(process)
+        errors = ab.stop_benchmark(process)
+        self.assertEqual(errors, [])
         process.send_signal.assert_called_once_with(ab.signal.SIGINT)
         process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
+    def test_stop_benchmark_preserves_signal_failure_and_falls_back(self) -> None:
+        process = mock.Mock()
+        process.poll.side_effect = [None, None]
+        process.send_signal.side_effect = ProcessLookupError("signal race")
+        process.wait.return_value = 0
+
+        errors = ab.stop_benchmark(process)
+
+        self.assertTrue(any("signal race" in error for error in errors))
+        process.terminate.assert_called_once()
         process.kill.assert_not_called()
 
     def test_complete_valid_run_passes(self) -> None:
@@ -245,6 +261,215 @@ class MetricsGateTests(unittest.TestCase):
         (metrics_dir / "metrics_2026-07-12_00.json").write_text(
             json.dumps(metric) + "\n",
             encoding="utf-8",
+        )
+
+
+class FailureDiagnosticTests(unittest.TestCase):
+    def test_unexpected_wrapper_exception_still_renders_failure_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir)
+            roots = {
+                name: Path("/fixture") / name
+                for name in ("cold-a", "cold-b", "hot")
+            }
+            stderr = io.StringIO()
+            with mock.patch.object(ab, "RUN_ROOT", run_root):
+                with mock.patch.object(ab, "utc_stamp", return_value="broken"):
+                    with mock.patch.object(ab, "rebuild_fixture", return_value=roots):
+                        with mock.patch.object(
+                            ab,
+                            "start_runner_process",
+                            side_effect=RuntimeError("unexpected spawn failure"),
+                        ):
+                            with contextlib.redirect_stdout(io.StringIO()):
+                                with contextlib.redirect_stderr(stderr):
+                                    result = ab.main(["a"])
+
+            self.assertEqual(result, 1)
+            self.assertIn("RuntimeError: unexpected spawn failure", stderr.getvalue())
+            self.assertIn("manifest=missing", stderr.getvalue())
+
+    def test_runner_output_is_streamed_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "runner.log"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                process, capture = ab.start_runner_process(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys; print('runner-out'); print('runner-err', file=sys.stderr)",
+                    ],
+                    SCRIPT.parent,
+                    log_path,
+                )
+                self.assertEqual(process.wait(timeout=10), 0)
+                self.assertEqual(capture.join(timeout=10), [])
+
+            persisted = log_path.read_text(encoding="utf-8")
+            self.assertIn("runner-out", persisted)
+            self.assertIn("runner-err", persisted)
+            self.assertIn("runner-out", stdout.getvalue())
+            self.assertIn("runner-err", stdout.getvalue())
+
+    def test_main_nonzero_runner_exit_surfaces_bounded_failure_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir)
+            run_dir = run_root / "fixed_a_rotating"
+            run_dir.mkdir()
+            (run_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "run_state": "failed",
+                        "failure_stage": "runtime",
+                        "fatal_error": "event storm crashed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "fd-rdd.log").write_text(
+                "ERROR daemon exited unexpectedly\n",
+                encoding="utf-8",
+            )
+            process = mock.Mock()
+            process.wait.return_value = 1
+            process.poll.return_value = 1
+            roots = {
+                name: Path("/fixture") / name
+                for name in ("cold-a", "cold-b", "hot")
+            }
+            stderr = io.StringIO()
+
+            with mock.patch.object(ab, "RUN_ROOT", run_root):
+                with mock.patch.object(ab, "utc_stamp", return_value="fixed"):
+                    with mock.patch.object(ab, "rebuild_fixture", return_value=roots):
+                        with mock.patch.object(ab.subprocess, "Popen", return_value=process):
+                            with mock.patch.object(ab, "wait_for_preflight"):
+                                with contextlib.redirect_stdout(io.StringIO()):
+                                    with contextlib.redirect_stderr(stderr):
+                                        result = ab.main(["a"])
+
+            rendered = stderr.getvalue()
+            self.assertEqual(result, 1)
+            self.assertIn("底层 benchmark 失败，退出码 1", rendered)
+            self.assertIn(f"失败现场目录：{run_dir}", rendered)
+            self.assertIn("failure_stage=runtime", rendered)
+            self.assertIn("event storm crashed", rendered)
+            self.assertIn("daemon exited unexpectedly", rendered)
+
+    def test_missing_artifacts_are_reported_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir) / "failed-run"
+            run_dir.mkdir()
+            (run_dir / "fd-rdd.log").write_text("daemon tail\n", encoding="utf-8")
+
+            rendered = "\n".join(ab_diagnostics.collect_failure_diagnostics(run_dir))
+
+            self.assertIn("manifest=missing", rendered)
+            self.assertIn("summary=missing", rendered)
+            self.assertIn("runner_log=missing", rendered)
+
+    def test_malformed_summary_reason_type_enters_gate_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            MetricsGateTests.write_complete_run(run_dir, MetricsGateTests.sample(False))
+            (run_dir / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "fd_rdd_exit_code": 0,
+                        "ab_comparable": False,
+                        "ab_comparability_reasons": [{"code": "schema-damaged"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ab.GateError, "schema-damaged"):
+                ab.validate_run(run_dir, "b")
+
+    def test_collect_failure_diagnostics_surfaces_runner_and_daemon_causes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            (run_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "run_state": "failed",
+                        "failure_stage": "runtime",
+                        "completion_reason": "daemon_exit",
+                        "fd_rdd_exit_code": 1,
+                        "fatal_error": "runner exploded",
+                        "cleanup_errors": ["daemon_shutdown_timeout"],
+                        "ab_comparability_reasons": ["daemon_exit_failed"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "fd_rdd_exit_code": 1,
+                        "fatal_error": "summary failure",
+                        "ab_comparability_reasons": ["final_snapshot_failed"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "event": "fatal_error",
+                        "error": "event loop failed",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (run_dir / "fd-rdd.log").write_text(
+                "normal line\n"
+                "2026 ERROR Final snapshot failed: snapshot_upsert_unresolved\n",
+                encoding="utf-8",
+            )
+
+            rendered = "\n".join(ab_diagnostics.collect_failure_diagnostics(run_dir))
+
+            self.assertIn(f"失败现场目录：{run_dir}", rendered)
+            self.assertIn("failure_stage=runtime", rendered)
+            self.assertIn("runner exploded", rendered)
+            self.assertIn("daemon_shutdown_timeout", rendered)
+            self.assertIn("final_snapshot_failed", rendered)
+            self.assertIn("event loop failed", rendered)
+            self.assertIn("snapshot_upsert_unresolved", rendered)
+            self.assertIn(str(run_dir / "fd-rdd.log"), rendered)
+
+    def test_collect_failure_diagnostics_bounds_log_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            (run_dir / "fd-rdd.log").write_text(
+                "".join(f"ERROR failure-{index:03d}\n" for index in range(100)),
+                encoding="utf-8",
+            )
+
+            diagnostics = ab_diagnostics.collect_failure_diagnostics(run_dir)
+            log_section = next(item for item in diagnostics if "fd-rdd.log 关键尾部" in item)
+
+            self.assertNotIn("failure-000", log_section)
+            self.assertIn("failure-099", log_section)
+            self.assertLessEqual(
+                len(log_section.splitlines()),
+                ab_diagnostics.DIAGNOSTIC_LOG_LINES + 1,
+            )
+
+    def test_render_gate_error_prints_each_reason_on_its_own_line(self) -> None:
+        stderr = io.StringIO()
+        ab.render_failure_report(["退出码 1", "manifest: runtime failed"], stderr)
+
+        self.assertEqual(
+            stderr.getvalue().splitlines(),
+            [
+                "M2 A/B 门禁失败：",
+                "- 退出码 1",
+                "- manifest: runtime failed",
+            ],
         )
 
 

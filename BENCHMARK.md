@@ -39,7 +39,7 @@ python3 scripts/m2-cold-window-ab.py a  # 开启 M2
 python3 scripts/m2-cold-window-ab.py b  # 关闭 M2
 ```
 
-驱动只接受 `a`/`b`，固定重建 `$HOME/fd-rdd-m2-roots` 专用 fixture，并把输出写入 `/tmp/fd-rdd-m2-runs`。两组除 treatment 开关外使用相同的一小时 event storm、canary、扫描预算和 seed。运行中会提前拒绝开关错配、没有 L2/L3 或 A 无 M2 活动，结束后再校验 runner 的 `ab_comparable`、完整时长、burst 和 summary/manifest/process/endpoint 产物；失败均返回非零。使用 `--dry-run` 可只打印固定命令，不修改环境。
+驱动只接受 `a`/`b`，固定重建 `$HOME/fd-rdd-m2-roots` 专用 fixture，并把输出写入 `/tmp/fd-rdd-m2-runs`。两组除 treatment 开关外使用相同的一小时 event storm、canary、扫描预算和 seed。运行中会提前拒绝开关错配、没有 L2/L3 或 A 无 M2 活动，结束后再校验 runner 的 `ab_comparable`、完整时长、burst 和 summary/manifest/process/endpoint 产物；失败均返回非零。wrapper 会把底层 runner 的 stdout/stderr 同步显示并持久化为 run 目录同级的 `<run-name>.runner.log`；失败输出会直接汇总 run 目录、manifest/summary 关键状态、缺失/空产物、最近错误事件，以及 runner/daemon 各最多 20 行关键日志，避免只有“底层 benchmark 退出码 1”而无法定位。使用 `--dry-run` 可只打印固定命令，不修改环境。
 
 ### 总不变量
 
