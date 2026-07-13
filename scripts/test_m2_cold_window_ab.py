@@ -128,6 +128,7 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--event-storm-kind save100,git_clone,subtree_rename", joined)
         self.assertIn("--event-storm-target-tier L3", joined)
         self.assertIn("--event-storm-start-delay-secs 240", joined)
+        self.assertIn("--event-storm-interval-secs 30", joined)
         self.assertIn("--event-storm-visibility-probes-per-burst 8", joined)
         self.assertIn("--event-storm-visibility-poll-interval-secs 1", joined)
         self.assertIn("--event-storm-max-bursts 6", joined)
@@ -141,6 +142,21 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(command_a.count("--event-storm-root"), 1)
         root_index = command_a.index("--event-storm-root")
         self.assertEqual(command_a[root_index + 1], "/fixture/cold-a")
+
+    def test_falsification_profile_leaves_l3_rearm_scheduling_margin(self) -> None:
+        profile = ab.PROFILES["falsification"]
+        l3_rearm_secs = 5 + 60 * 2
+        burst_period_secs = (
+            profile.event_settle_secs + profile.event_interval_secs
+        )
+        required_duration_secs = (
+            profile.event_start_delay_secs
+            + profile.max_bursts * profile.event_settle_secs
+            + (profile.max_bursts - 1) * profile.event_interval_secs
+        )
+
+        self.assertGreaterEqual(burst_period_secs - l3_rearm_secs, 20)
+        self.assertLessEqual(required_duration_secs, profile.duration_secs)
 
     def test_falsification_dry_run_accepts_explicit_run_dir(self) -> None:
         output = io.StringIO()

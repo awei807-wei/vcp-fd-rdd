@@ -73,7 +73,10 @@ PROFILES = {
         event_kinds="save100,git_clone,subtree_rename",
         target_tiers="L3",
         event_start_delay_secs=240,
-        event_interval_secs=10,
+        # A changed L3 root returns through L1/L2 before it is eligible for the
+        # next strict L3 burst. 120s settle + 30s interval leaves 25s beyond
+        # the configured 5s + 2*60s recovery path for scheduler jitter.
+        event_interval_secs=30,
         event_settle_secs=120,
         immediate_query=False,
         active_canary=False,

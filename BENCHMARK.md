@@ -50,7 +50,9 @@ python3 scripts/m2-cold-window-falsification.py
 ```
 
 套件固定运行 4 个配对 block（`2×AB + 2×BA`，共 8 腿），每腿 1200 秒，只向
-`cold-a` 的 L3 注入两轮 `save100`、`git_clone`、`subtree_rename`。每腿必须精确形成
+`cold-a` 的 L3 注入两轮 `save100`、`git_clone`、`subtree_rename`。相邻 burst 使用 120 秒 settle
+和 30 秒轮间隔：150 秒周期覆盖变更后 `L1 -> L2 -> L3` 的 125 秒配置恢复路径，并保留 25 秒
+调度余量；六轮和最后一次 settle 仍在 1200 秒内完成。每腿必须精确形成
 6 个 physical burst、806 个唯一路径主断言和 38 个有界可见性探针。它跨腿校验
 Git/binary/fixture/保序事件计划/协议指纹，并验证四块 order/position 精确满足 `2×AB + 2×BA`。
 完整运行的配对 CPU service time、I/O、RSS、fault、查询轮询负载、最终状态断言、目标目录实时 M2 租约与写入后扫描/事件证据、
@@ -69,7 +71,7 @@ visibility probe 判断。每腿的磁盘 snapshot label 还包含完整 run-dir
 一次可归因的安全 rebuild，但必须最终 `ready=true`、日志无 ERROR，且完整成本仍计入 A/B。
 每腿 process 采样还必须覆盖至少 95% 的 1200 秒窗口、最大间隔不超过 3 秒且单调计数器不回退。同一 block 的两腿启动间隔不得超过 30 分钟；中断后只复用完整且相邻的整块，不能把跨会话腿拼成配对结果。suite、wrapper 和 benchmark 分别拥有独立进程组，超时清理按运行中 sidecar 记录的已验证 benchmark 进程组执行，避免孤儿 daemon 污染续跑。
 
-快速 profile 额外启用 `--event-storm-strict-protocol`：固定调度只选择 daemon 已登记的配置根，不再选择没有独立 M2 entry 的 `dNNN` 子目录；每个 burst 在写入 fixture 前必须证明请求 tier 与实际 tier 一致。非固定模式下，目录没有独立 tier 行时继承最近祖先目录的 tier，不会匹配 sibling。`/debug/tiered-watch` 请求成功与目标 M2 entry 是否存在分开记录：A 必须有精确 entry、有效租约和合法 action；B 允许精确 entry 不存在，但所有 M2 活动字段必须为零。写后因果不再依赖可回拨的秒级系统时间：runner 用写前序列和写后租约栅栏包住 mutation 窗口，只接受同一租约周期内、发生在该窗口中或窗口后的 M2 scan/event 单调序列推进；scan 序列只由携带轮转 `cycle_id` 的 dirty source 完成时发布，普通周期/API/查询扫描不能冒充。租约同时使用单调时钟与墙上时钟判活，任一过期即失效。任一前置条件不成立会立即结束该腿，不再浪费完整 1200 秒。
+快速 profile 额外启用 `--event-storm-strict-protocol`：固定调度只选择 daemon 已登记的配置根，不再选择没有独立 M2 entry 的 `dNNN` 子目录；每个 burst 在写入 fixture 前必须证明请求 tier 与实际 tier 一致，仍不会把 L2 放宽成 L3。非固定模式下，目录没有独立 tier 行时继承最近祖先目录的 tier，不会匹配 sibling。`/debug/tiered-watch` 请求成功与目标 M2 entry 是否存在分开记录：A 必须有精确 entry、有效租约和合法 action；B 允许精确 entry 不存在，但所有 M2 活动字段必须为零。写后因果不再依赖可回拨的秒级系统时间：runner 用写前序列和写后租约栅栏包住 mutation 窗口，只接受同一租约周期内、发生在该窗口中或窗口后的 M2 scan/event 单调序列推进；scan 序列只由携带轮转 `cycle_id` 的 dirty source 完成时发布，普通周期/API/查询扫描不能冒充。租约同时使用单调时钟与墙上时钟判活，任一过期即失效。任一前置条件不成立会立即结束该腿，不再浪费完整 1200 秒。
 
 稳定性统计通过显式 `startup bootstrap` rebuild reason 识别 fresh-snapshot 启动构建，旧日志才回退到最早 ready 标记前后分账；bootstrap 最多一次。允许的 ready 后 rebuild 还必须带 `snapshot recovery` reason，且启动日志的字节偏移落在 shutdown snapshot quiesce 捕获窗口内；仅有全局 `rebuild_observed=true` 不能替运行期 rebuild 背书。suite 结束会逐条打印 `gate_reason`，并在 suite 目录旁生成 `<suite>-evidence.tar.gz`：只收集最终 summary 精确引用的八个 attempt，校验根级与逐腿必需成员，并附成员 SHA256 清单；根级 `build-provenance.json` 的实际 SHA256 还必须与八腿 `audit.receipt_sha256` 全部一致。不打包历史 attempt、`build-target`、腿内执行副本、snapshot、symlink 或伪造路径。缺件、摘要不一致、构建回执被替换或打包失败都会使旧包失效、写回基础设施失败并返回非零。
 
