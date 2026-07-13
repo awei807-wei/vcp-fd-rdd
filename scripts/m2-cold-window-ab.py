@@ -16,6 +16,7 @@ from m2_cold_window_ab_command import (
     BINARY,
     COLD_DIR_COUNT,
     FIXTURE_DIR_NAME,
+    FIXTURE_ROOT_NAMES,
     REPO_ROOT,
     RUN_ROOT,
     PROFILES,
@@ -238,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         else RUN_ROOT / f"{utc_stamp()}_{default_label}"
     )
     binary = args.binary.expanduser().resolve()
-    roots = {name: fixture_root() / name for name in ("cold-a", "cold-b", "hot")}
+    roots = {name: fixture_root() / name for name in FIXTURE_ROOT_NAMES}
     command = build_command(
         args.variant,
         run_dir,

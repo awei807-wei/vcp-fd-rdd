@@ -14,7 +14,9 @@ import fcntl
 
 from m2_cold_window_ab_command import (
     COLD_DIR_COUNT,
+    FALSIFICATION_EVENT_ROOT_NAMES,
     FIXTURE_DIR_NAME,
+    FIXTURE_ROOT_NAMES,
     WORKLOAD_SEED,
 )
 
@@ -78,7 +80,7 @@ def _write_fixture_manifest(
         "completed": True,
         "actual_file_count": file_count,
         "seed": WORKLOAD_SEED,
-        "layout_version": "m2-cold-window-ab-v2",
+        "layout_version": "m2-cold-window-ab-v3",
         "content_sha256": content_sha256,
     }
     (root / ".fd-rdd-m2-fixture.json").write_text(
@@ -96,7 +98,7 @@ def rebuild_fixture(
     if root.exists() or root.is_symlink():
         shutil.rmtree(root)
 
-    roots = {name: root / name for name in ("cold-a", "cold-b", "hot")}
+    roots = {name: root / name for name in FIXTURE_ROOT_NAMES}
     for cold_name in ("cold-a", "cold-b"):
         cold_root = roots[cold_name]
         digest = hashlib.sha256()
@@ -111,4 +113,15 @@ def rebuild_fixture(
 
     roots["hot"].mkdir(parents=True)
     _write_fixture_manifest(roots["hot"], 0, hashlib.sha256().hexdigest())
+
+    for root_name in FALSIFICATION_EVENT_ROOT_NAMES:
+        event_root = roots[root_name]
+        relative = Path("seed") / "sentinel.txt"
+        content = f"fd-rdd M2 cold storm anchor {root_name}\n".encode("utf-8")
+        target = event_root / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes(content)
+        digest = hashlib.sha256()
+        _hash_fixture_entry(digest, relative, content)
+        _write_fixture_manifest(event_root, 1, digest.hexdigest())
     return roots

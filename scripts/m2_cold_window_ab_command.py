@@ -15,6 +15,11 @@ RUN_ROOT = Path("/tmp/fd-rdd-m2-runs")
 FIXTURE_DIR_NAME = "fd-rdd-m2-roots"
 COLD_DIR_COUNT = 300
 WORKLOAD_SEED = 42
+BASE_ROOT_NAMES = ("cold-a", "cold-b", "hot")
+FALSIFICATION_EVENT_ROOT_NAMES = tuple(
+    f"cold-storm-{index:02d}" for index in range(1, 7)
+)
+FIXTURE_ROOT_NAMES = (*BASE_ROOT_NAMES, *FALSIFICATION_EVENT_ROOT_NAMES)
 
 VARIANTS = {
     "a": ("a_rotating", "--rotating-cold-window", True),
@@ -68,14 +73,13 @@ PROFILES = {
     "falsification": BenchmarkProfile(
         build="never",
         duration_secs=1200,
-        event_root_names=("cold-a",),
+        event_root_names=FALSIFICATION_EVENT_ROOT_NAMES,
         passive_root_name="cold-b",
         event_kinds="save100,git_clone,subtree_rename",
         target_tiers="L3",
         event_start_delay_secs=240,
-        # A changed L3 root returns through L1/L2 before it is eligible for the
-        # next strict L3 burst. 120s settle + 30s interval leaves 25s beyond
-        # the configured 5s + 2*60s recovery path for scheduler jitter.
+        # Each burst uses a distinct registered root, so strict L3 preflight
+        # never depends on a previously mutated root demoting back from L2.
         event_interval_secs=30,
         event_settle_secs=120,
         immediate_query=False,
@@ -105,8 +109,19 @@ def _base_args(
     profile: BenchmarkProfile,
     binary: Path,
 ) -> list[str]:
-    cold_roots = f"{roots['cold-a']},{roots['cold-b']}"
-    return [
+    daemon_root_names = tuple(
+        dict.fromkeys((*BASE_ROOT_NAMES, *profile.event_root_names))
+    )
+    cold_root_names = tuple(
+        dict.fromkeys(
+            (
+                "cold-a",
+                "cold-b",
+                *(name for name in profile.event_root_names if name != "hot"),
+            )
+        )
+    )
+    args = [
         sys.executable,
         str(BENCH_RUNNER),
         "--repo",
@@ -119,31 +134,32 @@ def _base_args(
         _run_label(run_dir),
         "--run-dir",
         str(run_dir),
-        "--root",
-        str(roots["cold-a"]),
-        "--root",
-        str(roots["cold-b"]),
-        "--root",
-        str(roots["hot"]),
-        "--hot-roots",
-        str(roots["hot"]),
-        "--cold-roots",
-        cold_roots,
-        "--watch-mode",
-        "tiered",
-        "--runtime-profile",
-        "default",
-        "--tiered-profile",
-        "balanced",
-        "--duration-secs",
-        str(profile.duration_secs),
-        "--sample-interval-secs",
-        "10",
-        "--process-sample-interval-secs",
-        "0.5",
-        "--snapshot-interval-secs",
-        "300",
     ]
+    for root_name in daemon_root_names:
+        args.extend(("--root", str(roots[root_name])))
+    args.extend(
+        [
+            "--hot-roots",
+            str(roots["hot"]),
+            "--cold-roots",
+            ",".join(str(roots[name]) for name in cold_root_names),
+            "--watch-mode",
+            "tiered",
+            "--runtime-profile",
+            "default",
+            "--tiered-profile",
+            "balanced",
+            "--duration-secs",
+            str(profile.duration_secs),
+            "--sample-interval-secs",
+            "10",
+            "--process-sample-interval-secs",
+            "0.5",
+            "--snapshot-interval-secs",
+            "300",
+        ]
+    )
+    return args
 
 
 def _tiered_args() -> list[str]:

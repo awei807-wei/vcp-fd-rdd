@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from m2_cold_window_ab_command import FALSIFICATION_EVENT_ROOT_NAMES
+
 
 SOFT_DEGRADED_RATIO_LIMIT = 0.10
 MAX_A_VISIBILITY_P95_SECS = 35.0
@@ -163,26 +165,20 @@ def _validate_stability(leg: dict[str, Any], reasons: list[str]) -> None:
         reasons.append(f"{label} direct_v7_unsupported 未由安全 rebuild 收敛")
 
 
-def _path_within(path: str, root: str) -> bool:
-    candidate = Path(path)
-    anchor = Path(root)
-    return candidate == anchor or anchor in candidate.parents
-
-
 def _validate_protocol(leg: dict[str, Any], reasons: list[str]) -> None:
     label = leg_label(leg)
     protocol = leg["protocol"]
-    configured = protocol.get("configured_event_roots", [])
+    configured = [str(root) for root in protocol.get("configured_event_roots", [])]
+    event_roots = [str(root) for root in protocol.get("event_roots", [])]
     cold_root_ok = (
-        len(configured) == 1
-        and Path(str(configured[0])).name == "cold-a"
-        and all(
-            _path_within(str(root), str(configured[0]))
-            for root in protocol.get("event_roots", [])
-        )
+        len(configured) == len(FALSIFICATION_EVENT_ROOT_NAMES)
+        and len(set(configured)) == len(FALSIFICATION_EVENT_ROOT_NAMES)
+        and {Path(root).name for root in configured}
+        == set(FALSIFICATION_EVENT_ROOT_NAMES)
+        and set(event_roots) == set(configured)
     )
     if not cold_root_ok:
-        reasons.append(f"{label}事件未完全限制在 cold-a")
+        reasons.append(f"{label}事件未精确使用固定六根池")
     if protocol.get("requested_tiers") != ["L3"]:
         reasons.append(f"{label}请求 tier 不是唯一 L3")
     tier_before = protocol.get("tier_before", {})
@@ -215,8 +211,6 @@ def _validate_protocol(leg: dict[str, Any], reasons: list[str]) -> None:
         and target_entry_present != physical_bursts
     ):
         reasons.append(f"{label}并非每个目标目录都有精确 M2 目标目录 entry")
-    if leg.get("variant") == "a" and target_seen != physical_bursts:
-        reasons.append(f"{label}并非每个目标目录都已被 M2 轮转触达")
     if leg.get("variant") == "a":
         if target_active != physical_bursts or target_unexpired != physical_bursts:
             reasons.append(f"{label}并非每个目标目录在写入时都持有有效 M2 租约")

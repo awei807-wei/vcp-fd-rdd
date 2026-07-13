@@ -43,6 +43,10 @@ def synthetic_leg(
 ) -> dict[str, object]:
     positive_total = 406
     primary_total = 806
+    event_roots = [
+        f"/home/test/fd-rdd-m2-roots/cold-storm-{index:02d}"
+        for index in range(1, 7)
+    ]
     order = "ab" if block <= 2 else "ba"
     position = (
         1
@@ -134,8 +138,8 @@ def synthetic_leg(
             "checks": 6,
             "requested_tiers": ["L3"],
             "tier_before": {tier_before: 6},
-            "configured_event_roots": ["/home/test/fd-rdd-m2-roots/cold-a"],
-            "event_roots": ["/home/test/fd-rdd-m2-roots/cold-a/d001"],
+            "configured_event_roots": event_roots,
+            "event_roots": event_roots,
             "workloads": {
                 "git_clone": 2,
                 "save100": 2,
@@ -849,7 +853,7 @@ class GateTests(unittest.TestCase):
         result = gate.evaluate_suite(legs)
 
         self.assertEqual(result["decision"], "fail")
-        self.assertTrue(any("cold-a" in reason for reason in result["reasons"]))
+        self.assertTrue(any("固定六根池" in reason for reason in result["reasons"]))
         self.assertTrue(any("workload" in reason for reason in result["reasons"]))
 
     def test_gate_rejects_baseline_daemon_instability(self) -> None:
@@ -997,17 +1001,24 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result["decision"], "fail")
         self.assertTrue(any("35 秒 SLA" in reason for reason in result["reasons"]))
 
-    def test_gate_rejects_visibility_transport_or_target_attribution_failure(self) -> None:
+    def test_gate_rejects_visibility_transport_failure(self) -> None:
         legs = self.passing_legs()
         legs[0]["correctness"]["visibility_transport_failures"] = 1
-        legs[2]["protocol"]["target_m2_seen_bursts"] = 5
-        legs[3]["protocol"]["target_m2_seen_bursts"] = 1
 
         result = gate.evaluate_suite(legs)
 
         self.assertEqual(result["decision"], "fail")
         self.assertTrue(any("visibility polling" in reason for reason in result["reasons"]))
-        self.assertTrue(any("轮转触达" in reason for reason in result["reasons"]))
+
+    def test_gate_accepts_active_leases_after_seen_cycle_resets(self) -> None:
+        legs = self.passing_legs()
+        for leg in legs:
+            if leg["variant"] == "a":
+                leg["protocol"]["target_m2_seen_bursts"] = 0
+
+        result = gate.evaluate_suite(legs)
+
+        self.assertEqual(result["decision"], "pass")
 
     def test_gate_rejects_historical_seen_without_live_causal_m2_evidence(self) -> None:
         legs = self.passing_legs()

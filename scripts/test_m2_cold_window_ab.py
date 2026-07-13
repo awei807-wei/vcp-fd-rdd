@@ -29,10 +29,10 @@ SPEC.loader.exec_module(ab)
 
 class CommandTests(unittest.TestCase):
     def setUp(self) -> None:
+        event_roots = tuple(f"cold-storm-{index:02d}" for index in range(1, 7))
         self.roots = {
-            "cold-a": Path("/fixture/cold-a"),
-            "cold-b": Path("/fixture/cold-b"),
-            "hot": Path("/fixture/hot"),
+            name: Path("/fixture") / name
+            for name in ("cold-a", "cold-b", "hot", *event_roots)
         }
 
     def test_a_b_treatment_is_the_only_command_difference(self) -> None:
@@ -139,23 +139,54 @@ class CommandTests(unittest.TestCase):
         )
         self.assertNotIn("--event-storm-immediate-query", command_a)
         self.assertNotIn("--canary-root", command_a)
-        self.assertEqual(command_a.count("--event-storm-root"), 1)
-        root_index = command_a.index("--event-storm-root")
-        self.assertEqual(command_a[root_index + 1], "/fixture/cold-a")
-
-    def test_falsification_profile_leaves_l3_rearm_scheduling_margin(self) -> None:
-        profile = ab.PROFILES["falsification"]
-        l3_rearm_secs = 5 + 60 * 2
-        burst_period_secs = (
-            profile.event_settle_secs + profile.event_interval_secs
+        self.assertEqual(command_a.count("--event-storm-root"), 6)
+        event_roots = [
+            command_a[index + 1]
+            for index, item in enumerate(command_a)
+            if item == "--event-storm-root"
+        ]
+        self.assertEqual(
+            event_roots,
+            [f"/fixture/cold-storm-{index:02d}" for index in range(1, 7)],
         )
+        daemon_roots = [
+            command_a[index + 1]
+            for index, item in enumerate(command_a)
+            if item == "--root"
+        ]
+        self.assertEqual(
+            daemon_roots,
+            [
+                "/fixture/cold-a",
+                "/fixture/cold-b",
+                "/fixture/hot",
+                *[f"/fixture/cold-storm-{index:02d}" for index in range(1, 7)],
+            ],
+        )
+        cold_roots = command_a[command_a.index("--cold-roots") + 1].split(",")
+        self.assertEqual(
+            cold_roots,
+            [
+                "/fixture/cold-a",
+                "/fixture/cold-b",
+                *[f"/fixture/cold-storm-{index:02d}" for index in range(1, 7)],
+            ],
+        )
+        rotating_dirs_per_tick = int(
+            command_a[command_a.index("--rotating-max-dirs-per-tick") + 1]
+        )
+        self.assertGreaterEqual(rotating_dirs_per_tick, len(cold_roots))
+
+    def test_falsification_profile_assigns_one_independent_root_per_burst(self) -> None:
+        profile = ab.PROFILES["falsification"]
         required_duration_secs = (
             profile.event_start_delay_secs
             + profile.max_bursts * profile.event_settle_secs
             + (profile.max_bursts - 1) * profile.event_interval_secs
         )
 
-        self.assertGreaterEqual(burst_period_secs - l3_rearm_secs, 20)
+        self.assertEqual(len(profile.event_root_names), profile.max_bursts)
+        self.assertEqual(len(set(profile.event_root_names)), profile.max_bursts)
         self.assertLessEqual(required_duration_secs, profile.duration_secs)
 
     def test_falsification_dry_run_accepts_explicit_run_dir(self) -> None:
@@ -293,6 +324,15 @@ class FixtureTests(unittest.TestCase):
                 self.assertEqual(files[0].relative_to(roots[cold_name]).as_posix(), "d000/file_000.txt")
                 self.assertEqual(files[-1].relative_to(roots[cold_name]).as_posix(), "d299/file_299.txt")
             self.assertTrue((roots["hot"] / ".fd-rdd-m2-fixture.json").is_file())
+            for index in range(1, 7):
+                storm_root = roots[f"cold-storm-{index:02d}"]
+                marker = json.loads(
+                    (storm_root / ".fd-rdd-m2-fixture.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(marker["actual_file_count"], 1)
+                self.assertTrue((storm_root / "seed" / "sentinel.txt").is_file())
 
             with self.assertRaisesRegex(ValueError, "拒绝删除非专用 fixture 根"):
                 ab.assert_safe_fixture_root(home, home)
@@ -323,7 +363,7 @@ class FixtureTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(first["layout_version"], "m2-cold-window-ab-v2")
+            self.assertEqual(first["layout_version"], "m2-cold-window-ab-v3")
             self.assertRegex(first["content_sha256"], r"^[0-9a-f]{64}$")
             self.assertEqual(first["content_sha256"], second["content_sha256"])
 

@@ -2611,23 +2611,14 @@ class EventStormRunner:
         return self.roots[(self.cycle - 1) % len(self.roots)]
 
     def fixed_root_schedule_index(self, candidate_count: int) -> int:
-        """Choose a deterministic root expected to hold an active rotation lease.
+        """Choose the same non-repeating root order in both A/B legs.
 
-        Falsification legs use the same index in A and B.  The two-tick lag gives
-        the A daemon time to apply the lease while keeping it well inside TTL.
+        Strict protocol preflight, rather than a wall-clock prediction, proves
+        the selected root's actual tier and treatment lease before mutation.
         """
         if candidate_count <= 0:
             raise ValueError("candidate_count must be positive")
-        if self.rotating_tick_secs <= 0 or self.rotating_dirs_per_tick <= 0:
-            return (self.cycle - 1) % candidate_count
-        planned_elapsed = self.start_delay_secs + max(0, self.cycle - 1) * (
-            self.settle_secs + self.interval_secs
-        )
-        completed_ticks = int(planned_elapsed // self.rotating_tick_secs)
-        ttl_ticks = int(self.rotating_ttl_secs // self.rotating_tick_secs)
-        lag_ticks = min(2, max(1, ttl_ticks - 1))
-        target_tick = max(1, completed_ticks - lag_ticks)
-        return ((target_tick - 1) * self.rotating_dirs_per_tick) % candidate_count
+        return (self.cycle - 1) % candidate_count
 
     @staticmethod
     def _has_event_storm_component(relative_path: Path) -> bool:
@@ -3119,7 +3110,7 @@ class EventStormRunner:
         if self.treatment_enabled:
             if evidence.get("target_m2_entry_present") is not True:
                 return "treatment target has no exact M2 entry"
-            if not evidence.get("target_m2_seen") or not evidence.get("target_m2_active"):
+            if not evidence.get("target_m2_active"):
                 return "treatment target has no active M2 lease"
             action = str(evidence.get("target_m2_action", ""))
             if action not in {"ephemeral_watch", "fast_scan_lease", "scan_only"}:

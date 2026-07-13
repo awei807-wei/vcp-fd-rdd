@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
-- 修复 M2 快速证伪同一 `cold-a` 连续 burst 的 L3 复位竞态：原 120 秒 settle + 10 秒间隔只比 `5 + 2×60` 秒的 `L1 -> L2 -> L3` 理论恢复路径多 5 秒，VM 调度抖动会让下一轮严格预检先看到 L2；falsification profile 将轮间隔增至 30 秒，保留 25 秒余量且六轮仍在 1200 秒内完成，严格协议继续拒绝 L2 冒充 L3。
+- 修复 M2 快速证伪复用同一 `cold-a` 的 L3 重降级竞态：VM 证明即使把 burst 周期从 130 秒增至 150 秒，后台扫描、水位线和调度仍可能让第 4 轮严格预检看到 L2，固定墙钟余量不是可靠协议。falsification fixture 升级为六个 daemon 已登记的独立冷根，每根用纳入内容身份的 sentinel 让 watch cost 明确超过 L0 上限，每腿六个 burst 各使用一个新根；每 tick 目录上限覆盖全部 8 个冷配置根，固定调度只定义 A/B 一致的无重复根序列，实际 tier、精确活跃租约与写后因果继续由写前严格证据判定。cycle `seen` 清空仅是诊断状态，不再否定尚未过期的精确租约，且绝不接受 L2 冒充 L3。
 - 修复 M2 快速证伪对 B 组的确定性假失败：event-storm 子目录现在从最近祖先继承 tier，debug 请求成功与精确 M2 entry 存在分开记录；A 仍要求逐 burst 精确 entry、有效租约和写后因果，B 允许 entry 不存在但禁止任何 M2 活动。falsification profile 新增写入前严格协议校验，前置证据不成立时立即结束该腿。
 - M2 稳定性门禁用显式 `startup bootstrap` reason 拆分 bootstrap 与 post-ready background rebuild，消除后台日志晚于 ready 的调度竞态；允许的 post-ready rebuild 必须带 `snapshot recovery` reason 且启动日志落在 shutdown quiesce 字节窗口内，仅有全局 rebuild 布尔值不能放行。写后扫描/事件改用写前序列、写后租约栅栏和同租约周期校验；轮转 scan 通过带 `cycle_id` 的专用 dirty source 贯穿队列与分片扫描，普通周期/API/查询扫描不再发布 M2 序列，序列发布也在每目录锁内保持单调。固定调度改为选择 daemon 已登记的配置根，消除 `dNNN` 子目录与精确 M2 entry 契约冲突。租约判活同时受单调时钟与墙上时钟约束，既保留 mutation 期间即时完成的真实 M2 事件，又避免同秒交错、时钟回拨和租约外工作造成假阳性。suite 同时逐条打印 gate reasons，并只对最终八腿引用的 attempt 生成带必需成员校验和 SHA256 清单的证据包；根级构建回执实际 SHA256 必须与八腿审计记录一致，历史 attempt、build-target、执行副本、snapshot、symlink 与伪造路径均被排除，缺件、回执替换或打包失败会使旧包失效并返回基础设施失败。
 - 补齐 `unbounded_summary_uses_walkbuilder_filter` 的 `.git/` fixture 前置条件，使测试与 `ignore` crate 仅在 Git 仓库启用 `.gitignore` 的真实语义一致，消除确定性误报。

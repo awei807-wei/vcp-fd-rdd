@@ -2106,10 +2106,31 @@ class EventStormFixtureTests(unittest.TestCase):
 
             self.assertEqual(error, "treatment target M2 lease is expired")
 
-    def test_rotation_aligned_fixed_schedule_targets_active_ttl_window(self) -> None:
+    def test_strict_protocol_accepts_an_active_lease_after_seen_cycle_resets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.strict_protocol = True
+            runner.treatment_enabled = True
+            evidence = {
+                "target_m2_debug_ok": True,
+                "target_m2_entry_present": True,
+                "target_m2_seen": False,
+                "target_m2_active": True,
+                "target_m2_action": "ephemeral_watch",
+                "target_m2_cycle_id": 0,
+                "target_m2_expires_unix_secs": 200,
+                "target_m2_observed_unix_secs": 150,
+            }
+
+            error = runner.protocol_precondition_error("L3", "L3", evidence)
+
+            self.assertEqual(error, "")
+
+    def test_fixed_schedule_uses_each_fully_covered_root_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             container = Path(tmp).resolve()
-            roots = [container / f"cold-{index}" for index in range(1, 4)]
+            roots = [container / f"cold-{index}" for index in range(1, 7)]
             for path in roots:
                 path.mkdir()
             runner = self.event_storm_runner(roots)
@@ -2121,13 +2142,12 @@ class EventStormFixtureTests(unittest.TestCase):
             runner.rotating_ttl_secs = 180
             runner.rotating_dirs_per_tick = 8
 
-            runner.cycle = 1
-            first = runner.select_root("L3")
-            runner.cycle = 2
-            second = runner.select_root("L3")
+            selected = []
+            for cycle in range(1, 7):
+                runner.cycle = cycle
+                selected.append(runner.select_root("L3"))
 
-            self.assertEqual(first, roots[1])
-            self.assertEqual(second, roots[0])
+            self.assertEqual(selected, roots)
 
     def test_process_sampling_diagnostics_detect_coverage_gaps_and_regressions(self) -> None:
         samples = [
