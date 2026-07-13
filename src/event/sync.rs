@@ -72,6 +72,7 @@ pub enum DirtyReason {
     QueryHitStale,
     QueryMiss,
     PeriodicColdScan,
+    RotatingColdWindow { cycle_id: u64 },
     FastScanBootstrapDir,
     FastScanChangedDir,
     StartupRepair,
@@ -87,9 +88,24 @@ impl DirtyReason {
             Self::InotifyEvent | Self::QueryMiss | Self::FastScanChangedDir => {
                 DirtyPriority::Normal
             }
-            Self::PeriodicColdScan | Self::FastScanBootstrapDir | Self::StartupRepairDeferred => {
-                DirtyPriority::Low
-            }
+            Self::PeriodicColdScan
+            | Self::RotatingColdWindow { .. }
+            | Self::FastScanBootstrapDir
+            | Self::StartupRepairDeferred => DirtyPriority::Low,
+        }
+    }
+
+    pub fn is_cold_scan(self) -> bool {
+        matches!(
+            self,
+            Self::PeriodicColdScan | Self::RotatingColdWindow { .. }
+        )
+    }
+
+    pub fn rotating_cold_window_cycle_id(self) -> Option<u64> {
+        match self {
+            Self::RotatingColdWindow { cycle_id } => Some(cycle_id),
+            _ => None,
         }
     }
 }
@@ -370,10 +386,26 @@ fn duration_ns(duration: Duration) -> u64 {
 }
 
 fn merge_reason(existing: DirtyReason, incoming: DirtyReason) -> DirtyReason {
-    if incoming.default_priority().rank() >= existing.default_priority().rank() {
-        incoming
-    } else {
-        existing
+    let existing_rank = existing.default_priority().rank();
+    let incoming_rank = incoming.default_priority().rank();
+    match incoming_rank.cmp(&existing_rank) {
+        std::cmp::Ordering::Greater => incoming,
+        std::cmp::Ordering::Less => existing,
+        std::cmp::Ordering::Equal => match (existing, incoming) {
+            (
+                DirtyReason::RotatingColdWindow {
+                    cycle_id: existing_cycle,
+                },
+                DirtyReason::RotatingColdWindow {
+                    cycle_id: incoming_cycle,
+                },
+            ) => DirtyReason::RotatingColdWindow {
+                cycle_id: existing_cycle.max(incoming_cycle),
+            },
+            (DirtyReason::RotatingColdWindow { .. }, _) => existing,
+            (_, DirtyReason::RotatingColdWindow { .. }) => incoming,
+            _ => incoming,
+        },
     }
 }
 
@@ -470,6 +502,42 @@ mod tests {
         assert_eq!(ready.len(), 2);
         assert_eq!(ready[0].priority, DirtyPriority::Critical);
         assert_eq!(ready[0].scope.dir_paths(), &[PathBuf::from("/tmp/high")]);
+    }
+
+    #[test]
+    fn dirty_queue_preserves_latest_rotating_cycle_over_periodic_scan() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        let scope = || DirtyScope::dirs(0, vec![PathBuf::from("/tmp/cold")]);
+        q.enqueue(
+            scope(),
+            DirtyReason::PeriodicColdScan,
+            DirtyPriority::Low,
+            1,
+        );
+        q.enqueue(
+            scope(),
+            DirtyReason::RotatingColdWindow { cycle_id: 7 },
+            DirtyPriority::Low,
+            2,
+        );
+        q.enqueue(
+            scope(),
+            DirtyReason::RotatingColdWindow { cycle_id: 8 },
+            DirtyPriority::Low,
+            3,
+        );
+        q.enqueue(
+            scope(),
+            DirtyReason::PeriodicColdScan,
+            DirtyPriority::Low,
+            4,
+        );
+
+        let ready = q.pop_ready(4, 1);
+        assert_eq!(
+            ready[0].reason,
+            DirtyReason::RotatingColdWindow { cycle_id: 8 }
+        );
     }
 
     #[test]

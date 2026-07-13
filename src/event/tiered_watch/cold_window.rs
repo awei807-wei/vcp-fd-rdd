@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
@@ -590,9 +591,16 @@ pub(super) fn next_l3_scan_unix_secs(now: u64, policy: L3ScanPolicy, interval_se
 pub(super) struct RotatingColdWindowLease {
     pub(super) action: RotatingColdWindowActionKind,
     pub(super) expires_unix_secs: u64,
+    pub(super) expires_at: Instant,
     pub(super) cycle_id: u64,
     pub(super) score: u64,
     pub(super) watch_cost: u64,
+}
+
+impl RotatingColdWindowLease {
+    pub(super) fn is_active(&self, now_unix_secs: u64, now: Instant) -> bool {
+        self.expires_unix_secs > now_unix_secs && self.expires_at > now
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -872,6 +880,85 @@ impl TieredWatchRuntime {
         self.waterline_alarm.effective_rotating_budget()
     }
 
+    pub fn record_rotating_cold_window_scan_completion(&self, path: &Path, cycle_id: u64) -> bool {
+        let Some(state) = self.state(path) else {
+            return false;
+        };
+        let now_unix_secs = unix_secs();
+        let now = Instant::now();
+        let mut progress = state.rotating_cold_window_progress.write();
+        {
+            let leases = self.rotating_cold_window_leases.read();
+            let Some(lease) = leases.get(path) else {
+                return false;
+            };
+            if lease.cycle_id != cycle_id || !lease.is_active(now_unix_secs, now) {
+                return false;
+            }
+        }
+        let sequence = self
+            .rotating_cold_window_causal_seq
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        progress.last_scan_seq = sequence;
+        progress.last_scan_cycle_id = cycle_id;
+        true
+    }
+
+    pub(super) fn record_rotating_cold_window_event_progress(
+        &self,
+        paths: &[&PathBuf],
+        now_unix_secs: u64,
+        now: Instant,
+    ) {
+        let roots = {
+            let leases = self.rotating_cold_window_leases.read();
+            let mut roots = HashSet::new();
+            for path in paths {
+                let nearest = leases
+                    .iter()
+                    .filter(|(root, lease)| {
+                        lease.action == RotatingColdWindowActionKind::EphemeralWatch
+                            && lease.is_active(now_unix_secs, now)
+                            && path_is_under_or_equal(path.as_path(), root.as_path())
+                    })
+                    .max_by_key(|(root, _)| root.as_os_str().as_encoded_bytes().len());
+                if let Some((root, lease)) = nearest {
+                    roots.insert((root.clone(), lease.cycle_id));
+                }
+            }
+            roots
+        };
+        if roots.is_empty() {
+            return;
+        }
+        let dirs = self.dirs.read();
+        for (root, cycle_id) in roots {
+            let Some(state) = dirs.get(root.as_path()) else {
+                continue;
+            };
+            let mut progress = state.rotating_cold_window_progress.write();
+            {
+                let leases = self.rotating_cold_window_leases.read();
+                let Some(lease) = leases.get(root.as_path()) else {
+                    continue;
+                };
+                if lease.cycle_id != cycle_id
+                    || lease.action != RotatingColdWindowActionKind::EphemeralWatch
+                    || !lease.is_active(now_unix_secs, now)
+                {
+                    continue;
+                }
+            }
+            let sequence = self
+                .rotating_cold_window_causal_seq
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            progress.last_event_seq = sequence;
+            progress.last_event_cycle_id = cycle_id;
+        }
+    }
+
     /// Evaluate the waterline alarm against the latest p99 coverage lag.
     /// Called from `report()` at each metrics sample. Returns the lag value.
     pub(super) fn check_waterline_alarm(&self, lag_p99_ms: u64) -> u64 {
@@ -887,6 +974,7 @@ impl TieredWatchRuntime {
         }
 
         let now = unix_secs();
+        let now_instant = Instant::now();
         let budget = config.budget.max(1);
         let ttl_secs = config.ttl_secs.max(1);
         let max_dirs_per_tick = config.max_dirs_per_tick.max(1);
@@ -895,7 +983,7 @@ impl TieredWatchRuntime {
 
         {
             let mut leases = self.rotating_cold_window_leases.write();
-            leases.retain(|_, lease| lease.expires_unix_secs > now);
+            leases.retain(|_, lease| lease.is_active(now, now_instant));
         }
 
         let active_count = self.rotating_cold_window_leases.read().len();
@@ -1000,6 +1088,9 @@ impl TieredWatchRuntime {
 
         let cycle_id = self.rotating_cold_window_cycle_id.load(Ordering::Relaxed);
         let expires_unix_secs = now.saturating_add(ttl_secs);
+        let expires_at = now_instant
+            .checked_add(Duration::from_secs(ttl_secs))
+            .unwrap_or(now_instant);
         let mut actions = Vec::new();
         let mut leases = self.rotating_cold_window_leases.write();
         for (path, watch_cost, score, _) in candidates.into_iter().take(capacity) {
@@ -1013,6 +1104,7 @@ impl TieredWatchRuntime {
                 RotatingColdWindowLease {
                     action,
                     expires_unix_secs,
+                    expires_at,
                     cycle_id,
                     score,
                     watch_cost,

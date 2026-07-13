@@ -39,6 +39,7 @@ class BenchmarkProfile:
     active_canary: bool
     fixed_root_schedule: bool
     deterministic_event_plan: bool
+    strict_protocol: bool
     max_bursts: int = 0
     visibility_probes_per_burst: int = 0
     visibility_poll_interval_secs: float = 1.0
@@ -62,6 +63,7 @@ PROFILES = {
         active_canary=True,
         fixed_root_schedule=False,
         deterministic_event_plan=False,
+        strict_protocol=False,
     ),
     "falsification": BenchmarkProfile(
         build="never",
@@ -77,6 +79,7 @@ PROFILES = {
         active_canary=False,
         fixed_root_schedule=True,
         deterministic_event_plan=True,
+        strict_protocol=True,
         max_bursts=6,
         visibility_probes_per_burst=8,
         visibility_poll_interval_secs=1.0,
@@ -227,6 +230,8 @@ def _event_storm_args(
         args.append("--event-storm-fixed-root-schedule")
     if profile.deterministic_event_plan:
         args.append("--event-storm-deterministic-plan")
+    if profile.strict_protocol:
+        args.append("--event-storm-strict-protocol")
     return args
 
 

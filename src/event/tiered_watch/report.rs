@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use crate::stats::WatchStateReport;
 use crate::util::unix_secs;
@@ -352,8 +353,9 @@ impl TieredWatchRuntime {
 
         // ── Rotating cold-window lease pruning + cycle progress ─────────────
         {
+            let now_instant = Instant::now();
             let mut leases = self.rotating_cold_window_leases.write();
-            leases.retain(|_, lease| lease.expires_unix_secs > now);
+            leases.retain(|_, lease| lease.is_active(now, now_instant));
         }
         let rotating_cold_window_enabled =
             self.rotating_cold_window_enabled.load(Ordering::Relaxed);
@@ -648,6 +650,8 @@ impl TieredWatchRuntime {
     }
 
     pub fn debug_dump(&self, root_filter: Option<&str>) -> TieredWatchDebugDump {
+        let now = unix_secs();
+        let now_instant = Instant::now();
         let dirs = self.dirs.read();
         let filter = root_filter.map(|s| s.to_string());
         let dir_paths = dirs.keys().cloned().collect::<Vec<_>>();
@@ -678,6 +682,7 @@ impl TieredWatchRuntime {
             .rotating_cold_window_leases
             .read()
             .iter()
+            .filter(|(_, lease)| lease.is_active(now, now_instant))
             .map(|(path, lease)| {
                 (
                     path.clone(),
@@ -713,6 +718,7 @@ impl TieredWatchRuntime {
                 state.last_budget_blocked_unix_secs.load(Ordering::Relaxed);
             let dirty = state.dirty.load(Ordering::Relaxed);
             let high_priority_scan = state.high_priority_scan.load(Ordering::Relaxed);
+            let rotating_progress = *state.rotating_cold_window_progress.read();
             let rotating = rotating_paths.get(path);
             let nearest_ancestor_root = nearest_ancestor_root(path.as_path(), &dir_paths);
             let descendant_roots = descendant_roots(path.as_path(), &dir_paths);
@@ -763,6 +769,10 @@ impl TieredWatchRuntime {
                     .map(|(_, _, cycle_id, _, _)| *cycle_id)
                     .unwrap_or(0),
                 rotating_cold_window_score: rotating.map(|(_, _, _, score, _)| *score).unwrap_or(0),
+                rotating_cold_window_last_scan_seq: rotating_progress.last_scan_seq,
+                rotating_cold_window_last_scan_cycle_id: rotating_progress.last_scan_cycle_id,
+                rotating_cold_window_last_event_seq: rotating_progress.last_event_seq,
+                rotating_cold_window_last_event_cycle_id: rotating_progress.last_event_cycle_id,
                 nearest_ancestor_root,
                 descendant_roots,
                 l0_covering_root,

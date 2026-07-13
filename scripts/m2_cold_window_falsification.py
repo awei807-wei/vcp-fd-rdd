@@ -208,27 +208,69 @@ def _analyze_correctness(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _target_m2_causal(burst: dict[str, Any], check: dict[str, Any]) -> bool:
+def _target_m2_fence_valid(burst: dict[str, Any]) -> bool:
+    if burst.get("target_m2_debug_ok") is not True:
+        return False
+    if burst.get("target_m2_entry_present") is not True:
+        return False
     if not burst.get("target_m2_active"):
         return False
     action = str(burst.get("target_m2_action", ""))
     if action not in {"ephemeral_watch", "fast_scan_lease", "scan_only"}:
         return False
-    observed = int(burst.get("target_m2_observed_unix_secs", 0) or 0)
-    expires = int(burst.get("target_m2_expires_unix_secs", 0) or 0)
-    mutation_completed = int(burst.get("mutation_completed_unix_secs", 0) or 0)
-    if (
-        observed <= 0
-        or mutation_completed <= 0
-        or expires < max(observed, mutation_completed)
+    if burst.get("target_m2_fence_debug_ok") is not True:
+        return False
+    if burst.get("target_m2_fence_entry_present") is not True:
+        return False
+    if not burst.get("target_m2_fence_active"):
+        return False
+    if str(burst.get("target_m2_fence_action", "")) != action:
+        return False
+    if int(burst.get("target_m2_fence_cycle_id", -1) or 0) != int(
+        burst.get("target_m2_cycle_id", -2) or 0
     ):
         return False
-    before_scan = int(burst.get("target_m2_last_scan_unix_secs", 0) or 0)
-    before_event = int(burst.get("target_m2_last_event_unix_secs", 0) or 0)
-    after_scan = int(check.get("target_m2_after_last_scan_unix_secs", 0) or 0)
-    after_event = int(check.get("target_m2_after_last_event_unix_secs", 0) or 0)
-    scan_advanced = after_scan > before_scan and after_scan >= mutation_completed
-    event_advanced = after_event > before_event and after_event >= mutation_completed
+    return (
+        int(burst.get("target_m2_fence_scan_seq", 0) or 0)
+        >= int(burst.get("target_m2_scan_seq", 0) or 0)
+        and int(burst.get("target_m2_fence_event_seq", 0) or 0)
+        >= int(burst.get("target_m2_event_seq", 0) or 0)
+    )
+
+
+def _target_m2_causal(burst: dict[str, Any], check: dict[str, Any]) -> bool:
+    if not _target_m2_fence_valid(burst):
+        return False
+    if check.get("target_m2_after_debug_ok") is not True:
+        return False
+    if check.get("target_m2_after_entry_present") is not True:
+        return False
+    action = str(burst.get("target_m2_action", ""))
+    cycle_id = int(burst.get("target_m2_cycle_id", 0) or 0)
+    before_scan = int(burst.get("target_m2_scan_seq", 0) or 0)
+    before_event = int(burst.get("target_m2_event_seq", 0) or 0)
+    fence_scan = int(burst.get("target_m2_fence_scan_seq", 0) or 0)
+    fence_event = int(burst.get("target_m2_fence_event_seq", 0) or 0)
+    after_scan = int(check.get("target_m2_after_scan_seq", 0) or 0)
+    after_event = int(check.get("target_m2_after_event_seq", 0) or 0)
+    scan_advanced_during_mutation = (
+        fence_scan > before_scan
+        and int(burst.get("target_m2_fence_scan_cycle_id", -1) or 0) == cycle_id
+    )
+    scan_advanced_after_mutation = (
+        after_scan > fence_scan
+        and int(check.get("target_m2_after_scan_cycle_id", -1) or 0) == cycle_id
+    )
+    event_advanced_during_mutation = (
+        fence_event > before_event
+        and int(burst.get("target_m2_fence_event_cycle_id", -1) or 0) == cycle_id
+    )
+    event_advanced_after_mutation = (
+        after_event > fence_event
+        and int(check.get("target_m2_after_event_cycle_id", -1) or 0) == cycle_id
+    )
+    scan_advanced = scan_advanced_during_mutation or scan_advanced_after_mutation
+    event_advanced = event_advanced_during_mutation or event_advanced_after_mutation
     return scan_advanced or (action == "ephemeral_watch" and event_advanced)
 
 
@@ -292,6 +334,9 @@ def _protocol_summary(
         "target_m2_debug_ok_bursts": sum(
             1 for row in bursts if row.get("target_m2_debug_ok") is True
         ),
+        "target_m2_entry_present_bursts": sum(
+            1 for row in bursts if row.get("target_m2_entry_present") is True
+        ),
         "target_m2_seen_bursts": sum(
             1 for row in bursts if row.get("target_m2_seen") is True
         ),
@@ -299,15 +344,7 @@ def _protocol_summary(
             1 for row in bursts if row.get("target_m2_active") is True
         ),
         "target_m2_unexpired_bursts": sum(
-            1
-            for row in bursts
-            if row.get("target_m2_active") is True
-            and int(row.get("target_m2_expires_unix_secs", 0) or 0)
-            >= max(
-                int(row.get("target_m2_observed_unix_secs", 0) or 0),
-                int(row.get("mutation_completed_unix_secs", 0) or 0),
-            )
-            > 0
+            1 for row in bursts if _target_m2_fence_valid(row)
         ),
         "target_m2_causal_bursts": len(causal_bursts),
         "target_m2_causal_actions": _count_values(
@@ -402,6 +439,64 @@ def _stability_summary(
     snapshot: dict[str, Any],
     log_text: str,
 ) -> dict[str, Any]:
+    log_bytes = log_text.encode("utf-8")
+    rebuild_marker = b"Starting background rebuild"
+    rebuild_records: list[tuple[int, str]] = []
+    search_from = 0
+    while True:
+        offset = log_bytes.find(rebuild_marker, search_from)
+        if offset < 0:
+            break
+        line_end = log_bytes.find(b"\n", offset)
+        if line_end < 0:
+            line_end = len(log_bytes)
+        rebuild_records.append(
+            (offset, log_bytes[offset:line_end].decode("utf-8", errors="replace"))
+        )
+        search_from = offset + len(rebuild_marker)
+    ready_offsets = [
+        offset
+        for marker in (b"HTTP Query Server listening", b"fd-rdd ready.")
+        if (offset := log_bytes.find(marker)) >= 0
+    ]
+    ready_offset = min(ready_offsets, default=-1)
+
+    def is_bootstrap_rebuild(offset: int, line: str) -> bool:
+        return "startup bootstrap" in line or (
+            ready_offset >= 0 and offset < ready_offset
+        )
+
+    bootstrap_rebuilds = sum(
+        is_bootstrap_rebuild(offset, line) for offset, line in rebuild_records
+    )
+    post_ready_rebuilds = len(rebuild_records) - bootstrap_rebuilds
+    raw_window_start = snapshot.get("daemon_log_offset_start", -1)
+    raw_window_end = snapshot.get("daemon_log_offset_end", -1)
+    snapshot_window_start = (
+        int(raw_window_start)
+        if isinstance(raw_window_start, (int, float))
+        and not isinstance(raw_window_start, bool)
+        else -1
+    )
+    snapshot_window_end = (
+        int(raw_window_end)
+        if isinstance(raw_window_end, (int, float))
+        and not isinstance(raw_window_end, bool)
+        else -1
+    )
+    snapshot_window_valid = bool(snapshot.get("daemon_log_window_valid")) and (
+        0 <= snapshot_window_start <= snapshot_window_end <= len(log_bytes)
+    )
+    snapshot_quiesce_rebuilds = sum(
+        "snapshot recovery" in line
+        and snapshot_window_valid
+        and snapshot_window_start <= offset < snapshot_window_end
+        and not is_bootstrap_rebuild(offset, line)
+        for offset, line in rebuild_records
+    )
+    unattributed_post_ready_rebuilds = max(
+        0, post_ready_rebuilds - snapshot_quiesce_rebuilds
+    )
     return {
         "snapshot_rebuild_observed": bool(snapshot.get("rebuild_observed")),
         "snapshot_ready": bool(snapshot.get("ready")),
@@ -421,7 +516,14 @@ def _stability_summary(
         "dirty_queue_len_last": int(watch.get("dirty_queue_len_last", 0) or 0),
         "log_error_count": log_text.count("ERROR"),
         "direct_v7_unsupported_count": log_text.count("direct_v7_unsupported"),
-        "background_rebuild_count": log_text.count("Starting background rebuild"),
+        "background_rebuild_count": len(rebuild_records),
+        "bootstrap_background_rebuild_count": bootstrap_rebuilds,
+        "post_ready_background_rebuild_count": post_ready_rebuilds,
+        "snapshot_log_window_valid": snapshot_window_valid,
+        "snapshot_quiesce_background_rebuild_count": snapshot_quiesce_rebuilds,
+        "unattributed_post_ready_background_rebuild_count": (
+            unattributed_post_ready_rebuilds
+        ),
         "waterline_trigger_count": log_text.count(
             "waterline alarm: soft degradation triggered"
         ),

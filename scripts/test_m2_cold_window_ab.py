@@ -131,6 +131,7 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--event-storm-visibility-probes-per-burst 8", joined)
         self.assertIn("--event-storm-visibility-poll-interval-secs 1", joined)
         self.assertIn("--event-storm-max-bursts 6", joined)
+        self.assertIn("--event-storm-strict-protocol", command_a)
         self.assertIn(
             "--artifact-provenance-receipt /tmp/m2-suite/build-provenance.json",
             joined,

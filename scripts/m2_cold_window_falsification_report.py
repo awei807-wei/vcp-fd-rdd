@@ -58,7 +58,7 @@ def _paired_cost_lines(gate: dict[str, Any]) -> list[str]:
 
 def _leg_result_lines(legs: list[dict[str, Any]]) -> list[str]:
     lines = [
-        "| block | order | leg | valid | bursts/expected records | unique assertions | positive/negative | visibility (p95 s / transport errors) | polls | target M2 seen/active/causal | sampling coverage/max gap | tier before | soft ratio/end | errors/rebuild |",
+        "| block | order | leg | valid | bursts/expected records | unique assertions | positive/negative | visibility (p95 s / transport errors) | polls | target M2 seen/active/causal | sampling coverage/max gap | tier before | soft ratio/end | errors / rebuild total:bootstrap:quiesce:unattributed / window |",
         "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---|",
     ]
     for leg in legs:
@@ -86,7 +86,11 @@ def _leg_result_lines(legs: list[dict[str, Any]]) -> list[str]:
             f"{stability['waterline_soft_degraded_ratio']:.4f}/"
             f"{stability['waterline_soft_degraded_last']} | "
             f"{stability['log_error_count']}/"
-            f"{stability['snapshot_rebuild_observed']} |"
+            f"{stability.get('background_rebuild_count', 0)}:"
+            f"{stability.get('bootstrap_background_rebuild_count', 0)}:"
+            f"{stability.get('snapshot_quiesce_background_rebuild_count', 0)}:"
+            f"{stability.get('unattributed_post_ready_background_rebuild_count', 0)}/"
+            f"{stability.get('snapshot_log_window_valid', False)} |"
         )
     return lines
 

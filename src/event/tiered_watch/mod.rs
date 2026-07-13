@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 
@@ -42,6 +43,15 @@ pub(super) struct DirState {
     budget_blocked_count: AtomicU32,
     last_budget_blocked_unix_secs: AtomicU64,
     high_priority_scan: AtomicBool,
+    rotating_cold_window_progress: RwLock<RotatingColdWindowProgress>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct RotatingColdWindowProgress {
+    pub(super) last_scan_seq: u64,
+    pub(super) last_scan_cycle_id: u64,
+    pub(super) last_event_seq: u64,
+    pub(super) last_event_cycle_id: u64,
 }
 
 impl DirState {
@@ -75,6 +85,7 @@ impl DirState {
             budget_blocked_count: AtomicU32::new(0),
             last_budget_blocked_unix_secs: AtomicU64::new(0),
             high_priority_scan: AtomicBool::new(false),
+            rotating_cold_window_progress: RwLock::new(RotatingColdWindowProgress::default()),
         }
     }
 
@@ -120,6 +131,7 @@ pub struct TieredWatchRuntime {
     rotating_cold_window_max_cost_per_root: AtomicUsize,
     rotating_cold_window_max_dirs_per_tick: AtomicUsize,
     rotating_cold_window_cycle_id: AtomicU64,
+    rotating_cold_window_causal_seq: AtomicU64,
     rotating_cold_window_promoted_to_ephemeral: AtomicU64,
     rotating_cold_window_fast_scan_lease_dirs: AtomicU64,
     rotating_cold_window_scan_only_dirs: AtomicU64,
@@ -273,6 +285,7 @@ impl TieredWatchRuntime {
             rotating_cold_window_max_cost_per_root: AtomicUsize::new(64),
             rotating_cold_window_max_dirs_per_tick: AtomicUsize::new(8),
             rotating_cold_window_cycle_id: AtomicU64::new(0),
+            rotating_cold_window_causal_seq: AtomicU64::new(0),
             rotating_cold_window_promoted_to_ephemeral: AtomicU64::new(0),
             rotating_cold_window_fast_scan_lease_dirs: AtomicU64::new(0),
             rotating_cold_window_scan_only_dirs: AtomicU64::new(0),
@@ -377,6 +390,7 @@ impl TieredWatchRuntime {
         let now = unix_secs();
         let paths = paths.into_iter().collect::<Vec<_>>();
         self.record_ephemeral_events(&paths, now);
+        self.record_rotating_cold_window_event_progress(&paths, now, Instant::now());
         let dirs = self.dirs.read();
         let mut dirty_dirs = Vec::new();
         let mut l0_event_lease_dirs = Vec::new();

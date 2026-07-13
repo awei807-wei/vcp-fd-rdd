@@ -10,6 +10,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tarfile  # 保留给既有故障注入测试的兼容导出
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -44,10 +45,25 @@ from m2_cold_window_falsification import (
 )
 from m2_cold_window_falsification_gate import evaluate_suite
 from m2_cold_window_falsification_report import render_report
+from m2_cold_window_evidence_bundle import (
+    BUILD_RECEIPT_NAME,
+    EVIDENCE_ATTEMPT_FILES,
+    EVIDENCE_CHECKSUMS_NAME,
+    EVIDENCE_MANIFEST_NAME,
+    EVIDENCE_OPTIONAL_ATTEMPT_FILES,
+    EVIDENCE_OPTIONAL_ROOT_FILES,
+    EVIDENCE_REQUIRED_ATTEMPT_FILES,
+    EVIDENCE_REQUIRED_ROOT_FILES,
+    EVIDENCE_ROOT_FILES,
+    EvidenceBundleError,
+    evidence_bundle_path as _evidence_bundle_path,
+    invalidate_published_evidence as _invalidate_published_evidence,
+    remove_published_documents as _remove_published_documents,
+    write_evidence_bundle as _write_evidence_bundle,
+)
 
 
 AB_DRIVER = REPO_ROOT / "scripts" / "m2-cold-window-ab.py"
-BUILD_RECEIPT_NAME = "build-provenance.json"
 BUILD_TARGET_NAME = "build-target"
 WRAPPER_TERMINATION_TIMEOUT_SECS = 420.0
 ORPHAN_TERMINATION_TIMEOUT_SECS = 10.0
@@ -473,33 +489,152 @@ def _suite_summary(
     }
 
 
-def _write_outputs(suite_dir: Path, summary: dict[str, Any]) -> None:
-    with cleanup_signal_shield():
+def _write_output_documents(suite_dir: Path, summary: dict[str, Any]) -> None:
+    _atomic_json(suite_dir / "summary.json", summary)
+    (suite_dir / "REPORT.md").write_text(
+        render_report(summary),
+        encoding="utf-8",
+    )
+    _atomic_json(
+        suite_dir / "manifest.json",
+        {
+            "schema": 1,
+            "run_state": (
+                "completed"
+                if len(summary["legs"]) == 8
+                and not summary.get("infrastructure_error")
+                else "failed"
+            ),
+            "decision": summary["gate"]["decision"],
+            "suite_dir": str(suite_dir),
+            "sequence_seed": summary["sequence_seed"],
+            "completed_legs": sum(
+                1 for leg in summary["legs"] if leg.get("valid") is True
+            ),
+            "observed_legs": len(summary["legs"]),
+            "reasons": summary["gate"]["reasons"],
+        },
+    )
+
+
+def _record_evidence_bundle_failure(
+    summary: dict[str, Any],
+    error: Exception,
+) -> None:
+    reason = f"证据包生成失败：{type(error).__name__}: {error}"
+    gate = summary.get("gate", {})
+    gate = dict(gate) if isinstance(gate, dict) else {}
+    reasons = gate.get("reasons", [])
+    reasons = list(reasons) if isinstance(reasons, list) else []
+    gate["decision"] = "fail"
+    if reason not in reasons:
+        reasons.append(reason)
+    gate["reasons"] = reasons
+    summary["gate"] = gate
+    previous = str(summary.get("infrastructure_error", ""))
+    summary["infrastructure_error"] = f"{previous}; {reason}" if previous else reason
+
+
+def _resume_rejection_documents(
+    suite_dir: Path,
+    requested_seed: int,
+    previous_manifest: dict[str, Any],
+    previous_summary: dict[str, Any],
+    reason: str,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    gate = previous_summary.get("gate", {})
+    gate = dict(gate) if isinstance(gate, dict) else {}
+    reasons = gate.get("reasons", [])
+    reasons = list(reasons) if isinstance(reasons, list) else []
+    if reason not in reasons:
+        reasons.append(reason)
+    gate.update({"decision": "fail", "reasons": reasons})
+    persisted_summary = dict(previous_summary)
+    persisted_summary.update(
+        {
+            "schema": (
+                previous_summary.get("schema")
+                if isinstance(previous_summary.get("schema"), int)
+                else 1
+            ),
+            "suite_dir": str(suite_dir),
+            "sequence_seed": previous_manifest.get(
+                "sequence_seed",
+                previous_summary.get("sequence_seed", requested_seed),
+            ),
+            "requested_sequence_seed": requested_seed,
+            "infrastructure_error": reason,
+            "gate": gate,
+        }
+    )
+    persisted_manifest = dict(previous_manifest)
+    manifest_reasons = persisted_manifest.get("reasons", [])
+    manifest_reasons = (
+        list(manifest_reasons) if isinstance(manifest_reasons, list) else []
+    )
+    if reason not in manifest_reasons:
+        manifest_reasons.append(reason)
+    persisted_manifest.update(
+        {
+            "schema": (
+                previous_manifest.get("schema")
+                if isinstance(previous_manifest.get("schema"), int)
+                else 1
+            ),
+            "run_state": "failed",
+            "decision": "fail",
+            "suite_dir": str(suite_dir),
+            "requested_sequence_seed": requested_seed,
+            "reasons": manifest_reasons,
+        }
+    )
+    report = (
+        "# M2 快速证伪续跑被拒绝\n\n"
+        f"- 判定：`fail`\n- 原因：{reason}\n"
+    )
+    return persisted_summary, persisted_manifest, report
+
+
+def _persist_resume_rejection(
+    suite_dir: Path,
+    requested_seed: int,
+    previous_manifest: dict[str, Any],
+    previous_summary: dict[str, Any],
+    reason: str,
+) -> None:
+    """Invalidate a prior pass before recording a rejected resume request."""
+    _invalidate_published_evidence(suite_dir, remove_documents=True)
+    summary, manifest, report = _resume_rejection_documents(
+        suite_dir,
+        requested_seed,
+        previous_manifest,
+        previous_summary,
+        reason,
+    )
+    try:
         _atomic_json(suite_dir / "summary.json", summary)
-        (suite_dir / "REPORT.md").write_text(
-            render_report(summary),
-            encoding="utf-8",
-        )
-        _atomic_json(
-            suite_dir / "manifest.json",
-            {
-                "schema": 1,
-                "run_state": (
-                    "completed"
-                    if len(summary["legs"]) == 8
-                    and not summary.get("infrastructure_error")
-                    else "failed"
-                ),
-                "decision": summary["gate"]["decision"],
-                "suite_dir": str(suite_dir),
-                "sequence_seed": summary["sequence_seed"],
-                "completed_legs": sum(
-                    1 for leg in summary["legs"] if leg.get("valid") is True
-                ),
-                "observed_legs": len(summary["legs"]),
-                "reasons": summary["gate"]["reasons"],
-            },
-        )
+        (suite_dir / "REPORT.md").write_text(report, encoding="utf-8")
+        _atomic_json(suite_dir / "manifest.json", manifest)
+    except Exception:  # noqa: BLE001 - absence is safer than a stale pass
+        _invalidate_published_evidence(suite_dir, remove_documents=True)
+
+
+def _write_outputs(suite_dir: Path, summary: dict[str, Any]) -> Path | None:
+    suite_dir.mkdir(parents=True, exist_ok=True)
+    with cleanup_signal_shield():
+        _invalidate_published_evidence(suite_dir)
+        try:
+            _write_output_documents(suite_dir, summary)
+            return _write_evidence_bundle(suite_dir, summary)
+        except Exception as exc:  # noqa: BLE001 - persist explicit infrastructure failure
+            _record_evidence_bundle_failure(summary, exc)
+            _invalidate_published_evidence(suite_dir, remove_documents=True)
+            try:
+                _write_output_documents(suite_dir, summary)
+            except Exception as persist_exc:  # noqa: BLE001 - fail closed on disk errors
+                _record_evidence_bundle_failure(summary, persist_exc)
+                _invalidate_published_evidence(suite_dir, remove_documents=True)
+            return None
 
 
 def _validate_build_receipt(receipt_path: Path, binary: Path) -> str:
@@ -573,14 +708,32 @@ def _prepare_build(suite_dir: Path, skip_build: bool) -> str:
     return _build_release(suite_dir)
 
 
+def _prepare_suite_resume(suite_dir: Path, sequence_seed: int) -> str:
+    previous_manifest = _read_json(suite_dir / "manifest.json")
+    previous_summary = _read_json(suite_dir / "summary.json")
+    error = _resume_error(suite_dir, sequence_seed)
+    if error:
+        _persist_resume_rejection(
+            suite_dir,
+            sequence_seed,
+            previous_manifest,
+            previous_summary,
+            error,
+        )
+        return error
+    _invalidate_published_evidence(suite_dir, remove_documents=True)
+    return ""
+
+
 def _run_suite(
     args: argparse.Namespace,
     suite_dir: Path,
     specs: list[LegSpec],
     receipt_path: Path,
 ) -> int:
+    suite_dir.mkdir(parents=True, exist_ok=True)
     interrupted_exit_code = 0
-    infrastructure_error = _resume_error(suite_dir, args.sequence_seed)
+    infrastructure_error = _prepare_suite_resume(suite_dir, args.sequence_seed)
     if infrastructure_error:
         print(f"M2 快速证伪拒绝续跑：{infrastructure_error}", file=sys.stderr)
         return 1
@@ -614,11 +767,18 @@ def _run_suite(
         legs,
         infrastructure_error,
     )
-    _write_outputs(suite_dir, summary)
+    evidence_bundle = _write_outputs(suite_dir, summary)
     print(f"suite_dir: {suite_dir}")
+    print(f"summary_path: {suite_dir / 'summary.json'}")
+    print(f"report_path: {suite_dir / 'REPORT.md'}")
+    print(f"evidence_bundle: {evidence_bundle or 'unavailable'}")
     print(f"M2 快速证伪判定: {summary['gate']['decision']}")
+    for reason in summary["gate"]["reasons"]:
+        print(f"gate_reason: {reason}")
     if interrupted_exit_code:
         return interrupted_exit_code
+    if evidence_bundle is None:
+        return 1
     if infrastructure_error:
         return 1
     return 0 if summary["gate"]["decision"] == "pass" else 2

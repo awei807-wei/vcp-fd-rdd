@@ -522,7 +522,7 @@ fn run_startup_repair(
     let needs_full_build =
         loaded_from_empty_snapshot || repair_stats.escalated || index.file_count() == 0;
     if needs_full_build && !index.rebuild_in_progress() {
-        index.spawn_full_build();
+        index.spawn_startup_full_build();
     }
 }
 
@@ -1459,7 +1459,7 @@ fn spawn_dirty_queue_loop(
                 .map(|runtime| {
                     let mut skip_dirs = HashSet::new();
                     for entry in &work {
-                        if entry.reason != DirtyReason::PeriodicColdScan {
+                        if !entry.reason.is_cold_scan() {
                             continue;
                         }
                         for dir in entry.scope.dir_paths() {
@@ -1546,6 +1546,7 @@ fn spawn_dirty_queue_loop(
                     for scan in report.outcomes {
                         let changed = scan.outcome.changed;
                         let project_roots = scan.outcome.project_roots.clone();
+                        let rotating_cycle_id = entry.reason.rotating_cold_window_cycle_id();
                         let policy_dir = runtime
                             .record_scan_for_path_with_manifest_status(
                                 scan.dir.as_path(),
@@ -1553,6 +1554,12 @@ fn spawn_dirty_queue_loop(
                                 scan.manifest_skipped,
                             )
                             .unwrap_or_else(|| scan.dir.clone());
+                        if let Some(cycle_id) = rotating_cycle_id {
+                            runtime.record_rotating_cold_window_scan_completion(
+                                policy_dir.as_path(),
+                                cycle_id,
+                            );
+                        }
                         runtime.apply_scan_policy(
                             policy_dir.as_path(),
                             tiered.l1_scan_interval_secs,
@@ -1852,7 +1859,12 @@ fn spawn_rotating_cold_window_loop(
             }
 
             if !scan_only_dirs.is_empty() {
-                index.enqueue_dirty_dirs(scan_only_dirs, DirtyReason::PeriodicColdScan);
+                index.enqueue_dirty_dirs(
+                    scan_only_dirs,
+                    DirtyReason::RotatingColdWindow {
+                        cycle_id: tick.cycle_id,
+                    },
+                );
             }
         }
     });

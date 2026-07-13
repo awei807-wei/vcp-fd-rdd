@@ -8,6 +8,7 @@ import io
 import json
 import os
 import signal
+import tarfile
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -143,6 +144,7 @@ def synthetic_leg(
             "events_total": primary_total,
             "within_budget_bursts": 6,
             "target_m2_debug_ok_bursts": 6,
+            "target_m2_entry_present_bursts": 6 if variant == "a" else 0,
             "target_m2_seen_bursts": 6 if variant == "a" else 0,
             "target_m2_active_bursts": 6 if variant == "a" else 0,
             "target_m2_unexpired_bursts": 6 if variant == "a" else 0,
@@ -206,6 +208,11 @@ def synthetic_leg(
             "log_error_count": 0,
             "direct_v7_unsupported_count": 0,
             "background_rebuild_count": 0,
+            "bootstrap_background_rebuild_count": 0,
+            "post_ready_background_rebuild_count": 0,
+            "snapshot_log_window_valid": True,
+            "snapshot_quiesce_background_rebuild_count": 0,
+            "unattributed_post_ready_background_rebuild_count": 0,
             "waterline_trigger_count": 0,
             "waterline_recover_count": 0,
         },
@@ -246,6 +253,72 @@ class SequenceTests(unittest.TestCase):
 
 
 class LegAnalysisTests(unittest.TestCase):
+    def test_stability_summary_splits_bootstrap_and_post_ready_rebuilds(self) -> None:
+        summary = falsification._stability_summary(
+            {},
+            {"ready": True},
+            "\n".join(
+                (
+                    "fd-rdd ready. Query via: http://localhost:6060/search?q=keyword",
+                    "Starting background rebuild: startup bootstrap",
+                    "Starting background rebuild: runtime",
+                )
+            ),
+        )
+
+        self.assertEqual(summary["background_rebuild_count"], 2)
+        self.assertEqual(summary["bootstrap_background_rebuild_count"], 1)
+        self.assertEqual(summary["post_ready_background_rebuild_count"], 1)
+
+    def test_stability_summary_only_attributes_snapshot_recovery_inside_log_window(
+        self,
+    ) -> None:
+        prefix = "\n".join(
+            (
+                "fd-rdd ready. Query via: http://localhost:6060/search?q=keyword",
+                "Starting background rebuild: full build requested (strategy=Serial)",
+                "",
+            )
+        )
+        quiesce = (
+            "Starting background rebuild: snapshot recovery (strategy=Serial)\n"
+        )
+        log_text = prefix + quiesce
+        summary = falsification._stability_summary(
+            {},
+            {
+                "ready": True,
+                "rebuild_observed": True,
+                "daemon_log_window_valid": True,
+                "daemon_log_offset_start": len(prefix.encode("utf-8")),
+                "daemon_log_offset_end": len(log_text.encode("utf-8")),
+            },
+            log_text,
+        )
+
+        self.assertEqual(summary["post_ready_background_rebuild_count"], 2)
+        self.assertEqual(summary["snapshot_quiesce_background_rebuild_count"], 1)
+        self.assertEqual(
+            summary["unattributed_post_ready_background_rebuild_count"], 1
+        )
+        self.assertTrue(summary["snapshot_log_window_valid"])
+
+    def test_legacy_generic_rebuild_after_http_ready_is_not_bootstrap(self) -> None:
+        summary = falsification._stability_summary(
+            {},
+            {"ready": True},
+            "\n".join(
+                (
+                    "HTTP Query Server listening on 127.0.0.1:6060",
+                    "Starting background rebuild: full build requested",
+                    "fd-rdd ready. Query via: http://localhost:6060/search?q=keyword",
+                )
+            ),
+        )
+
+        self.assertEqual(summary["bootstrap_background_rebuild_count"], 0)
+        self.assertEqual(summary["post_ready_background_rebuild_count"], 1)
+
     def test_protocol_fingerprint_excludes_only_the_treatment(self) -> None:
         base = {
             "duration_secs": 1200,
@@ -464,33 +537,147 @@ class LegAnalysisTests(unittest.TestCase):
             forward["event_plan_sha256"], reverse["event_plan_sha256"]
         )
 
-    def test_target_m2_causality_requires_live_lease_and_post_write_progress(self) -> None:
+    def test_target_m2_causality_requires_same_cycle_progress_after_fence(self) -> None:
         burst = {
+            "target_m2_debug_ok": True,
+            "target_m2_entry_present": True,
             "target_m2_active": True,
             "target_m2_action": "scan_only",
+            "target_m2_cycle_id": 7,
             "target_m2_observed_unix_secs": 100,
             "target_m2_expires_unix_secs": 200,
             "target_m2_last_scan_unix_secs": 90,
             "target_m2_last_event_unix_secs": 80,
+            "target_m2_scan_seq": 10,
+            "target_m2_event_seq": 8,
             "mutation_completed_unix_secs": 110,
+            "target_m2_fence_debug_ok": True,
+            "target_m2_fence_entry_present": True,
+            "target_m2_fence_active": True,
+            "target_m2_fence_action": "scan_only",
+            "target_m2_fence_cycle_id": 7,
+            "target_m2_fence_scan_seq": 10,
+            "target_m2_fence_event_seq": 8,
         }
         check = {
+            "target_m2_after_debug_ok": True,
+            "target_m2_after_entry_present": True,
             "target_m2_after_last_scan_unix_secs": 111,
             "target_m2_after_last_event_unix_secs": 80,
+            "target_m2_after_scan_seq": 11,
+            "target_m2_after_scan_cycle_id": 7,
+            "target_m2_after_event_seq": 8,
+            "target_m2_after_event_cycle_id": 6,
         }
 
         self.assertTrue(falsification._target_m2_causal(burst, check))
         self.assertFalse(
             falsification._target_m2_causal(
-                {**burst, "target_m2_expires_unix_secs": 99}, check
+                {**burst, "target_m2_fence_active": False}, check
             )
         )
         self.assertFalse(
             falsification._target_m2_causal(
                 burst,
-                {**check, "target_m2_after_last_scan_unix_secs": 90},
+                {**check, "target_m2_after_scan_seq": 10},
             )
         )
+        self.assertFalse(
+            falsification._target_m2_causal(
+                burst,
+                {**check, "target_m2_after_scan_cycle_id": 8},
+            ),
+            "progress from a different rotating lease cycle must not be attributed",
+        )
+
+    def test_target_m2_causality_ignores_wall_clock_rollback(self) -> None:
+        burst = {
+            "target_m2_debug_ok": True,
+            "target_m2_entry_present": True,
+            "target_m2_active": True,
+            "target_m2_action": "scan_only",
+            "target_m2_cycle_id": 4,
+            "target_m2_observed_unix_secs": 111,
+            "mutation_completed_unix_secs": 110,
+            "target_m2_fence_debug_ok": True,
+            "target_m2_fence_entry_present": True,
+            "target_m2_fence_active": True,
+            "target_m2_fence_action": "scan_only",
+            "target_m2_fence_cycle_id": 4,
+            "target_m2_scan_seq": 20,
+            "target_m2_event_seq": 0,
+            "target_m2_fence_scan_seq": 20,
+            "target_m2_fence_event_seq": 0,
+        }
+        check = {
+            "target_m2_after_debug_ok": True,
+            "target_m2_after_entry_present": True,
+            "target_m2_after_last_scan_unix_secs": 50,
+            "target_m2_after_scan_seq": 20,
+            "target_m2_after_scan_cycle_id": 4,
+        }
+
+        self.assertFalse(
+            falsification._target_m2_causal(burst, check),
+            "wall-clock movement cannot replace a monotonic M2 sequence advance",
+        )
+
+    def test_target_m2_causality_accepts_progress_inside_the_mutation_window(self) -> None:
+        burst = {
+            "target_m2_debug_ok": True,
+            "target_m2_entry_present": True,
+            "target_m2_active": True,
+            "target_m2_action": "ephemeral_watch",
+            "target_m2_cycle_id": 9,
+            "target_m2_scan_seq": 40,
+            "target_m2_event_seq": 41,
+            "target_m2_fence_debug_ok": True,
+            "target_m2_fence_entry_present": True,
+            "target_m2_fence_active": True,
+            "target_m2_fence_action": "ephemeral_watch",
+            "target_m2_fence_cycle_id": 9,
+            "target_m2_fence_scan_seq": 40,
+            "target_m2_fence_scan_cycle_id": 8,
+            "target_m2_fence_event_seq": 42,
+            "target_m2_fence_event_cycle_id": 9,
+        }
+        check = {
+            "target_m2_after_debug_ok": True,
+            "target_m2_after_entry_present": True,
+            "target_m2_after_scan_seq": 40,
+            "target_m2_after_scan_cycle_id": 8,
+            "target_m2_after_event_seq": 42,
+            "target_m2_after_event_cycle_id": 9,
+        }
+
+        self.assertTrue(falsification._target_m2_causal(burst, check))
+
+    def test_target_m2_causality_rejects_ordinary_scan_after_lease_expiry(self) -> None:
+        burst = {
+            "target_m2_debug_ok": True,
+            "target_m2_entry_present": True,
+            "target_m2_active": True,
+            "target_m2_action": "scan_only",
+            "target_m2_cycle_id": 2,
+            "target_m2_fence_debug_ok": True,
+            "target_m2_fence_entry_present": True,
+            "target_m2_fence_active": True,
+            "target_m2_fence_action": "scan_only",
+            "target_m2_fence_cycle_id": 2,
+            "target_m2_scan_seq": 30,
+            "target_m2_event_seq": 0,
+            "target_m2_fence_scan_seq": 30,
+            "target_m2_fence_event_seq": 0,
+        }
+        check = {
+            "target_m2_after_debug_ok": True,
+            "target_m2_after_entry_present": True,
+            "target_m2_after_last_scan_unix_secs": 130,
+            "target_m2_after_scan_seq": 30,
+            "target_m2_after_scan_cycle_id": 2,
+        }
+
+        self.assertFalse(falsification._target_m2_causal(burst, check))
 
 
 class GateTests(unittest.TestCase):
@@ -533,6 +720,7 @@ class GateTests(unittest.TestCase):
         legs = self.passing_legs()
         legs[0]["stability"]["waterline_hard_degraded_samples"] = 1
         legs[2]["stability"]["background_rebuild_count"] = 1
+        legs[2]["stability"]["post_ready_background_rebuild_count"] = 1
 
         result = gate.evaluate_suite(legs)
 
@@ -543,12 +731,93 @@ class GateTests(unittest.TestCase):
     def test_gate_accepts_one_snapshot_quiesce_rebuild_when_it_finishes_ready(self) -> None:
         legs = self.passing_legs()
         legs[0]["stability"]["snapshot_rebuild_observed"] = True
+        legs[0]["stability"]["snapshot_log_window_valid"] = True
         legs[0]["stability"]["background_rebuild_count"] = 1
+        legs[0]["stability"]["post_ready_background_rebuild_count"] = 1
+        legs[0]["stability"]["snapshot_quiesce_background_rebuild_count"] = 1
+        legs[0]["stability"][
+            "unattributed_post_ready_background_rebuild_count"
+        ] = 0
         legs[0]["stability"]["direct_v7_unsupported_count"] = 1
 
         result = gate.evaluate_suite(legs)
 
         self.assertEqual(result["decision"], "pass")
+
+    def test_gate_rejects_runtime_rebuild_even_when_snapshot_boolean_is_true(self) -> None:
+        legs = self.passing_legs()
+        stability = legs[0]["stability"]
+        stability["snapshot_rebuild_observed"] = True
+        stability["snapshot_log_window_valid"] = True
+        stability["background_rebuild_count"] = 1
+        stability["post_ready_background_rebuild_count"] = 1
+        stability["snapshot_quiesce_background_rebuild_count"] = 0
+        stability["unattributed_post_ready_background_rebuild_count"] = 1
+
+        result = gate.evaluate_suite(legs)
+
+        self.assertEqual(result["decision"], "fail")
+        self.assertTrue(
+            any("未归因" in reason or "窗口" in reason for reason in result["reasons"])
+        )
+
+    def test_gate_accepts_bootstrap_rebuild_but_rejects_unattributed_post_ready_rebuild(self) -> None:
+        legs = self.passing_legs()
+        legs[0]["stability"]["background_rebuild_count"] = 1
+        legs[0]["stability"]["bootstrap_background_rebuild_count"] = 1
+
+        bootstrap_only = gate.evaluate_suite(legs)
+
+        self.assertEqual(bootstrap_only["decision"], "pass")
+
+        legs[0]["stability"]["post_ready_background_rebuild_count"] = 1
+        post_ready = gate.evaluate_suite(legs)
+
+        self.assertEqual(post_ready["decision"], "fail")
+        self.assertTrue(
+            any("background rebuild" in reason for reason in post_ready["reasons"])
+        )
+
+    def test_gate_rejects_repeated_bootstrap_rebuilds(self) -> None:
+        legs = self.passing_legs()
+        legs[0]["stability"]["background_rebuild_count"] = 2
+        legs[0]["stability"]["bootstrap_background_rebuild_count"] = 2
+
+        result = gate.evaluate_suite(legs)
+
+        self.assertEqual(result["decision"], "fail")
+        self.assertTrue(
+            any("bootstrap background rebuild 超过一次" in reason for reason in result["reasons"])
+        )
+
+    def test_gate_treats_legacy_unclassified_rebuild_as_post_ready(self) -> None:
+        legs = self.passing_legs()
+        stability = legs[0]["stability"]
+        stability["background_rebuild_count"] = 1
+        del stability["bootstrap_background_rebuild_count"]
+        del stability["post_ready_background_rebuild_count"]
+        del stability["snapshot_log_window_valid"]
+        del stability["snapshot_quiesce_background_rebuild_count"]
+        del stability["unattributed_post_ready_background_rebuild_count"]
+
+        result = gate.evaluate_suite(legs)
+
+        self.assertEqual(result["decision"], "fail")
+        self.assertTrue(
+            any("未归因到 snapshot quiesce" in reason for reason in result["reasons"])
+        )
+
+    def test_gate_requires_exact_target_entry_only_for_treatment(self) -> None:
+        legs = self.passing_legs()
+        self.assertEqual(gate.evaluate_suite(legs)["decision"], "pass")
+
+        treatment = next(leg for leg in legs if leg["variant"] == "a")
+        treatment["protocol"]["target_m2_entry_present_bursts"] = 5
+
+        result = gate.evaluate_suite(legs)
+
+        self.assertEqual(result["decision"], "fail")
+        self.assertTrue(any("目标目录 entry" in reason for reason in result["reasons"]))
 
     def test_gate_rejects_baseline_that_never_reached_requested_l3(self) -> None:
         legs = self.passing_legs()
@@ -829,6 +1098,197 @@ class GateTests(unittest.TestCase):
 
 
 class DriverTests(unittest.TestCase):
+    def test_suite_outputs_include_a_bounded_single_file_evidence_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            suite_dir = Path(tmp) / "suite"
+            suite_dir.mkdir()
+            specs = falsification.build_leg_specs(suite_dir, 42)
+            legs: list[dict[str, object]] = []
+            (suite_dir / runner.BUILD_RECEIPT_NAME).write_text(
+                json.dumps({"build_succeeded": True}) + "\n",
+                encoding="utf-8",
+            )
+            attempts: list[Path] = []
+            for spec in specs:
+                attempt = spec.base_dir / "attempt-01"
+                attempt.mkdir(parents=True)
+                attempts.append(attempt)
+                leg = synthetic_leg(
+                    spec.block,
+                    spec.variant,
+                    visibility_rate=1.0 if spec.variant == "a" else 0.0,
+                    positive_rate=1.0 if spec.variant == "a" else 0.8,
+                )
+                leg.update(
+                    {
+                        "position": spec.position,
+                        "order": spec.order,
+                        "run_dir": str(attempt),
+                    }
+                )
+                legs.append(leg)
+                (attempt / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "run_state": "completed",
+                            "runner_args": {"watch_mode": "tiered"},
+                            "command": ["fd-rdd", "--watch-mode", "tiered"],
+                            "config": str(
+                                attempt / "config-home" / "fd-rdd" / "config.toml"
+                            ),
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (attempt / "summary.json").write_text("{}\n", encoding="utf-8")
+                (attempt / runner.WRAPPER_RESULT_NAME).write_text(
+                    "{}\n", encoding="utf-8"
+                )
+                (attempt / "event-storm-samples.jsonl").write_text(
+                    '{"event_kind":"burst_written"}\n', encoding="utf-8"
+                )
+                (attempt / "fd-rdd.log").write_text("ready\n", encoding="utf-8")
+                for name in runner.EVIDENCE_OPTIONAL_ATTEMPT_FILES:
+                    (attempt / name).write_text(f"{name}\n", encoding="utf-8")
+                config = attempt / "config-home" / "fd-rdd" / "config.toml"
+                config.parent.mkdir(parents=True)
+                config.write_text("[general]\n", encoding="utf-8")
+                metric = attempt / "reports" / "metrics" / "metrics.json"
+                metric.parent.mkdir(parents=True)
+                metric.write_text("{}\n", encoding="utf-8")
+                runner_log = attempt.parent / "attempt-01.runner.log"
+                runner_log.write_text("runner\n", encoding="utf-8")
+            first_run = attempts[0]
+            artifact = first_run / "artifact"
+            artifact.mkdir()
+            (artifact / "fd-rdd").write_bytes(b"binary")
+            snapshot = first_run / "index.d"
+            snapshot.mkdir()
+            (snapshot / "manifest.json").write_text("secret\n", encoding="utf-8")
+            build_target = suite_dir / "build-target"
+            build_target.mkdir()
+            (build_target / "fd-rdd").write_bytes(b"build")
+            rogue_attempt = suite_dir / "rogue" / "attempt-secret"
+            rogue_attempt.mkdir(parents=True)
+            (rogue_attempt / "fd-rdd.log").write_text("rogue\n", encoding="utf-8")
+            (suite_dir / "rogue" / "secret.runner.log").write_text(
+                "rogue\n",
+                encoding="utf-8",
+            )
+            outside = Path(tmp) / "outside.log"
+            outside.write_text("outside\n", encoding="utf-8")
+            symlink_attempt = specs[0].base_dir / "attempt-99"
+            symlink_attempt.mkdir()
+            (symlink_attempt / "fd-rdd.log").symlink_to(outside)
+            summary = runner._suite_summary(suite_dir, 42, legs, "")
+
+            bundle = runner._write_outputs(suite_dir, summary)
+
+            self.assertIsNotNone(bundle)
+            assert bundle is not None
+            self.assertEqual(
+                bundle,
+                suite_dir.with_name("suite-evidence.tar.gz"),
+            )
+            with tarfile.open(bundle, "r:gz") as archive_file:
+                names = set(archive_file.getnames())
+            self.assertIn("suite/summary.json", names)
+            for spec in specs:
+                relative = spec.base_dir.relative_to(suite_dir)
+                self.assertIn(
+                    str(Path("suite") / relative / "attempt-01" / "manifest.json"),
+                    names,
+                )
+                self.assertIn(
+                    str(Path("suite") / relative / "attempt-01.runner.log"),
+                    names,
+                )
+            first_relative = first_run.relative_to(suite_dir)
+            self.assertIn(
+                str(Path("suite") / first_relative / "ab-wrapper-result.json"),
+                names,
+            )
+            self.assertIn(
+                str(
+                    Path("suite")
+                    / first_relative
+                    / "config-home"
+                    / "fd-rdd"
+                    / "config.toml"
+                ),
+                names,
+            )
+            self.assertIn(
+                str(
+                    Path("suite")
+                    / first_relative
+                    / "reports"
+                    / "metrics"
+                    / "metrics.json"
+                ),
+                names,
+            )
+            self.assertFalse(any("/artifact/" in name for name in names))
+            self.assertFalse(any("/build-target/" in name for name in names))
+            self.assertFalse(any("/index.d/" in name for name in names))
+            self.assertFalse(any("/rogue/" in name for name in names))
+            self.assertFalse(any("attempt-99/fd-rdd.log" in name for name in names))
+
+    def test_evidence_bundle_failure_invalidates_the_old_bundle_and_suite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            suite_dir = Path(tmp) / "suite"
+            suite_dir.mkdir()
+            summary = runner._suite_summary(
+                suite_dir,
+                42,
+                [],
+                "forced failure",
+            )
+            bundle = runner._write_outputs(suite_dir, summary)
+            self.assertIsNotNone(bundle)
+            assert bundle is not None and bundle.exists()
+
+            with mock.patch.object(
+                runner.tarfile,
+                "open",
+                side_effect=OSError("disk full"),
+            ):
+                failed_bundle = runner._write_outputs(suite_dir, summary)
+
+            self.assertIsNone(failed_bundle)
+            self.assertFalse(bundle.exists())
+            persisted = json.loads(
+                (suite_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(persisted["gate"]["decision"], "fail")
+            self.assertTrue(
+                any(
+                    "证据包生成失败：OSError: disk full" in reason
+                    for reason in persisted["gate"]["reasons"]
+                )
+            )
+
+    def test_failed_suite_prints_each_gate_reason_and_bundle_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            suite_dir = Path(tmp) / "suite"
+            args = mock.Mock(sequence_seed=42, skip_build=True)
+            specs = falsification.build_leg_specs(suite_dir, 42)
+            output = io.StringIO()
+            with mock.patch.object(
+                runner, "_prepare_build", return_value="forced infrastructure failure"
+            ), contextlib.redirect_stdout(output):
+                result = runner._run_suite(
+                    args,
+                    suite_dir,
+                    specs,
+                    suite_dir / "build-provenance.json",
+                )
+
+            self.assertEqual(result, 1)
+            self.assertIn("gate_reason: forced infrastructure failure", output.getvalue())
+            self.assertIn("evidence_bundle:", output.getvalue())
+
     def test_leg_command_forwards_the_shared_build_receipt(self) -> None:
         spec = falsification.build_leg_specs(Path("/tmp/suite"), seed=42)[0]
         receipt = Path("/tmp/suite/build-provenance.json")
@@ -1464,6 +1924,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("incremental write / recovered path", rendered)
         self.assertIn("2000/2000", rendered)
         self.assertIn("主收益端点", rendered)
+        self.assertIn("rebuild total:bootstrap:quiesce:unattributed", rendered)
         self.assertIn("筛查", rendered)
         self.assertIn("不等价于生产发布结论", rendered)
 

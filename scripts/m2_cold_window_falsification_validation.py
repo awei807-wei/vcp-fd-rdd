@@ -113,12 +113,52 @@ def _validate_stability(leg: dict[str, Any], reasons: list[str]) -> None:
     if stability["log_error_count"]:
         reasons.append(f"{label} daemon 日志存在 ERROR")
     rebuild_count = int(stability.get("background_rebuild_count", 0) or 0)
-    if rebuild_count and not stability.get("snapshot_rebuild_observed"):
+    bootstrap_rebuild_count = int(
+        stability.get("bootstrap_background_rebuild_count", 0) or 0
+    )
+    post_ready_rebuild_count = int(
+        stability.get("post_ready_background_rebuild_count", rebuild_count) or 0
+    )
+    snapshot_quiesce_rebuild_count = int(
+        stability.get("snapshot_quiesce_background_rebuild_count", 0) or 0
+    )
+    unattributed_post_ready_rebuild_count = int(
+        stability.get(
+            "unattributed_post_ready_background_rebuild_count",
+            post_ready_rebuild_count,
+        )
+        or 0
+    )
+    if bootstrap_rebuild_count > 1:
+        reasons.append(f"{label} bootstrap background rebuild 超过一次")
+    if (
+        "bootstrap_background_rebuild_count" in stability
+        and "post_ready_background_rebuild_count" in stability
+        and bootstrap_rebuild_count + post_ready_rebuild_count != rebuild_count
+    ):
+        reasons.append(f"{label} background rebuild 分账不一致")
+    if post_ready_rebuild_count and not stability.get("snapshot_log_window_valid"):
+        reasons.append(f"{label}缺少可验证的 snapshot quiesce 日志窗口")
+    if (
+        snapshot_quiesce_rebuild_count + unattributed_post_ready_rebuild_count
+        != post_ready_rebuild_count
+    ):
+        reasons.append(f"{label} post-ready background rebuild 归因分账不一致")
+    if unattributed_post_ready_rebuild_count:
         reasons.append(f"{label}出现未归因到 snapshot quiesce 的 background rebuild")
-    if rebuild_count > 1:
-        reasons.append(f"{label} background rebuild 超过一次")
-    if stability.get("direct_v7_unsupported_count", 0) and not stability.get(
+    if snapshot_quiesce_rebuild_count > 1:
+        reasons.append(f"{label} snapshot quiesce background rebuild 超过一次")
+    if snapshot_quiesce_rebuild_count and not stability.get(
         "snapshot_rebuild_observed"
+    ):
+        reasons.append(f"{label} snapshot rebuild 日志与 quiesce 回执不一致")
+    if stability.get("snapshot_rebuild_observed") and not snapshot_quiesce_rebuild_count:
+        reasons.append(f"{label} snapshot quiesce 回执缺少对应 rebuild 日志")
+    if post_ready_rebuild_count > 1:
+        reasons.append(f"{label} background rebuild 超过一次")
+    if stability.get("direct_v7_unsupported_count", 0) and not (
+        snapshot_quiesce_rebuild_count == 1
+        and unattributed_post_ready_rebuild_count == 0
     ):
         reasons.append(f"{label} direct_v7_unsupported 未由安全 rebuild 收敛")
 
@@ -160,6 +200,9 @@ def _validate_protocol(leg: dict[str, Any], reasons: list[str]) -> None:
     if int(protocol.get("visibility_poll_count", 0) or 0) <= 0:
         reasons.append(f"{label}缺少等负载 visibility polling 证据")
     target_debug_ok = int(protocol.get("target_m2_debug_ok_bursts", 0) or 0)
+    target_entry_present = int(
+        protocol.get("target_m2_entry_present_bursts", 0) or 0
+    )
     target_seen = int(protocol.get("target_m2_seen_bursts", 0) or 0)
     target_active = int(protocol.get("target_m2_active_bursts", 0) or 0)
     target_unexpired = int(protocol.get("target_m2_unexpired_bursts", 0) or 0)
@@ -167,6 +210,11 @@ def _validate_protocol(leg: dict[str, Any], reasons: list[str]) -> None:
     target_actions = protocol.get("target_m2_actions", {})
     if target_debug_ok != physical_bursts:
         reasons.append(f"{label}缺少逐 burst 目标目录 M2 证据")
+    if (
+        leg.get("variant") == "a"
+        and target_entry_present != physical_bursts
+    ):
+        reasons.append(f"{label}并非每个目标目录都有精确 M2 目标目录 entry")
     if leg.get("variant") == "a" and target_seen != physical_bursts:
         reasons.append(f"{label}并非每个目标目录都已被 M2 轮转触达")
     if leg.get("variant") == "a":

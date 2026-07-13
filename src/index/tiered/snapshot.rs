@@ -195,7 +195,7 @@ where
             tracing::warn!(
                 "direct snapshot entered rebuild recovery; delta and sealed WAL retained: {error:#}"
             );
-            idx.spawn_full_build();
+            idx.spawn_snapshot_recovery_full_build();
         }
         return Err(error);
     }

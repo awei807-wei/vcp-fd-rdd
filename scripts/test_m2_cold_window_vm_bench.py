@@ -949,6 +949,8 @@ class PassiveCanaryShutdownTests(unittest.TestCase):
     def test_snapshot_quiesce_retries_rebuild_until_durable_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
+            daemon_log = run_dir / "fd-rdd.log"
+            daemon_log.write_text("fd-rdd ready.\n", encoding="utf-8")
             responses = [
                 self.scan_response(
                     {
@@ -988,6 +990,7 @@ class PassiveCanaryShutdownTests(unittest.TestCase):
                     run_dir / "shutdown-samples.jsonl",
                     started_at=time.monotonic() - 10.0,
                     timeout_secs=30.0,
+                    daemon_log_path=daemon_log,
                 )
 
             self.assertTrue(record["ok"])
@@ -1001,6 +1004,13 @@ class PassiveCanaryShutdownTests(unittest.TestCase):
             self.assertGreaterEqual(record["elapsed_secs"], 10.0)
             self.assertGreaterEqual(
                 record["elapsed_secs"], record["started_elapsed_secs"]
+            )
+            self.assertTrue(record["daemon_log_window_valid"])
+            self.assertEqual(
+                record["daemon_log_offset_start"], daemon_log.stat().st_size
+            )
+            self.assertEqual(
+                record["daemon_log_offset_end"], daemon_log.stat().st_size
             )
             self.assertEqual(sleep.call_count, 2)
             self.assertEqual(urlopen.call_count, 3)
@@ -1089,6 +1099,9 @@ class PassiveCanaryShutdownTests(unittest.TestCase):
                         "started_elapsed_secs": 100.0,
                         "elapsed_secs": 104.0,
                         "latency_secs": 4.0,
+                        "daemon_log_window_valid": True,
+                        "daemon_log_offset_start": 120,
+                        "daemon_log_offset_end": 360,
                     }
                 ],
             )
@@ -1109,6 +1122,9 @@ class PassiveCanaryShutdownTests(unittest.TestCase):
             self.assertTrue(quiesce["ready"])
             self.assertTrue(quiesce["written"])
             self.assertTrue(quiesce["rebuild_observed"])
+            self.assertTrue(quiesce["daemon_log_window_valid"])
+            self.assertEqual(quiesce["daemon_log_offset_start"], 120)
+            self.assertEqual(quiesce["daemon_log_offset_end"], 360)
             self.assertEqual(quiesce["attempts_max"], 3)
             self.assertEqual(quiesce["latency_max_secs"], 4.0)
             self.assertEqual(quiesce["process_sample_count"], 2)
@@ -1825,10 +1841,6 @@ class EventStormFixtureTests(unittest.TestCase):
     def test_fixed_root_schedule_ignores_treatment_tier_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
-            first = root / "d001"
-            second = root / "d002"
-            first.mkdir()
-            second.mkdir()
             runner = self.event_storm_runner([root])
             runner.fixed_root_schedule = True
 
@@ -1842,8 +1854,8 @@ class EventStormFixtureTests(unittest.TestCase):
                 runner.cycle = 2
                 selected_second = runner.select_root("L3")
 
-            self.assertEqual(selected_first, first)
-            self.assertEqual(selected_second, second)
+            self.assertEqual(selected_first, root)
+            self.assertEqual(selected_second, root)
 
     def test_target_m2_evidence_is_bound_to_the_exact_selected_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1861,6 +1873,10 @@ class EventStormFixtureTests(unittest.TestCase):
                             "rotating_cold_window_action": "scan_only",
                             "rotating_cold_window_cycle_id": 7,
                             "rotating_cold_window_expires_unix_secs": 200,
+                            "rotating_cold_window_last_scan_seq": 31,
+                            "rotating_cold_window_last_scan_cycle_id": 7,
+                            "rotating_cold_window_last_event_seq": 29,
+                            "rotating_cold_window_last_event_cycle_id": 7,
                             "last_scan": 101,
                             "last_event": 102,
                         },
@@ -1877,6 +1893,7 @@ class EventStormFixtureTests(unittest.TestCase):
                 evidence,
                 {
                     "target_m2_debug_ok": True,
+                    "target_m2_entry_present": True,
                     "target_m2_seen": True,
                     "target_m2_active": True,
                     "target_m2_action": "scan_only",
@@ -1884,17 +1901,218 @@ class EventStormFixtureTests(unittest.TestCase):
                     "target_m2_expires_unix_secs": 200,
                     "target_m2_last_scan_unix_secs": 101,
                     "target_m2_last_event_unix_secs": 102,
+                    "target_m2_scan_seq": 31,
+                    "target_m2_scan_cycle_id": 7,
+                    "target_m2_event_seq": 29,
+                    "target_m2_event_cycle_id": 7,
                     "target_m2_observed_unix_secs": 150,
                 },
             )
 
-    def test_rotation_aligned_fixed_schedule_targets_active_ttl_window(self) -> None:
+    def test_burst_written_captures_a_post_mutation_m2_sequence_fence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
-            dirs = [root / f"d{index:03d}" for index in range(1, 301)]
-            for path in dirs:
-                path.mkdir()
             runner = self.event_storm_runner([root])
+            before = {
+                "target_m2_debug_ok": True,
+                "target_m2_entry_present": True,
+                "target_m2_active": True,
+                "target_m2_action": "scan_only",
+                "target_m2_cycle_id": 3,
+                "target_m2_scan_seq": 10,
+                "target_m2_event_seq": 4,
+            }
+            fence = {
+                **before,
+                "target_m2_scan_seq": 11,
+                "target_m2_event_seq": 4,
+            }
+            emitted: list[dict[str, object]] = []
+            with mock.patch.object(runner, "select_root", return_value=root), mock.patch.object(
+                runner, "tier_for_root", return_value="L0"
+            ), mock.patch.object(
+                runner, "m2_evidence_for_root", side_effect=[before, fence]
+            ), mock.patch.object(
+                runner, "write_rw100", return_value=[]
+            ), mock.patch.object(
+                runner, "emit", side_effect=lambda row: emitted.append(dict(row))
+            ):
+                runner.start_cycle(time.monotonic())
+
+            written = next(
+                row for row in emitted if row.get("event_kind") == "burst_written"
+            )
+            self.assertEqual(written["target_m2_scan_seq"], 10)
+            self.assertEqual(written["target_m2_fence_scan_seq"], 11)
+            self.assertEqual(written["target_m2_fence_cycle_id"], 3)
+
+    def test_tier_for_root_inherits_the_nearest_ancestor_not_a_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp).resolve()
+            cold_a = fixture / "cold-a"
+            selected = cold_a / "d040"
+            selected.mkdir(parents=True)
+            runner = self.event_storm_runner([cold_a])
+
+            with mock.patch.object(
+                BENCH,
+                "debug_tiered_watch",
+                return_value={
+                    "dirs": [
+                        {"path": str(fixture), "watch_tier": "L2"},
+                        {"path": str(cold_a), "watch_tier": "L3"},
+                        {"path": str(fixture / "cold-b"), "watch_tier": "L1"},
+                    ]
+                },
+            ) as debug:
+                tier = runner.tier_for_root(selected)
+
+            self.assertEqual(tier, "L3")
+            debug.assert_called_once_with(runner.base_url, cold_a)
+
+    def test_tier_for_root_does_not_infer_a_parent_tier_from_a_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cold_a = Path(tmp).resolve() / "cold-a"
+            cold_a.mkdir()
+            runner = self.event_storm_runner([cold_a])
+
+            with mock.patch.object(
+                BENCH,
+                "debug_tiered_watch",
+                return_value={
+                    "dirs": [
+                        {"path": str(cold_a / "deep"), "watch_tier": "L3"},
+                    ]
+                },
+            ):
+                tier = runner.tier_for_root(cold_a)
+
+            self.assertEqual(tier, "")
+
+    def test_missing_exact_m2_entry_is_valid_negative_debug_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cold_a = Path(tmp).resolve() / "cold-a"
+            selected = cold_a / "d040"
+            selected.mkdir(parents=True)
+            runner = self.event_storm_runner([cold_a])
+
+            with mock.patch.object(
+                BENCH,
+                "debug_tiered_watch",
+                return_value={
+                    "dirs": [
+                        {"path": str(cold_a), "watch_tier": "L3"},
+                    ]
+                },
+            ), mock.patch.object(BENCH.time, "time", return_value=150.25):
+                evidence = runner.m2_evidence_for_root(selected)
+
+            self.assertEqual(
+                evidence,
+                {
+                    "target_m2_debug_ok": True,
+                    "target_m2_entry_present": False,
+                    "target_m2_seen": False,
+                    "target_m2_active": False,
+                    "target_m2_action": "",
+                    "target_m2_cycle_id": 0,
+                    "target_m2_expires_unix_secs": 0,
+                    "target_m2_last_scan_unix_secs": 0,
+                    "target_m2_last_event_unix_secs": 0,
+                    "target_m2_scan_seq": 0,
+                    "target_m2_scan_cycle_id": 0,
+                    "target_m2_event_seq": 0,
+                    "target_m2_event_cycle_id": 0,
+                    "target_m2_observed_unix_secs": 150,
+                },
+            )
+
+            runner.strict_protocol = True
+            runner.treatment_enabled = False
+            self.assertEqual(
+                runner.protocol_precondition_error("L3", "L3", evidence),
+                "",
+            )
+
+    def test_strict_protocol_stops_before_mutation_when_tier_is_unproven(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.strict_protocol = True
+            runner.treatment_enabled = True
+
+            with mock.patch.object(
+                runner, "tier_for_root", return_value=""
+            ), mock.patch.object(
+                runner,
+                "m2_evidence_for_root",
+                return_value={
+                    "target_m2_debug_ok": False,
+                    "target_m2_entry_present": False,
+                    "target_m2_seen": False,
+                    "target_m2_active": False,
+                    "target_m2_action": "",
+                    "target_m2_cycle_id": 0,
+                    "target_m2_expires_unix_secs": 0,
+                    "target_m2_last_scan_unix_secs": 0,
+                    "target_m2_last_event_unix_secs": 0,
+                    "target_m2_observed_unix_secs": 150,
+                },
+            ), mock.patch.object(runner, "write_rw100") as write:
+                runner.start_cycle(time.monotonic())
+
+            self.assertIn("requested L0 but observed unknown", runner.protocol_error)
+            write.assert_not_called()
+
+    def test_strict_protocol_does_not_create_a_missing_fixture_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve() / "missing"
+            runner = self.event_storm_runner([root])
+            runner.out_path = Path(tmp) / "events.jsonl"
+            runner.strict_protocol = True
+
+            with mock.patch.object(
+                runner,
+                "_emit_tier_distribution",
+            ), mock.patch.object(
+                runner,
+                "select_root",
+                return_value=root,
+            ), mock.patch.object(runner, "write_rw100") as write:
+                runner.start_cycle(time.monotonic())
+
+            self.assertFalse(root.exists())
+            self.assertIn("selected fixture root does not exist", runner.protocol_error)
+            write.assert_not_called()
+
+    def test_strict_protocol_rejects_a_lease_at_its_expiry_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.strict_protocol = True
+            runner.treatment_enabled = True
+            evidence = {
+                "target_m2_debug_ok": True,
+                "target_m2_entry_present": True,
+                "target_m2_seen": True,
+                "target_m2_active": True,
+                "target_m2_action": "scan_only",
+                "target_m2_cycle_id": 7,
+                "target_m2_expires_unix_secs": 150,
+                "target_m2_observed_unix_secs": 150,
+            }
+
+            error = runner.protocol_precondition_error("L3", "L3", evidence)
+
+            self.assertEqual(error, "treatment target M2 lease is expired")
+
+    def test_rotation_aligned_fixed_schedule_targets_active_ttl_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            container = Path(tmp).resolve()
+            roots = [container / f"cold-{index}" for index in range(1, 4)]
+            for path in roots:
+                path.mkdir()
+            runner = self.event_storm_runner(roots)
             runner.fixed_root_schedule = True
             runner.start_delay_secs = 240
             runner.settle_secs = 120
@@ -1908,8 +2126,8 @@ class EventStormFixtureTests(unittest.TestCase):
             runner.cycle = 2
             second = runner.select_root("L3")
 
-            self.assertEqual(first, root / "d041")
-            self.assertEqual(second, root / "d073")
+            self.assertEqual(first, roots[1])
+            self.assertEqual(second, roots[0])
 
     def test_process_sampling_diagnostics_detect_coverage_gaps_and_regressions(self) -> None:
         samples = [
@@ -2356,6 +2574,31 @@ class EventStormFixtureTests(unittest.TestCase):
                 [first.random.randint(10, 50) for _ in range(8)],
                 [second.random.randint(10, 50) for _ in range(8)],
             )
+
+    def test_sweep_returns_nonzero_when_a_variant_fails_protocol(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sweep_config = root / "sweep.json"
+            sweep_config.write_text(
+                json.dumps({"variants": [{"label": "strict"}]}),
+                encoding="utf-8",
+            )
+            args = Namespace(
+                sweep_config=str(sweep_config),
+                port=6060,
+                repo=str(root),
+            )
+            failed = {
+                "label": "strict",
+                "fatal_error": "event_storm_protocol_failed: unproven tier",
+                "fd_rdd_exit_code": 0,
+                "ab_comparable": False,
+            }
+
+            with mock.patch.object(BENCH, "run_single", return_value=failed):
+                result = BENCH.run_sweep(args)
+
+            self.assertEqual(result, 1)
 
 
 if __name__ == "__main__":

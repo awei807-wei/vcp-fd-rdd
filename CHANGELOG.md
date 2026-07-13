@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- 修复 M2 快速证伪对 B 组的确定性假失败：event-storm 子目录现在从最近祖先继承 tier，debug 请求成功与精确 M2 entry 存在分开记录；A 仍要求逐 burst 精确 entry、有效租约和写后因果，B 允许 entry 不存在但禁止任何 M2 活动。falsification profile 新增写入前严格协议校验，前置证据不成立时立即结束该腿。
+- M2 稳定性门禁用显式 `startup bootstrap` reason 拆分 bootstrap 与 post-ready background rebuild，消除后台日志晚于 ready 的调度竞态；允许的 post-ready rebuild 必须带 `snapshot recovery` reason 且启动日志落在 shutdown quiesce 字节窗口内，仅有全局 rebuild 布尔值不能放行。写后扫描/事件改用写前序列、写后租约栅栏和同租约周期校验；轮转 scan 通过带 `cycle_id` 的专用 dirty source 贯穿队列与分片扫描，普通周期/API/查询扫描不再发布 M2 序列，序列发布也在每目录锁内保持单调。固定调度改为选择 daemon 已登记的配置根，消除 `dNNN` 子目录与精确 M2 entry 契约冲突。租约判活同时受单调时钟与墙上时钟约束，既保留 mutation 期间即时完成的真实 M2 事件，又避免同秒交错、时钟回拨和租约外工作造成假阳性。suite 同时逐条打印 gate reasons，并只对最终八腿引用的 attempt 生成带必需成员校验和 SHA256 清单的证据包；根级构建回执实际 SHA256 必须与八腿审计记录一致，历史 attempt、build-target、执行副本、snapshot、symlink 与伪造路径均被排除，缺件、回执替换或打包失败会使旧包失效并返回基础设施失败。
 - 补齐 `unbounded_summary_uses_walkbuilder_filter` 的 `.git/` fixture 前置条件，使测试与 `ignore` crate 仅在 Git 仓库启用 `.gitignore` 的真实语义一致，消除确定性误报。
 - M2 benchmark 新增最终持久化静默屏障：可信 `/scan` 对账后同步 POST `/snapshot`，若目录 rename/mount storm 触发 `subtree move completeness is unproven`，daemon 在 shutdown 前执行完整 rebuild，runner 重试到 durable generation `ready=true` 后才发送 SIGTERM；`shutdown_snapshot_quiesce` 单独记录 rebuild、尝试次数、耗时和 CPU/RSS，失败或缺失继续拒绝 A/B。
 - M2 benchmark 在时长结束后、SIGTERM 前新增可审计的关机静默对账：runner 同步 POST `/scan` 到 passive/active canary、event-storm parent/active burst 与 mixed hot roots，手动扫描复用完整目录读取、fingerprint、`event_seq` 与 freeze gate 的可信负事实逻辑并返回 `stable/deleted`；持续不稳定、记录缺失或失败都会拒绝 A/B，避免未完成 create→rename→delete 或 active burst 的 Live 路径击穿最终快照，同时保留 snapshot fail-closed。

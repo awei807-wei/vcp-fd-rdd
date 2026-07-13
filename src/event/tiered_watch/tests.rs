@@ -1906,6 +1906,88 @@ fn rotating_cold_window_budget_and_ttl_gate_selection() {
     assert_eq!(next_tick.actions.len(), 1);
 }
 
+#[test]
+fn rotating_cold_window_progress_is_scoped_to_an_active_lease_cycle() {
+    let cold = PathBuf::from("/tmp/cold-causal-progress");
+    let child = cold.join("changed.txt");
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(cold.clone(), 4)], 16, 5_000, 20);
+    let state = rt.state(&cold).expect("cold dir should exist");
+    state.tier.store(WatchTier::L3.as_u8(), Ordering::Release);
+    state
+        .last_scan_unix_secs
+        .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
+
+    let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
+        enabled: true,
+        budget: 1,
+        ttl_secs: 60,
+        max_cost_per_root: 64,
+        max_dirs_per_tick: 1,
+    });
+    assert_eq!(tick.actions.len(), 1);
+    assert_eq!(
+        tick.actions[0].action,
+        RotatingColdWindowActionKind::EphemeralWatch
+    );
+
+    rt.record_scan(
+        cold.as_path(),
+        ScanOutcome {
+            scanned: 1,
+            changed: 1,
+            elapsed_ms: 0,
+            project_roots: Vec::new(),
+        },
+    );
+    let ordinary = rt.debug_dump(Some("/tmp/cold-causal-progress"));
+    let ordinary_dir = ordinary.dirs.first().expect("cold dir should be present");
+    assert_eq!(ordinary_dir.rotating_cold_window_last_scan_seq, 0);
+    assert!(!rt.record_rotating_cold_window_scan_completion(
+        cold.as_path(),
+        tick.cycle_id.saturating_add(1)
+    ));
+    assert!(rt.record_rotating_cold_window_scan_completion(cold.as_path(), tick.cycle_id));
+    rt.record_event_paths([&child]);
+    let active = rt.debug_dump(Some("/tmp/cold-causal-progress"));
+    let active_dir = active.dirs.first().expect("cold dir should be present");
+    assert!(active_dir.rotating_cold_window_last_scan_seq > 0);
+    assert_eq!(
+        active_dir.rotating_cold_window_last_scan_cycle_id,
+        tick.cycle_id
+    );
+    assert!(
+        active_dir.rotating_cold_window_last_event_seq
+            > active_dir.rotating_cold_window_last_scan_seq
+    );
+    assert_eq!(
+        active_dir.rotating_cold_window_last_event_cycle_id,
+        tick.cycle_id
+    );
+
+    let scan_seq = active_dir.rotating_cold_window_last_scan_seq;
+    let event_seq = active_dir.rotating_cold_window_last_event_seq;
+    if let Some(lease) = rt.rotating_cold_window_leases.write().get_mut(&cold) {
+        lease.expires_unix_secs = unix_secs().saturating_sub(1);
+    }
+    rt.record_scan(
+        cold.as_path(),
+        ScanOutcome {
+            scanned: 1,
+            changed: 1,
+            elapsed_ms: 0,
+            project_roots: Vec::new(),
+        },
+    );
+    assert!(!rt.record_rotating_cold_window_scan_completion(cold.as_path(), tick.cycle_id));
+    rt.record_event_paths([&child]);
+
+    let expired = rt.debug_dump(Some("/tmp/cold-causal-progress"));
+    let expired_dir = expired.dirs.first().expect("cold dir should be present");
+    assert!(!expired_dir.rotating_cold_window);
+    assert_eq!(expired_dir.rotating_cold_window_last_scan_seq, scan_seq);
+    assert_eq!(expired_dir.rotating_cold_window_last_event_seq, event_seq);
+}
+
 // ── Waterline alarm tests ───────────────────────────────────────────────────
 
 fn waterline_config() -> TieredWatchConfig {

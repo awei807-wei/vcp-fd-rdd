@@ -673,6 +673,20 @@ impl TieredIndex {
         }
     }
 
+    /// Start the one expected rebuild for an empty or untrusted startup snapshot.
+    pub(crate) fn spawn_startup_full_build(self: &Arc<Self>) {
+        if !self.try_start_rebuild_with_cooldown("startup bootstrap") {
+            tracing::debug!("Startup bootstrap rebuild request coalesced or scheduled");
+        }
+    }
+
+    /// Recover a durable snapshot generation that cannot be merged directly.
+    pub(crate) fn spawn_snapshot_recovery_full_build(self: &Arc<Self>) {
+        if !self.try_start_rebuild_with_cooldown("snapshot recovery") {
+            tracing::debug!("Snapshot recovery rebuild request coalesced or scheduled");
+        }
+    }
+
     /// overflow 兜底：dirty region + cooldown/max-staleness 触发后执行一次 fast-sync（best-effort）。
     ///
     /// 设计目标：
@@ -866,17 +880,18 @@ impl TieredIndex {
                     }
                     match std::fs::symlink_metadata(dir) {
                         Ok(meta) if meta.is_dir() => {
-                            let allow_manifest_skip = entry.reason == DirtyReason::PeriodicColdScan
-                                && manifest_skip_dirs.contains(dir);
+                            let allow_manifest_skip =
+                                entry.reason.is_cold_scan() && manifest_skip_dirs.contains(dir);
                             let discard_if_event_seq_advances = matches!(
                                 entry.reason,
                                 DirtyReason::PeriodicColdScan
+                                    | DirtyReason::RotatingColdWindow { .. }
                                     | DirtyReason::StartupRepairDeferred
                                     | DirtyReason::FastScanBootstrapDir
                                     | DirtyReason::FastScanChangedDir
                             );
                             let (outcome, manifest_skipped, dropped_stale_batch) =
-                                if entry.reason == DirtyReason::PeriodicColdScan {
+                                if entry.reason.is_cold_scan() {
                                     let sliced = self.scan_dir_repair_slice_with_project_markers(
                                         dir,
                                         entry.repair_cursor.as_ref(),

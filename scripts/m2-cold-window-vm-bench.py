@@ -1023,15 +1023,33 @@ def record_shutdown_snapshot_quiesce(
     *,
     started_at: float,
     timeout_secs: float,
+    daemon_log_path: Path | None = None,
 ) -> dict[str, Any]:
     """Persist and audit the final non-shutdown snapshot/rebuild barrier."""
     record_started_at = time.monotonic()
+    log_offset_start = -1
+    if daemon_log_path is not None:
+        try:
+            log_offset_start = daemon_log_path.stat().st_size
+        except OSError:
+            log_offset_start = -1
     record: dict[str, Any] = {
         "operation": "shutdown_snapshot_quiesce",
         "timeout_secs": timeout_secs,
         "started_elapsed_secs": round(record_started_at - started_at, 3),
+        "daemon_log_offset_start": log_offset_start,
     }
     record.update(stable_snapshot_audit(base_url, timeout_secs))
+    log_offset_end = -1
+    if daemon_log_path is not None:
+        try:
+            log_offset_end = daemon_log_path.stat().st_size
+        except OSError:
+            log_offset_end = -1
+    record["daemon_log_offset_end"] = log_offset_end
+    record["daemon_log_window_valid"] = (
+        log_offset_start >= 0 and log_offset_end >= log_offset_start
+    )
     record["ts"] = utc_now()
     record["elapsed_secs"] = round(time.monotonic() - started_at, 3)
     json_line(out_path, record)
@@ -1739,6 +1757,8 @@ class EventStormRunner:
         rotating_tick_secs: float = 0.0,
         rotating_ttl_secs: float = 0.0,
         rotating_dirs_per_tick: int = 0,
+        strict_protocol: bool = False,
+        treatment_enabled: bool = False,
     ) -> None:
         self.base_url = base_url
         self.roots = roots
@@ -1771,6 +1791,9 @@ class EventStormRunner:
         self.rotating_tick_secs = max(0.0, rotating_tick_secs)
         self.rotating_ttl_secs = max(0.0, rotating_ttl_secs)
         self.rotating_dirs_per_tick = max(0, rotating_dirs_per_tick)
+        self.strict_protocol = bool(strict_protocol)
+        self.treatment_enabled = bool(treatment_enabled)
+        self.protocol_error = ""
         self.kinds = normalize_event_storm_kinds(kinds)
         self.target_tiers = [tier.upper() for tier in target_tiers]
         tiers = self.target_tiers or [""]
@@ -1815,10 +1838,35 @@ class EventStormRunner:
             self._emit_tier_distribution("storm_start")
         requested_tier, selected_kind = self.work_items[(self.cycle - 1) % len(self.work_items)]
         root = self.select_root(requested_tier)
+        if self.strict_protocol and not root.is_dir():
+            self.reject_protocol_precondition(
+                root,
+                requested_tier,
+                selected_kind,
+                "",
+                f"selected fixture root does not exist: {root}",
+                {},
+            )
+            return
         root.mkdir(parents=True, exist_ok=True)
         burst_root = self.burst_root(root, self.burst_directory_kind(selected_kind))
         tier_before = self.tier_for_root(root)
         target_m2_evidence = self.m2_evidence_for_root(root)
+        protocol_error = self.protocol_precondition_error(
+            requested_tier,
+            tier_before,
+            target_m2_evidence,
+        )
+        if protocol_error:
+            self.reject_protocol_precondition(
+                root,
+                requested_tier,
+                selected_kind,
+                tier_before,
+                protocol_error,
+                target_m2_evidence,
+            )
+            return
         events: list[dict[str, Any]] = []
         cycle_started = time.monotonic()
         self.current_burst_started_at = cycle_started
@@ -1890,6 +1938,10 @@ class EventStormRunner:
             return
         generation_secs = time.monotonic() - cycle_started
         mutation_completed_unix_secs = int(time.time())
+        target_m2_fence = {
+            key.replace("target_m2_", "target_m2_fence_", 1): value
+            for key, value in self.m2_evidence_for_root(root).items()
+        }
         # Task 2: when immediate-query mode is enabled, the first due point is
         # the immediate settle (e.g. 5s); after that pass we reschedule to the
         # normal settle_secs for the delayed pass. Otherwise a single pass at
@@ -1917,6 +1969,7 @@ class EventStormRunner:
             "visibility_probes": self.select_visibility_probes(events),
             "visibility_next_poll_at": time.monotonic(),
             "target_m2_before": target_m2_evidence,
+            "target_m2_fence": target_m2_fence,
             "mutation_completed_unix_secs": mutation_completed_unix_secs,
         }
         self.emit(
@@ -1934,6 +1987,7 @@ class EventStormRunner:
                 "mutation_completed_unix_secs": mutation_completed_unix_secs,
                 "kinds": self.kinds,
                 **target_m2_evidence,
+                **target_m2_fence,
             }
         )
         for event in events:
@@ -2519,12 +2573,11 @@ class EventStormRunner:
     def select_root(self, requested_tier: str) -> Path:
         if self.fixed_root_schedule:
             candidates = [
-                child
+                root
                 for root in sorted(self.roots)
-                for child in sorted(root.iterdir())
-                if child.is_dir()
-                and not child.is_symlink()
-                and self._stable_fixture_anchor(child) == child.resolve()
+                if root.is_dir()
+                and not root.is_symlink()
+                and self._stable_fixture_anchor(root) == root.resolve()
             ]
             if not candidates:
                 raise RuntimeError("fixed event-storm root schedule has no directory")
@@ -2915,25 +2968,52 @@ class EventStormRunner:
 
     def tier_for_root(self, root: Path) -> str:
         try:
-            dump = debug_tiered_watch(self.base_url, root)
+            root_path = Path(root)
+            configured_ancestors = [
+                Path(candidate)
+                for candidate in self.roots
+                if Path(candidate) == root_path or Path(candidate) in root_path.parents
+            ]
+            debug_anchor = (
+                max(configured_ancestors, key=lambda path: len(path.parts))
+                if configured_ancestors
+                else root_path
+            )
+            dump = debug_tiered_watch(self.base_url, debug_anchor)
             dirs = dump.get("dirs")
             if not isinstance(dirs, list):
                 return ""
-            root_str = str(root)
-            exact = [item for item in dirs if isinstance(item, dict) and item.get("path") == root_str]
-            if exact:
-                return str(exact[0].get("watch_tier", ""))
-            prefix = root_str.rstrip("/") + "/"
-            candidates = [
-                item for item in dirs
-                if isinstance(item, dict) and str(item.get("path", "")).startswith(prefix)
-            ]
-            return str(candidates[0].get("watch_tier", "")) if candidates else ""
+            ancestors: list[tuple[int, dict[str, Any]]] = []
+            for item in dirs:
+                if not isinstance(item, dict) or not item.get("path"):
+                    continue
+                candidate_path = Path(str(item["path"]))
+                if candidate_path == root_path or candidate_path in root_path.parents:
+                    ancestors.append((len(candidate_path.parts), item))
+            if ancestors:
+                nearest = max(ancestors, key=lambda row: row[0])[1]
+                return str(nearest.get("watch_tier", ""))
+            return ""
         except Exception:
             return ""
 
     def m2_evidence_for_root(self, root: Path) -> dict[str, Any]:
-        """Capture target-specific M2 evidence before mutating the selected root."""
+        """Capture one target-specific M2 lease and progress snapshot."""
+        observed_unix_secs = int(time.time())
+        empty_evidence = {
+            "target_m2_seen": False,
+            "target_m2_active": False,
+            "target_m2_action": "",
+            "target_m2_cycle_id": 0,
+            "target_m2_expires_unix_secs": 0,
+            "target_m2_last_scan_unix_secs": 0,
+            "target_m2_last_event_unix_secs": 0,
+            "target_m2_scan_seq": 0,
+            "target_m2_scan_cycle_id": 0,
+            "target_m2_event_seq": 0,
+            "target_m2_event_cycle_id": 0,
+            "target_m2_observed_unix_secs": observed_unix_secs,
+        }
         try:
             dump = debug_tiered_watch(self.base_url, root)
             dirs = dump.get("dirs")
@@ -2950,9 +3030,14 @@ class EventStormRunner:
                 None,
             )
             if item is None:
-                raise RuntimeError("selected root missing from debug tiered-watch")
+                return {
+                    "target_m2_debug_ok": True,
+                    "target_m2_entry_present": False,
+                    **empty_evidence,
+                }
             return {
                 "target_m2_debug_ok": True,
+                "target_m2_entry_present": True,
                 "target_m2_seen": bool(item.get("rotating_cold_window_seen")),
                 "target_m2_active": bool(item.get("rotating_cold_window")),
                 "target_m2_action": str(
@@ -2966,21 +3051,98 @@ class EventStormRunner:
                 ),
                 "target_m2_last_scan_unix_secs": int(item.get("last_scan", 0) or 0),
                 "target_m2_last_event_unix_secs": int(item.get("last_event", 0) or 0),
-                "target_m2_observed_unix_secs": int(time.time()),
+                "target_m2_scan_seq": int(
+                    item.get("rotating_cold_window_last_scan_seq", 0) or 0
+                ),
+                "target_m2_scan_cycle_id": int(
+                    item.get("rotating_cold_window_last_scan_cycle_id", 0) or 0
+                ),
+                "target_m2_event_seq": int(
+                    item.get("rotating_cold_window_last_event_seq", 0) or 0
+                ),
+                "target_m2_event_cycle_id": int(
+                    item.get("rotating_cold_window_last_event_cycle_id", 0) or 0
+                ),
+                "target_m2_observed_unix_secs": observed_unix_secs,
             }
         except Exception as exc:  # noqa: BLE001 - evidence failure must gate the leg
             return {
                 "target_m2_debug_ok": False,
-                "target_m2_seen": False,
-                "target_m2_active": False,
-                "target_m2_action": "",
-                "target_m2_cycle_id": 0,
-                "target_m2_expires_unix_secs": 0,
-                "target_m2_last_scan_unix_secs": 0,
-                "target_m2_last_event_unix_secs": 0,
-                "target_m2_observed_unix_secs": int(time.time()),
+                "target_m2_entry_present": False,
+                **empty_evidence,
                 "target_m2_debug_error": repr(exc),
             }
+
+    def reject_protocol_precondition(
+        self,
+        root: Path,
+        requested_tier: str,
+        selected_kind: str,
+        tier_before: str,
+        error: str,
+        evidence: dict[str, Any],
+    ) -> None:
+        self.protocol_error = error
+        self.emit(
+            {
+                "event_kind": "protocol_precondition_failed",
+                "operation": "protocol_precondition_failed",
+                "root": str(root),
+                "requested_tier": requested_tier,
+                "selected_kind": selected_kind,
+                "tier_before": tier_before,
+                "fixed_root_schedule": self.fixed_root_schedule,
+                "error": error,
+                "ok": False,
+                **evidence,
+            }
+        )
+
+    def protocol_precondition_error(
+        self,
+        requested_tier: str,
+        observed_tier: str,
+        evidence: dict[str, Any],
+    ) -> str:
+        """Return a strict-protocol error before the workload mutates the fixture."""
+        if not self.strict_protocol:
+            return ""
+        normalized_requested = requested_tier.upper()
+        normalized_observed = observed_tier.upper()
+        if normalized_requested and normalized_requested != normalized_observed:
+            return (
+                f"requested {normalized_requested} but observed "
+                f"{normalized_observed or 'unknown'}"
+            )
+        if evidence.get("target_m2_debug_ok") is not True:
+            return "target M2 debug request failed"
+        if self.treatment_enabled:
+            if evidence.get("target_m2_entry_present") is not True:
+                return "treatment target has no exact M2 entry"
+            if not evidence.get("target_m2_seen") or not evidence.get("target_m2_active"):
+                return "treatment target has no active M2 lease"
+            action = str(evidence.get("target_m2_action", ""))
+            if action not in {"ephemeral_watch", "fast_scan_lease", "scan_only"}:
+                return f"treatment target has invalid M2 action: {action or 'missing'}"
+            observed = int(evidence.get("target_m2_observed_unix_secs", 0) or 0)
+            expires = int(evidence.get("target_m2_expires_unix_secs", 0) or 0)
+            if observed <= 0 or expires <= observed:
+                return "treatment target M2 lease is expired"
+            return ""
+        baseline_activity = any(
+            (
+                bool(evidence.get("target_m2_seen")),
+                bool(evidence.get("target_m2_active")),
+                bool(evidence.get("target_m2_action")),
+                int(evidence.get("target_m2_cycle_id", 0) or 0) != 0,
+                int(evidence.get("target_m2_expires_unix_secs", 0) or 0) != 0,
+                int(evidence.get("target_m2_scan_seq", 0) or 0) != 0,
+                int(evidence.get("target_m2_scan_cycle_id", 0) or 0) != 0,
+                int(evidence.get("target_m2_event_seq", 0) or 0) != 0,
+                int(evidence.get("target_m2_event_cycle_id", 0) or 0) != 0,
+            )
+        )
+        return "baseline target unexpectedly has M2 activity" if baseline_activity else ""
 
     def emit(self, record: dict[str, Any]) -> None:
         record.setdefault("ok", True)
@@ -3839,6 +4001,17 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         if item.get("ok") is True and item.get("ready") is True
     )
     snapshot_quiesce_failures = len(snapshot_quiesce_rows) - snapshot_quiesce_ok
+    snapshot_log_window_valid = len(snapshot_quiesce_rows) == 1 and all(
+        item.get("daemon_log_window_valid") is True
+        and isinstance(item.get("daemon_log_offset_start"), int)
+        and not isinstance(item.get("daemon_log_offset_start"), bool)
+        and isinstance(item.get("daemon_log_offset_end"), int)
+        and not isinstance(item.get("daemon_log_offset_end"), bool)
+        and int(item["daemon_log_offset_start"]) >= 0
+        and int(item["daemon_log_offset_end"])
+        >= int(item["daemon_log_offset_start"])
+        for item in snapshot_quiesce_rows
+    )
     quiesce_start = min(
         (
             float(item.get("started_elapsed_secs", 0.0) or 0.0)
@@ -4507,6 +4680,23 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
                 item.get("rebuild_observed") is True
                 for item in snapshot_quiesce_rows
             ),
+            "daemon_log_window_valid": snapshot_log_window_valid,
+            "daemon_log_offset_start": min(
+                (
+                    int(item.get("daemon_log_offset_start", -1))
+                    for item in snapshot_quiesce_rows
+                    if item.get("daemon_log_window_valid") is True
+                ),
+                default=-1,
+            ),
+            "daemon_log_offset_end": max(
+                (
+                    int(item.get("daemon_log_offset_end", -1))
+                    for item in snapshot_quiesce_rows
+                    if item.get("daemon_log_window_valid") is True
+                ),
+                default=-1,
+            ),
             "attempts_max": max(
                 (
                     int(item.get("attempts", 0) or 0)
@@ -5093,6 +5283,14 @@ def parse_args() -> argparse.Namespace:
         help="select deterministic fixture child directories instead of post-treatment tiers",
     )
     parser.add_argument(
+        "--event-storm-strict-protocol",
+        action="store_true",
+        help=(
+            "fail the run before the first fixture mutation when the requested tier "
+            "or treatment-specific M2 evidence cannot be proven"
+        ),
+    )
+    parser.add_argument(
         "--event-storm-deterministic-plan",
         action="store_true",
         help="derive event-storm paths from --workload-seed for paired A/B identity",
@@ -5557,6 +5755,8 @@ def _run_single_prepared(
                 rotating_tick_secs=args.rotating_tick_secs,
                 rotating_ttl_secs=args.rotating_ttl_secs,
                 rotating_dirs_per_tick=args.rotating_max_dirs_per_tick,
+                strict_protocol=args.event_storm_strict_protocol,
+                treatment_enabled=args.rotating_cold_window,
             )
             if args.event_storm
             else None
@@ -5610,6 +5810,21 @@ def _run_single_prepared(
                 passive_canary.tick(now)
             if event_storm:
                 event_storm.tick(now)
+                if event_storm.protocol_error:
+                    completion_reason = "protocol_failed"
+                    fatal_error = (
+                        "event_storm_protocol_failed: "
+                        f"{event_storm.protocol_error}"
+                    )
+                    json_line(
+                        run_dir / "events.jsonl",
+                        {
+                            "ts": utc_now(),
+                            "event": "fatal_error",
+                            "error": fatal_error,
+                        },
+                    )
+                    break
             time.sleep(0.2)
     except KeyboardInterrupt:
         completion_reason = "interrupted"
@@ -5658,6 +5873,7 @@ def _run_single_prepared(
                     run_dir / "shutdown-samples.jsonl",
                     started_at=started_at,
                     timeout_secs=max(1.0, float(args.shutdown_timeout_secs)),
+                    daemon_log_path=run_dir / "fd-rdd.log",
                 )
             except BaseException as exc:  # keep SIGTERM reachable on every failure
                 cleanup_errors.append(
@@ -5850,6 +6066,7 @@ def _apply_overrides(args: argparse.Namespace, overrides: dict[str, Any]) -> arg
             "canary-in-fixture", "immediate-query-settle-secs",
             "mixed-workload-interval-secs", "workload-seed",
             "snapshot-path-disk", "event-storm-start-delay-secs",
+            "event-storm-strict-protocol",
         ]
     }
     for raw_key, value in overrides.items():
@@ -5946,7 +6163,16 @@ def run_sweep(args: argparse.Namespace) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(sweep_report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"\nsweep comparison written to: {out_path}")
-    return 0
+    return (
+        0
+        if all(
+            not summary.get("fatal_error")
+            and summary.get("fd_rdd_exit_code") == 0
+            and summary.get("ab_comparable") is True
+            for summary in results
+        )
+        else 1
+    )
 
 
 def main() -> int:
