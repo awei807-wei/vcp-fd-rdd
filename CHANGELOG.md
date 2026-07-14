@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- 修复 M2 rotating cold-window watcher 生命周期竞态：活跃 scan-only lease 不再粗暴阻断普通 watcher（保留深层 subtree rename 可见性）；所有被 rotating lease 覆盖的新建/刷新 ephemeral lease 继承其剩余 TTL，`EphemeralWatch`/`ScanOnly` lease 过期至下一轮 rotation 前禁止普通路径重建。scan-only follow-up 限制为租约内两次有界扫描，并保留 rotating cycle provenance；冻结 L3 探针与离线复算均已通过五阶段门禁。
 - M2 focused probe 写入可验证 fixture 完成声明，仅容忍 `git_worktree_dirty` / `artifact_provenance_unverified` 两类开发态 A/B 原因导致 runner=1；fixture、初始状态、未知门禁、daemon 异常或其他非零退出均归为基础设施错误。event storm 同时新增默认关闭的 cleanup 延迟审计，以实际 lease/rotation 时间窗记录 root/subtree 的 ephemeral/rotating watcher 残留；查询年龄按每次查询完成时刻计算。auto-port 在 daemon 启动前复查并通过本轮日志证明监听归属，避免误连外部服务。
 - 修复 M2 快速证伪复用同一 `cold-a` 的 L3 重降级竞态：VM 证明即使把 burst 周期从 130 秒增至 150 秒，后台扫描、水位线和调度仍可能让第 4 轮严格预检看到 L2，固定墙钟余量不是可靠协议。falsification fixture 升级为六个 daemon 已登记的独立冷根，每根用纳入内容身份的 sentinel 让 watch cost 明确超过 L0 上限，每腿六个 burst 各使用一个新根；每 tick 目录上限覆盖全部 8 个冷配置根，固定调度只定义 A/B 一致的无重复根序列，实际 tier、精确活跃租约与写后因果继续由写前严格证据判定。cycle `seen` 清空仅是诊断状态，不再否定尚未过期的精确租约，且绝不接受 L2 冒充 L3。
 - 修复 M2 快速证伪对 B 组的确定性假失败：event-storm 子目录现在从最近祖先继承 tier，debug 请求成功与精确 M2 entry 存在分开记录；A 仍要求逐 burst 精确 entry、有效租约和写后因果，B 允许 entry 不存在但禁止任何 M2 活动。falsification profile 新增写入前严格协议校验，前置证据不成立时立即结束该腿。

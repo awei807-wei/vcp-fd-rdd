@@ -904,6 +904,7 @@ impl TieredIndex {
                                             dir.clone(),
                                             entry.reason,
                                             entry.priority,
+                                            entry.rotating_cold_window_cycle_id(),
                                             cursor,
                                         );
                                     }
@@ -970,6 +971,7 @@ impl TieredIndex {
         dir: PathBuf,
         reason: DirtyReason,
         priority: DirtyPriority,
+        rotating_cold_window_cycle_id: Option<u64>,
         cursor: DirtyRepairCursor,
     ) {
         {
@@ -979,6 +981,7 @@ impl TieredIndex {
                 reason,
                 priority,
                 now_ns(),
+                rotating_cold_window_cycle_id,
                 cursor,
             );
         }

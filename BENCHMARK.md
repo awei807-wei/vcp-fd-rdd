@@ -104,6 +104,8 @@ python3 scripts/m2-l3-causal-probe.py \
 
 2026-07-14 冻结代码后的最终真实短跑位于 `/tmp/fd-rdd-m2-l3-final-20260714T073410Z`，fixture manifest 声明的 17 个初始文件已通过 runner 验证。目标根写入前为 L3，action=`scan_only`，lease 剩余 20 秒；rename 首次查询 20/20 正确，10/10 新路径连续探针可见，最慢 5.122 秒；snapshot quiesce `ready=true` 且无 rebuild。`before/fence/after` 的 `scan_seq` 均为 0，`event_seq` 均为 0，因此同一 lease cycle 内没有可归因的 M2 推进；cleanup 后第 22 秒审计明确位于 lease 到期之后、下一 rotation 之前，但 exact root 仍持有 ephemeral watch、watcher ledger 未清除。顶层 verdict 与 `--analyze-only` 重算一致为机制 `fail`。分析器同时拒绝跨 burst 拼接、缺失 watcher/snapshot 负证据、runner 退出状态矛盾及畸形字段。可见性结果本身不能归功于 M2 因果链，当前优先修复点是 scan-only 的序列发布和过期 watcher 的释放。
 
+2026-07-14 修复后的真实短跑位于 `/tmp/fd-rdd-m2-l3-runtime-fix7-20260714T0855Z`，执行二进制 SHA256 为 `5caa648557eeeeb2de14fabcdb5cc174ad1f3d522ce194b122c25528d7c3a6c0`。本轮仍使用同一冻结协议和 17 个 fixture 初始文件：`protocol`、`causal_progress`、`rename_visibility`、`watcher_cleanup`、`snapshot_persistence` 五阶段均为 `pass`；因果证据为 `before_scan_seq=1 → fence_scan_seq=1 → after_scan_seq=2`，10/10 新路径可见、10/10 旧路径隐藏，最长可见延迟 4.369 秒；cleanup 后审计位于 lease 到期与下一轮 rotation 之间，`target_ephemeral_watch_seen=false`、`watcher_ledger_cleared=1`。同一底层目录执行 `--analyze-only` 离线复算仍为 `decision=pass`。这同时验证了“活跃 lease 保留 watcher 可见性、剩余 TTL 约束后续新 lease、过期窗口禁止重建”的收敛策略。
+
 ### 总不变量
 
 | 类别 | 不变量 |

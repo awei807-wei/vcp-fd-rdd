@@ -153,12 +153,19 @@ impl DirtyRepairCursor {
 pub struct DirtyQueueEntry {
     pub scope: DirtyScope,
     pub reason: DirtyReason,
+    rotating_cold_window_cycle_id: Option<u64>,
     pub priority: DirtyPriority,
     pub first_enqueue_ns: u64,
     pub last_enqueue_ns: u64,
     pub not_before_ns: u64,
     pub attempts: u32,
     pub repair_cursor: Option<DirtyRepairCursor>,
+}
+
+impl DirtyQueueEntry {
+    pub fn rotating_cold_window_cycle_id(&self) -> Option<u64> {
+        self.rotating_cold_window_cycle_id
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -249,7 +256,14 @@ impl DirtyQueue {
         priority: DirtyPriority,
         now_ns: u64,
     ) {
-        self.enqueue_inner(scope, reason, priority, now_ns, None);
+        self.enqueue_inner(
+            scope,
+            reason,
+            priority,
+            now_ns,
+            reason.rotating_cold_window_cycle_id(),
+            None,
+        );
     }
 
     pub fn enqueue_repair_slice(
@@ -258,9 +272,20 @@ impl DirtyQueue {
         reason: DirtyReason,
         priority: DirtyPriority,
         now_ns: u64,
+        rotating_cold_window_cycle_id: Option<u64>,
         cursor: DirtyRepairCursor,
     ) {
-        self.enqueue_inner(scope, reason, priority, now_ns, Some(cursor));
+        self.enqueue_inner(
+            scope,
+            reason,
+            priority,
+            now_ns,
+            merge_rotating_cycle_id(
+                reason.rotating_cold_window_cycle_id(),
+                rotating_cold_window_cycle_id,
+            ),
+            Some(cursor),
+        );
     }
 
     fn enqueue_inner(
@@ -269,6 +294,7 @@ impl DirtyQueue {
         reason: DirtyReason,
         priority: DirtyPriority,
         now_ns: u64,
+        rotating_cold_window_cycle_id: Option<u64>,
         repair_cursor: Option<DirtyRepairCursor>,
     ) {
         let scope = scope.normalized();
@@ -278,6 +304,10 @@ impl DirtyQueue {
             .entry(key)
             .and_modify(|entry| {
                 entry.reason = merge_reason(entry.reason, reason);
+                entry.rotating_cold_window_cycle_id = merge_rotating_cycle_id(
+                    entry.rotating_cold_window_cycle_id,
+                    rotating_cold_window_cycle_id,
+                );
                 entry.priority = entry.priority.max(priority);
                 entry.last_enqueue_ns = now_ns;
                 entry.not_before_ns = not_before_ns;
@@ -287,6 +317,7 @@ impl DirtyQueue {
             .or_insert_with(|| DirtyQueueEntry {
                 scope,
                 reason,
+                rotating_cold_window_cycle_id,
                 priority,
                 first_enqueue_ns: now_ns,
                 last_enqueue_ns: now_ns,
@@ -347,6 +378,10 @@ impl DirtyQueue {
             .entry(key)
             .and_modify(|existing| {
                 existing.reason = merge_reason(existing.reason, entry.reason);
+                existing.rotating_cold_window_cycle_id = merge_rotating_cycle_id(
+                    existing.rotating_cold_window_cycle_id,
+                    entry.rotating_cold_window_cycle_id,
+                );
                 existing.priority = existing.priority.max(entry.priority);
                 existing.last_enqueue_ns = existing.last_enqueue_ns.max(entry.last_enqueue_ns);
                 existing.not_before_ns = existing.not_before_ns.min(entry.not_before_ns);
@@ -406,6 +441,15 @@ fn merge_reason(existing: DirtyReason, incoming: DirtyReason) -> DirtyReason {
             (_, DirtyReason::RotatingColdWindow { .. }) => incoming,
             _ => incoming,
         },
+    }
+}
+
+fn merge_rotating_cycle_id(existing: Option<u64>, incoming: Option<u64>) -> Option<u64> {
+    match (existing, incoming) {
+        (Some(existing), Some(incoming)) => Some(existing.max(incoming)),
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (None, None) => None,
     }
 }
 
@@ -538,6 +582,29 @@ mod tests {
             ready[0].reason,
             DirtyReason::RotatingColdWindow { cycle_id: 8 }
         );
+        assert_eq!(ready[0].rotating_cold_window_cycle_id(), Some(8));
+    }
+
+    #[test]
+    fn dirty_queue_keeps_rotating_provenance_when_higher_priority_reason_wins() {
+        let mut q = DirtyQueue::new(Duration::ZERO).with_retry_policy(Duration::ZERO, 2);
+        let scope = || DirtyScope::dirs(0, vec![PathBuf::from("/tmp/cold")]);
+        q.enqueue(
+            scope(),
+            DirtyReason::RotatingColdWindow { cycle_id: 9 },
+            DirtyPriority::Low,
+            1,
+        );
+        q.enqueue(scope(), DirtyReason::InotifyEvent, DirtyPriority::Normal, 2);
+
+        let entry = q.pop_ready(2, 1).pop().unwrap();
+        assert_eq!(entry.reason, DirtyReason::InotifyEvent);
+        assert_eq!(entry.priority, DirtyPriority::Normal);
+        assert_eq!(entry.rotating_cold_window_cycle_id(), Some(9));
+
+        assert!(q.retry(entry, 3));
+        let retry = q.pop_ready(3, 1).pop().unwrap();
+        assert_eq!(retry.rotating_cold_window_cycle_id(), Some(9));
     }
 
     #[test]
@@ -602,6 +669,7 @@ mod tests {
             DirtyReason::PeriodicColdScan,
             DirtyPriority::Low,
             1,
+            Some(12),
             DirtyRepairCursor::new(dir.clone(), 200),
         );
         q.enqueue_repair_slice(
@@ -609,6 +677,7 @@ mod tests {
             DirtyReason::PeriodicColdScan,
             DirtyPriority::Low,
             2,
+            Some(13),
             DirtyRepairCursor::new(dir.clone(), 100),
         );
 
@@ -617,12 +686,14 @@ mod tests {
             entry.repair_cursor,
             Some(DirtyRepairCursor::new(dir.clone(), 100))
         );
+        assert_eq!(entry.rotating_cold_window_cycle_id(), Some(13));
 
         q.enqueue_repair_slice(
             DirtyScope::dirs(0, vec![dir.clone()]),
             DirtyReason::PeriodicColdScan,
             DirtyPriority::Low,
             3,
+            Some(14),
             DirtyRepairCursor::new(dir.clone(), 300),
         );
         q.enqueue(
@@ -635,5 +706,6 @@ mod tests {
         let full = q.pop_ready(4, 1).pop().unwrap();
         assert!(full.repair_cursor.is_none());
         assert_eq!(full.reason, DirtyReason::InotifyEvent);
+        assert_eq!(full.rotating_cold_window_cycle_id(), Some(14));
     }
 }

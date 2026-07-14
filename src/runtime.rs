@@ -682,6 +682,12 @@ fn spawn_background_workers(
         if let Some(runtime) = tiered_runtime.clone() {
             spawn_tiered_scan_loop(
                 index.clone(),
+                runtime.clone(),
+                watch_command_tx.clone(),
+                cfg.tiered_watch.clone(),
+            );
+            spawn_ephemeral_watch_maintenance_loop(
+                index.clone(),
                 runtime,
                 watch_command_tx.clone(),
                 cfg.tiered_watch.clone(),
@@ -1546,7 +1552,7 @@ fn spawn_dirty_queue_loop(
                     for scan in report.outcomes {
                         let changed = scan.outcome.changed;
                         let project_roots = scan.outcome.project_roots.clone();
-                        let rotating_cycle_id = entry.reason.rotating_cold_window_cycle_id();
+                        let rotating_cycle_id = entry.rotating_cold_window_cycle_id();
                         let policy_dir = runtime
                             .record_scan_for_path_with_manifest_status(
                                 scan.dir.as_path(),
@@ -1696,6 +1702,28 @@ fn spawn_tiered_scan_loop(
                 }
             }
 
+            let batch = runtime.scan_batch(max_dirs_per_tick);
+            if batch.is_empty() {
+                continue;
+            }
+            index.enqueue_dirty_dirs(batch, DirtyReason::PeriodicColdScan);
+        }
+    });
+}
+
+fn spawn_ephemeral_watch_maintenance_loop(
+    index: Arc<TieredIndex>,
+    runtime: Arc<TieredWatchRuntime>,
+    watch_command_tx: tokio::sync::mpsc::Sender<WatchCommand>,
+    tiered: crate::config::TieredWatchConfig,
+) {
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(1);
+        loop {
+            tokio::time::sleep(interval).await;
+            for (path, cycle_id) in runtime.take_due_rotating_cold_window_scans() {
+                index.enqueue_dirty_dirs(vec![path], DirtyReason::RotatingColdWindow { cycle_id });
+            }
             for removal in runtime.expire_ephemeral_watches(
                 tiered.ephemeral_idle_secs,
                 tiered.ephemeral_watch_ttl_secs,
@@ -1709,12 +1737,6 @@ fn spawn_tiered_scan_loop(
                     runtime.rollback_ephemeral_remove(removal.path.as_path());
                 }
             }
-
-            let batch = runtime.scan_batch(max_dirs_per_tick);
-            if batch.is_empty() {
-                continue;
-            }
-            index.enqueue_dirty_dirs(batch, DirtyReason::PeriodicColdScan);
         }
     });
 }
@@ -1802,6 +1824,10 @@ fn spawn_rotating_cold_window_loop(
 
             let mut scan_only_dirs = Vec::new();
             for action in tick.actions {
+                runtime.constrain_ephemeral_watch_ttl(
+                    action.path.as_path(),
+                    tiered.rotating_cold_window_ttl_secs.max(1),
+                );
                 match action.action {
                     RotatingColdWindowActionKind::EphemeralWatch => {
                         let sent = maybe_send_ephemeral_watch_command(
@@ -2006,7 +2032,10 @@ async fn maybe_send_ephemeral_watch_command(
     exclude_dirs: &[String],
     config: &EphemeralWatchConfig,
 ) -> bool {
-    if config.budget == 0 || !dir.is_dir() {
+    if config.budget == 0
+        || !dir.is_dir()
+        || runtime.rotating_cold_window_expired_ephemeral_covers(dir.as_path())
+    {
         return false;
     }
     if crate::util::path_has_excluded_component(dir.as_path(), exclude_dirs) {

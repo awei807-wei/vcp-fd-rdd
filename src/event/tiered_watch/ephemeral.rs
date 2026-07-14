@@ -17,6 +17,7 @@ pub(super) struct EphemeralWatchLease {
     pub(super) path: PathBuf,
     pub(super) watch_cost: u64,
     pub(super) created_unix_secs: u64,
+    pub(super) expires_unix_secs: u64,
     pub(super) last_event_unix_secs: AtomicU64,
     pub(super) last_dirty_unix_secs: u64,
     pub(super) dirty_hits: u32,
@@ -27,11 +28,16 @@ pub(super) struct EphemeralWatchLease {
 }
 
 impl EphemeralWatchLease {
-    pub(super) fn pending(path: PathBuf, watch_cost: usize, now: u64) -> Self {
+    pub(super) fn pending(path: PathBuf, watch_cost: usize, now: u64, ttl_secs: u64) -> Self {
         Self {
             path,
             watch_cost: watch_cost as u64,
             created_unix_secs: now,
+            expires_unix_secs: if ttl_secs > 0 {
+                now.saturating_add(ttl_secs)
+            } else {
+                0
+            },
             last_event_unix_secs: AtomicU64::new(now),
             last_dirty_unix_secs: now,
             dirty_hits: 1,
@@ -51,6 +57,32 @@ pub(super) struct DirtyScopeObservation {
 }
 
 impl TieredWatchRuntime {
+    pub fn constrain_ephemeral_watch_ttl(&self, path: &Path, ttl_secs: u64) -> bool {
+        self.constrain_ephemeral_watch_ttl_at(path, ttl_secs, unix_secs())
+    }
+
+    pub(super) fn constrain_ephemeral_watch_ttl_at(
+        &self,
+        path: &Path,
+        ttl_secs: u64,
+        now: u64,
+    ) -> bool {
+        if ttl_secs == 0 {
+            return false;
+        }
+        let mut ephemeral = self.ephemeral.write();
+        let Some(lease) = ephemeral.get_mut(path) else {
+            return false;
+        };
+        let requested_expiry = now.saturating_add(ttl_secs);
+        lease.expires_unix_secs = if lease.expires_unix_secs == 0 {
+            requested_expiry
+        } else {
+            lease.expires_unix_secs.min(requested_expiry)
+        };
+        true
+    }
+
     pub(super) fn record_ephemeral_events(&self, paths: &[&PathBuf], now: u64) {
         if paths.is_empty() {
             return;
@@ -117,6 +149,16 @@ impl TieredWatchRuntime {
         if config.budget == 0 || watch_cost == 0 {
             return EphemeralWatchDecision::NotEligible;
         }
+        let ttl_secs = self
+            .rotating_cold_window_ephemeral_ttl_cap_secs(path.as_path(), now)
+            .map(|cap| {
+                if config.ttl_secs == 0 {
+                    cap
+                } else {
+                    config.ttl_secs.min(cap)
+                }
+            })
+            .unwrap_or(config.ttl_secs);
         if watch_cost > config.max_cost_per_root.max(1) {
             return EphemeralWatchDecision::NotEligible;
         }
@@ -141,6 +183,14 @@ impl TieredWatchRuntime {
         {
             let mut ephemeral = self.ephemeral.write();
             if let Some(lease) = ephemeral.get_mut(&key) {
+                if ttl_secs > 0 {
+                    let requested_expiry = now.saturating_add(ttl_secs);
+                    lease.expires_unix_secs = if lease.expires_unix_secs == 0 {
+                        requested_expiry
+                    } else {
+                        lease.expires_unix_secs.min(requested_expiry)
+                    };
+                }
                 lease.dirty_hits = observed;
                 lease.last_dirty_unix_secs = now;
                 lease.last_event_unix_secs.store(now, Ordering::Relaxed);
@@ -172,7 +222,7 @@ impl TieredWatchRuntime {
             return EphemeralWatchDecision::NotEligible;
         }
 
-        let mut probe = EphemeralWatchLease::pending(path.clone(), watch_cost, now);
+        let mut probe = EphemeralWatchLease::pending(path.clone(), watch_cost, now, ttl_secs);
         probe.dirty_hits = observed;
         probe.value_score = candidate_score;
         let cost = probe.watch_cost;
@@ -331,7 +381,9 @@ impl TieredWatchRuntime {
                 .any(|root| path_is_under_or_equal(lease.path.as_path(), root.as_path()))
             {
                 Some(EphemeralWatchExpiry::CoveredByL0)
-            } else if ttl_secs > 0 && now.saturating_sub(lease.created_unix_secs) >= ttl_secs {
+            } else if (lease.expires_unix_secs > 0 && now >= lease.expires_unix_secs)
+                || (ttl_secs > 0 && now.saturating_sub(lease.created_unix_secs) >= ttl_secs)
+            {
                 Some(EphemeralWatchExpiry::Ttl)
             } else if idle_secs > 0
                 && now.saturating_sub(lease.last_event_unix_secs.load(Ordering::Relaxed))

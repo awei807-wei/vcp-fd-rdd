@@ -592,6 +592,9 @@ pub(super) struct RotatingColdWindowLease {
     pub(super) action: RotatingColdWindowActionKind,
     pub(super) expires_unix_secs: u64,
     pub(super) expires_at: Instant,
+    pub(super) follow_up_interval_secs: u64,
+    pub(super) next_follow_up_at: Instant,
+    pub(super) follow_up_scans_remaining: u8,
     pub(super) cycle_id: u64,
     pub(super) score: u64,
     pub(super) watch_cost: u64,
@@ -601,6 +604,19 @@ impl RotatingColdWindowLease {
     pub(super) fn is_active(&self, now_unix_secs: u64, now: Instant) -> bool {
         self.expires_unix_secs > now_unix_secs && self.expires_at > now
     }
+}
+
+fn rotating_cold_window_controls_ephemeral_watch(action: RotatingColdWindowActionKind) -> bool {
+    matches!(
+        action,
+        RotatingColdWindowActionKind::EphemeralWatch | RotatingColdWindowActionKind::ScanOnly
+    )
+}
+
+fn rotating_scan_follow_up_interval_secs(ttl_secs: u64) -> u64 {
+    let quotient = ttl_secs / 5;
+    let remainder = ttl_secs % 5;
+    quotient.saturating_add(u64::from(remainder != 0)).max(1)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1091,6 +1107,10 @@ impl TieredWatchRuntime {
         let expires_at = now_instant
             .checked_add(Duration::from_secs(ttl_secs))
             .unwrap_or(now_instant);
+        let follow_up_interval_secs = rotating_scan_follow_up_interval_secs(ttl_secs);
+        let next_follow_up_at = now_instant
+            .checked_add(Duration::from_secs(follow_up_interval_secs))
+            .unwrap_or(now_instant);
         let mut actions = Vec::new();
         let mut leases = self.rotating_cold_window_leases.write();
         for (path, watch_cost, score, _) in candidates.into_iter().take(capacity) {
@@ -1105,6 +1125,9 @@ impl TieredWatchRuntime {
                     action,
                     expires_unix_secs,
                     expires_at,
+                    follow_up_interval_secs,
+                    next_follow_up_at,
+                    follow_up_scans_remaining: 2,
                     cycle_id,
                     score,
                     watch_cost,
@@ -1153,6 +1176,78 @@ impl TieredWatchRuntime {
             actions,
             budget_blocked: false,
         }
+    }
+
+    pub fn take_due_rotating_cold_window_scans(&self) -> Vec<(PathBuf, u64)> {
+        let now_unix_secs = unix_secs();
+        let now = Instant::now();
+        let mut leases = self.rotating_cold_window_leases.write();
+        let mut due = Vec::new();
+        for (path, lease) in leases.iter_mut() {
+            if lease.action != RotatingColdWindowActionKind::ScanOnly
+                || lease.follow_up_scans_remaining == 0
+                || !lease.is_active(now_unix_secs, now)
+                || lease.next_follow_up_at > now
+            {
+                continue;
+            }
+            due.push((path.clone(), lease.cycle_id));
+            lease.follow_up_scans_remaining = lease.follow_up_scans_remaining.saturating_sub(1);
+            if lease.follow_up_scans_remaining > 0 {
+                let delay_multiplier = if lease.follow_up_scans_remaining == 1 {
+                    2
+                } else {
+                    1
+                };
+                lease.next_follow_up_at = now
+                    .checked_add(Duration::from_secs(
+                        lease
+                            .follow_up_interval_secs
+                            .saturating_mul(delay_multiplier),
+                    ))
+                    .unwrap_or(now);
+            }
+        }
+        due
+    }
+
+    pub(super) fn rotating_cold_window_ephemeral_ttl_cap_secs(
+        &self,
+        path: &Path,
+        now_unix_secs: u64,
+    ) -> Option<u64> {
+        let now = Instant::now();
+        self.rotating_cold_window_leases
+            .read()
+            .iter()
+            .filter_map(|(root, lease)| {
+                if !rotating_cold_window_controls_ephemeral_watch(lease.action)
+                    || !lease.is_active(now_unix_secs, now)
+                    || !path_is_under_or_equal(path, root.as_path())
+                {
+                    return None;
+                }
+                let wall_remaining = lease.expires_unix_secs.saturating_sub(now_unix_secs);
+                let monotonic_remaining = lease.expires_at.saturating_duration_since(now);
+                let monotonic_remaining_secs = monotonic_remaining
+                    .as_secs()
+                    .saturating_add(u64::from(monotonic_remaining.subsec_nanos() > 0));
+                Some(wall_remaining.min(monotonic_remaining_secs).max(1))
+            })
+            .min()
+    }
+
+    pub fn rotating_cold_window_expired_ephemeral_covers(&self, path: &Path) -> bool {
+        let now_unix_secs = unix_secs();
+        let now = Instant::now();
+        self.rotating_cold_window_leases
+            .read()
+            .iter()
+            .any(|(root, lease)| {
+                rotating_cold_window_controls_ephemeral_watch(lease.action)
+                    && !lease.is_active(now_unix_secs, now)
+                    && path_is_under_or_equal(path, root.as_path())
+            })
     }
 
     pub fn cancel_rotating_cold_window_lease(&self, path: &Path) {

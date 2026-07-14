@@ -71,6 +71,14 @@ fn note_watch_exclude_rejected(runtime: &Option<Arc<TieredWatchRuntime>>) {
     }
 }
 
+fn watch_remove_error_is_already_absent(error: &notify::Error) -> bool {
+    match &error.kind {
+        notify::ErrorKind::PathNotFound | notify::ErrorKind::WatchNotFound => true,
+        notify::ErrorKind::Io(error) => error.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum WatchCommand {
     Add(PathBuf),
@@ -708,6 +716,17 @@ fn handle_remove_ephemeral_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
             if let Some(runtime) = ctx.tiered_runtime.as_ref() {
                 runtime.confirm_ephemeral_removed(path.as_path());
             }
+        }
+        Err(error) if watch_remove_error_is_already_absent(&error) => {
+            ctx.ephemeral_watches.remove(&path);
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.confirm_ephemeral_removed(path.as_path());
+            }
+            tracing::debug!(
+                "tiered ephemeral watcher already absent while removing {:?}: {}",
+                path,
+                error
+            );
         }
         Err(e) => {
             ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
@@ -1437,6 +1456,22 @@ mod tests {
 
         assert!(!shrink_if_large_vec(&mut raw, 4096));
         assert!(!shrink_if_large_map(&mut merged, 4096));
+    }
+
+    #[test]
+    fn already_absent_watch_errors_are_idempotent() {
+        assert!(watch_remove_error_is_already_absent(
+            &notify::Error::path_not_found()
+        ));
+        assert!(watch_remove_error_is_already_absent(
+            &notify::Error::watch_not_found()
+        ));
+        assert!(watch_remove_error_is_already_absent(&notify::Error::io(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "gone")
+        )));
+        assert!(!watch_remove_error_is_already_absent(
+            &notify::Error::generic("permission denied")
+        ));
     }
 
     fn mk_event(kind: notify::EventKind, paths: Vec<PathBuf>) -> notify::Event {

@@ -1702,6 +1702,141 @@ fn ephemeral_watch_expires_for_idle_ttl_no_change_and_l0_cover() {
 }
 
 #[test]
+fn ephemeral_watch_uses_per_lease_ttl_before_global_ttl() {
+    let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 10);
+    let path = temp_root("per-lease-ttl");
+    std::fs::create_dir_all(&path).unwrap();
+    let cfg = EphemeralWatchConfig {
+        budget: 10,
+        ttl_secs: 20,
+        repeat_threshold: 1,
+        max_cost_per_root: 2,
+        ..EphemeralWatchConfig::default()
+    };
+
+    assert_eq!(
+        rt.note_dirty_scope_at(path.clone(), 1, &[], &cfg, 100, 1),
+        EphemeralWatchDecision::Add(path.clone())
+    );
+    rt.confirm_ephemeral_added(path.as_path());
+    let removals = rt.expire_ephemeral_watches_at(121, 1_000, 600, 3);
+    assert_eq!(removals.len(), 1);
+    assert_eq!(removals[0].path, path);
+    assert_eq!(removals[0].reason, EphemeralWatchExpiry::Ttl);
+    std::fs::remove_dir_all(&removals[0].path).unwrap();
+}
+
+#[test]
+fn rotating_reuse_shortens_existing_ephemeral_watch_deadline() {
+    let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 10);
+    let path = temp_root("shorten-existing-lease");
+    std::fs::create_dir_all(&path).unwrap();
+    let long_cfg = EphemeralWatchConfig {
+        budget: 10,
+        ttl_secs: 600,
+        repeat_threshold: 1,
+        max_cost_per_root: 2,
+        ..EphemeralWatchConfig::default()
+    };
+    let rotating_cfg = EphemeralWatchConfig {
+        ttl_secs: 20,
+        ..long_cfg.clone()
+    };
+
+    assert_eq!(
+        rt.note_dirty_scope_at(path.clone(), 1, &[], &long_cfg, 100, 1),
+        EphemeralWatchDecision::Add(path.clone())
+    );
+    rt.confirm_ephemeral_added(path.as_path());
+    assert_eq!(
+        rt.note_dirty_scope_at(path.clone(), 1, &[], &rotating_cfg, 110, 1),
+        EphemeralWatchDecision::NotEligible
+    );
+
+    let removals = rt.expire_ephemeral_watches_at(131, 1_000, 600, 3);
+    assert_eq!(removals.len(), 1);
+    assert_eq!(removals[0].reason, EphemeralWatchExpiry::Ttl);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rotating_scan_only_constrains_existing_ephemeral_watch_deadline() {
+    let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 10);
+    let path = temp_root("scan-only-shorten-existing-lease");
+    std::fs::create_dir_all(&path).unwrap();
+    let long_cfg = EphemeralWatchConfig {
+        budget: 10,
+        ttl_secs: 600,
+        repeat_threshold: 1,
+        max_cost_per_root: 2,
+        ..EphemeralWatchConfig::default()
+    };
+
+    assert_eq!(
+        rt.note_dirty_scope_at(path.clone(), 1, &[], &long_cfg, 100, 1),
+        EphemeralWatchDecision::Add(path.clone())
+    );
+    rt.confirm_ephemeral_added(path.as_path());
+    assert!(rt.constrain_ephemeral_watch_ttl_at(path.as_path(), 20, 110));
+
+    let removals = rt.expire_ephemeral_watches_at(131, 1_000, 600, 3);
+    assert_eq!(removals.len(), 1);
+    assert_eq!(removals[0].reason, EphemeralWatchExpiry::Ttl);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rotating_lease_caps_ephemeral_watch_created_after_rotation() {
+    let path = temp_root("cap-new-rotating-lease");
+    std::fs::create_dir_all(&path).unwrap();
+    let rt = TieredWatchRuntime::new_with_ephemeral(
+        Vec::new(),
+        vec![(path.clone(), 4)],
+        1,
+        5_000,
+        20,
+        10,
+    );
+    let state = rt.state(&path).expect("cold dir should exist");
+    state.tier.store(WatchTier::L3.as_u8(), Ordering::Release);
+    state
+        .last_scan_unix_secs
+        .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
+
+    let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
+        enabled: true,
+        budget: 1,
+        ttl_secs: 20,
+        max_cost_per_root: 64,
+        max_dirs_per_tick: 1,
+    });
+    assert_eq!(
+        tick.actions[0].action,
+        RotatingColdWindowActionKind::EphemeralWatch
+    );
+
+    let config = EphemeralWatchConfig {
+        budget: 10,
+        ttl_secs: 600,
+        repeat_threshold: 1,
+        max_cost_per_root: 2,
+        ..EphemeralWatchConfig::default()
+    };
+    assert_eq!(
+        rt.note_dirty_scope_at(path.clone(), 1, &[], &config, unix_secs(), 1),
+        EphemeralWatchDecision::Add(path.clone())
+    );
+    let lease_expiry = rt
+        .ephemeral
+        .read()
+        .get(&path)
+        .expect("ephemeral lease should exist")
+        .expires_unix_secs;
+    assert!(lease_expiry <= tick.actions[0].expires_unix_secs);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn ephemeral_budget_replaces_low_value_lease_and_rolls_back() {
     let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 2);
     let cfg = EphemeralWatchConfig {
@@ -1986,6 +2121,88 @@ fn rotating_cold_window_progress_is_scoped_to_an_active_lease_cycle() {
     assert!(!expired_dir.rotating_cold_window);
     assert_eq!(expired_dir.rotating_cold_window_last_scan_seq, scan_seq);
     assert_eq!(expired_dir.rotating_cold_window_last_event_seq, event_seq);
+}
+
+#[test]
+fn rotating_scan_only_lease_schedules_two_bounded_follow_up_scans() {
+    let cold = PathBuf::from("/tmp/cold-scan-only-follow-up");
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(cold.clone(), 700)], 16, 5_000, 20);
+    let state = rt.state(&cold).expect("cold dir should exist");
+    state.tier.store(WatchTier::L3.as_u8(), Ordering::Release);
+
+    let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
+        enabled: true,
+        budget: 1,
+        ttl_secs: 20,
+        max_cost_per_root: 64,
+        max_dirs_per_tick: 1,
+    });
+    assert_eq!(tick.actions.len(), 1);
+    assert_eq!(
+        tick.actions[0].action,
+        RotatingColdWindowActionKind::ScanOnly
+    );
+
+    {
+        let mut leases = rt.rotating_cold_window_leases.write();
+        let lease = leases.get_mut(&cold).expect("scan-only lease should exist");
+        assert_eq!(lease.follow_up_interval_secs, 4);
+        lease.next_follow_up_at = Instant::now();
+    }
+    assert_eq!(
+        rt.take_due_rotating_cold_window_scans(),
+        vec![(cold.clone(), tick.cycle_id)]
+    );
+    assert!(rt.take_due_rotating_cold_window_scans().is_empty());
+
+    {
+        let mut leases = rt.rotating_cold_window_leases.write();
+        let lease = leases.get_mut(&cold).expect("scan-only lease should exist");
+        lease.next_follow_up_at = Instant::now();
+    }
+    assert_eq!(
+        rt.take_due_rotating_cold_window_scans(),
+        vec![(cold.clone(), tick.cycle_id)]
+    );
+
+    {
+        let mut leases = rt.rotating_cold_window_leases.write();
+        let lease = leases.get_mut(&cold).expect("scan-only lease should exist");
+        lease.next_follow_up_at = Instant::now();
+    }
+    assert!(rt.take_due_rotating_cold_window_scans().is_empty());
+}
+
+#[test]
+fn expired_rotating_scan_only_lease_blocks_ephemeral_recreation_under_its_root() {
+    let cold = PathBuf::from("/tmp/cold-scan-only-coverage");
+    let child = cold.join("child");
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(cold.clone(), 700)], 16, 5_000, 20);
+    let state = rt.state(&cold).expect("cold dir should exist");
+    state.tier.store(WatchTier::L3.as_u8(), Ordering::Release);
+
+    let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
+        enabled: true,
+        budget: 1,
+        ttl_secs: 20,
+        max_cost_per_root: 64,
+        max_dirs_per_tick: 1,
+    });
+    assert_eq!(
+        tick.actions[0].action,
+        RotatingColdWindowActionKind::ScanOnly
+    );
+    assert!(!rt.rotating_cold_window_expired_ephemeral_covers(cold.as_path()));
+    assert!(!rt.rotating_cold_window_expired_ephemeral_covers(child.as_path()));
+
+    if let Some(lease) = rt.rotating_cold_window_leases.write().get_mut(&cold) {
+        lease.expires_unix_secs = unix_secs().saturating_sub(1);
+    }
+    assert!(rt.rotating_cold_window_expired_ephemeral_covers(cold.as_path()));
+    assert!(rt.rotating_cold_window_expired_ephemeral_covers(child.as_path()));
+
+    rt.cancel_rotating_cold_window_lease(cold.as_path());
+    assert!(!rt.rotating_cold_window_expired_ephemeral_covers(cold.as_path()));
 }
 
 // ── Waterline alarm tests ───────────────────────────────────────────────────
