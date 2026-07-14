@@ -1056,17 +1056,100 @@ def record_shutdown_snapshot_quiesce(
     return record
 
 
-def wait_for_http(base_url: str, timeout_secs: float) -> None:
+def daemon_http_startup_error(log_text: str) -> str:
+    """Return the first log line proving that the HTTP query server failed."""
+    error_markers = (
+        "query server error",
+        "failed to bind",
+        "bind failed",
+        "binding failed",
+        "bind error",
+        "failure binding",
+        "error binding",
+        "unable to bind",
+        "cannot bind",
+        "address already in use",
+        "query server disabled",
+    )
+    for raw_line in log_text.splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+        if "uds query server error" in lowered:
+            continue
+        if line and any(marker in lowered for marker in error_markers):
+            return line
+    return ""
+
+
+def _read_daemon_startup_log(daemon_log_path: Path) -> str:
+    try:
+        return daemon_log_path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        raise RuntimeError(
+            f"failed to read current fd-rdd startup log {daemon_log_path}: {exc}"
+        ) from exc
+
+
+def _raise_if_daemon_exited(
+    process: subprocess.Popen[bytes],
+    expected_log: str,
+) -> None:
+    exit_code = process.poll()
+    if exit_code is not None:
+        raise RuntimeError(
+            "fd-rdd exited before HTTP startup completed "
+            f"(exit code {exit_code}); expected log confirmation: {expected_log}"
+        )
+
+
+def wait_for_http(
+    base_url: str,
+    timeout_secs: float,
+    *,
+    process: subprocess.Popen[bytes],
+    daemon_log_path: Path,
+    expected_port: int,
+) -> None:
+    """Wait for HTTP health and prove that this daemon owns the selected port."""
+    expected_log = f"HTTP Query Server listening on port {expected_port}"
+    timeout_secs = max(0.0, timeout_secs)
     deadline = time.monotonic() + timeout_secs
-    last_error: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            http_json(base_url, "/health", timeout=1.0)
-            return
-        except Exception as exc:  # noqa: BLE001 - diagnostics include exact error
-            last_error = exc
-            time.sleep(0.25)
-    raise RuntimeError(f"fd-rdd HTTP endpoint did not become ready: {last_error}")
+    last_http_error: Exception | None = None
+
+    while True:
+        log_text = _read_daemon_startup_log(daemon_log_path)
+        startup_error = daemon_http_startup_error(log_text)
+        if startup_error:
+            raise RuntimeError(
+                f"fd-rdd HTTP query server startup failed: {startup_error}"
+            )
+        _raise_if_daemon_exited(process, expected_log)
+
+        log_confirmed = expected_log in log_text
+        if log_confirmed:
+            try:
+                http_json(base_url, "/health", timeout=1.0)
+            except Exception as exc:  # noqa: BLE001 - preserve exact HTTP failure
+                last_http_error = exc
+            else:
+                _raise_if_daemon_exited(process, expected_log)
+                return
+
+        _raise_if_daemon_exited(process, expected_log)
+        now = time.monotonic()
+        if now >= deadline:
+            details: list[str] = []
+            if log_confirmed:
+                details.append(f"health endpoint not ready: {last_http_error!r}")
+            else:
+                details.append(f"missing current-run log confirmation: {expected_log}")
+            raise RuntimeError(
+                f"fd-rdd HTTP startup timed out after {timeout_secs:.3f}s: "
+                + "; ".join(details)
+            )
+        time.sleep(min(0.25, deadline - now))
 
 
 def port_is_free(port: int) -> bool:
@@ -1759,6 +1842,9 @@ class EventStormRunner:
         rotating_dirs_per_tick: int = 0,
         strict_protocol: bool = False,
         treatment_enabled: bool = False,
+        post_cleanup_audit_secs: float = 0.0,
+        precondition_wait_secs: float = 0.0,
+        min_lease_remaining_secs: float = 0.0,
     ) -> None:
         self.base_url = base_url
         self.roots = roots
@@ -1793,6 +1879,11 @@ class EventStormRunner:
         self.rotating_dirs_per_tick = max(0, rotating_dirs_per_tick)
         self.strict_protocol = bool(strict_protocol)
         self.treatment_enabled = bool(treatment_enabled)
+        self.post_cleanup_audit_secs = max(0.0, post_cleanup_audit_secs)
+        self.pending_cleanup_audits: list[dict[str, Any]] = []
+        self.precondition_wait_secs = max(0.0, precondition_wait_secs)
+        self.min_lease_remaining_secs = max(0.0, min_lease_remaining_secs)
+        self.precondition_wait_started_at: float | None = None
         self.protocol_error = ""
         self.kinds = normalize_event_storm_kinds(kinds)
         self.target_tiers = [tier.upper() for tier in target_tiers]
@@ -1815,6 +1906,7 @@ class EventStormRunner:
         self.cycle = 0
 
     def tick(self, now: float) -> None:
+        self.poll_post_cleanup_audits(now)
         if self.active is None:
             if now >= self.next_start_at:
                 if self.max_bursts > 0 and self.cycle >= self.max_bursts:
@@ -1831,11 +1923,8 @@ class EventStormRunner:
             return
         if self.max_bursts > 0 and self.cycle >= self.max_bursts:
             return
+        previous_cycle = self.cycle
         self.cycle += 1
-        # Task 3: on the very first burst, capture and report tier distribution
-        # so the summary can show how many dirs demoted during the settle phase.
-        if self.cycle == 1:
-            self._emit_tier_distribution("storm_start")
         requested_tier, selected_kind = self.work_items[(self.cycle - 1) % len(self.work_items)]
         root = self.select_root(requested_tier)
         if self.strict_protocol and not root.is_dir():
@@ -1858,6 +1947,18 @@ class EventStormRunner:
             target_m2_evidence,
         )
         if protocol_error:
+            if self.defer_protocol_precondition(
+                now,
+                root,
+                requested_tier,
+                selected_kind,
+                tier_before,
+                protocol_error,
+                target_m2_evidence,
+            ):
+                self.cycle = previous_cycle
+                return
+            self.precondition_wait_started_at = None
             self.reject_protocol_precondition(
                 root,
                 requested_tier,
@@ -1867,6 +1968,11 @@ class EventStormRunner:
                 target_m2_evidence,
             )
             return
+        self.precondition_wait_started_at = None
+        # Capture the distribution only once the strict precondition is proven;
+        # retries while the root is demoting must not masquerade as bursts.
+        if self.cycle == 1:
+            self._emit_tier_distribution("storm_start")
         events: list[dict[str, Any]] = []
         cycle_started = time.monotonic()
         self.current_burst_started_at = cycle_started
@@ -1992,6 +2098,47 @@ class EventStormRunner:
         )
         for event in events:
             self.emit(event)
+
+    def defer_protocol_precondition(
+        self,
+        now: float,
+        root: Path,
+        requested_tier: str,
+        selected_kind: str,
+        tier_before: str,
+        error: str,
+        evidence: dict[str, Any],
+    ) -> bool:
+        """Wait for a strict L3/fresh-lease precondition without consuming a cycle."""
+        if self.precondition_wait_secs <= 0:
+            return False
+        if self.precondition_wait_started_at is None:
+            self.precondition_wait_started_at = now
+        elapsed = max(0.0, now - self.precondition_wait_started_at)
+        if elapsed >= self.precondition_wait_secs:
+            return False
+        self.emit(
+            {
+                "event_kind": "protocol_precondition_wait",
+                "operation": "protocol_precondition_wait",
+                "root": str(root),
+                "requested_tier": requested_tier,
+                "selected_kind": selected_kind,
+                "tier_before": tier_before,
+                "error": error,
+                "wait_elapsed_secs": round(elapsed, 3),
+                "wait_remaining_secs": round(
+                    self.precondition_wait_secs - elapsed, 3
+                ),
+                "ok": False,
+                **evidence,
+            }
+        )
+        self.next_start_at = now + min(
+            0.5,
+            self.precondition_wait_secs - elapsed,
+        )
+        return True
 
     def select_visibility_probes(
         self,
@@ -2711,7 +2858,7 @@ class EventStormRunner:
             return
         # delayed_query (default, backwards compatible)
         self.run_query_pass(now, phase="delayed")
-        self.finalize_visibility_probes(now)
+        self.finalize_visibility_probes(time.monotonic())
         self.cleanup_burst_root(
             Path(self.active["burst_root"]),
             Path(self.active["root"]),
@@ -2782,6 +2929,146 @@ class EventStormRunner:
                 **({"error": error} if error else {}),
             }
         )
+        if self.post_cleanup_audit_secs > 0:
+            active = self.active if isinstance(self.active, dict) else {}
+            fence = active.get("target_m2_fence")
+            fence = fence if isinstance(fence, dict) else {}
+            lease_expires = int(
+                fence.get("target_m2_fence_expires_unix_secs", 0) or 0
+            )
+            next_rotation = (
+                lease_expires - self.rotating_ttl_secs + self.rotating_tick_secs
+                if lease_expires > 0
+                else 0
+            )
+            self.pending_cleanup_audits.append(
+                {
+                    "due_at": time.monotonic() + self.post_cleanup_audit_secs,
+                    "selected_root": selected_root,
+                    "cleanup_target": burst_root,
+                    "workload": workload,
+                    "cleanup_removed": removed,
+                    "lease_expires_unix_secs": lease_expires,
+                    "next_rotation_estimate_unix_secs": next_rotation,
+                }
+            )
+
+    def poll_post_cleanup_audits(self, now: float) -> None:
+        """Record whether expired rotating/ephemeral watcher state has converged."""
+        pending: list[dict[str, Any]] = []
+        for audit in self.pending_cleanup_audits:
+            if now < float(audit["due_at"]):
+                pending.append(audit)
+                continue
+            self.emit_post_cleanup_audit(audit)
+        self.pending_cleanup_audits = pending
+
+    def emit_post_cleanup_audit(self, audit: dict[str, Any]) -> None:
+        selected_root = Path(audit["selected_root"])
+        cleanup_target = Path(audit["cleanup_target"])
+        debug_ok = False
+        error = ""
+        dirs: list[dict[str, Any]] = []
+        try:
+            dump = debug_tiered_watch(self.base_url, selected_root)
+            raw_dirs = dump.get("dirs")
+            if not isinstance(raw_dirs, list):
+                raise RuntimeError("debug tiered-watch response has no dirs array")
+            dirs = [item for item in raw_dirs if isinstance(item, dict)]
+            debug_ok = True
+        except Exception as exc:  # noqa: BLE001 - audit failure is probe evidence
+            error = repr(exc)
+
+        root_str = str(selected_root)
+        target_entry = next(
+            (item for item in dirs if str(item.get("path", "")) == root_str),
+            None,
+        )
+        cleanup_entries: list[dict[str, Any]] = []
+        for item in dirs:
+            value = str(item.get("path", ""))
+            if not value:
+                continue
+            candidate = Path(value)
+            if candidate == cleanup_target or cleanup_target in candidate.parents:
+                cleanup_entries.append(item)
+
+        target_ephemeral = bool(
+            target_entry is not None and target_entry.get("ephemeral_watch")
+        )
+        target_rotating = bool(
+            target_entry is not None
+            and target_entry.get("rotating_cold_window")
+        )
+        target_action = (
+            str(target_entry.get("rotating_cold_window_action", ""))
+            if target_entry is not None
+            else ""
+        )
+        cleanup_ephemeral = sum(
+            1 for item in cleanup_entries if bool(item.get("ephemeral_watch"))
+        )
+        cleanup_rotating = sum(
+            1
+            for item in cleanup_entries
+            if bool(item.get("rotating_cold_window"))
+        )
+        ledger_cleared = (
+            target_entry is not None
+            and not target_ephemeral
+            and not target_rotating
+            and not target_action
+            and cleanup_ephemeral == 0
+            and cleanup_rotating == 0
+        )
+        cleanup_target_exists = cleanup_target.exists()
+        audited_unix_secs = int(time.time())
+        lease_expires = int(audit.get("lease_expires_unix_secs", 0) or 0)
+        next_rotation = int(
+            audit.get("next_rotation_estimate_unix_secs", 0) or 0
+        )
+        after_lease_expiry = (
+            lease_expires > 0 and audited_unix_secs >= lease_expires
+        )
+        before_next_rotation = (
+            next_rotation > 0 and audited_unix_secs < next_rotation
+        )
+        self.emit(
+            {
+                "event_kind": "post_cleanup_audit",
+                "operation": "post_cleanup_audit",
+                "workload": str(audit.get("workload", "")),
+                "root": root_str,
+                "cleanup_target": str(cleanup_target),
+                "audit_delay_secs": self.post_cleanup_audit_secs,
+                "cleanup_removed": bool(audit.get("cleanup_removed")),
+                "cleanup_target_exists": cleanup_target_exists,
+                "audit_unix_secs": audited_unix_secs,
+                "lease_expires_unix_secs": lease_expires,
+                "next_rotation_estimate_unix_secs": next_rotation,
+                "audit_after_lease_expiry": after_lease_expiry,
+                "audit_before_next_rotation": before_next_rotation,
+                "audit_window_valid": (
+                    after_lease_expiry and before_next_rotation
+                ),
+                "debug_ok": debug_ok,
+                "target_entry_present": target_entry is not None,
+                "target_ephemeral_watch": target_ephemeral,
+                "target_rotating_active": target_rotating,
+                "target_rotating_action": target_action,
+                "cleanup_target_entries": len(cleanup_entries),
+                "cleanup_target_ephemeral_watch_dirs": cleanup_ephemeral,
+                "cleanup_target_rotating_active_dirs": cleanup_rotating,
+                "watcher_ledger_cleared": ledger_cleared,
+                "ok": (
+                    debug_ok
+                    and bool(audit.get("cleanup_removed"))
+                    and not cleanup_target_exists
+                    and ledger_cleared
+                ),
+                **({"error": error} if error else {}),
+            }
+        )
 
     def run_query_pass(self, now: float, phase: str) -> None:
         """Run a single query pass over the active burst's expected events.
@@ -2794,10 +3081,6 @@ class EventStormRunner:
         events = list(self.active["events"])
         root = Path(self.active["root"])
         tier_after = self.tier_for_root(root)
-        target_m2_after = {
-            key.replace("target_m2_", "target_m2_after_", 1): value
-            for key, value in self.m2_evidence_for_root(root).items()
-        }
         ok_count = 0
         positive_total = 0
         positive_ok = 0
@@ -2811,6 +3094,7 @@ class EventStormRunner:
                 Path(event["path"]),
                 bool(event["should_exist"]),
             )
+            query_completed_at = time.monotonic()
             if ok:
                 ok_count += 1
                 latencies.append(latency)
@@ -2832,12 +3116,13 @@ class EventStormRunner:
                     "first_query_exists": exists,
                     "latency_secs": round(latency, 3),
                     "query_phase": phase,
-                    "settle_secs": round(now - float(self.active["started_at"]), 3),
+                    "settle_secs": round(
+                        query_completed_at - float(self.active["started_at"]), 3
+                    ),
                     "event_age_secs": round(
-                        now
+                        query_completed_at
                         - float(self.active["started_at"])
-                        - float(event.get("burst_elapsed_secs", 0.0))
-                        + latency,
+                        - float(event.get("burst_elapsed_secs", 0.0)),
                         3,
                     ),
                     "burst_elapsed_secs": float(event.get("burst_elapsed_secs", 0.0)),
@@ -2857,6 +3142,7 @@ class EventStormRunner:
                     bool(event["should_exist"]),
                     self.timeout_secs,
                 )
+                after_completed_at = time.monotonic()
                 self.emit(
                     {
                         "event_kind": "after_query",
@@ -2870,10 +3156,9 @@ class EventStormRunner:
                         "polls": after_polls,
                         "query_phase": phase,
                         "event_age_secs": round(
-                            now
+                            after_completed_at
                             - float(self.active["started_at"])
-                            - float(event.get("burst_elapsed_secs", 0.0))
-                            + after_latency,
+                            - float(event.get("burst_elapsed_secs", 0.0)),
                             3,
                         ),
                         "burst_elapsed_secs": float(event.get("burst_elapsed_secs", 0.0)),
@@ -2884,6 +3169,10 @@ class EventStormRunner:
                         **event_details,
                     }
                 )
+        target_m2_after = {
+            key.replace("target_m2_", "target_m2_after_", 1): value
+            for key, value in self.m2_evidence_for_root(root).items()
+        }
         total = len(events)
         self.emit(
             {
@@ -3119,6 +3408,12 @@ class EventStormRunner:
             expires = int(evidence.get("target_m2_expires_unix_secs", 0) or 0)
             if observed <= 0 or expires <= observed:
                 return "treatment target M2 lease is expired"
+            remaining = expires - observed
+            if remaining < self.min_lease_remaining_secs:
+                return (
+                    f"treatment target M2 lease remaining {remaining}s is below "
+                    f"minimum {self.min_lease_remaining_secs:g}s"
+                )
             return ""
         baseline_activity = any(
             (
@@ -4088,6 +4383,11 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
     event_cleanups = [
         item for item in event_storm_samples if item.get("event_kind") == "burst_cleanup"
     ]
+    event_post_cleanup_audits = [
+        item
+        for item in event_storm_samples
+        if item.get("event_kind") == "post_cleanup_audit"
+    ]
     event_visibility = [
         item for item in event_storm_samples if item.get("event_kind") == "visibility_probe"
     ]
@@ -4193,6 +4493,64 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         "entries_estimated_total": sum(cleanup_entries),
         "duration_p95_secs": round(percentile(cleanup_durations, 95), 3),
         "duration_max_secs": round(max(cleanup_durations) if cleanup_durations else 0.0, 3),
+    }
+    event_post_cleanup_summary = {
+        "count": len(event_post_cleanup_audits),
+        "ok": sum(
+            1 for item in event_post_cleanup_audits if item.get("ok") is True
+        ),
+        "failures": sum(
+            1 for item in event_post_cleanup_audits if item.get("ok") is not True
+        ),
+        "watcher_ledger_cleared": sum(
+            1
+            for item in event_post_cleanup_audits
+            if item.get("watcher_ledger_cleared") is True
+        ),
+        "cleanup_target_entries_max": max(
+            (
+                int(item.get("cleanup_target_entries", 0) or 0)
+                for item in event_post_cleanup_audits
+            ),
+            default=0,
+        ),
+        "cleanup_target_ephemeral_watch_dirs_max": max(
+            (
+                int(item.get("cleanup_target_ephemeral_watch_dirs", 0) or 0)
+                for item in event_post_cleanup_audits
+            ),
+            default=0,
+        ),
+        "cleanup_target_rotating_active_dirs_max": max(
+            (
+                int(item.get("cleanup_target_rotating_active_dirs", 0) or 0)
+                for item in event_post_cleanup_audits
+            ),
+            default=0,
+        ),
+        "target_ephemeral_watch_seen": any(
+            item.get("target_ephemeral_watch") is True
+            for item in event_post_cleanup_audits
+        ),
+        "target_rotating_active_seen": any(
+            item.get("target_rotating_active") is True
+            for item in event_post_cleanup_audits
+        ),
+        "audit_after_lease_expiry": sum(
+            1
+            for item in event_post_cleanup_audits
+            if item.get("audit_after_lease_expiry") is True
+        ),
+        "audit_before_next_rotation": sum(
+            1
+            for item in event_post_cleanup_audits
+            if item.get("audit_before_next_rotation") is True
+        ),
+        "audit_window_valid": sum(
+            1
+            for item in event_post_cleanup_audits
+            if item.get("audit_window_valid") is True
+        ),
     }
     burst_durations = [float(item.get("duration_secs", 0.0)) for item in event_written]
 
@@ -4772,6 +5130,7 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
             "delayed_query": summarize_event_rows(event_delayed_queries),
             "visibility": summarize_visibility_rows(event_visibility),
             "cleanup": event_cleanup_summary,
+            "post_cleanup_audit": event_post_cleanup_summary,
             "by_workload": event_by_workload,
             "by_tier_before": event_by_tier,
             "special": event_special,
@@ -4926,6 +5285,10 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | event storm cleanup failures | {summary["event_storm"]["cleanup"]["failures"]} |
 | event storm cleanup entries estimated | {summary["event_storm"]["cleanup"]["entries_estimated_total"]} |
 | event storm cleanup p95 s | {summary["event_storm"]["cleanup"]["duration_p95_secs"]} |
+| post-cleanup audit count | {summary["event_storm"]["post_cleanup_audit"]["count"]} |
+| post-cleanup audit failures | {summary["event_storm"]["post_cleanup_audit"]["failures"]} |
+| post-cleanup watcher ledger cleared | {summary["event_storm"]["post_cleanup_audit"]["watcher_ledger_cleared"]} |
+| post-cleanup audit window valid | {summary["event_storm"]["post_cleanup_audit"]["audit_window_valid"]} |
 | hot layer query success rate | {summary["hot_layer_query"]["success_rate"]} |
 | hot layer query p95 s | {summary["hot_layer_query"]["first_query_p95_secs"]} |
 | inode reuse status | {summary["event_storm"]["special"]["inode_reuse_status"]} |
@@ -5269,6 +5632,33 @@ def parse_args() -> argparse.Namespace:
         help="poll interval for non-blocking write-to-visible probes (default 1s)",
     )
     parser.add_argument(
+        "--event-storm-post-cleanup-audit-secs",
+        type=float,
+        default=0.0,
+        help=(
+            "after each burst cleanup, wait this many seconds and record exact "
+            "rotating/ephemeral watcher ledger state; 0 disables"
+        ),
+    )
+    parser.add_argument(
+        "--event-storm-precondition-wait-secs",
+        type=float,
+        default=0.0,
+        help=(
+            "wait up to this many seconds for strict tier/lease preconditions "
+            "instead of failing the burst immediately; 0 disables"
+        ),
+    )
+    parser.add_argument(
+        "--event-storm-min-lease-remaining-secs",
+        type=float,
+        default=0.0,
+        help=(
+            "strict treatment bursts require at least this many seconds of "
+            "remaining M2 lease; 0 keeps the legacy expiry-only check"
+        ),
+    )
+    parser.add_argument(
         "--event-storm-fixed-root-schedule",
         action="store_true",
         help="select deterministic fixture child directories instead of post-treatment tiers",
@@ -5352,6 +5742,7 @@ def _update_manifest(
 def _start_daemon_process(
     cmd: list[str],
     *,
+    port: int,
     run_dir: Path,
     env: dict[str, str],
     process_sample_interval_secs: float,
@@ -5361,6 +5752,8 @@ def _start_daemon_process(
     proc: subprocess.Popen[bytes] | None = None
     samples: ProcessSampleRunner | None = None
     try:
+        if not port_is_free(port):
+            raise SystemExit(f"127.0.0.1:{port} is already in use")
         proc = subprocess.Popen(
             cmd,
             cwd=run_dir,
@@ -5507,9 +5900,6 @@ def _run_single_prepared(
     artifact_provenance["source_binary"] = str(source_binary)
     artifact_provenance["execution_binary"] = str(binary)
     artifact_provenance["execution_binary_sha256"] = execution_binary_sha256
-    if not port_is_free(args.port):
-        raise SystemExit(f"127.0.0.1:{args.port} is already in use")
-
     _update_manifest(manifest_path, manifest, failure_stage="fixture_validation")
     hot_roots = resolve_root_paths(args.hot_roots)
     cold_roots = resolve_root_paths(args.cold_roots)
@@ -5656,6 +6046,7 @@ def _run_single_prepared(
         raise RuntimeError("artifact_binary_identity_changed_before_exec")
     proc, log_file, process_samples, started_at = _start_daemon_process(
         cmd,
+        port=args.port,
         run_dir=run_dir,
         env=env,
         process_sample_interval_secs=args.process_sample_interval_secs,
@@ -5696,7 +6087,13 @@ def _run_single_prepared(
             daemon_pid=proc.pid,
             daemon_started_at=utc_now(),
         )
-        wait_for_http(base_url, args.startup_timeout_secs)
+        wait_for_http(
+            base_url,
+            args.startup_timeout_secs,
+            process=proc,
+            daemon_log_path=run_dir / "fd-rdd.log",
+            expected_port=args.port,
+        )
         json_line(
             run_dir / "events.jsonl",
             {"ts": utc_now(), "event": "http_ready", "pid": proc.pid},
@@ -5748,6 +6145,15 @@ def _run_single_prepared(
                 rotating_dirs_per_tick=args.rotating_max_dirs_per_tick,
                 strict_protocol=args.event_storm_strict_protocol,
                 treatment_enabled=args.rotating_cold_window,
+                post_cleanup_audit_secs=(
+                    args.event_storm_post_cleanup_audit_secs
+                ),
+                precondition_wait_secs=(
+                    args.event_storm_precondition_wait_secs
+                ),
+                min_lease_remaining_secs=(
+                    args.event_storm_min_lease_remaining_secs
+                ),
             )
             if args.event_storm
             else None
@@ -5787,6 +6193,10 @@ def _run_single_prepared(
                     base_url, run_dir / "endpoint-samples.jsonl", started_at
                 )
                 next_endpoint_sample = time.monotonic() + args.sample_interval_secs
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    completion_reason = "duration_elapsed"
+                    break
             if canary_root and now >= next_canary:
                 for record in run_canary_cycle(
                     base_url, canary_root, args.canary_timeout_secs
@@ -5797,8 +6207,16 @@ def _run_single_prepared(
                     )
                     json_line(run_dir / "canary-samples.jsonl", record)
                 next_canary = time.monotonic() + args.canary_interval_secs
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    completion_reason = "duration_elapsed"
+                    break
             if passive_canary:
                 passive_canary.tick(now)
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    completion_reason = "duration_elapsed"
+                    break
             if event_storm:
                 event_storm.tick(now)
                 if event_storm.protocol_error:

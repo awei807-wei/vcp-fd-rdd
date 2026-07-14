@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from m2_causal_evidence import target_m2_causal, target_m2_fence_valid
+
 
 PROTOCOL_TREATMENT_KEYS = frozenset({"rotating_cold_window"})
 
@@ -209,69 +211,11 @@ def _analyze_correctness(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _target_m2_fence_valid(burst: dict[str, Any]) -> bool:
-    if burst.get("target_m2_debug_ok") is not True:
-        return False
-    if burst.get("target_m2_entry_present") is not True:
-        return False
-    if not burst.get("target_m2_active"):
-        return False
-    action = str(burst.get("target_m2_action", ""))
-    if action not in {"ephemeral_watch", "fast_scan_lease", "scan_only"}:
-        return False
-    if burst.get("target_m2_fence_debug_ok") is not True:
-        return False
-    if burst.get("target_m2_fence_entry_present") is not True:
-        return False
-    if not burst.get("target_m2_fence_active"):
-        return False
-    if str(burst.get("target_m2_fence_action", "")) != action:
-        return False
-    if int(burst.get("target_m2_fence_cycle_id", -1) or 0) != int(
-        burst.get("target_m2_cycle_id", -2) or 0
-    ):
-        return False
-    return (
-        int(burst.get("target_m2_fence_scan_seq", 0) or 0)
-        >= int(burst.get("target_m2_scan_seq", 0) or 0)
-        and int(burst.get("target_m2_fence_event_seq", 0) or 0)
-        >= int(burst.get("target_m2_event_seq", 0) or 0)
-    )
+    return target_m2_fence_valid(burst)
 
 
 def _target_m2_causal(burst: dict[str, Any], check: dict[str, Any]) -> bool:
-    if not _target_m2_fence_valid(burst):
-        return False
-    if check.get("target_m2_after_debug_ok") is not True:
-        return False
-    if check.get("target_m2_after_entry_present") is not True:
-        return False
-    action = str(burst.get("target_m2_action", ""))
-    cycle_id = int(burst.get("target_m2_cycle_id", 0) or 0)
-    before_scan = int(burst.get("target_m2_scan_seq", 0) or 0)
-    before_event = int(burst.get("target_m2_event_seq", 0) or 0)
-    fence_scan = int(burst.get("target_m2_fence_scan_seq", 0) or 0)
-    fence_event = int(burst.get("target_m2_fence_event_seq", 0) or 0)
-    after_scan = int(check.get("target_m2_after_scan_seq", 0) or 0)
-    after_event = int(check.get("target_m2_after_event_seq", 0) or 0)
-    scan_advanced_during_mutation = (
-        fence_scan > before_scan
-        and int(burst.get("target_m2_fence_scan_cycle_id", -1) or 0) == cycle_id
-    )
-    scan_advanced_after_mutation = (
-        after_scan > fence_scan
-        and int(check.get("target_m2_after_scan_cycle_id", -1) or 0) == cycle_id
-    )
-    event_advanced_during_mutation = (
-        fence_event > before_event
-        and int(burst.get("target_m2_fence_event_cycle_id", -1) or 0) == cycle_id
-    )
-    event_advanced_after_mutation = (
-        after_event > fence_event
-        and int(check.get("target_m2_after_event_cycle_id", -1) or 0) == cycle_id
-    )
-    scan_advanced = scan_advanced_during_mutation or scan_advanced_after_mutation
-    event_advanced = event_advanced_during_mutation or event_advanced_after_mutation
-    return scan_advanced or (action == "ephemeral_watch" and event_advanced)
+    return target_m2_causal(burst, check)
 
 
 def _protocol_summary(

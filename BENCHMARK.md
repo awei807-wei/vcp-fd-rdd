@@ -83,6 +83,27 @@ visibility probe 判断。每腿的磁盘 snapshot label 还包含完整 run-dir
 
 第四轮 A 已证明上述负事实收敛有效：`passive_shutdown_reconcile` 删除 7 条且 `stable=true`，但最终快照转而命中 `direct_v7_unsupported: subtree move completeness is unproven`。这是 `subtree_rename` / mount storm 的安全降级要求，不是幽灵路径。runner 因此在 `/scan` 后、SIGTERM 前追加 POST `/snapshot` 持久化屏障：第一次直接快照若要求 rebuild，daemon 在运行态启动完整扫描，runner 有界重试直到 rebuild generation 真正写入并返回 `ready=true`。该阶段单独记录为 `shutdown_snapshot_quiesce`，包含 rebuild 是否发生、尝试次数、耗时以及窗口内 CPU/RSS；缺失、失败或超时继续拒绝 A/B，不能通过清除结构完整性标志绕过。定向验证先把旧目录写入冷基座再整体 rename，首次 `/snapshot` 确认返回同一 `direct_v7_unsupported`，full rebuild 发布后连续两次 `ready=true`；正式 runner smoke 最终 `fd_rdd_exit_code=0` 且无 `Final snapshot failed`。
 
+### 单 L3 根因果探针
+
+八腿套件失败后，先用约 80 秒的单根探针拆分故障阶段：
+
+```bash
+python3 scripts/m2-l3-causal-probe.py \
+  --binary "./target/release/fd-rdd" \
+  --build never
+```
+
+探针自动创建唯一 fixture、选择空闲 loopback 端口，并等待最多 60 秒，直到唯一根在写入前精确进入 L3、持有有效 M2 lease 且剩余时间不少于 18 秒。随后只执行一次三层深、10 个文件的 `subtree_rename`，依次判定协议前置、`before → write fence → after` 同 action/同 cycle 的 `scan_seq/event_seq` 因果推进、10 组新旧路径可见性、cleanup 后 watcher 账本释放，以及最终 snapshot quiesce。序列任一阶段回退、after lease/action/cycle 变化、缺少精确路径配对或审计时间窗不成立都会 fail-close。输出目录包含 `command.json`、`runner.log`、`summary.json`、`REPORT.md` 和完整 `benchmark/` 原始产物。
+
+退出码 `0` 表示五阶段全部通过，`1` 表示机制证据失败，`2` 表示产物缺失、运行未完成等基础设施错误。focused fixture 会写入 runner 可验证的完成声明；底层 benchmark 只有在 daemon 正常退出、产物完整，且非零退出精确来自 `git_worktree_dirty`、`artifact_provenance_unverified` 这两类开发态 A/B 审计原因时，才允许 focused probe 继续使用五阶段 verdict；fixture/初始状态异常和其他非零退出全部升级为基础设施错误。端口在 daemon `Popen` 前再次检查，并要求本轮 `fd-rdd.log` 出现对应监听行后才访问 health，避免误连占用端口的外部服务。suite 目录使用微秒、PID 和随机尾缀并原子占用，不覆盖历史或并发运行。保存下来的底层目录可离线重算：
+
+```bash
+python3 scripts/m2-l3-causal-probe.py \
+  --analyze-only "/tmp/fd-rdd-m2-runs/<run>/benchmark"
+```
+
+2026-07-14 冻结代码后的最终真实短跑位于 `/tmp/fd-rdd-m2-l3-final-20260714T073410Z`，fixture manifest 声明的 17 个初始文件已通过 runner 验证。目标根写入前为 L3，action=`scan_only`，lease 剩余 20 秒；rename 首次查询 20/20 正确，10/10 新路径连续探针可见，最慢 5.122 秒；snapshot quiesce `ready=true` 且无 rebuild。`before/fence/after` 的 `scan_seq` 均为 0，`event_seq` 均为 0，因此同一 lease cycle 内没有可归因的 M2 推进；cleanup 后第 22 秒审计明确位于 lease 到期之后、下一 rotation 之前，但 exact root 仍持有 ephemeral watch、watcher ledger 未清除。顶层 verdict 与 `--analyze-only` 重算一致为机制 `fail`。分析器同时拒绝跨 burst 拼接、缺失 watcher/snapshot 负证据、runner 退出状态矛盾及畸形字段。可见性结果本身不能归功于 M2 因果链，当前优先修复点是 scan-only 的序列发布和过期 watcher 的释放。
+
 ### 总不变量
 
 | 类别 | 不变量 |

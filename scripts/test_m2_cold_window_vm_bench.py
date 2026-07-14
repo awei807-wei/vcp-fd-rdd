@@ -69,6 +69,48 @@ def memory_sample(
 
 
 class SummarySemanticsTests(unittest.TestCase):
+    def test_post_cleanup_audit_summary_exposes_watcher_convergence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            write_jsonl(
+                run_dir / "event-storm-samples.jsonl",
+                [
+                    {
+                        "event_kind": "post_cleanup_audit",
+                        "ok": True,
+                        "watcher_ledger_cleared": True,
+                        "cleanup_target_entries": 0,
+                        "cleanup_target_ephemeral_watch_dirs": 0,
+                        "cleanup_target_rotating_active_dirs": 0,
+                        "target_ephemeral_watch": False,
+                        "target_rotating_active": False,
+                        "audit_after_lease_expiry": True,
+                        "audit_before_next_rotation": True,
+                        "audit_window_valid": True,
+                    }
+                ],
+            )
+
+            summary = BENCH.summarize(run_dir, "cleanup-audit", 0)
+
+            self.assertEqual(
+                summary["event_storm"]["post_cleanup_audit"],
+                {
+                    "count": 1,
+                    "ok": 1,
+                    "failures": 0,
+                    "watcher_ledger_cleared": 1,
+                    "cleanup_target_entries_max": 0,
+                    "cleanup_target_ephemeral_watch_dirs_max": 0,
+                    "cleanup_target_rotating_active_dirs_max": 0,
+                    "target_ephemeral_watch_seen": False,
+                    "target_rotating_active_seen": False,
+                    "audit_after_lease_expiry": 1,
+                    "audit_before_next_rotation": 1,
+                    "audit_window_valid": 1,
+                },
+            )
+
     def test_first_query_uses_expected_existence_and_keeps_transport_health(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
@@ -1690,6 +1732,145 @@ class UdsPathTests(unittest.TestCase):
             self.assertFalse(socket_path.exists())
 
 
+class DaemonStartupTests(unittest.TestCase):
+    def test_start_daemon_rechecks_port_immediately_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            events: list[tuple[str, object]] = []
+
+            def port_is_free(port: int) -> bool:
+                events.append(("port_check", port))
+                return True
+
+            def popen(*args: object, **kwargs: object) -> object:
+                events.append(("popen", args[0]))
+                raise OSError("spawn stopped for ordering assertion")
+
+            with (
+                mock.patch.object(BENCH, "port_is_free", side_effect=port_is_free),
+                mock.patch.object(BENCH.subprocess, "Popen", side_effect=popen),
+            ):
+                with self.assertRaisesRegex(OSError, "ordering assertion"):
+                    BENCH._start_daemon_process(
+                        ["fd-rdd", "--http-port", "45680"],
+                        port=45680,
+                        run_dir=Path(tmp),
+                        env={},
+                        process_sample_interval_secs=0.5,
+                    )
+
+            self.assertEqual(
+                events,
+                [
+                    ("port_check", 45680),
+                    ("popen", ["fd-rdd", "--http-port", "45680"]),
+                ],
+            )
+
+    def test_start_daemon_does_not_spawn_when_final_port_check_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            BENCH, "port_is_free", return_value=False
+        ), mock.patch.object(BENCH.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(SystemExit, "127.0.0.1:45680.*already in use"):
+                BENCH._start_daemon_process(
+                    ["fd-rdd", "--http-port", "45680"],
+                    port=45680,
+                    run_dir=Path(tmp),
+                    env={},
+                    process_sample_interval_secs=0.5,
+                )
+
+            popen.assert_not_called()
+
+    def test_wait_for_http_requires_current_daemon_listening_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon_log = Path(tmp) / "fd-rdd.log"
+            daemon_log.write_text(
+                "INFO HTTP Query Server listening on port 45679\n",
+                encoding="utf-8",
+            )
+            process = mock.Mock()
+            process.poll.return_value = None
+
+            with mock.patch.object(
+                BENCH, "http_json", return_value={"ok": True}
+            ) as http_json:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "timed out.*HTTP Query Server listening on port 45680",
+                ):
+                    BENCH.wait_for_http(
+                        "http://127.0.0.1:45680",
+                        0,
+                        process=process,
+                        daemon_log_path=daemon_log,
+                        expected_port=45680,
+                    )
+
+            http_json.assert_not_called()
+
+    def test_wait_for_http_accepts_health_only_after_log_proves_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon_log = Path(tmp) / "fd-rdd.log"
+            daemon_log.write_text(
+                "INFO HTTP Query Server listening on port 45680\n",
+                encoding="utf-8",
+            )
+            process = mock.Mock()
+            process.poll.return_value = None
+
+            with mock.patch.object(BENCH, "http_json", return_value={"ok": True}):
+                BENCH.wait_for_http(
+                    "http://127.0.0.1:45680",
+                    1,
+                    process=process,
+                    daemon_log_path=daemon_log,
+                    expected_port=45680,
+                )
+
+    def test_wait_for_http_fails_immediately_on_query_server_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon_log = Path(tmp) / "fd-rdd.log"
+            daemon_log.write_text(
+                "ERROR Query server error: Address already in use (os error 98)\n",
+                encoding="utf-8",
+            )
+            process = mock.Mock()
+            process.poll.return_value = None
+
+            with mock.patch.object(BENCH, "http_json") as http_json:
+                with self.assertRaisesRegex(
+                    RuntimeError, "query server startup failed.*Address already in use"
+                ):
+                    BENCH.wait_for_http(
+                        "http://127.0.0.1:45680",
+                        1,
+                        process=process,
+                        daemon_log_path=daemon_log,
+                        expected_port=45680,
+                    )
+
+            http_json.assert_not_called()
+
+    def test_wait_for_http_fails_immediately_when_daemon_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon_log = Path(tmp) / "fd-rdd.log"
+            daemon_log.write_text("daemon initialization\n", encoding="utf-8")
+            process = mock.Mock()
+            process.poll.return_value = 23
+
+            with mock.patch.object(BENCH, "http_json") as http_json:
+                with self.assertRaisesRegex(RuntimeError, "exited.*code 23"):
+                    BENCH.wait_for_http(
+                        "http://127.0.0.1:45680",
+                        1,
+                        process=process,
+                        daemon_log_path=daemon_log,
+                        expected_port=45680,
+                    )
+
+            http_json.assert_not_called()
+
+
 class ProcessSampleRunnerTests(unittest.TestCase):
     def test_process_sampler_includes_io_and_fault_counters(self) -> None:
         sample = next(BENCH.process_sampler(os.getpid()))
@@ -1790,6 +1971,266 @@ class EventStormFixtureTests(unittest.TestCase):
             kinds=["rw100"],
             target_tiers=["L0", "L1", "L2", "L3"],
         )
+
+    def test_post_cleanup_audit_cli_option_is_explicit_and_disabled_by_default(self) -> None:
+        argv = [str(SCRIPT_PATH), "--root", "/tmp/probe-root"]
+        with mock.patch.object(sys, "argv", argv):
+            defaults = BENCH.parse_args()
+        self.assertEqual(defaults.event_storm_post_cleanup_audit_secs, 0.0)
+        self.assertEqual(defaults.event_storm_precondition_wait_secs, 0.0)
+        self.assertEqual(defaults.event_storm_min_lease_remaining_secs, 0.0)
+
+        argv.extend(
+            (
+                "--event-storm-post-cleanup-audit-secs",
+                "22",
+                "--event-storm-precondition-wait-secs",
+                "60",
+                "--event-storm-min-lease-remaining-secs",
+                "18",
+            )
+        )
+        with mock.patch.object(sys, "argv", argv):
+            enabled = BENCH.parse_args()
+        self.assertEqual(enabled.event_storm_post_cleanup_audit_secs, 22.0)
+        self.assertEqual(enabled.event_storm_precondition_wait_secs, 60.0)
+        self.assertEqual(enabled.event_storm_min_lease_remaining_secs, 18.0)
+
+    def test_strict_protocol_waits_for_a_fresh_l3_lease_before_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = BENCH.EventStormRunner(
+                base_url="http://127.0.0.1:1",
+                roots=[root],
+                out_path=root / "events.jsonl",
+                started_at=90.0,
+                start_delay_secs=0,
+                interval_secs=1,
+                settle_secs=0,
+                timeout_secs=0,
+                ops_per_burst=10,
+                duration_budget_secs=10,
+                time_skew_secs=3600,
+                kinds=["subtree_rename"],
+                target_tiers=["L3"],
+                strict_protocol=True,
+                treatment_enabled=True,
+                precondition_wait_secs=10,
+                min_lease_remaining_secs=18,
+            )
+            evidence = {
+                "target_m2_debug_ok": True,
+                "target_m2_entry_present": True,
+                "target_m2_active": False,
+                "target_m2_action": "",
+                "target_m2_observed_unix_secs": 100,
+                "target_m2_expires_unix_secs": 0,
+            }
+            with (
+                mock.patch.object(runner, "tier_for_root", return_value="L2"),
+                mock.patch.object(
+                    runner, "m2_evidence_for_root", return_value=evidence
+                ),
+            ):
+                runner.start_cycle(100.0)
+                self.assertEqual(runner.protocol_error, "")
+                self.assertEqual(runner.cycle, 0)
+                self.assertGreater(runner.next_start_at, 100.0)
+
+                runner.start_cycle(111.0)
+
+            self.assertIn("requested L3 but observed L2", runner.protocol_error)
+            self.assertEqual(runner.cycle, 1)
+
+    def test_strict_protocol_requires_configured_lease_remaining_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.strict_protocol = True
+            runner.treatment_enabled = True
+            runner.min_lease_remaining_secs = 18.0
+            evidence = {
+                "target_m2_debug_ok": True,
+                "target_m2_entry_present": True,
+                "target_m2_active": True,
+                "target_m2_action": "scan_only",
+                "target_m2_observed_unix_secs": 100,
+                "target_m2_expires_unix_secs": 117,
+            }
+
+            too_old = runner.protocol_precondition_error("L3", "L3", evidence)
+            fresh = runner.protocol_precondition_error(
+                "L3",
+                "L3",
+                {**evidence, "target_m2_expires_unix_secs": 118},
+            )
+
+            self.assertIn("remaining", too_old)
+            self.assertEqual(fresh, "")
+
+    def test_query_age_uses_each_query_completion_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.active = {
+                "root": root,
+                "requested_tier": "L3",
+                "tier_before": "L3",
+                "started_at": 100.0,
+                "events": [
+                    {
+                        "operation": f"probe_{index}",
+                        "workload": "subtree_rename",
+                        "path": str(root / f"file-{index}.txt"),
+                        "query": f"file-{index}.txt",
+                        "should_exist": True,
+                        "tier_before": "L3",
+                        "burst_elapsed_secs": 0.5,
+                    }
+                    for index in range(2)
+                ],
+                "visibility_probes": [],
+                "mutation_completed_unix_secs": 1,
+            }
+            after = {
+                "target_m2_debug_ok": True,
+                "target_m2_entry_present": True,
+            }
+            with (
+                mock.patch.object(
+                    BENCH,
+                    "check_search_state_once",
+                    side_effect=[
+                        (True, True, 0.1, ""),
+                        (True, True, 0.1, ""),
+                    ],
+                ),
+                mock.patch.object(runner, "tier_for_root", return_value="L3"),
+                mock.patch.object(
+                    runner, "m2_evidence_for_root", return_value=after
+                ),
+                mock.patch.object(runner, "emit") as emit,
+                mock.patch.object(
+                    BENCH.time, "monotonic", side_effect=[106.5, 108.25]
+                ),
+            ):
+                runner.run_query_pass(105.0, phase="delayed")
+
+            queries = [
+                call.args[0]
+                for call in emit.call_args_list
+                if call.args[0].get("event_kind") == "first_query"
+            ]
+            self.assertEqual([row["settle_secs"] for row in queries], [6.5, 8.25])
+            self.assertEqual([row["event_age_secs"] for row in queries], [6.0, 7.75])
+
+    def test_post_cleanup_audit_proves_expired_root_lease_and_watcher_ledger_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = BENCH.EventStormRunner(
+                base_url="http://127.0.0.1:1",
+                roots=[root],
+                out_path=root / "events.jsonl",
+                started_at=time.monotonic(),
+                start_delay_secs=0,
+                interval_secs=1,
+                settle_secs=0,
+                timeout_secs=0,
+                ops_per_burst=10,
+                duration_budget_secs=10,
+                time_skew_secs=3600,
+                kinds=["subtree_rename"],
+                target_tiers=["L3"],
+                post_cleanup_audit_secs=5,
+            )
+            runner.cycle = 1
+            runner.rotating_ttl_secs = 20
+            runner.rotating_tick_secs = 45
+            burst_root = runner.burst_root(root, "subtree-rename")
+            (burst_root / "dir_b").mkdir(parents=True)
+            runner.active = {
+                "target_m2_fence": {
+                    "target_m2_fence_expires_unix_secs": 100,
+                }
+            }
+
+            with mock.patch.object(runner, "emit") as emit:
+                runner.cleanup_burst_root(
+                    burst_root,
+                    root,
+                    "subtree_rename",
+                    phase="delayed_query",
+                )
+                self.assertEqual(len(runner.pending_cleanup_audits), 1)
+                with mock.patch.object(
+                    BENCH,
+                    "debug_tiered_watch",
+                    return_value={
+                        "dirs": [
+                            {
+                                "path": str(root),
+                                "ephemeral_watch": False,
+                                "rotating_cold_window": False,
+                                "rotating_cold_window_action": "",
+                            }
+                        ]
+                    },
+                ), mock.patch.object(BENCH.time, "time", return_value=110):
+                    runner.poll_post_cleanup_audits(time.monotonic() + 10)
+
+            record = emit.call_args_list[-1].args[0]
+            self.assertEqual(record["event_kind"], "post_cleanup_audit")
+            self.assertTrue(record["watcher_ledger_cleared"])
+            self.assertFalse(record["cleanup_target_exists"])
+            self.assertEqual(record["cleanup_target_entries"], 0)
+            self.assertFalse(record["target_rotating_active"])
+            self.assertFalse(record["target_ephemeral_watch"])
+            self.assertTrue(record["audit_after_lease_expiry"])
+            self.assertTrue(record["audit_before_next_rotation"])
+            self.assertTrue(record["audit_window_valid"])
+            self.assertEqual(runner.pending_cleanup_audits, [])
+
+    def test_post_cleanup_audit_fails_when_deleted_subtree_keeps_active_watcher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.post_cleanup_audit_secs = 5
+            runner.cycle = 1
+            burst_root = runner.burst_root(root, "subtree-rename")
+            runner.pending_cleanup_audits = [
+                {
+                    "due_at": 1.0,
+                    "selected_root": root,
+                    "cleanup_target": burst_root,
+                    "workload": "subtree_rename",
+                    "cleanup_removed": True,
+                }
+            ]
+            with mock.patch.object(
+                BENCH,
+                "debug_tiered_watch",
+                return_value={
+                    "dirs": [
+                        {
+                            "path": str(root),
+                            "ephemeral_watch": False,
+                            "rotating_cold_window": False,
+                            "rotating_cold_window_action": "",
+                        },
+                        {
+                            "path": str(burst_root / "dir_b"),
+                            "ephemeral_watch": True,
+                            "rotating_cold_window": False,
+                        },
+                    ]
+                },
+            ), mock.patch.object(runner, "emit") as emit:
+                runner.poll_post_cleanup_audits(2.0)
+
+            record = emit.call_args.args[0]
+            self.assertFalse(record["ok"])
+            self.assertFalse(record["watcher_ledger_cleared"])
+            self.assertEqual(record["cleanup_target_ephemeral_watch_dirs"], 1)
 
     def test_select_root_never_reuses_event_storm_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

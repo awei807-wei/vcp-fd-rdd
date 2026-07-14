@@ -566,6 +566,9 @@ class LegAnalysisTests(unittest.TestCase):
         check = {
             "target_m2_after_debug_ok": True,
             "target_m2_after_entry_present": True,
+            "target_m2_after_active": True,
+            "target_m2_after_action": "scan_only",
+            "target_m2_after_cycle_id": 7,
             "target_m2_after_last_scan_unix_secs": 111,
             "target_m2_after_last_event_unix_secs": 80,
             "target_m2_after_scan_seq": 11,
@@ -616,6 +619,9 @@ class LegAnalysisTests(unittest.TestCase):
         check = {
             "target_m2_after_debug_ok": True,
             "target_m2_after_entry_present": True,
+            "target_m2_after_active": True,
+            "target_m2_after_action": "scan_only",
+            "target_m2_after_cycle_id": 4,
             "target_m2_after_last_scan_unix_secs": 50,
             "target_m2_after_scan_seq": 20,
             "target_m2_after_scan_cycle_id": 4,
@@ -648,6 +654,9 @@ class LegAnalysisTests(unittest.TestCase):
         check = {
             "target_m2_after_debug_ok": True,
             "target_m2_after_entry_present": True,
+            "target_m2_after_active": True,
+            "target_m2_after_action": "ephemeral_watch",
+            "target_m2_after_cycle_id": 9,
             "target_m2_after_scan_seq": 40,
             "target_m2_after_scan_cycle_id": 8,
             "target_m2_after_event_seq": 42,
@@ -676,6 +685,9 @@ class LegAnalysisTests(unittest.TestCase):
         check = {
             "target_m2_after_debug_ok": True,
             "target_m2_after_entry_present": True,
+            "target_m2_after_active": True,
+            "target_m2_after_action": "scan_only",
+            "target_m2_after_cycle_id": 2,
             "target_m2_after_last_scan_unix_secs": 130,
             "target_m2_after_scan_seq": 30,
             "target_m2_after_scan_cycle_id": 2,
