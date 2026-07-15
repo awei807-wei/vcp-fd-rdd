@@ -49,11 +49,13 @@ python3 scripts/m2-cold-window-ab.py b  # 关闭 M2
 python3 scripts/m2-cold-window-falsification.py
 ```
 
-套件固定运行 4 个配对 block（`2×AB + 2×BA`，共 8 腿），每腿 1200 秒。fixture 额外提供
+套件固定运行 4 个配对 block（`2×AB + 2×BA`，共 8 腿），每腿 1500 秒。fixture 额外提供
 `cold-storm-01` 至 `cold-storm-06` 六个 daemon 已登记的独立冷根；每根带一个纳入 fixture 身份的
 `seed/sentinel.txt`，使 watch cost 明确超过 L0 上限。240 秒预热后，每个根只承载一个
 L3 burst，按顺序执行两轮 `save100`、`git_clone`、`subtree_rename`。相邻 burst 使用 120 秒 settle
-和 30 秒轮间隔，六轮和最后一次 settle 仍在 1200 秒内完成。独立根池避免严格预检依赖前一轮
+和 60 秒轮间隔，形成 180 秒 cadence。严格预检要求租约至少剩余 125 秒；若暂不满足，整条腿共享
+160 秒等待预算，而不是每个 burst 重置。最坏协议预算为 `240 + 6×120 + 5×60 + 160 = 1420` 秒，
+仍在 1500 秒腿内。独立根池避免严格预检依赖前一轮
 变更根在固定墙钟内从 L2 重新降到 L3；门禁仍要求每个根在写入前实际处于 L3。每腿必须精确形成
 6 个 physical burst、806 个唯一路径主断言和 38 个有界可见性探针。它跨腿校验
 Git/binary/fixture/保序事件计划/协议指纹，并验证四块 order/position 精确满足 `2×AB + 2×BA`。
@@ -71,9 +73,9 @@ active canary，只保留 passive canary 作为关机可信对账输入；正确
 visibility probe 判断。每腿的磁盘 snapshot label 还包含完整 run-dir 哈希，避免不同 block 都叫
 `attempt-01` 时误复用前一腿快照。hard waterline 一经观测即拒绝样本；结构移动在持久化静默阶段允许至多
 一次可归因的安全 rebuild，但必须最终 `ready=true`、日志无 ERROR，且完整成本仍计入 A/B。
-每腿 process 采样还必须覆盖至少 95% 的 1200 秒窗口、最大间隔不超过 3 秒且单调计数器不回退。同一 block 的两腿启动间隔不得超过 30 分钟；中断后只复用完整且相邻的整块，不能把跨会话腿拼成配对结果。suite、wrapper 和 benchmark 分别拥有独立进程组，超时清理按运行中 sidecar 记录的已验证 benchmark 进程组执行，避免孤儿 daemon 污染续跑。
+每腿 process 采样还必须覆盖至少 95% 的 1500 秒窗口、最大间隔不超过 3 秒且单调计数器不回退。同一 block 的两腿启动间隔不得超过 30 分钟；中断后只复用完整且相邻的整块，不能把跨会话腿拼成配对结果。suite、wrapper 和 benchmark 分别拥有独立进程组，超时清理按运行中 sidecar 记录的已验证 benchmark 进程组执行，避免孤儿 daemon 污染续跑。
 
-快速 profile 额外启用 `--event-storm-strict-protocol`：固定调度只选择六个 daemon 已登记的独立事件根，并在单腿内无重复遍历，不再选择没有独立 M2 entry 的 `dNNN` 子目录；配置中的每 tick 目录上限覆盖全部 8 个冷配置根。runner 不再根据墙钟猜测哪一根应持有租约，而由每个 burst 的严格预检直接证明请求 tier 与实际 tier 一致，仍不会把 L2 放宽成 L3。非固定模式下，目录没有独立 tier 行时继承最近祖先目录的 tier，不会匹配 sibling。`/debug/tiered-watch` 请求成功与目标 M2 entry 是否存在分开记录：A 必须有精确 entry、当前有效租约和合法 action；轮转 cycle 的 `seen` 集合在完成覆盖后允许清空，只保留诊断用途，不能否定仍活跃的精确租约。B 允许精确 entry 不存在，但所有 M2 活动字段必须为零。写后因果不再依赖可回拨的秒级系统时间：runner 用写前序列和写后租约栅栏包住 mutation 窗口，只接受同一租约周期内、发生在该窗口中或窗口后的 M2 scan/event 单调序列推进；scan 序列只由携带轮转 `cycle_id` 的 dirty source 完成时发布，普通周期/API/查询扫描不能冒充。租约同时使用单调时钟与墙上时钟判活，任一过期即失效。任一前置条件不成立会立即结束该腿，不再浪费完整 1200 秒。
+快速 profile 额外启用 `--event-storm-strict-protocol`：固定调度只选择六个 daemon 已登记的独立事件根，并在单腿内无重复遍历，不再选择没有独立 M2 entry 的 `dNNN` 子目录；配置中的每 tick 目录上限覆盖全部 8 个冷配置根。runner 不再根据墙钟猜测哪一根应持有租约，而由每个 burst 的严格预检直接证明请求 tier 与实际 tier 一致，仍不会把 L2 放宽成 L3。非固定模式下，目录没有独立 tier 行时继承最近祖先目录的 tier，不会匹配 sibling。`/debug/tiered-watch` 请求成功与目标 M2 entry 是否存在分开记录：A 必须有精确 entry、当前有效租约和合法 action；轮转 cycle 的 `seen` 集合在完成覆盖后允许清空，只保留诊断用途，不能否定仍活跃的精确租约。B 允许精确 entry 不存在，但所有 M2 活动字段必须为零。写后因果不再依赖可回拨的秒级系统时间：runner 用写前序列和写后租约栅栏包住 mutation 窗口，只接受同一租约周期内、发生在该窗口中或窗口后的 M2 scan/event 单调序列推进；scan 序列只由携带轮转 `cycle_id` 的 dirty source 完成时发布，普通周期/API/查询扫描不能冒充。租约同时使用单调时钟与墙上时钟判活，任一过期即失效。任一前置条件不成立会立即结束该腿，不再浪费完整 1500 秒。
 
 稳定性统计通过显式 `startup bootstrap` rebuild reason 识别 fresh-snapshot 启动构建，旧日志才回退到最早 ready 标记前后分账；bootstrap 最多一次。允许的 ready 后 rebuild 还必须带 `snapshot recovery` reason，且启动日志的字节偏移落在 shutdown snapshot quiesce 捕获窗口内；仅有全局 `rebuild_observed=true` 不能替运行期 rebuild 背书。suite 结束会逐条打印 `gate_reason`，并在 suite 目录旁生成 `<suite>-evidence.tar.gz`：只收集最终 summary 精确引用的八个 attempt，校验根级与逐腿必需成员，并附成员 SHA256 清单；根级 `build-provenance.json` 的实际 SHA256 还必须与八腿 `audit.receipt_sha256` 全部一致。不打包历史 attempt、`build-target`、腿内执行副本、snapshot、symlink 或伪造路径。缺件、摘要不一致、构建回执被替换或打包失败都会使旧包失效、写回基础设施失败并返回非零。
 
@@ -94,6 +96,8 @@ python3 scripts/m2-l3-causal-probe.py \
 ```
 
 探针自动创建唯一 fixture、选择空闲 loopback 端口，并等待最多 60 秒，直到唯一根在写入前精确进入 L3、持有有效 M2 lease 且剩余时间不少于 18 秒。随后只执行一次三层深、10 个文件的 `subtree_rename`，依次判定协议前置、`before → write fence → after` 同 action/同 cycle 的 `scan_seq/event_seq` 因果推进、10 组新旧路径可见性、cleanup 后 watcher 账本释放，以及最终 snapshot quiesce。序列任一阶段回退、after lease/action/cycle 变化、缺少精确路径配对或审计时间窗不成立都会 fail-close。输出目录包含 `command.json`、`runner.log`、`summary.json`、`REPORT.md` 和完整 `benchmark/` 原始产物。
+
+2026-07-15 在当前工作树的 release 二进制上执行 `/tmp/fd-rdd-m2-runs/focused-gate-fix-final`：五阶段全部通过，action=`scan_only`，scan sequence `1 → 2`，新旧路径均 `10/10`，visibility 最大 5.221 秒，watcher ledger 清空，snapshot 无 unresolved/direct-v7/final failure marker 且未触发 background rebuild。该结果只证明单根机制闭合；正式 CPU/I/O 比值仍以完整八腿复跑为准。
 
 退出码 `0` 表示五阶段全部通过，`1` 表示机制证据失败，`2` 表示产物缺失、运行未完成等基础设施错误。focused fixture 会写入 runner 可验证的完成声明；底层 benchmark 只有在 daemon 正常退出、产物完整，且非零退出精确来自 `git_worktree_dirty`、`artifact_provenance_unverified` 这两类开发态 A/B 审计原因时，才允许 focused probe 继续使用五阶段 verdict；fixture/初始状态异常和其他非零退出全部升级为基础设施错误。端口在 daemon `Popen` 前再次检查，并要求本轮 `fd-rdd.log` 出现对应监听行后才访问 health，避免误连占用端口的外部服务。suite 目录使用微秒、PID 和随机尾缀并原子占用，不覆盖历史或并发运行。保存下来的底层目录可离线重算：
 

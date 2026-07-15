@@ -2042,6 +2042,36 @@ class EventStormFixtureTests(unittest.TestCase):
             self.assertIn("requested L3 but observed L2", runner.protocol_error)
             self.assertEqual(runner.cycle, 1)
 
+    def test_strict_protocol_precondition_wait_budget_is_shared_across_bursts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = self.event_storm_runner([root])
+            runner.precondition_wait_secs = 10.0
+            evidence: dict[str, object] = {}
+
+            self.assertTrue(
+                runner.defer_protocol_precondition(
+                    100.0, root, "L3", "subtree_rename", "L2", "not ready", evidence
+                )
+            )
+            self.assertTrue(
+                runner.defer_protocol_precondition(
+                    106.0, root, "L3", "subtree_rename", "L2", "not ready", evidence
+                )
+            )
+            runner.finish_precondition_wait(106.0)
+
+            self.assertTrue(
+                runner.defer_protocol_precondition(
+                    200.0, root, "L3", "subtree_rename", "L2", "not ready", evidence
+                )
+            )
+            self.assertFalse(
+                runner.defer_protocol_precondition(
+                    204.0, root, "L3", "subtree_rename", "L2", "not ready", evidence
+                )
+            )
+
     def test_strict_protocol_requires_configured_lease_remaining_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

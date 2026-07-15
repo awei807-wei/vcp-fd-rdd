@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- 修复正式 M2 八腿报告暴露的多根因果与成本放大：falsification 腿延长为 1500 秒，六个 burst 使用 180 秒 cadence，并以整腿共享的 160 秒等待预算保证每次写入前租约至少剩余 125 秒；rotating watcher 命令在副作用前校验 active cycle，失败才降级到同 cycle scan-only，旧命令不能再污染新租约。Ephemeral bootstrap 与冷目录 rename 统一进入有界递归 DirtyQueue，递归属性和 cycle provenance 在合并、重试及后代任务中独立保留，避免成功路径重复深扫和 scan-only 因果丢失。
+- 修复 subtree rename 与 snapshot 收敛边界：冷目录结构变更逐层扫描新子树并可信对齐旧前缀，超时未配对的 Rename From 会修复源父目录；仅对目录 Create/rename 目标执行消失路径 `NotFound -> Delete` 归一化，普通 Modify 继续 fail-closed，减少 treatment 独有 metadata syscall。waterline soft 告警改为连续三次超限才降级，恢复阈值允许精确边界，配置强制 recover pct 小于 trigger pct 且 SLA 不低于 fast-scan service target，避免 5001-5003ms 调度抖动长期压低轮转预算。
 - 修复 M2 rotating cold-window watcher 生命周期竞态：活跃 scan-only lease 不再粗暴阻断普通 watcher（保留深层 subtree rename 可见性）；所有被 rotating lease 覆盖的新建/刷新 ephemeral lease 继承其剩余 TTL，`EphemeralWatch`/`ScanOnly` lease 过期至下一轮 rotation 前禁止普通路径重建。scan-only follow-up 限制为租约内两次有界扫描，并保留 rotating cycle provenance；冻结 L3 探针与离线复算均已通过五阶段门禁。
 - M2 focused probe 写入可验证 fixture 完成声明，仅容忍 `git_worktree_dirty` / `artifact_provenance_unverified` 两类开发态 A/B 原因导致 runner=1；fixture、初始状态、未知门禁、daemon 异常或其他非零退出均归为基础设施错误。event storm 同时新增默认关闭的 cleanup 延迟审计，以实际 lease/rotation 时间窗记录 root/subtree 的 ephemeral/rotating watcher 残留；查询年龄按每次查询完成时刻计算。auto-port 在 daemon 启动前复查并通过本轮日志证明监听归属，避免误连外部服务。
 - 修复 M2 快速证伪复用同一 `cold-a` 的 L3 重降级竞态：VM 证明即使把 burst 周期从 130 秒增至 150 秒，后台扫描、水位线和调度仍可能让第 4 轮严格预检看到 L2，固定墙钟余量不是可靠协议。falsification fixture 升级为六个 daemon 已登记的独立冷根，每根用纳入内容身份的 sentinel 让 watch cost 明确超过 L0 上限，每腿六个 burst 各使用一个新根；每 tick 目录上限覆盖全部 8 个冷配置根，固定调度只定义 A/B 一致的无重复根序列，实际 tier、精确活跃租约与写后因果继续由写前严格证据判定。cycle `seen` 清空仅是诊断状态，不再否定尚未过期的精确租约，且绝不接受 L2 冒充 L3。

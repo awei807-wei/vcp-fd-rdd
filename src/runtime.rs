@@ -1594,6 +1594,7 @@ fn spawn_dirty_queue_loop(
                                 changed,
                                 &exclude_dirs,
                                 &ephemeral_config,
+                                None,
                             )
                             .await;
                         }
@@ -1641,6 +1642,7 @@ fn spawn_dirty_queue_loop(
                                     changed.max(1),
                                     &exclude_dirs,
                                     &marker_ephemeral_config,
+                                    None,
                                 )
                                 .await;
                             }
@@ -1837,21 +1839,19 @@ fn spawn_rotating_cold_window_loop(
                             1,
                             &exclude_dirs,
                             &ephemeral_config,
+                            Some(tick.cycle_id),
                         )
                         .await;
-                        if sent {
-                            scan_only_dirs.push(action.path);
-                        } else {
+                        if rotating_action_needs_initial_dirty_scan(action.action, sent) {
                             tracing::debug!(
                                 "rotating cold window ephemeral lease unavailable, falling back to scan-only for {:?}",
                                 action.path
                             );
                             if runtime.downgrade_rotating_cold_window_lease_to_scan_only(
                                 action.path.as_path(),
+                                tick.cycle_id,
                             ) {
                                 scan_only_dirs.push(action.path);
-                            } else {
-                                runtime.cancel_rotating_cold_window_lease(action.path.as_path());
                             }
                         }
                     }
@@ -1871,10 +1871,9 @@ fn spawn_rotating_cold_window_loop(
                             );
                             if runtime.downgrade_rotating_cold_window_lease_to_scan_only(
                                 action.path.as_path(),
+                                tick.cycle_id,
                             ) {
                                 scan_only_dirs.push(action.path);
-                            } else {
-                                runtime.cancel_rotating_cold_window_lease(action.path.as_path());
                             }
                         }
                     }
@@ -1964,6 +1963,7 @@ fn spawn_proc_sampler_loop(
                     1,
                     &exclude_dirs,
                     &ephemeral_config,
+                    None,
                 )
                 .await
                 {
@@ -2031,6 +2031,7 @@ async fn maybe_send_ephemeral_watch_command(
     changed: usize,
     exclude_dirs: &[String],
     config: &EphemeralWatchConfig,
+    fallback_cycle_id: Option<u64>,
 ) -> bool {
     if config.budget == 0
         || !dir.is_dir()
@@ -2049,7 +2050,10 @@ async fn maybe_send_ephemeral_watch_command(
     match runtime.note_dirty_scope_with_changed(dir.clone(), cost, exclude_dirs, config, changed) {
         EphemeralWatchDecision::Add(path) => {
             if watch_command_tx
-                .send(WatchCommand::AddEphemeral(path.clone()))
+                .send(WatchCommand::AddEphemeral {
+                    path: path.clone(),
+                    fallback_cycle_id,
+                })
                 .await
                 .is_err()
             {
@@ -2064,6 +2068,7 @@ async fn maybe_send_ephemeral_watch_command(
                 .send(WatchCommand::ReplaceEphemeral {
                     remove: remove.clone(),
                     add: add.clone(),
+                    fallback_cycle_id,
                 })
                 .await
                 .is_err()
@@ -2080,6 +2085,13 @@ async fn maybe_send_ephemeral_watch_command(
         }
         EphemeralWatchDecision::NotEligible => false,
     }
+}
+
+fn rotating_action_needs_initial_dirty_scan(
+    action: RotatingColdWindowActionKind,
+    mechanism_ready: bool,
+) -> bool {
+    action != RotatingColdWindowActionKind::EphemeralWatch || !mechanism_ready
 }
 
 fn initial_hot_candidates(
@@ -2103,6 +2115,26 @@ fn path_is_under_or_equal(path: &std::path::Path, root: &std::path::Path) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotating_ephemeral_dispatch_avoids_duplicate_dirty_scan() {
+        assert!(!rotating_action_needs_initial_dirty_scan(
+            RotatingColdWindowActionKind::EphemeralWatch,
+            true,
+        ));
+        assert!(rotating_action_needs_initial_dirty_scan(
+            RotatingColdWindowActionKind::EphemeralWatch,
+            false,
+        ));
+        assert!(rotating_action_needs_initial_dirty_scan(
+            RotatingColdWindowActionKind::FastScanLease,
+            true,
+        ));
+        assert!(rotating_action_needs_initial_dirty_scan(
+            RotatingColdWindowActionKind::ScanOnly,
+            true,
+        ));
+    }
 
     fn temp_root(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

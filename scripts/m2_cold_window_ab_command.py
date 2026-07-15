@@ -48,6 +48,8 @@ class BenchmarkProfile:
     max_bursts: int = 0
     visibility_probes_per_burst: int = 0
     visibility_poll_interval_secs: float = 1.0
+    event_precondition_wait_secs: int = 0
+    event_min_lease_remaining_secs: int = 0
 
 
 PROFILES = {
@@ -72,7 +74,7 @@ PROFILES = {
     ),
     "falsification": BenchmarkProfile(
         build="never",
-        duration_secs=1200,
+        duration_secs=1500,
         event_root_names=FALSIFICATION_EVENT_ROOT_NAMES,
         passive_root_name="cold-b",
         event_kinds="save100,git_clone,subtree_rename",
@@ -80,7 +82,7 @@ PROFILES = {
         event_start_delay_secs=240,
         # Each burst uses a distinct registered root, so strict L3 preflight
         # never depends on a previously mutated root demoting back from L2.
-        event_interval_secs=30,
+        event_interval_secs=60,
         event_settle_secs=120,
         immediate_query=False,
         active_canary=False,
@@ -90,6 +92,8 @@ PROFILES = {
         max_bursts=6,
         visibility_probes_per_burst=8,
         visibility_poll_interval_secs=1.0,
+        event_precondition_wait_secs=160,
+        event_min_lease_remaining_secs=125,
     ),
 }
 
@@ -251,6 +255,20 @@ def _event_storm_args(
         args.append("--event-storm-deterministic-plan")
     if profile.strict_protocol:
         args.append("--event-storm-strict-protocol")
+    if profile.event_precondition_wait_secs > 0:
+        args.extend(
+            (
+                "--event-storm-precondition-wait-secs",
+                str(profile.event_precondition_wait_secs),
+            )
+        )
+    if profile.event_min_lease_remaining_secs > 0:
+        args.extend(
+            (
+                "--event-storm-min-lease-remaining-secs",
+                str(profile.event_min_lease_remaining_secs),
+            )
+        )
     return args
 
 

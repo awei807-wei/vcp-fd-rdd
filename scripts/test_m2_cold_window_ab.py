@@ -124,15 +124,17 @@ class CommandTests(unittest.TestCase):
 
         joined = " ".join(command_a)
         self.assertIn("--build never", joined)
-        self.assertIn("--duration-secs 1200", joined)
+        self.assertIn("--duration-secs 1500", joined)
         self.assertIn("--event-storm-kind save100,git_clone,subtree_rename", joined)
         self.assertIn("--event-storm-target-tier L3", joined)
         self.assertIn("--event-storm-start-delay-secs 240", joined)
-        self.assertIn("--event-storm-interval-secs 30", joined)
+        self.assertIn("--event-storm-interval-secs 60", joined)
         self.assertIn("--event-storm-visibility-probes-per-burst 8", joined)
         self.assertIn("--event-storm-visibility-poll-interval-secs 1", joined)
         self.assertIn("--event-storm-max-bursts 6", joined)
         self.assertIn("--event-storm-strict-protocol", command_a)
+        self.assertIn("--event-storm-precondition-wait-secs 160", joined)
+        self.assertIn("--event-storm-min-lease-remaining-secs 125", joined)
         self.assertIn(
             "--artifact-provenance-receipt /tmp/m2-suite/build-provenance.json",
             joined,
@@ -189,6 +191,39 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(len(set(profile.event_root_names)), profile.max_bursts)
         self.assertLessEqual(required_duration_secs, profile.duration_secs)
 
+    def test_falsification_profile_keeps_each_check_inside_one_fresh_lease(self) -> None:
+        profile = ab.PROFILES["falsification"]
+        command = ab.build_command(
+            "a",
+            Path("/tmp/run"),
+            self.roots,
+            profile="falsification",
+        )
+        min_remaining = int(
+            command[command.index("--event-storm-min-lease-remaining-secs") + 1]
+        )
+        precondition_wait = int(
+            command[command.index("--event-storm-precondition-wait-secs") + 1]
+        )
+        required_duration = (
+            profile.event_start_delay_secs
+            + profile.max_bursts * profile.event_settle_secs
+            + (profile.max_bursts - 1) * profile.event_interval_secs
+            + precondition_wait
+        )
+
+        self.assertGreaterEqual(min_remaining, profile.event_settle_secs + 5)
+        rotating_tick = int(command[command.index("--rotating-tick-secs") + 1])
+        self.assertGreaterEqual(
+            precondition_wait,
+            min_remaining - 1 + rotating_tick,
+        )
+        self.assertEqual(
+            profile.event_settle_secs + profile.event_interval_secs,
+            180,
+        )
+        self.assertLessEqual(required_duration, profile.duration_secs)
+
     def test_falsification_dry_run_accepts_explicit_run_dir(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -207,7 +242,7 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("profile: falsification", rendered)
         self.assertIn("run_dir: /tmp/fixed-falsification-a", rendered)
-        self.assertIn("--duration-secs 1200", rendered)
+        self.assertIn("--duration-secs 1500", rendered)
 
     def test_falsification_run_requires_suite_build_receipt_before_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

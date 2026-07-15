@@ -214,6 +214,23 @@ fn tiered_watch_waterline_alarm_validation_rejects_invalid_pct() {
     cfg.tiered_watch.waterline_soft_trigger_pct = 0.8;
     cfg.tiered_watch.waterline_sla_ms = 0;
     assert!(cfg.tiered_watch.validate().is_err());
+
+    cfg.tiered_watch.waterline_sla_ms = 4_999;
+    assert!(cfg.tiered_watch.validate().is_err());
+
+    cfg.tiered_watch.l1_l2_fast_scan_enabled = false;
+    assert!(cfg.tiered_watch.validate().is_ok());
+}
+
+#[test]
+fn tiered_watch_waterline_alarm_validation_requires_hysteresis_order() {
+    let mut cfg = Config::default();
+    cfg.tiered_watch.waterline_soft_recover_pct = cfg.tiered_watch.waterline_soft_trigger_pct;
+    assert!(cfg.tiered_watch.validate().is_err());
+
+    cfg.tiered_watch.waterline_soft_recover_pct = 0.4;
+    cfg.tiered_watch.waterline_hard_recover_pct = cfg.tiered_watch.waterline_hard_trigger_pct + 0.1;
+    assert!(cfg.tiered_watch.validate().is_err());
 }
 
 #[test]

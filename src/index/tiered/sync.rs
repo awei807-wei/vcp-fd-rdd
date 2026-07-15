@@ -123,6 +123,7 @@ struct SlicedScanOutcome {
     manifest_skipped: bool,
     completed: bool,
     next_cursor: Option<DirtyRepairCursor>,
+    child_dirs: Vec<PathBuf>,
     dropped_stale_batch: bool,
 }
 
@@ -729,6 +730,22 @@ impl TieredIndex {
         self.enqueue_dirty(DirtyScope::dirs(now_ns(), dirs), reason);
     }
 
+    pub fn enqueue_recursive_dirty_dirs(&self, dirs: Vec<PathBuf>, reason: DirtyReason) {
+        if dirs.is_empty() {
+            return;
+        }
+        {
+            let mut queue = self.dirty_queue.lock();
+            queue.enqueue_recursive(
+                DirtyScope::dirs(now_ns(), dirs),
+                reason,
+                reason.default_priority(),
+                now_ns(),
+            );
+        }
+        self.dirty_notify.notify_one();
+    }
+
     pub fn set_cold_sweep_period_estimate_from_tiered_policy(
         &self,
         l2_scan_interval_secs: u64,
@@ -889,9 +906,12 @@ impl TieredIndex {
                                     | DirtyReason::StartupRepairDeferred
                                     | DirtyReason::FastScanBootstrapDir
                                     | DirtyReason::FastScanChangedDir
-                            );
+                            ) || entry
+                                .requires_recursive_subtree_repair();
                             let (outcome, manifest_skipped, dropped_stale_batch) =
-                                if entry.reason.is_cold_scan() {
+                                if entry.reason.is_cold_scan()
+                                    || entry.requires_recursive_subtree_repair()
+                                {
                                     let sliced = self.scan_dir_repair_slice_with_project_markers(
                                         dir,
                                         entry.repair_cursor.as_ref(),
@@ -903,12 +923,23 @@ impl TieredIndex {
                                         self.enqueue_dirty_repair_slice(
                                             dir.clone(),
                                             entry.reason,
+                                            entry.requires_recursive_subtree_repair(),
                                             entry.priority,
                                             entry.rotating_cold_window_cycle_id(),
                                             cursor,
                                         );
                                     }
-                                    if sliced.completed {
+                                    if entry.requires_recursive_subtree_repair()
+                                        && !sliced.dropped_stale_batch
+                                    {
+                                        for child_dir in &sliced.child_dirs {
+                                            self.enqueue_recursive_dirty_dirs(
+                                                vec![child_dir.clone()],
+                                                entry.reason,
+                                            );
+                                        }
+                                    }
+                                    if sliced.completed && entry.reason.is_cold_scan() {
                                         self.mark_cold_sweep_completed();
                                     }
                                     (
@@ -960,6 +991,9 @@ impl TieredIndex {
                     }
                 }
                 report.failed = had_failed_dir && report.dirs_scanned == 0;
+                if entry.requires_recursive_subtree_repair() && report.dropped_stale_batches > 0 {
+                    report.failed = true;
+                }
             }
         }
 
@@ -970,6 +1004,7 @@ impl TieredIndex {
         &self,
         dir: PathBuf,
         reason: DirtyReason,
+        recursive_subtree_repair: bool,
         priority: DirtyPriority,
         rotating_cold_window_cycle_id: Option<u64>,
         cursor: DirtyRepairCursor,
@@ -979,6 +1014,7 @@ impl TieredIndex {
             queue.enqueue_repair_slice(
                 DirtyScope::dirs(now_ns(), vec![dir]),
                 reason,
+                recursive_subtree_repair,
                 priority,
                 now_ns(),
                 rotating_cold_window_cycle_id,
@@ -1473,6 +1509,7 @@ impl TieredIndex {
                                         manifest_skipped: true,
                                         completed: true,
                                         next_cursor: None,
+                                        child_dirs: Vec::new(),
                                         dropped_stale_batch: false,
                                     };
                                 }
@@ -1530,6 +1567,7 @@ impl TieredIndex {
                         manifest_skipped: true,
                         completed: true,
                         next_cursor: None,
+                        child_dirs: Vec::new(),
                         dropped_stale_batch: false,
                     };
                 }
@@ -1565,6 +1603,7 @@ impl TieredIndex {
                             manifest_skipped: true,
                             completed: true,
                             next_cursor: None,
+                            child_dirs: Vec::new(),
                             dropped_stale_batch: false,
                         };
                     }
@@ -1596,6 +1635,7 @@ impl TieredIndex {
                     manifest_skipped: false,
                     completed: true,
                     next_cursor: None,
+                    child_dirs: Vec::new(),
                     dropped_stale_batch: false,
                 };
             }
@@ -1604,6 +1644,7 @@ impl TieredIndex {
         let mut upsert_events: Vec<EventRecord> = Vec::with_capacity(slice.entries.len());
         let mut upsert_metas: Vec<FileMeta> = Vec::with_capacity(slice.entries.len());
         let mut project_roots = Vec::new();
+        let mut child_dirs = Vec::new();
         let mut scanned = 0usize;
         let mut changed = 0usize;
         let mut seq = 0u64;
@@ -1634,6 +1675,9 @@ impl TieredIndex {
                 hidden_markers_enabled,
             ) {
                 continue;
+            }
+            if meta.is_dir() {
+                child_dirs.push(path.clone());
             }
             if let Some(project_root) = project_root_for_marker(path.as_path(), project_markers) {
                 project_roots.push(project_root);
@@ -1728,6 +1772,7 @@ impl TieredIndex {
                 });
                 Some(DirtyRepairCursor::new(dir.clone(), offset))
             },
+            child_dirs,
             dropped_stale_batch,
         }
     }

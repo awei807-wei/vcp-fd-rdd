@@ -1127,6 +1127,48 @@ fn sliced_repair_processes_large_dir_in_bounded_chunks() {
 }
 
 #[test]
+fn recursive_subtree_repair_walks_deep_tree_through_bounded_queue_entries() {
+    let root = unique_tmp_dir("recursive-subtree-repair");
+    let destination = root.join("renamed/level1/level2");
+    std::fs::create_dir_all(&destination).unwrap();
+    let file = destination.join("deep-repair-visible.txt");
+    std::fs::write(&file, b"deep repair").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.enqueue_recursive_dirty_dirs(
+        vec![root.join("renamed")],
+        DirtyReason::RotatingColdWindow { cycle_id: 42 },
+    );
+
+    let mut processed = 0usize;
+    while processed < 16 {
+        let batch = idx.dirty_queue.lock().pop_ready(u64::MAX, 16);
+        if batch.is_empty() {
+            break;
+        }
+        for entry in batch {
+            assert!(entry.requires_recursive_subtree_repair());
+            assert_eq!(entry.rotating_cold_window_cycle_id(), Some(42));
+            let report = idx.process_dirty_entry(entry, &[]);
+            assert!(!report.failed);
+            processed = processed.saturating_add(1);
+        }
+    }
+
+    assert!(
+        processed >= 3,
+        "each directory level should be queued separately"
+    );
+    assert_eq!(idx.dirty_queue_len(), 0);
+    assert!(idx
+        .query("deep-repair-visible")
+        .iter()
+        .any(|meta| meta.path == file));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn sliced_repair_cursor_resumes_after_first_chunk() {
     let root = unique_tmp_dir("sliced-repair-cursor");
     std::fs::create_dir_all(&root).unwrap();

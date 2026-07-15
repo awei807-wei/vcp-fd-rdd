@@ -1884,6 +1884,7 @@ class EventStormRunner:
         self.precondition_wait_secs = max(0.0, precondition_wait_secs)
         self.min_lease_remaining_secs = max(0.0, min_lease_remaining_secs)
         self.precondition_wait_started_at: float | None = None
+        self.precondition_wait_consumed_secs = 0.0
         self.protocol_error = ""
         self.kinds = normalize_event_storm_kinds(kinds)
         self.target_tiers = [tier.upper() for tier in target_tiers]
@@ -1958,7 +1959,7 @@ class EventStormRunner:
             ):
                 self.cycle = previous_cycle
                 return
-            self.precondition_wait_started_at = None
+            self.finish_precondition_wait(now)
             self.reject_protocol_precondition(
                 root,
                 requested_tier,
@@ -1968,7 +1969,7 @@ class EventStormRunner:
                 target_m2_evidence,
             )
             return
-        self.precondition_wait_started_at = None
+        self.finish_precondition_wait(now)
         # Capture the distribution only once the strict precondition is proven;
         # retries while the root is demoting must not masquerade as bursts.
         if self.cycle == 1:
@@ -2114,7 +2115,8 @@ class EventStormRunner:
             return False
         if self.precondition_wait_started_at is None:
             self.precondition_wait_started_at = now
-        elapsed = max(0.0, now - self.precondition_wait_started_at)
+        current_wait = max(0.0, now - self.precondition_wait_started_at)
+        elapsed = self.precondition_wait_consumed_secs + current_wait
         if elapsed >= self.precondition_wait_secs:
             return False
         self.emit(
@@ -2139,6 +2141,15 @@ class EventStormRunner:
             self.precondition_wait_secs - elapsed,
         )
         return True
+
+    def finish_precondition_wait(self, now: float) -> None:
+        if self.precondition_wait_started_at is None:
+            return
+        self.precondition_wait_consumed_secs += max(
+            0.0,
+            now - self.precondition_wait_started_at,
+        )
+        self.precondition_wait_started_at = None
 
     def select_visibility_probes(
         self,

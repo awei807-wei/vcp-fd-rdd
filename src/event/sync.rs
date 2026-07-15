@@ -69,6 +69,7 @@ impl DirtyScope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DirtyReason {
     InotifyEvent,
+    RecursiveSubtreeRepair,
     QueryHitStale,
     QueryMiss,
     PeriodicColdScan,
@@ -85,9 +86,10 @@ impl DirtyReason {
         match self {
             Self::OverflowRecovery => DirtyPriority::Critical,
             Self::QueryHitStale | Self::StartupRepair => DirtyPriority::High,
-            Self::InotifyEvent | Self::QueryMiss | Self::FastScanChangedDir => {
-                DirtyPriority::Normal
-            }
+            Self::InotifyEvent
+            | Self::RecursiveSubtreeRepair
+            | Self::QueryMiss
+            | Self::FastScanChangedDir => DirtyPriority::Normal,
             Self::PeriodicColdScan
             | Self::RotatingColdWindow { .. }
             | Self::FastScanBootstrapDir
@@ -153,6 +155,7 @@ impl DirtyRepairCursor {
 pub struct DirtyQueueEntry {
     pub scope: DirtyScope,
     pub reason: DirtyReason,
+    recursive_subtree_repair: bool,
     rotating_cold_window_cycle_id: Option<u64>,
     pub priority: DirtyPriority,
     pub first_enqueue_ns: u64,
@@ -163,6 +166,10 @@ pub struct DirtyQueueEntry {
 }
 
 impl DirtyQueueEntry {
+    pub fn requires_recursive_subtree_repair(&self) -> bool {
+        self.recursive_subtree_repair
+    }
+
     pub fn rotating_cold_window_cycle_id(&self) -> Option<u64> {
         self.rotating_cold_window_cycle_id
     }
@@ -259,6 +266,25 @@ impl DirtyQueue {
         self.enqueue_inner(
             scope,
             reason,
+            reason == DirtyReason::RecursiveSubtreeRepair,
+            priority,
+            now_ns,
+            reason.rotating_cold_window_cycle_id(),
+            None,
+        );
+    }
+
+    pub fn enqueue_recursive(
+        &mut self,
+        scope: DirtyScope,
+        reason: DirtyReason,
+        priority: DirtyPriority,
+        now_ns: u64,
+    ) {
+        self.enqueue_inner(
+            scope,
+            reason,
+            true,
             priority,
             now_ns,
             reason.rotating_cold_window_cycle_id(),
@@ -270,6 +296,7 @@ impl DirtyQueue {
         &mut self,
         scope: DirtyScope,
         reason: DirtyReason,
+        recursive_subtree_repair: bool,
         priority: DirtyPriority,
         now_ns: u64,
         rotating_cold_window_cycle_id: Option<u64>,
@@ -278,6 +305,7 @@ impl DirtyQueue {
         self.enqueue_inner(
             scope,
             reason,
+            recursive_subtree_repair,
             priority,
             now_ns,
             merge_rotating_cycle_id(
@@ -292,6 +320,7 @@ impl DirtyQueue {
         &mut self,
         scope: DirtyScope,
         reason: DirtyReason,
+        recursive_subtree_repair: bool,
         priority: DirtyPriority,
         now_ns: u64,
         rotating_cold_window_cycle_id: Option<u64>,
@@ -304,6 +333,7 @@ impl DirtyQueue {
             .entry(key)
             .and_modify(|entry| {
                 entry.reason = merge_reason(entry.reason, reason);
+                entry.recursive_subtree_repair |= recursive_subtree_repair;
                 entry.rotating_cold_window_cycle_id = merge_rotating_cycle_id(
                     entry.rotating_cold_window_cycle_id,
                     rotating_cold_window_cycle_id,
@@ -317,6 +347,7 @@ impl DirtyQueue {
             .or_insert_with(|| DirtyQueueEntry {
                 scope,
                 reason,
+                recursive_subtree_repair,
                 rotating_cold_window_cycle_id,
                 priority,
                 first_enqueue_ns: now_ns,
@@ -378,6 +409,7 @@ impl DirtyQueue {
             .entry(key)
             .and_modify(|existing| {
                 existing.reason = merge_reason(existing.reason, entry.reason);
+                existing.recursive_subtree_repair |= entry.recursive_subtree_repair;
                 existing.rotating_cold_window_cycle_id = merge_rotating_cycle_id(
                     existing.rotating_cold_window_cycle_id,
                     entry.rotating_cold_window_cycle_id,
@@ -608,6 +640,49 @@ mod tests {
     }
 
     #[test]
+    fn dirty_queue_preserves_recursive_repair_across_reason_merges_and_retry() {
+        for recursive_first in [true, false] {
+            let mut q = DirtyQueue::new(Duration::ZERO).with_retry_policy(Duration::ZERO, 2);
+            let scope = || DirtyScope::dirs(0, vec![PathBuf::from("/tmp/cold-rename")]);
+            let reasons = if recursive_first {
+                [
+                    DirtyReason::RecursiveSubtreeRepair,
+                    DirtyReason::InotifyEvent,
+                ]
+            } else {
+                [
+                    DirtyReason::InotifyEvent,
+                    DirtyReason::RecursiveSubtreeRepair,
+                ]
+            };
+            for (now, reason) in reasons.into_iter().enumerate() {
+                q.enqueue(scope(), reason, reason.default_priority(), now as u64 + 1);
+            }
+
+            let entry = q.pop_ready(3, 1).pop().unwrap();
+            assert!(entry.requires_recursive_subtree_repair());
+            assert!(q.retry(entry, 4));
+            let retry = q.pop_ready(4, 1).pop().unwrap();
+            assert!(retry.requires_recursive_subtree_repair());
+        }
+    }
+
+    #[test]
+    fn recursive_rotating_entry_keeps_cycle_provenance() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        q.enqueue_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/rotating-recursive")]),
+            DirtyReason::RotatingColdWindow { cycle_id: 42 },
+            DirtyPriority::Low,
+            1,
+        );
+
+        let entry = q.pop_ready(1, 1).pop().unwrap();
+        assert!(entry.requires_recursive_subtree_repair());
+        assert_eq!(entry.rotating_cold_window_cycle_id(), Some(42));
+    }
+
+    #[test]
     fn dirty_queue_memory_stats_counts_pending_scopes() {
         let mut q = DirtyQueue::new(Duration::ZERO);
         q.enqueue(
@@ -667,6 +742,7 @@ mod tests {
         q.enqueue_repair_slice(
             DirtyScope::dirs(0, vec![dir.clone()]),
             DirtyReason::PeriodicColdScan,
+            false,
             DirtyPriority::Low,
             1,
             Some(12),
@@ -675,6 +751,7 @@ mod tests {
         q.enqueue_repair_slice(
             DirtyScope::dirs(0, vec![dir.clone()]),
             DirtyReason::PeriodicColdScan,
+            false,
             DirtyPriority::Low,
             2,
             Some(13),
@@ -691,6 +768,7 @@ mod tests {
         q.enqueue_repair_slice(
             DirtyScope::dirs(0, vec![dir.clone()]),
             DirtyReason::PeriodicColdScan,
+            false,
             DirtyPriority::Low,
             3,
             Some(14),

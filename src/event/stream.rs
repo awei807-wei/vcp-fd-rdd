@@ -83,10 +83,20 @@ fn watch_remove_error_is_already_absent(error: &notify::Error) -> bool {
 pub enum WatchCommand {
     Add(PathBuf),
     Remove(PathBuf),
-    Replace { demote: PathBuf, promote: PathBuf },
-    AddEphemeral(PathBuf),
+    Replace {
+        demote: PathBuf,
+        promote: PathBuf,
+    },
+    AddEphemeral {
+        path: PathBuf,
+        fallback_cycle_id: Option<u64>,
+    },
     RemoveEphemeral(PathBuf),
-    ReplaceEphemeral { remove: PathBuf, add: PathBuf },
+    ReplaceEphemeral {
+        remove: PathBuf,
+        add: PathBuf,
+        fallback_cycle_id: Option<u64>,
+    },
 }
 
 type WatchCommandRx = Arc<Mutex<Option<tokio::sync::mpsc::Receiver<WatchCommand>>>>;
@@ -315,15 +325,23 @@ impl EventPipeline {
         let pending_moves: Arc<tokio::sync::Mutex<PendingMoveMap>> =
             Arc::new(tokio::sync::Mutex::new(PendingMoveMap::new()));
         let pending_moves_cleaner = pending_moves.clone();
+        let pending_moves_index = index.clone();
 
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(PENDING_MOVE_TIMEOUT).await;
                 let mut pm = pending_moves_cleaner.lock().await;
                 let before = pm.len();
-                cleanup_pending_moves(&mut pm);
+                let expired_paths = cleanup_pending_moves(&mut pm);
                 let after = pm.len();
                 drop(pm);
+                for path in expired_paths {
+                    let repair_dir = path.parent().unwrap_or(path.as_path()).to_path_buf();
+                    pending_moves_index.enqueue_recursive_dirty_dirs(
+                        vec![repair_dir],
+                        DirtyReason::RecursiveSubtreeRepair,
+                    );
+                }
                 if before != after {
                     tracing::debug!(
                         "PendingMoveMap cleanup: {} expired, {} remaining",
@@ -454,6 +472,7 @@ impl EventPipeline {
                         index.enqueue_dirty_dirs(dirty_dirs, DirtyReason::InotifyEvent);
                     }
                 }
+                let structural_live_paths = structural_live_paths(&raw_events);
 
                 // 动态注册新目录的递归监控。
                 // RecursiveMode::Recursive 不会自动为新创建的目录添加 inotify watch，
@@ -496,6 +515,7 @@ impl EventPipeline {
                     &index,
                     &total_events,
                     &last_batch_size,
+                    &structural_live_paths,
                 ) {
                     continue;
                 }
@@ -512,6 +532,10 @@ impl EventPipeline {
                 records_capacity.store(merge_scratch.records.capacity() as u64, Ordering::Relaxed);
 
                 if !merge_scratch.records.is_empty() {
+                    normalize_disappeared_live_records(
+                        &mut merge_scratch.records,
+                        &structural_live_paths,
+                    );
                     let merged_count = merge_scratch.records.len();
                     tracing::debug!(
                         "EventPipeline: raw={} merged={} total={}",
@@ -558,15 +582,20 @@ struct WatchCtx<'a> {
 fn handle_watch_command(cmd: Option<WatchCommand>, ctx: &mut WatchCtx<'_>) {
     match cmd {
         Some(WatchCommand::Add(path)) => handle_add_watch(ctx, path),
-        Some(WatchCommand::AddEphemeral(path)) => handle_add_ephemeral_watch(ctx, path),
+        Some(WatchCommand::AddEphemeral {
+            path,
+            fallback_cycle_id,
+        }) => handle_add_ephemeral_watch(ctx, path, fallback_cycle_id),
         Some(WatchCommand::Remove(path)) => handle_remove_watch(ctx, path),
         Some(WatchCommand::RemoveEphemeral(path)) => handle_remove_ephemeral_watch(ctx, path),
         Some(WatchCommand::Replace { demote, promote }) => {
             handle_replace_watch(ctx, demote, promote)
         }
-        Some(WatchCommand::ReplaceEphemeral { remove, add }) => {
-            handle_replace_ephemeral_watch(ctx, remove, add)
-        }
+        Some(WatchCommand::ReplaceEphemeral {
+            remove,
+            add,
+            fallback_cycle_id,
+        }) => handle_replace_ephemeral_watch(ctx, remove, add, fallback_cycle_id),
         None => {}
     }
 }
@@ -611,7 +640,19 @@ fn handle_add_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
 }
 
 /// `WatchCommand::AddEphemeral` — add an ephemeral (evictable) recursive watch.
-fn handle_add_ephemeral_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
+fn handle_add_ephemeral_watch(
+    ctx: &mut WatchCtx<'_>,
+    path: PathBuf,
+    fallback_cycle_id: Option<u64>,
+) {
+    if !rotating_ephemeral_command_is_current(ctx, path.as_path(), fallback_cycle_id) {
+        tracing::debug!(
+            ?path,
+            ?fallback_cycle_id,
+            "ignored stale ephemeral watch add"
+        );
+        return;
+    }
     if !mount_policy_allows_dynamic_watch(
         ctx.fs_policy.as_ref(),
         ctx.mount_policy_counters,
@@ -622,6 +663,7 @@ fn handle_add_ephemeral_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
         if let Some(runtime) = ctx.tiered_runtime.as_ref() {
             runtime.rollback_ephemeral_add(path.as_path());
         }
+        fallback_rotating_ephemeral_to_scan(ctx, path.as_path(), fallback_cycle_id);
         tracing::warn!(
             "tiered ephemeral watcher add denied by mount policy for {:?}",
             path
@@ -637,19 +679,70 @@ fn handle_add_ephemeral_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
                 runtime.confirm_ephemeral_added(path.as_path());
             }
             ctx.ephemeral_watches.insert(path.clone());
-            let scan_index = ctx.index.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = scan_index.scan_dirs_immediate_deep(&[path]);
-            });
+            schedule_ephemeral_bootstrap_scan(ctx, path, fallback_cycle_id);
         }
         Err(e) => {
             ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
             if let Some(runtime) = ctx.tiered_runtime.as_ref() {
                 runtime.rollback_ephemeral_add(path.as_path());
             }
+            fallback_rotating_ephemeral_to_scan(ctx, path.as_path(), fallback_cycle_id);
             tracing::warn!("tiered ephemeral watcher add failed for {:?}: {}", path, e);
         }
     }
+}
+
+fn rotating_ephemeral_command_is_current(
+    ctx: &WatchCtx<'_>,
+    path: &Path,
+    fallback_cycle_id: Option<u64>,
+) -> bool {
+    fallback_cycle_id.is_none_or(|cycle_id| {
+        ctx.tiered_runtime.as_ref().is_some_and(|runtime| {
+            runtime.rotating_cold_window_ephemeral_lease_matches(path, cycle_id)
+        })
+    })
+}
+
+fn fallback_rotating_ephemeral_to_scan(
+    ctx: &WatchCtx<'_>,
+    path: &Path,
+    fallback_cycle_id: Option<u64>,
+) {
+    let (Some(runtime), Some(cycle_id)) = (ctx.tiered_runtime.as_ref(), fallback_cycle_id) else {
+        return;
+    };
+    if runtime.downgrade_rotating_cold_window_lease_to_scan_only(path, cycle_id) {
+        ctx.index.enqueue_dirty_dirs(
+            vec![path.to_path_buf()],
+            DirtyReason::RotatingColdWindow { cycle_id },
+        );
+    }
+}
+
+fn schedule_ephemeral_bootstrap_scan(
+    ctx: &WatchCtx<'_>,
+    path: PathBuf,
+    fallback_cycle_id: Option<u64>,
+) {
+    if let Some(cycle_id) = fallback_cycle_id {
+        if ctx.tiered_runtime.as_ref().is_some_and(|runtime| {
+            runtime.rotating_cold_window_ephemeral_lease_matches(path.as_path(), cycle_id)
+        }) {
+            ctx.index.enqueue_recursive_dirty_dirs(
+                vec![path],
+                DirtyReason::RotatingColdWindow { cycle_id },
+            );
+        } else {
+            ctx.index
+                .enqueue_recursive_dirty_dirs(vec![path], DirtyReason::RecursiveSubtreeRepair);
+        }
+        return;
+    }
+    let scan_index = ctx.index.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = scan_index.scan_dirs_immediate_deep(&[path]);
+    });
 }
 
 /// `WatchCommand::Remove` — demote a path: unwatch it and all child watches.
@@ -861,7 +954,20 @@ fn handle_replace_watch(ctx: &mut WatchCtx<'_>, demote: PathBuf, promote: PathBu
 }
 
 /// `WatchCommand::ReplaceEphemeral` — remove `remove` and add `add` as ephemeral.
-fn handle_replace_ephemeral_watch(ctx: &mut WatchCtx<'_>, remove: PathBuf, add: PathBuf) {
+fn handle_replace_ephemeral_watch(
+    ctx: &mut WatchCtx<'_>,
+    remove: PathBuf,
+    add: PathBuf,
+    fallback_cycle_id: Option<u64>,
+) {
+    if !rotating_ephemeral_command_is_current(ctx, add.as_path(), fallback_cycle_id) {
+        tracing::debug!(
+            ?add,
+            ?fallback_cycle_id,
+            "ignored stale ephemeral watch replacement"
+        );
+        return;
+    }
     if !mount_policy_allows_dynamic_watch(
         ctx.fs_policy.as_ref(),
         ctx.mount_policy_counters,
@@ -872,6 +978,7 @@ fn handle_replace_ephemeral_watch(ctx: &mut WatchCtx<'_>, remove: PathBuf, add: 
         if let Some(runtime) = ctx.tiered_runtime.as_ref() {
             runtime.rollback_ephemeral_replace(remove.as_path(), add.as_path());
         }
+        fallback_rotating_ephemeral_to_scan(ctx, add.as_path(), fallback_cycle_id);
         tracing::warn!(
             "tiered ephemeral replacement add denied by mount policy for {:?}",
             add
@@ -891,6 +998,7 @@ fn handle_replace_ephemeral_watch(ctx: &mut WatchCtx<'_>, remove: PathBuf, add: 
             if let Some(runtime) = ctx.tiered_runtime.as_ref() {
                 runtime.rollback_ephemeral_replace(remove.as_path(), add.as_path());
             }
+            fallback_rotating_ephemeral_to_scan(ctx, add.as_path(), fallback_cycle_id);
             tracing::warn!(
                 "tiered ephemeral replacement remove failed for {:?}: {}",
                 remove,
@@ -910,16 +1018,14 @@ fn handle_replace_ephemeral_watch(ctx: &mut WatchCtx<'_>, remove: PathBuf, add: 
                 runtime.confirm_ephemeral_added(add.as_path());
             }
             ctx.ephemeral_watches.insert(add.clone());
-            let scan_index = ctx.index.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = scan_index.scan_dirs_immediate_deep(&[add]);
-            });
+            schedule_ephemeral_bootstrap_scan(ctx, add, fallback_cycle_id);
         }
         Err(e) => {
             ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
             if let Some(runtime) = ctx.tiered_runtime.as_ref() {
                 runtime.rollback_ephemeral_add(add.as_path());
             }
+            fallback_rotating_ephemeral_to_scan(ctx, add.as_path(), fallback_cycle_id);
             tracing::warn!(
                 "tiered ephemeral replacement add failed for {:?}: {}",
                 add,
@@ -986,12 +1092,15 @@ fn register_dynamic_watches(raw_events: &[notify::Event], ctx: &mut WatchCtx<'_>
 
     let mut changed_dirs: Vec<PathBuf> = Vec::new();
     for ev in raw_events {
-        let dir_paths = match ev.kind {
-            notify::EventKind::Create(notify::event::CreateKind::Folder) => ev.paths.as_slice(),
-            notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
-                ev.paths.last().map(std::slice::from_ref).unwrap_or(&[])
+        let (dir_paths, deep_scan_when_cold): (&[PathBuf], bool) = match ev.kind {
+            notify::EventKind::Create(notify::event::CreateKind::Folder) => {
+                (ev.paths.as_slice(), false)
             }
-            _ => &[],
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => (
+                ev.paths.last().map(std::slice::from_ref).unwrap_or(&[]),
+                true,
+            ),
+            _ => (&[], false),
         };
         for path in dir_paths {
             if ignore_paths
@@ -1031,7 +1140,15 @@ fn register_dynamic_watches(raw_events: &[notify::Event], ctx: &mut WatchCtx<'_>
                     runtime.covering_tier(path.as_path()),
                     Some(WatchTier::L2 | WatchTier::L3)
                 ) {
-                    index.enqueue_dirty_dirs(vec![path.clone()], DirtyReason::InotifyEvent);
+                    if deep_scan_when_cold {
+                        let reason = runtime
+                            .rotating_cold_window_active_cycle_for_path(path.as_path())
+                            .map(|cycle_id| DirtyReason::RotatingColdWindow { cycle_id })
+                            .unwrap_or(DirtyReason::RecursiveSubtreeRepair);
+                        index.enqueue_recursive_dirty_dirs(vec![path.clone()], reason);
+                    } else {
+                        index.enqueue_dirty_dirs(vec![path.clone()], DirtyReason::InotifyEvent);
+                    }
                     continue;
                 }
                 let watch_cost = estimate_notify_recursive_watch_count(
@@ -1143,6 +1260,7 @@ fn try_fast_path(
     index: &Arc<TieredIndex>,
     total_events: &Arc<AtomicU64>,
     last_batch_size: &Arc<AtomicU64>,
+    structural_live_paths: &HashSet<PathBuf>,
 ) -> bool {
     let all_create = raw_events
         .iter()
@@ -1164,11 +1282,49 @@ fn try_fast_path(
         }
     }
     if !fast_records.is_empty() {
+        normalize_disappeared_live_records(&mut fast_records, structural_live_paths);
         index.apply_events(&fast_records);
         total_events.fetch_add(fast_records.len() as u64, Ordering::Relaxed);
         last_batch_size.store(fast_records.len() as u64, Ordering::Relaxed);
     }
     true
+}
+
+fn structural_live_paths(raw_events: &[notify::Event]) -> HashSet<PathBuf> {
+    let mut paths = HashSet::new();
+    for event in raw_events {
+        match event.kind {
+            notify::EventKind::Create(notify::event::CreateKind::Folder) => {
+                paths.extend(event.paths.iter().cloned());
+            }
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
+                if let Some(path) = event.paths.last() {
+                    paths.insert(path.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    paths
+}
+
+fn normalize_disappeared_live_records(
+    records: &mut [EventRecord],
+    structural_live_paths: &HashSet<PathBuf>,
+) {
+    for record in records {
+        if !matches!(record.event_type, EventType::Create | EventType::Modify) {
+            continue;
+        }
+        let explicitly_missing = record.best_path().is_some_and(|path| {
+            structural_live_paths.contains(path)
+                && std::fs::symlink_metadata(path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        });
+        if explicitly_missing {
+            record.event_type = EventType::Delete;
+        }
+    }
 }
 
 /// Cross-batch Rename pairing: merge inotify-split From/To events into
@@ -1291,10 +1447,20 @@ type PendingMoveMap = HashMap<usize, (Instant, notify::Event)>;
 
 const PENDING_MOVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 清理超时的 pending rename 记录
-fn cleanup_pending_moves(pending: &mut PendingMoveMap) {
+/// Remove expired pending renames and return their source paths for repair.
+fn cleanup_pending_moves(pending: &mut PendingMoveMap) -> Vec<PathBuf> {
     let now = Instant::now();
-    pending.retain(|_, (t, _)| now.duration_since(*t) < PENDING_MOVE_TIMEOUT);
+    let expired = pending
+        .iter()
+        .filter_map(|(tracker, (inserted_at, _))| {
+            (now.duration_since(*inserted_at) >= PENDING_MOVE_TIMEOUT).then_some(*tracker)
+        })
+        .collect::<Vec<_>>();
+    expired
+        .into_iter()
+        .filter_map(|tracker| pending.remove(&tracker))
+        .filter_map(|(_, event)| event.paths.first().cloned())
+        .collect()
 }
 
 fn should_keep_existing_merged_event(existing: &EventType, incoming: &EventType) -> bool {
@@ -1709,6 +1875,244 @@ mod tests {
         if let Err(e) = std::fs::remove_dir_all(&root) {
             tracing::warn!("Failed to clean up test temp dir {:?}: {}", root, e);
         }
+    }
+
+    #[tokio::test]
+    async fn cold_directory_rename_deep_scans_the_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-cold-directory-rename-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+        let runtime = Arc::new(TieredWatchRuntime::new(
+            Vec::new(),
+            vec![(root.clone(), 1)],
+            16,
+            5_000,
+            20,
+        ));
+        for _ in 0..2 {
+            runtime.record_scan(
+                root.as_path(),
+                crate::index::tiered::ScanOutcome {
+                    scanned: 1,
+                    changed: 0,
+                    elapsed_ms: 1,
+                    project_roots: Vec::new(),
+                },
+            );
+            runtime.apply_scan_policy(
+                root.as_path(),
+                1,
+                2,
+                crate::config::L3ScanPolicy::Interval,
+                4,
+                1,
+                1,
+            );
+        }
+        assert_eq!(runtime.covering_tier(root.as_path()), Some(WatchTier::L3));
+
+        let pipeline = EventPipeline::new_with_config(index.clone(), 5, 1024)
+            .with_watch_roots(vec![root.clone()])
+            .with_tiered_runtime(Some(runtime));
+        pipeline.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let source = root.join("dir_a");
+        let deep_source = source.join("level1/level2");
+        std::fs::create_dir_all(&deep_source).unwrap();
+        let old_file = deep_source.join("cold_rename_deep_file.txt");
+        std::fs::write(&old_file, b"deep rename").unwrap();
+        let destination = root.join("dir_b");
+        std::fs::rename(&source, &destination).unwrap();
+        let new_file = destination.join("level1/level2/cold_rename_deep_file.txt");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut results = Vec::new();
+        let mut saw_recursive_repair = false;
+        while tokio::time::Instant::now() < deadline {
+            for entry in index.dirty_queue_ready_batch(16) {
+                saw_recursive_repair |= entry.reason == DirtyReason::RecursiveSubtreeRepair;
+                let report = index.process_dirty_entry(entry, &[]);
+                assert!(!report.failed, "cold rename repair failed: {report:?}");
+            }
+            results = index.query("cold_rename_deep_file");
+            if results.iter().any(|meta| meta.path == new_file) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            saw_recursive_repair,
+            "cold directory rename should use the bounded recursive repair queue"
+        );
+        assert!(
+            results.iter().any(|meta| meta.path == new_file),
+            "renamed cold subtree was not indexed at its destination: {results:?}"
+        );
+        assert!(results.iter().all(|meta| meta.path != old_file));
+
+        drop(pipeline);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn disappeared_fast_path_directory_create_does_not_poison_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-disappeared-fast-create-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let content_root = root.join("content");
+        std::fs::create_dir_all(&content_root).unwrap();
+
+        let index = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+        let missing = content_root.join("already-removed");
+        let mut raw = vec![mk_event(
+            notify::EventKind::Create(notify::event::CreateKind::Folder),
+            vec![missing.clone()],
+        )];
+        let structural_live_paths = HashSet::from([missing]);
+        let mut seq = 0;
+        let total_events = Arc::new(AtomicU64::new(0));
+        let last_batch_size = Arc::new(AtomicU64::new(0));
+
+        assert!(try_fast_path(
+            &mut raw,
+            &mut seq,
+            &index,
+            &total_events,
+            &last_batch_size,
+            &structural_live_paths,
+        ));
+
+        let store = Arc::new(crate::storage::SnapshotStore::new(root.join("index.db")));
+        let result = index.snapshot_now(store).await;
+        assert!(
+            result.is_ok(),
+            "a disappeared create must become a delete before snapshot: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn disappeared_merged_structural_modify_does_not_poison_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-disappeared-merged-modify-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let content_root = root.join("content");
+        std::fs::create_dir_all(&content_root).unwrap();
+
+        let index = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+        let missing = content_root.join("already-removed");
+        let mut raw = vec![mk_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Any,
+            )),
+            vec![missing.clone()],
+        )];
+        let structural_live_paths = HashSet::from([missing]);
+        let mut seq = 0;
+        let mut scratch = MergeScratch::default();
+        merge_events_in_place(&mut seq, &mut raw, &mut scratch);
+        normalize_disappeared_live_records(&mut scratch.records, &structural_live_paths);
+        index.apply_events_drain(&mut scratch.records);
+
+        let store = Arc::new(crate::storage::SnapshotStore::new(root.join("index.db")));
+        let result = index.snapshot_now(store).await;
+        assert!(
+            result.is_ok(),
+            "a disappeared modify must become a delete before snapshot: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn existing_modify_remains_live_during_normalization() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-existing-modify-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("present.txt");
+        std::fs::write(&path, b"present").unwrap();
+        let mut records = vec![EventRecord {
+            seq: 1,
+            timestamp: std::time::SystemTime::now(),
+            event_type: EventType::Modify,
+            id: FileIdentifier::Path(path.clone()),
+            path_hint: None,
+        }];
+        let structural_live_paths = HashSet::from([path]);
+
+        normalize_disappeared_live_records(&mut records, &structural_live_paths);
+
+        assert!(matches!(records[0].event_type, EventType::Modify));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_non_structural_modify_remains_fail_closed() {
+        let missing = std::env::temp_dir().join(format!(
+            "fd-rdd-missing-non-structural-modify-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut records = vec![EventRecord {
+            seq: 1,
+            timestamp: std::time::SystemTime::now(),
+            event_type: EventType::Modify,
+            id: FileIdentifier::Path(missing),
+            path_hint: None,
+        }];
+
+        normalize_disappeared_live_records(&mut records, &HashSet::new());
+
+        assert!(matches!(records[0].event_type, EventType::Modify));
+    }
+
+    #[test]
+    fn expired_pending_rename_returns_source_path_for_repair() {
+        let source = PathBuf::from("/tmp/expired-rename/source");
+        let event = mk_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::From,
+            )),
+            vec![source.clone()],
+        );
+        let mut pending = PendingMoveMap::new();
+        pending.insert(
+            7,
+            (
+                Instant::now() - PENDING_MOVE_TIMEOUT - Duration::from_millis(1),
+                event,
+            ),
+        );
+
+        let expired = cleanup_pending_moves(&mut pending);
+
+        assert_eq!(expired, vec![source]);
+        assert!(pending.is_empty());
     }
 
     #[test]

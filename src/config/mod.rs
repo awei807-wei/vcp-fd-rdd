@@ -617,6 +617,13 @@ impl TieredWatchConfig {
             if self.waterline_sla_ms == 0 {
                 return Err("waterline_sla_ms must be > 0".to_string());
             }
+            let fast_scan_target_ms = self.l1_l2_fast_scan_target_secs.saturating_mul(1_000);
+            if self.l1_l2_fast_scan_enabled && self.waterline_sla_ms < fast_scan_target_ms {
+                return Err(format!(
+                    "waterline_sla_ms must be >= the fast-scan target ({fast_scan_target_ms}ms), got {}",
+                    self.waterline_sla_ms
+                ));
+            }
             if self.waterline_hard_degraded_l3_interval_secs == 0 {
                 return Err("waterline_hard_degraded_l3_interval_secs must be > 0".to_string());
             }
@@ -645,6 +652,18 @@ impl TieredWatchConfig {
                 if !(0.0..=1.0).contains(&val) {
                     return Err(format!("{name} must be in [0.0, 1.0], got {val}"));
                 }
+            }
+            if self.waterline_soft_recover_pct >= self.waterline_soft_trigger_pct {
+                return Err(
+                    "waterline_soft_recover_pct must be less than waterline_soft_trigger_pct"
+                        .to_string(),
+                );
+            }
+            if self.waterline_hard_recover_pct >= self.waterline_hard_trigger_pct {
+                return Err(
+                    "waterline_hard_recover_pct must be less than waterline_hard_trigger_pct"
+                        .to_string(),
+                );
             }
         }
         Ok(())

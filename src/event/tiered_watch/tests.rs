@@ -1969,13 +1969,23 @@ fn rotating_cold_window_downgrade_keeps_lease_as_scan_only() {
         RotatingColdWindowActionKind::EphemeralWatch
     );
     assert_eq!(rt.report().rotating_cold_window_active_dirs, 1);
+    assert!(rt.rotating_cold_window_ephemeral_lease_matches(cold.as_path(), tick.cycle_id));
+    assert_eq!(
+        rt.rotating_cold_window_active_cycle_for_path(cold.join("child").as_path()),
+        Some(tick.cycle_id)
+    );
 
-    assert!(rt.downgrade_rotating_cold_window_lease_to_scan_only(cold.as_path()));
+    assert!(rt.downgrade_rotating_cold_window_lease_to_scan_only(cold.as_path(), tick.cycle_id));
     assert_eq!(rt.report().rotating_cold_window_active_dirs, 1);
     assert_eq!(rt.report().rotating_cold_window_scan_only_dirs, 1);
 
-    assert!(rt.downgrade_rotating_cold_window_lease_to_scan_only(cold.as_path()));
+    assert!(rt.downgrade_rotating_cold_window_lease_to_scan_only(cold.as_path(), tick.cycle_id));
     assert_eq!(rt.report().rotating_cold_window_scan_only_dirs, 1);
+
+    assert!(!rt.downgrade_rotating_cold_window_lease_to_scan_only(
+        cold.as_path(),
+        tick.cycle_id.saturating_add(1)
+    ));
 
     let dump = rt.debug_dump(Some("/tmp/cold-downgrade"));
     let dir = dump.dirs.first().expect("cold dir should be present");
@@ -2001,6 +2011,15 @@ fn rotating_cold_window_downgrade_keeps_lease_as_scan_only() {
     assert!(encoded_dir["rotating_cold_window_score"]
         .as_u64()
         .is_some_and(|value| value > 0));
+
+    if let Some(lease) = rt.rotating_cold_window_leases.write().get_mut(&cold) {
+        lease.expires_unix_secs = unix_secs().saturating_sub(1);
+    }
+    assert_eq!(
+        rt.rotating_cold_window_active_cycle_for_path(cold.as_path()),
+        None
+    );
+    assert!(!rt.downgrade_rotating_cold_window_lease_to_scan_only(cold.as_path(), tick.cycle_id));
 }
 
 #[test]
@@ -2233,20 +2252,50 @@ fn waterline_alarm_soft_triggers_and_recovers_with_hysteresis() {
     rt.check_waterline_alarm(3_000);
     assert!(!rt.waterline_soft_degraded());
 
-    rt.check_waterline_alarm(4_001);
-    assert!(rt.waterline_soft_degraded());
-
-    rt.check_waterline_alarm(3_000);
-    assert!(rt.waterline_soft_degraded());
-
-    rt.check_waterline_alarm(1_500);
-    assert!(rt.waterline_soft_degraded());
-
-    rt.check_waterline_alarm(1_500);
-    assert!(rt.waterline_soft_degraded());
-
-    rt.check_waterline_alarm(1_500);
+    rt.check_waterline_alarm(5_001);
     assert!(!rt.waterline_soft_degraded());
+
+    rt.check_waterline_alarm(5_001);
+    assert!(!rt.waterline_soft_degraded());
+
+    rt.check_waterline_alarm(5_001);
+    assert!(rt.waterline_soft_degraded());
+
+    rt.check_waterline_alarm(5_000);
+    assert!(rt.waterline_soft_degraded());
+
+    rt.check_waterline_alarm(5_000);
+    assert!(rt.waterline_soft_degraded());
+
+    rt.check_waterline_alarm(5_000);
+    assert!(!rt.waterline_soft_degraded());
+}
+
+#[test]
+fn waterline_alarm_does_not_degrade_inside_fast_scan_service_window() {
+    let rt = runtime();
+    let cfg = waterline_config();
+    rt.apply_waterline_config(&cfg);
+
+    rt.check_waterline_alarm(5_000);
+
+    assert!(!rt.waterline_soft_degraded());
+    assert_eq!(rt.waterline_effective_rotating_budget(), 128);
+}
+
+#[test]
+fn waterline_alarm_ignores_transient_service_target_jitter() {
+    let rt = runtime();
+    let cfg = waterline_config();
+    rt.apply_waterline_config(&cfg);
+
+    rt.check_waterline_alarm(5_001);
+    rt.check_waterline_alarm(5_003);
+    rt.check_waterline_alarm(5_000);
+    rt.check_waterline_alarm(5_003);
+
+    assert!(!rt.waterline_soft_degraded());
+    assert_eq!(rt.waterline_effective_rotating_budget(), 128);
 }
 
 #[test]
@@ -2279,7 +2328,9 @@ fn waterline_alarm_soft_reduces_effective_rotating_budget() {
 
     assert_eq!(rt.waterline_effective_rotating_budget(), 128);
 
-    rt.check_waterline_alarm(4_500);
+    for _ in 0..3 {
+        rt.check_waterline_alarm(5_001);
+    }
     assert!(rt.waterline_soft_degraded());
 
     assert_eq!(rt.waterline_effective_rotating_budget(), 64);
@@ -2307,21 +2358,23 @@ fn waterline_alarm_recovery_streak_resets_on_spike() {
     let cfg = waterline_config();
     rt.apply_waterline_config(&cfg);
 
-    rt.check_waterline_alarm(4_500);
+    for _ in 0..3 {
+        rt.check_waterline_alarm(5_001);
+    }
     assert!(rt.waterline_soft_degraded());
 
-    rt.check_waterline_alarm(1_000);
-    rt.check_waterline_alarm(1_000);
+    rt.check_waterline_alarm(5_000);
+    rt.check_waterline_alarm(5_000);
     assert!(rt.waterline_soft_degraded());
 
-    rt.check_waterline_alarm(3_500);
+    rt.check_waterline_alarm(5_001);
     assert!(rt.waterline_soft_degraded());
 
-    rt.check_waterline_alarm(1_000);
-    rt.check_waterline_alarm(1_000);
+    rt.check_waterline_alarm(5_000);
+    rt.check_waterline_alarm(5_000);
     assert!(rt.waterline_soft_degraded());
 
-    rt.check_waterline_alarm(1_000);
+    rt.check_waterline_alarm(5_000);
     assert!(!rt.waterline_soft_degraded());
 }
 

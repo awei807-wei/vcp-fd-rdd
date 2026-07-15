@@ -626,6 +626,9 @@ fn rotating_scan_follow_up_interval_secs(ttl_secs: u64) -> u64 {
 /// Number of consecutive below-recovery-threshold checks required to clear
 /// soft degradation.
 const WATERLINE_SOFT_RECOVERY_CHECKS: u32 = 3;
+/// Number of consecutive above-threshold checks required to enter soft
+/// degradation, so scheduler jitter around the service target is ignored.
+const WATERLINE_SOFT_TRIGGER_CHECKS: u32 = 3;
 /// Number of consecutive below-recovery-threshold checks required to clear
 /// hard degradation.
 const WATERLINE_HARD_RECOVERY_CHECKS: u32 = 5;
@@ -635,6 +638,7 @@ const WATERLINE_HARD_RECOVERY_CHECKS: u32 = 5;
 struct WaterlineAlarmConfig {
     enabled: bool,
     sla_ms: u64,
+    fast_scan_target_ms: u64,
     soft_trigger_pct: f64,
     soft_recover_pct: f64,
     hard_trigger_pct: f64,
@@ -648,6 +652,7 @@ impl Default for WaterlineAlarmConfig {
         Self {
             enabled: true,
             sla_ms: 5_000,
+            fast_scan_target_ms: 5_000,
             soft_trigger_pct: 0.8,
             soft_recover_pct: 0.4,
             hard_trigger_pct: 0.8,
@@ -667,6 +672,7 @@ pub(super) struct WaterlineAlarm {
     configured_rotating_budget: AtomicUsize,
     soft_degraded: AtomicBool,
     hard_degraded: AtomicBool,
+    soft_trigger_streak: AtomicU32,
     soft_recovery_streak: AtomicU32,
     hard_recovery_streak: AtomicU32,
 }
@@ -680,6 +686,7 @@ impl WaterlineAlarm {
             configured_rotating_budget: AtomicUsize::new(128),
             soft_degraded: AtomicBool::new(false),
             hard_degraded: AtomicBool::new(false),
+            soft_trigger_streak: AtomicU32::new(0),
             soft_recovery_streak: AtomicU32::new(0),
             hard_recovery_streak: AtomicU32::new(0),
         }
@@ -689,6 +696,7 @@ impl WaterlineAlarm {
         let wc = WaterlineAlarmConfig {
             enabled: config.waterline_alarm_enabled,
             sla_ms: config.waterline_sla_ms,
+            fast_scan_target_ms: config.l1_l2_fast_scan_target_secs.saturating_mul(1_000),
             soft_trigger_pct: config.waterline_soft_trigger_pct,
             soft_recover_pct: config.waterline_soft_recover_pct,
             hard_trigger_pct: config.waterline_hard_trigger_pct,
@@ -747,40 +755,53 @@ impl WaterlineAlarm {
         let l2_ms = self.l2_scan_interval_ms.load(Ordering::Relaxed).max(1);
 
         // ── Soft level ──────────────────────────────────────────────────────
-        let soft_trigger_ms = (sla_ms as f64 * cfg.soft_trigger_pct) as u64;
-        let soft_recover_ms = (sla_ms as f64 * cfg.soft_recover_pct) as u64;
+        let service_target_ms = cfg.fast_scan_target_ms.max(1);
+        let soft_trigger_ms =
+            ((sla_ms as f64 * cfg.soft_trigger_pct) as u64).max(service_target_ms);
+        let soft_recover_ms =
+            ((sla_ms as f64 * cfg.soft_recover_pct) as u64).max(service_target_ms);
 
         let was_soft = self.is_soft_degraded();
-        if !was_soft && lag_p99_ms > soft_trigger_ms {
-            self.soft_degraded.store(true, Ordering::Relaxed);
-            self.soft_recovery_streak.store(0, Ordering::Relaxed);
-            tracing::warn!(
-                lag_p99_ms,
-                soft_trigger_ms,
-                sla_ms,
-                "waterline alarm: soft degradation triggered — \
-                 reducing rotating cold-window budget"
-            );
-        } else if was_soft {
-            if lag_p99_ms < soft_recover_ms {
+        if !was_soft {
+            if lag_p99_ms > soft_trigger_ms {
                 let streak = self
-                    .soft_recovery_streak
+                    .soft_trigger_streak
                     .fetch_add(1, Ordering::Relaxed)
                     .saturating_add(1);
-                if streak >= WATERLINE_SOFT_RECOVERY_CHECKS {
-                    self.soft_degraded.store(false, Ordering::Relaxed);
+                if streak >= WATERLINE_SOFT_TRIGGER_CHECKS {
+                    self.soft_degraded.store(true, Ordering::Relaxed);
+                    self.soft_trigger_streak.store(0, Ordering::Relaxed);
                     self.soft_recovery_streak.store(0, Ordering::Relaxed);
-                    tracing::info!(
+                    tracing::warn!(
                         lag_p99_ms,
-                        soft_recover_ms,
+                        soft_trigger_ms,
+                        sla_ms,
                         streak,
-                        "waterline alarm: soft degradation recovered — \
-                         rotating budget restored"
+                        "waterline alarm: sustained soft degradation triggered — \
+                         reducing rotating cold-window budget"
                     );
                 }
             } else {
-                self.soft_recovery_streak.store(0, Ordering::Relaxed);
+                self.soft_trigger_streak.store(0, Ordering::Relaxed);
             }
+        } else if lag_p99_ms <= soft_recover_ms {
+            let streak = self
+                .soft_recovery_streak
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if streak >= WATERLINE_SOFT_RECOVERY_CHECKS {
+                self.soft_degraded.store(false, Ordering::Relaxed);
+                self.soft_recovery_streak.store(0, Ordering::Relaxed);
+                tracing::info!(
+                    lag_p99_ms,
+                    soft_recover_ms,
+                    streak,
+                    "waterline alarm: soft degradation recovered — \
+                     rotating budget restored"
+                );
+            }
+        } else {
+            self.soft_recovery_streak.store(0, Ordering::Relaxed);
         }
 
         // ── Hard level ──────────────────────────────────────────────────────
@@ -1255,11 +1276,51 @@ impl TieredWatchRuntime {
         self.rotating_cold_window_seen.write().remove(path);
     }
 
-    pub fn downgrade_rotating_cold_window_lease_to_scan_only(&self, path: &Path) -> bool {
+    pub fn rotating_cold_window_ephemeral_lease_matches(
+        &self,
+        path: &Path,
+        expected_cycle_id: u64,
+    ) -> bool {
+        let now_unix_secs = unix_secs();
+        let now = Instant::now();
+        self.rotating_cold_window_leases
+            .read()
+            .get(path)
+            .is_some_and(|lease| {
+                lease.cycle_id == expected_cycle_id
+                    && lease.action == RotatingColdWindowActionKind::EphemeralWatch
+                    && lease.is_active(now_unix_secs, now)
+            })
+    }
+
+    pub fn rotating_cold_window_active_cycle_for_path(&self, path: &Path) -> Option<u64> {
+        let now_unix_secs = unix_secs();
+        let now = Instant::now();
+        self.rotating_cold_window_leases
+            .read()
+            .iter()
+            .filter(|(root, lease)| {
+                lease.is_active(now_unix_secs, now) && path_is_under_or_equal(path, root.as_path())
+            })
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, lease)| lease.cycle_id)
+    }
+
+    pub fn downgrade_rotating_cold_window_lease_to_scan_only(
+        &self,
+        path: &Path,
+        expected_cycle_id: u64,
+    ) -> bool {
         let mut leases = self.rotating_cold_window_leases.write();
         let Some(lease) = leases.get_mut(path) else {
             return false;
         };
+        if lease.cycle_id != expected_cycle_id {
+            return false;
+        }
+        if !lease.is_active(unix_secs(), Instant::now()) {
+            return false;
+        }
         if lease.action != RotatingColdWindowActionKind::ScanOnly {
             lease.action = RotatingColdWindowActionKind::ScanOnly;
             self.rotating_cold_window_scan_only_dirs
