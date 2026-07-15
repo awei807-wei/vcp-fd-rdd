@@ -114,6 +114,10 @@ def _validate_stability(leg: dict[str, Any], reasons: list[str]) -> None:
         reasons.append(f"{label}结束时 dirty queue 非零")
     if stability["log_error_count"]:
         reasons.append(f"{label} daemon 日志存在 ERROR")
+    if stability.get("watch_remove_failure_count", 0):
+        reasons.append(f"{label} watcher remove 存在失败")
+    if stability.get("dirty_queue_retry_drop_count", 0):
+        reasons.append(f"{label} dirty queue repair 重试耗尽并丢弃")
     rebuild_count = int(stability.get("background_rebuild_count", 0) or 0)
     bootstrap_rebuild_count = int(
         stability.get("bootstrap_background_rebuild_count", 0) or 0

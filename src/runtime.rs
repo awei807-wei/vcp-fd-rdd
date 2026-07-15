@@ -946,7 +946,11 @@ fn serve_queries(
             let tiered_runtime = tiered_runtime.clone();
             Arc::new(move |dirs, kind| {
                 if let Some(runtime) = tiered_runtime.as_ref() {
-                    runtime.grant_fast_scan_leases(dirs, kind, None, 2);
+                    if kind == FastScanLeaseKind::Query {
+                        runtime.grant_query_fast_scan_leases(dirs, None, 2);
+                    } else {
+                        runtime.grant_fast_scan_leases(dirs, kind, None, 2);
+                    }
                 }
             })
         });
@@ -1459,7 +1463,11 @@ fn spawn_dirty_queue_loop(
                 continue;
             }
 
-            let work = batch.clone();
+            let retry_batch = batch
+                .iter()
+                .map(|entry| entry.clone_without_repair_cursor())
+                .collect::<Vec<_>>();
+            let work = batch;
             let work_manifest_skip_dirs = runtime
                 .as_ref()
                 .map(|runtime| {
@@ -1486,14 +1494,15 @@ fn spawn_dirty_queue_loop(
             let processed = tokio::task::spawn_blocking(move || {
                 work.into_iter()
                     .map(|entry| {
+                        let post_process_entry = entry.clone_without_repair_cursor();
                         let report = work_index
                             .process_dirty_entry_with_project_markers_and_manifest_skip_dirs(
-                                entry.clone(),
+                                entry,
                                 &work_ignore_prefixes,
                                 &work_project_markers,
                                 &work_manifest_skip_dirs,
                             );
-                        (entry, report)
+                        (post_process_entry, report)
                     })
                     .collect::<Vec<_>>()
             })
@@ -1501,7 +1510,7 @@ fn spawn_dirty_queue_loop(
 
             let Ok(processed) = processed else {
                 tracing::warn!("dirty queue worker task failed");
-                for entry in batch {
+                for entry in retry_batch {
                     if !index.retry_dirty_entry(entry) {
                         tracing::warn!(
                             "dirty queue retry failed, entry dropped after worker task failure"
@@ -1560,11 +1569,13 @@ fn spawn_dirty_queue_loop(
                                 scan.manifest_skipped,
                             )
                             .unwrap_or_else(|| scan.dir.clone());
-                        if let Some(cycle_id) = rotating_cycle_id {
-                            runtime.record_rotating_cold_window_scan_completion(
-                                policy_dir.as_path(),
-                                cycle_id,
-                            );
+                        if scan.completion_ready {
+                            if let Some(cycle_id) = rotating_cycle_id {
+                                runtime.record_rotating_cold_window_scan_completion(
+                                    policy_dir.as_path(),
+                                    cycle_id,
+                                );
+                            }
                         }
                         runtime.apply_scan_policy(
                             policy_dir.as_path(),
@@ -1724,7 +1735,7 @@ fn spawn_ephemeral_watch_maintenance_loop(
         loop {
             tokio::time::sleep(interval).await;
             for (path, cycle_id) in runtime.take_due_rotating_cold_window_scans() {
-                index.enqueue_dirty_dirs(vec![path], DirtyReason::RotatingColdWindow { cycle_id });
+                enqueue_rotating_scan_only(&index, vec![path], cycle_id);
             }
             for removal in runtime.expire_ephemeral_watches(
                 tiered.ephemeral_idle_secs,
@@ -1884,15 +1895,14 @@ fn spawn_rotating_cold_window_loop(
             }
 
             if !scan_only_dirs.is_empty() {
-                index.enqueue_dirty_dirs(
-                    scan_only_dirs,
-                    DirtyReason::RotatingColdWindow {
-                        cycle_id: tick.cycle_id,
-                    },
-                );
+                enqueue_rotating_scan_only(&index, scan_only_dirs, tick.cycle_id);
             }
         }
     });
+}
+
+fn enqueue_rotating_scan_only(index: &TieredIndex, dirs: Vec<PathBuf>, cycle_id: u64) {
+    index.enqueue_recursive_dirty_dirs(dirs, DirtyReason::RotatingColdWindow { cycle_id });
 }
 
 fn spawn_proc_sampler_loop(
@@ -2134,6 +2144,20 @@ mod tests {
             RotatingColdWindowActionKind::ScanOnly,
             true,
         ));
+    }
+
+    #[test]
+    fn rotating_scan_only_uses_recursive_repair_with_cycle_provenance() {
+        let root = temp_root("rotating-scan-only-recursive");
+        let index = TieredIndex::empty(vec![root.clone()]);
+
+        enqueue_rotating_scan_only(&index, vec![root.clone()], 42);
+        std::thread::sleep(Duration::from_millis(260));
+
+        let entry = index.dirty_queue_ready_batch(1).pop().unwrap();
+        assert!(entry.requires_recursive_subtree_repair());
+        assert_eq!(entry.rotating_cold_window_cycle_id(), Some(42));
+        assert_eq!(entry.scope.dir_paths(), &[root]);
     }
 
     fn temp_root(tag: &str) -> PathBuf {

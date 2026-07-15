@@ -1,4 +1,4 @@
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 
 use roaring::RoaringBitmap;
 
@@ -22,7 +22,7 @@ pub(super) const V7_SEGMENT_ORDER: [V7SegKind; 6] = [
 ];
 
 struct SegmentChecksumWriter<'a> {
-    file: &'a mut std::fs::File,
+    file: &'a mut dyn Write,
     segment_crc: Crc32c,
     global_crc: &'a mut Crc32c,
     len: u64,
@@ -86,15 +86,18 @@ impl<'a> V7StreamingWriter<'a> {
 
         self.write_alignment_padding()?;
         let offset = self.cursor;
-        let mut sink = SegmentChecksumWriter {
-            file: self.file,
-            segment_crc: Crc32c::new(),
-            global_crc: &mut self.global_crc,
-            len: 0,
+        let (len, crc32c) = {
+            let mut buffered = BufWriter::with_capacity(64 * 1024, &mut *self.file);
+            let mut sink = SegmentChecksumWriter {
+                file: &mut buffered,
+                segment_crc: Crc32c::new(),
+                global_crc: &mut self.global_crc,
+                len: 0,
+            };
+            producer(&mut sink)?;
+            sink.flush()?;
+            (sink.len, sink.segment_crc.finalize())
         };
-        producer(&mut sink)?;
-        let len = sink.len;
-        let crc32c = sink.segment_crc.finalize();
         self.cursor = self.cursor.saturating_add(len);
         self.segment_descs.push(V7SegDesc {
             offset,

@@ -291,6 +291,19 @@ impl TieredWatchRuntime {
             .count()
     }
 
+    /// Grants query hotset leases only where no recursive ephemeral watcher exists.
+    pub fn grant_query_fast_scan_leases(
+        &self,
+        dirs: impl IntoIterator<Item = PathBuf>,
+        ttl_secs: Option<u64>,
+        source_score: u64,
+    ) -> usize {
+        let uncovered = dirs
+            .into_iter()
+            .filter(|path| !self.confirmed_ephemeral_watch_covers(path));
+        self.grant_fast_scan_leases(uncovered, FastScanLeaseKind::Query, ttl_secs, source_score)
+    }
+
     pub fn grant_fast_scan_lease(
         &self,
         path: PathBuf,

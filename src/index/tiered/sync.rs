@@ -125,6 +125,105 @@ struct SlicedScanOutcome {
     next_cursor: Option<DirtyRepairCursor>,
     child_dirs: Vec<PathBuf>,
     dropped_stale_batch: bool,
+    failed: bool,
+    dir_start_stamp: Option<(FileKey, i64)>,
+}
+
+type DirectoryStamp = (PathBuf, FileKey, i64);
+
+struct RepairContinuationState {
+    cursor: Option<DirtyRepairCursor>,
+    completion_stamps: Option<Vec<DirectoryStamp>>,
+}
+
+fn repair_continuation_cursor(
+    entry: &mut DirtyQueueEntry,
+    sliced: &SlicedScanOutcome,
+    recursive_subtree_repair: bool,
+) -> RepairContinuationState {
+    if sliced.dropped_stale_batch || sliced.failed {
+        return RepairContinuationState {
+            cursor: None,
+            completion_stamps: None,
+        };
+    }
+    if !recursive_subtree_repair {
+        return RepairContinuationState {
+            cursor: sliced.next_cursor.clone(),
+            completion_stamps: None,
+        };
+    }
+
+    let (current_dir, mut pending_dirs, mut completed_dir_stamps) = entry
+        .repair_cursor
+        .take()
+        .map(DirtyRepairCursor::into_recursive_collections)
+        .unwrap_or_else(|| {
+            (
+                entry.scope.dir_paths()[0].clone(),
+                Default::default(),
+                Vec::new(),
+            )
+        });
+    pending_dirs.extend(sliced.child_dirs.iter().cloned());
+    if sliced.completed {
+        let Some((file_key, dir_start_mtime_ns)) = sliced.dir_start_stamp else {
+            return RepairContinuationState {
+                cursor: None,
+                completion_stamps: None,
+            };
+        };
+        completed_dir_stamps.push((current_dir, file_key, dir_start_mtime_ns));
+    }
+
+    if let Some(cursor) = &sliced.next_cursor {
+        return RepairContinuationState {
+            cursor: Some(DirtyRepairCursor::from_recursive_collections(
+                cursor.dir.clone(),
+                cursor.offset,
+                pending_dirs,
+                completed_dir_stamps,
+                sliced.dir_start_stamp,
+            )),
+            completion_stamps: None,
+        };
+    }
+    if !sliced.completed || pending_dirs.is_empty() {
+        return RepairContinuationState {
+            cursor: None,
+            completion_stamps: sliced.completed.then_some(completed_dir_stamps),
+        };
+    }
+
+    let next_dir = pending_dirs
+        .pop_first()
+        .expect("pending dir checked non-empty");
+    RepairContinuationState {
+        cursor: Some(DirtyRepairCursor::from_recursive_collections(
+            next_dir,
+            0,
+            pending_dirs,
+            completed_dir_stamps,
+            None,
+        )),
+        completion_stamps: None,
+    }
+}
+
+fn recursive_completion_stable(stamps: &[DirectoryStamp]) -> bool {
+    stamps
+        .iter()
+        .all(|(dir, expected_file_key, expected_mtime_ns)| {
+            std::fs::symlink_metadata(dir)
+                .ok()
+                .filter(|meta| meta.is_dir())
+                .and_then(|meta| {
+                    let file_key = FileKey::from_path_and_metadata(dir, &meta)?;
+                    let mtime_ns = mtime_to_ns(meta.modified().ok());
+                    Some(file_key == *expected_file_key && mtime_ns == *expected_mtime_ns)
+                })
+                .unwrap_or(false)
+        })
 }
 
 #[derive(Debug)]
@@ -736,12 +835,14 @@ impl TieredIndex {
         }
         {
             let mut queue = self.dirty_queue.lock();
-            queue.enqueue_recursive(
-                DirtyScope::dirs(now_ns(), dirs),
-                reason,
-                reason.default_priority(),
-                now_ns(),
-            );
+            for dir in dirs {
+                queue.enqueue_recursive(
+                    DirtyScope::dirs(now_ns(), vec![dir]),
+                    reason,
+                    reason.default_priority(),
+                    now_ns(),
+                );
+            }
         }
         self.dirty_notify.notify_one();
     }
@@ -841,7 +942,7 @@ impl TieredIndex {
 
     pub fn process_dirty_entry_with_project_markers_and_manifest_skip_dirs(
         &self,
-        entry: DirtyQueueEntry,
+        mut entry: DirtyQueueEntry,
         ignore_prefixes: &[PathBuf],
         project_markers: &[String],
         manifest_skip_dirs: &HashSet<PathBuf>,
@@ -861,7 +962,8 @@ impl TieredIndex {
                 return report;
             }
             DirtyScope::Dirs { dirs, .. } => {
-                if entry.reason == DirtyReason::StartupRepairDeferred {
+                let recursive_subtree_repair = entry.requires_recursive_subtree_repair();
+                if entry.reason == DirtyReason::StartupRepairDeferred && !recursive_subtree_repair {
                     let sync = self.fast_sync(entry.scope.clone(), ignore_prefixes);
                     report.dirs_scanned = sync.dirs_scanned;
                     report.fast_sync_upserts = sync.upsert_events;
@@ -869,7 +971,7 @@ impl TieredIndex {
                     report.changed = sync.upsert_events.saturating_add(sync.delete_events);
                     return report;
                 }
-                if entry.reason == DirtyReason::FastScanChangedDir {
+                if entry.reason == DirtyReason::FastScanChangedDir && !recursive_subtree_repair {
                     let sync = self.fast_sync(entry.scope.clone(), ignore_prefixes);
                     report.dirs_scanned = sync.dirs_scanned;
                     report.fast_sync_upserts = sync.upsert_events;
@@ -886,19 +988,30 @@ impl TieredIndex {
                             },
                             reason: entry.reason,
                             manifest_skipped: false,
+                            completion_ready: true,
                         });
                     }
                     return report;
                 }
+                let scan_dirs = if recursive_subtree_repair {
+                    entry
+                        .repair_cursor
+                        .as_ref()
+                        .map(|cursor| vec![cursor.dir.clone()])
+                        .unwrap_or_else(|| dirs.clone())
+                } else {
+                    dirs.clone()
+                };
                 let mut had_failed_dir = false;
-                for dir in dirs {
+                for dir in &scan_dirs {
                     if should_skip_dirty_dir(dir, ignore_prefixes, &self.exclude_dirs) {
                         continue;
                     }
                     match std::fs::symlink_metadata(dir) {
                         Ok(meta) if meta.is_dir() => {
-                            let allow_manifest_skip =
-                                entry.reason.is_cold_scan() && manifest_skip_dirs.contains(dir);
+                            let allow_manifest_skip = entry.reason.is_cold_scan()
+                                && !recursive_subtree_repair
+                                && manifest_skip_dirs.contains(dir);
                             let discard_if_event_seq_advances = matches!(
                                 entry.reason,
                                 DirtyReason::PeriodicColdScan
@@ -908,57 +1021,84 @@ impl TieredIndex {
                                     | DirtyReason::FastScanChangedDir
                             ) || entry
                                 .requires_recursive_subtree_repair();
-                            let (outcome, manifest_skipped, dropped_stale_batch) =
-                                if entry.reason.is_cold_scan()
-                                    || entry.requires_recursive_subtree_repair()
+                            let (
+                                outcome,
+                                manifest_skipped,
+                                dropped_stale_batch,
+                                completion_ready,
+                                scan_failed,
+                            ) = if entry.reason.is_cold_scan() || recursive_subtree_repair {
+                                let sliced = self.scan_dir_repair_slice_with_project_markers(
+                                    dir,
+                                    entry.repair_cursor.as_ref(),
+                                    ignore_prefixes,
+                                    project_markers,
+                                    allow_manifest_skip,
+                                    discard_if_event_seq_advances,
+                                    recursive_subtree_repair,
+                                );
+                                let continuation_state = repair_continuation_cursor(
+                                    &mut entry,
+                                    &sliced,
+                                    recursive_subtree_repair,
+                                );
+                                let continuation = continuation_state.cursor;
+                                let mut completion_ready = sliced.completed
+                                    && !sliced.dropped_stale_batch
+                                    && !sliced.failed
+                                    && continuation.is_none();
+                                let mut scan_failed = sliced.failed;
+                                if completion_ready
+                                    && recursive_subtree_repair
+                                    && !continuation_state
+                                        .completion_stamps
+                                        .as_deref()
+                                        .is_some_and(recursive_completion_stable)
                                 {
-                                    let sliced = self.scan_dir_repair_slice_with_project_markers(
-                                        dir,
-                                        entry.repair_cursor.as_ref(),
+                                    completion_ready = false;
+                                    scan_failed = true;
+                                }
+                                if let Some(cursor) = continuation {
+                                    let continuation_scope = if recursive_subtree_repair {
+                                        entry.scope.dir_paths()[0].clone()
+                                    } else {
+                                        dir.clone()
+                                    };
+                                    self.enqueue_dirty_repair_slice(
+                                        continuation_scope,
+                                        &entry,
+                                        cursor,
+                                    );
+                                }
+                                if completion_ready && entry.reason.is_cold_scan() {
+                                    self.mark_cold_sweep_completed();
+                                }
+                                (
+                                    sliced.outcome,
+                                    sliced.manifest_skipped,
+                                    sliced.dropped_stale_batch,
+                                    completion_ready,
+                                    scan_failed,
+                                )
+                            } else {
+                                let scanned = self
+                                    .scan_dirs_with_depth_and_project_markers_budgeted(
+                                        &[dir],
+                                        Some(1),
+                                        10_000,
                                         project_markers,
-                                        allow_manifest_skip,
+                                        None,
                                         discard_if_event_seq_advances,
                                     );
-                                    if let Some(cursor) = sliced.next_cursor {
-                                        self.enqueue_dirty_repair_slice(
-                                            dir.clone(),
-                                            entry.reason,
-                                            entry.requires_recursive_subtree_repair(),
-                                            entry.priority,
-                                            entry.rotating_cold_window_cycle_id(),
-                                            cursor,
-                                        );
-                                    }
-                                    if entry.requires_recursive_subtree_repair()
-                                        && !sliced.dropped_stale_batch
-                                    {
-                                        for child_dir in &sliced.child_dirs {
-                                            self.enqueue_recursive_dirty_dirs(
-                                                vec![child_dir.clone()],
-                                                entry.reason,
-                                            );
-                                        }
-                                    }
-                                    if sliced.completed && entry.reason.is_cold_scan() {
-                                        self.mark_cold_sweep_completed();
-                                    }
-                                    (
-                                        sliced.outcome,
-                                        sliced.manifest_skipped,
-                                        sliced.dropped_stale_batch,
-                                    )
-                                } else {
-                                    let scanned = self
-                                        .scan_dirs_with_depth_and_project_markers_budgeted(
-                                            &[dir],
-                                            Some(1),
-                                            10_000,
-                                            project_markers,
-                                            None,
-                                            discard_if_event_seq_advances,
-                                        );
-                                    (scanned.outcome, false, scanned.dropped_stale_batch)
-                                };
+                                (
+                                    scanned.outcome,
+                                    false,
+                                    scanned.dropped_stale_batch,
+                                    !scanned.dropped_stale_batch,
+                                    false,
+                                )
+                            };
+                            had_failed_dir |= scan_failed;
                             if dropped_stale_batch {
                                 report.dropped_stale_batches =
                                     report.dropped_stale_batches.saturating_add(1);
@@ -972,13 +1112,23 @@ impl TieredIndex {
                                 outcome,
                                 reason: entry.reason,
                                 manifest_skipped,
+                                completion_ready,
                             });
                         }
                         Ok(_) => {
                             had_failed_dir = true;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            had_failed_dir = true;
+                            // Fast-scan work can race workload cleanup. Once the
+                            // target directory is gone there is nothing left to
+                            // bootstrap or validate, so retrying only creates
+                            // stale I/O and an eventual retry-budget warning.
+                            if !matches!(
+                                entry.reason,
+                                DirtyReason::FastScanBootstrapDir | DirtyReason::FastScanChangedDir
+                            ) {
+                                had_failed_dir = true;
+                            }
                         }
                         Err(e) => {
                             tracing::debug!(
@@ -990,8 +1140,9 @@ impl TieredIndex {
                         }
                     }
                 }
-                report.failed = had_failed_dir && report.dirs_scanned == 0;
-                if entry.requires_recursive_subtree_repair() && report.dropped_stale_batches > 0 {
+                report.failed = had_failed_dir;
+                if recursive_subtree_repair && (had_failed_dir || report.dropped_stale_batches > 0)
+                {
                     report.failed = true;
                 }
             }
@@ -1003,21 +1154,15 @@ impl TieredIndex {
     fn enqueue_dirty_repair_slice(
         &self,
         dir: PathBuf,
-        reason: DirtyReason,
-        recursive_subtree_repair: bool,
-        priority: DirtyPriority,
-        rotating_cold_window_cycle_id: Option<u64>,
+        source: &DirtyQueueEntry,
         cursor: DirtyRepairCursor,
     ) {
         {
             let mut queue = self.dirty_queue.lock();
             queue.enqueue_repair_slice(
                 DirtyScope::dirs(now_ns(), vec![dir]),
-                reason,
-                recursive_subtree_repair,
-                priority,
+                source,
                 now_ns(),
-                rotating_cold_window_cycle_id,
                 cursor,
             );
         }
@@ -1468,10 +1613,24 @@ impl TieredIndex {
         &self,
         dir: &PathBuf,
         cursor: Option<&DirtyRepairCursor>,
+        ignore_prefixes: &[PathBuf],
         project_markers: &[String],
         allow_manifest_skip: bool,
         discard_if_event_seq_advances: bool,
+        force_scan: bool,
     ) -> SlicedScanOutcome {
+        let dir_start_stamp = cursor
+            .and_then(DirtyRepairCursor::current_dir_start_stamp)
+            .or_else(|| {
+                std::fs::symlink_metadata(dir)
+                    .ok()
+                    .filter(|meta| meta.is_dir())
+                    .and_then(|meta| {
+                        let file_key = FileKey::from_path_and_metadata(dir, &meta)?;
+                        Some((file_key, mtime_to_ns(meta.modified().ok())))
+                    })
+            });
+
         // Phase 3：标记 mtime 预检是否判定为"变了或首次扫描"（Some(false) 或 None）。
         // 供段 1.5（unbounded summary 二次确认）使用。
         let mut mtime_precheck_changed = false;
@@ -1479,7 +1638,7 @@ impl TieredIndex {
         // ===== 段 1：目录 mtime 预检（Phase 1 新增）=====
         // 对所有 PeriodicColdScan 目录生效，独立于 allow_manifest_skip，
         // 在 manifest skip（段 2）之前执行——廉价优先（1 stat vs ≤512 stat）。
-        if cursor.is_none() {
+        if cursor.is_none() && !force_scan {
             if self.clock_cutoff_trusted() {
                 match std::fs::symlink_metadata(dir) {
                     Ok(dir_meta) => match dir_meta.modified() {
@@ -1511,6 +1670,8 @@ impl TieredIndex {
                                         next_cursor: None,
                                         child_dirs: Vec::new(),
                                         dropped_stale_batch: false,
+                                        failed: false,
+                                        dir_start_stamp,
                                     };
                                 }
                                 Some(false) => {
@@ -1569,6 +1730,8 @@ impl TieredIndex {
                         next_cursor: None,
                         child_dirs: Vec::new(),
                         dropped_stale_batch: false,
+                        failed: false,
+                        dir_start_stamp,
                     };
                 }
                 self.directory_manifests
@@ -1605,6 +1768,8 @@ impl TieredIndex {
                             next_cursor: None,
                             child_dirs: Vec::new(),
                             dropped_stale_batch: false,
+                            failed: false,
+                            dir_start_stamp,
                         };
                     }
                 }
@@ -1637,6 +1802,8 @@ impl TieredIndex {
                     next_cursor: None,
                     child_dirs: Vec::new(),
                     dropped_stale_batch: false,
+                    failed: true,
+                    dir_start_stamp,
                 };
             }
         };
@@ -1647,11 +1814,15 @@ impl TieredIndex {
         let mut child_dirs = Vec::new();
         let mut scanned = 0usize;
         let mut changed = 0usize;
+        let mut metadata_failed = false;
         let mut seq = 0u64;
         let hidden_markers_enabled = project_markers.iter().any(|marker| marker.starts_with('.'));
 
         for child in &slice.entries {
             let path = super::normalize_path(child.path.as_path());
+            if should_skip_dirty_dir(path.as_path(), ignore_prefixes, &self.exclude_dirs) {
+                continue;
+            }
             self.io_governor.before_io();
             let meta = match std::fs::symlink_metadata(&path) {
                 Ok(meta) => meta,
@@ -1661,6 +1832,7 @@ impl TieredIndex {
                         path.display(),
                         err
                     );
+                    metadata_failed = true;
                     continue;
                 }
             };
@@ -1713,25 +1885,41 @@ impl TieredIndex {
 
         let stale_low_priority_scan = discard_if_event_seq_advances
             && self.event_seq.load(Ordering::Relaxed) > scan_started_seq;
-        if stale_low_priority_scan {
+        let mut dropped_stale_batch = stale_low_priority_scan;
+        let mut alignment_started_seq = None;
+        if stale_low_priority_scan || metadata_failed {
             tracing::debug!(
-                "discarded stale low-priority repair slice after newer apply seq advanced"
+                "discarded incomplete repair slice after event advance or metadata failure"
             );
             changed = 0;
-        } else if !upsert_events.is_empty() {
-            self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
+        } else if discard_if_event_seq_advances {
+            alignment_started_seq = self.apply_upserted_metas_if_event_seq(
+                upsert_events.as_slice(),
+                &mut upsert_metas,
+                true,
+                scan_started_seq,
+            );
+            if alignment_started_seq.is_none() {
+                dropped_stale_batch = true;
+                changed = 0;
+            }
+        } else {
+            if !upsert_events.is_empty() {
+                self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
+            }
+            alignment_started_seq = Some(self.event_seq.load(Ordering::Relaxed));
         }
 
         let completed = slice.completed;
-        let mut dropped_stale_batch = stale_low_priority_scan;
-        if completed && !dropped_stale_batch {
-            let alignment_started_seq = self.event_seq.load(Ordering::Relaxed);
-            let (deleted, dropped_stale) =
-                self.align_missing_indexed_direct_children(dir, alignment_started_seq);
+        if completed && !dropped_stale_batch && !metadata_failed {
+            let (deleted, dropped_stale) = self.align_missing_indexed_direct_children(
+                dir,
+                alignment_started_seq.expect("trusted repair slice apply sequence"),
+            );
             changed = changed.saturating_add(deleted);
             dropped_stale_batch |= dropped_stale;
         }
-        if completed && !dropped_stale_batch {
+        if completed && !dropped_stale_batch && !metadata_failed {
             if let Some((summary, true)) = self.directory_manifest_summary_bounded(
                 dir,
                 project_markers,
@@ -1774,6 +1962,8 @@ impl TieredIndex {
             },
             child_dirs,
             dropped_stale_batch,
+            failed: metadata_failed,
+            dir_start_stamp,
         }
     }
 

@@ -441,6 +441,16 @@ def _stability_summary(
     unattributed_post_ready_rebuilds = max(
         0, post_ready_rebuilds - snapshot_quiesce_rebuilds
     )
+    log_lines = log_text.splitlines()
+    watch_remove_failures = sum(
+        "tiered " in line and " remove failed" in line
+        for line in log_lines
+    )
+    dirty_queue_retry_drops = sum(
+        "dirty queue dropped entry after retry budget" in line
+        or "dirty queue retry failed, entry dropped after worker task failure" in line
+        for line in log_lines
+    )
     return {
         "snapshot_rebuild_observed": bool(snapshot.get("rebuild_observed")),
         "snapshot_ready": bool(snapshot.get("ready")),
@@ -459,6 +469,8 @@ def _stability_summary(
         ),
         "dirty_queue_len_last": int(watch.get("dirty_queue_len_last", 0) or 0),
         "log_error_count": log_text.count("ERROR"),
+        "watch_remove_failure_count": watch_remove_failures,
+        "dirty_queue_retry_drop_count": dirty_queue_retry_drops,
         "direct_v7_unsupported_count": log_text.count("direct_v7_unsupported"),
         "background_rebuild_count": len(rebuild_records),
         "bootstrap_background_rebuild_count": bootstrap_rebuilds,

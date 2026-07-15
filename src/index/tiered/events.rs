@@ -380,12 +380,36 @@ impl TieredIndex {
         log_to_wal: bool,
     ) {
         let _snapshot_boundary = self.snapshot_event_gate.lock();
+        self.apply_upserted_metas_locked(events, metas, log_to_wal);
+    }
+
+    pub(super) fn apply_upserted_metas_if_event_seq(
+        &self,
+        events: &[EventRecord],
+        metas: &mut Vec<FileMeta>,
+        log_to_wal: bool,
+        expected_event_seq: u64,
+    ) -> Option<u64> {
+        let _snapshot_boundary = self.snapshot_event_gate.lock();
+        if self.event_seq.load(Ordering::Relaxed) != expected_event_seq {
+            metas.clear();
+            return None;
+        }
+        Some(self.apply_upserted_metas_locked(events, metas, log_to_wal))
+    }
+
+    fn apply_upserted_metas_locked(
+        &self,
+        events: &[EventRecord],
+        metas: &mut Vec<FileMeta>,
+        log_to_wal: bool,
+    ) -> u64 {
         let events = self.filter_upserted_for_freeze(events, metas);
         let Some(batch) =
             self.begin_apply_batch(events.as_slice(), log_to_wal, Some(metas.as_slice()))
         else {
             metas.clear();
-            return;
+            return self.event_seq.load(Ordering::Relaxed);
         };
         if batch.rebuild_in_progress {
             batch.l2.apply_file_metas(metas.as_slice());
@@ -393,9 +417,11 @@ impl TieredIndex {
             batch.l2.apply_file_metas_drain(metas);
         }
         metas.clear();
-        self.event_seq
+        let previous = self
+            .event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
         self.stats.record_events_applied(batch.event_count as u64);
+        previous.saturating_add(batch.event_count as u64)
     }
 }
 

@@ -1566,6 +1566,74 @@ fn ephemeral_watch_created_after_repeated_dirty_scope() {
 }
 
 #[test]
+fn query_fast_scan_skips_confirmed_ephemeral_watch_coverage() {
+    let root = temp_root("query-fast-scan-ephemeral-cover");
+    let child = root.join("repo/src");
+    std::fs::create_dir_all(&child).unwrap();
+    let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 4);
+    let cfg = EphemeralWatchConfig {
+        budget: 4,
+        repeat_threshold: 1,
+        max_cost_per_root: 4,
+        ..EphemeralWatchConfig::default()
+    };
+
+    assert_eq!(
+        rt.note_dirty_scope_with_changed(root.clone(), 1, &[], &cfg, 1),
+        EphemeralWatchDecision::Add(root.clone())
+    );
+    rt.confirm_ephemeral_added(root.as_path());
+
+    assert_eq!(
+        rt.grant_query_fast_scan_leases(vec![child.clone()], None, 2),
+        0
+    );
+    let report = rt.report();
+    assert_eq!(report.fast_scan_hotset_lease_count, 0);
+    assert_eq!(report.fast_scan_lease_renewals, 0);
+
+    assert!(rt.grant_fast_scan_lease(child.clone(), FastScanLeaseKind::Query, Some(2), 2,));
+    let before = rt.report();
+    assert_eq!(before.fast_scan_hotset_lease_count, 1);
+    assert_eq!(rt.grant_query_fast_scan_leases(vec![child], None, 2), 0);
+    let after = rt.report();
+    assert_eq!(after.fast_scan_hotset_lease_count, 1);
+    assert_eq!(
+        after.fast_scan_lease_renewals,
+        before.fast_scan_lease_renewals
+    );
+    assert!(rt.confirmed_ephemeral_watch_covers(root.join("repo").as_path()));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn query_fast_scan_treats_expired_but_not_removed_watcher_as_covered() {
+    let root = temp_root("query-fast-scan-expired-ephemeral-cover");
+    let child = root.join("repo/src");
+    std::fs::create_dir_all(&child).unwrap();
+    let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 4);
+    let cfg = EphemeralWatchConfig {
+        budget: 4,
+        ttl_secs: 1,
+        repeat_threshold: 1,
+        max_cost_per_root: 4,
+        ..EphemeralWatchConfig::default()
+    };
+
+    assert_eq!(
+        rt.note_dirty_scope_at(root.clone(), 1, &[], &cfg, 100, 1),
+        EphemeralWatchDecision::Add(root.clone())
+    );
+    assert!(rt.confirm_ephemeral_added(root.as_path()));
+    assert!(rt.confirmed_ephemeral_watch_covers(child.as_path()));
+    assert_eq!(rt.grant_query_fast_scan_leases(vec![child], None, 2), 0);
+    assert_eq!(rt.report().fast_scan_hotset_lease_count, 0);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn ephemeral_watch_respects_exclude_l0_and_cost_limits() {
     let rt = TieredWatchRuntime::new_with_ephemeral(
         vec![(PathBuf::from("/tmp/hot"), 1)],

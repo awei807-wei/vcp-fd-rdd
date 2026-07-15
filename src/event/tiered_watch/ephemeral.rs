@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use crate::util::unix_secs;
 
@@ -57,6 +58,15 @@ pub(super) struct DirtyScopeObservation {
 }
 
 impl TieredWatchRuntime {
+    /// Returns whether an installed ephemeral recursive watcher covers `path`.
+    pub fn confirmed_ephemeral_watch_covers(&self, path: &Path) -> bool {
+        self.ephemeral.read().iter().any(|(root, lease)| {
+            !lease.pending_add
+                && !lease.pending_remove
+                && path_is_under_or_equal(path, root.as_path())
+        })
+    }
+
     pub fn constrain_ephemeral_watch_ttl(&self, path: &Path, ttl_secs: u64) -> bool {
         self.constrain_ephemeral_watch_ttl_at(path, ttl_secs, unix_secs())
     }
@@ -406,13 +416,37 @@ impl TieredWatchRuntime {
         removals
     }
 
-    pub fn confirm_ephemeral_added(&self, path: &Path) {
+    pub fn confirm_ephemeral_added(&self, path: &Path) -> bool {
         if let Some(lease) = self.ephemeral.write().get_mut(path) {
-            if lease.pending_add {
+            if lease.pending_add && !lease.pending_remove {
                 lease.pending_add = false;
                 self.ephemeral_watch_created.fetch_add(1, Ordering::Relaxed);
+                return true;
             }
         }
+        false
+    }
+
+    pub fn confirm_ephemeral_added_for_cycle(
+        &self,
+        path: &Path,
+        expected_cycle_id: Option<u64>,
+    ) -> bool {
+        let Some(expected_cycle_id) = expected_cycle_id else {
+            return self.confirm_ephemeral_added(path);
+        };
+        let now_unix_secs = unix_secs();
+        let now = Instant::now();
+        let rotating_leases = self.rotating_cold_window_leases.read();
+        let current = rotating_leases.get(path).is_some_and(|lease| {
+            lease.cycle_id == expected_cycle_id
+                && lease.action == RotatingColdWindowActionKind::EphemeralWatch
+                && lease.is_active(now_unix_secs, now)
+        });
+        if !current {
+            return false;
+        }
+        self.confirm_ephemeral_added(path)
     }
 
     pub fn rollback_ephemeral_add(&self, path: &Path) {

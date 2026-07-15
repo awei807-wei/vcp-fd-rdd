@@ -133,6 +133,7 @@ pub struct DirtyScanOutcome {
     pub outcome: ScanOutcome,
     pub reason: crate::event::sync::DirtyReason,
     pub manifest_skipped: bool,
+    pub completion_ready: bool,
 }
 
 #[derive(Clone, Debug, Default)]

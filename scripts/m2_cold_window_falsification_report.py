@@ -58,7 +58,7 @@ def _paired_cost_lines(gate: dict[str, Any]) -> list[str]:
 
 def _leg_result_lines(legs: list[dict[str, Any]]) -> list[str]:
     lines = [
-        "| block | order | leg | valid | bursts/expected records | unique assertions | positive/negative | visibility (p95 s / transport errors) | polls | target M2 seen/active/causal | sampling coverage/max gap | tier before | soft ratio/end | errors / rebuild total:bootstrap:quiesce:unattributed / window |",
+        "| block | order | leg | valid | bursts/expected records | unique assertions | positive/negative | visibility (p95 s / transport errors) | polls | target M2 seen/active/causal | sampling coverage/max gap | tier before | soft ratio/end | errors / watcher-remove / dirty-drop / rebuild total:bootstrap:quiesce:unattributed / window |",
         "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---|",
     ]
     for leg in legs:
@@ -86,6 +86,8 @@ def _leg_result_lines(legs: list[dict[str, Any]]) -> list[str]:
             f"{stability['waterline_soft_degraded_ratio']:.4f}/"
             f"{stability['waterline_soft_degraded_last']} | "
             f"{stability['log_error_count']}/"
+            f"{stability.get('watch_remove_failure_count', 0)}/"
+            f"{stability.get('dirty_queue_retry_drop_count', 0)}/"
             f"{stability.get('background_rebuild_count', 0)}:"
             f"{stability.get('bootstrap_background_rebuild_count', 0)}:"
             f"{stability.get('snapshot_quiesce_background_rebuild_count', 0)}:"

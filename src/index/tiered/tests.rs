@@ -1127,8 +1127,45 @@ fn sliced_repair_processes_large_dir_in_bounded_chunks() {
 }
 
 #[test]
-fn recursive_subtree_repair_walks_deep_tree_through_bounded_queue_entries() {
-    let root = unique_tmp_dir("recursive-subtree-repair");
+fn multi_dir_cold_scan_continuation_stays_with_the_sliced_directory() {
+    let root = unique_tmp_dir("multi-dir-sliced-repair");
+    let first_dir = root.join("a-small");
+    let second_dir = root.join("b-large");
+    std::fs::create_dir_all(&first_dir).unwrap();
+    std::fs::create_dir_all(&second_dir).unwrap();
+    std::fs::write(first_dir.join("first.txt"), b"first").unwrap();
+    for i in 0..620 {
+        std::fs::write(second_dir.join(format!("second_{i:04}.txt")), b"second").unwrap();
+    }
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.enqueue_dirty_dirs(
+        vec![first_dir.clone(), second_dir.clone()],
+        DirtyReason::PeriodicColdScan,
+    );
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let first = idx.process_dirty_entry(entry, &[]);
+    assert!(!first.failed);
+    assert_eq!(first.outcomes.len(), 2);
+    assert_eq!(idx.dirty_queue_len(), 1);
+
+    let continuation = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    assert_eq!(
+        continuation.scope.dir_paths(),
+        std::slice::from_ref(&second_dir)
+    );
+    assert_eq!(continuation.repair_cursor.as_ref().unwrap().dir, second_dir);
+    let second = idx.process_dirty_entry(continuation, &[]);
+    assert!(!second.failed);
+    assert_eq!(second.outcomes[0].outcome.scanned, 108);
+    assert_eq!(idx.dirty_queue_len(), 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recursive_scan_only_repair_preserves_cycle_until_deep_subtree_completion() {
+    let root = unique_tmp_dir("recursive-scan-only-repair");
     let destination = root.join("renamed/level1/level2");
     std::fs::create_dir_all(&destination).unwrap();
     let file = destination.join("deep-repair-visible.txt");
@@ -1139,18 +1176,31 @@ fn recursive_subtree_repair_walks_deep_tree_through_bounded_queue_entries() {
         vec![root.join("renamed")],
         DirtyReason::RotatingColdWindow { cycle_id: 42 },
     );
+    idx.enqueue_dirty_dirs(vec![root.join("renamed")], DirtyReason::InotifyEvent);
 
     let mut processed = 0usize;
+    let mut completions = 0usize;
     while processed < 16 {
         let batch = idx.dirty_queue.lock().pop_ready(u64::MAX, 16);
         if batch.is_empty() {
             break;
         }
         for entry in batch {
+            assert_eq!(entry.reason, DirtyReason::InotifyEvent);
             assert!(entry.requires_recursive_subtree_repair());
             assert_eq!(entry.rotating_cold_window_cycle_id(), Some(42));
             let report = idx.process_dirty_entry(entry, &[]);
             assert!(!report.failed);
+            completions = completions.saturating_add(
+                report
+                    .outcomes
+                    .iter()
+                    .filter(|outcome| outcome.completion_ready)
+                    .count(),
+            );
+            if idx.dirty_queue_len() > 0 {
+                assert_eq!(completions, 0, "completion published before descendants");
+            }
             processed = processed.saturating_add(1);
         }
     }
@@ -1160,10 +1210,240 @@ fn recursive_subtree_repair_walks_deep_tree_through_bounded_queue_entries() {
         "each directory level should be queued separately"
     );
     assert_eq!(idx.dirty_queue_len(), 0);
+    assert_eq!(completions, 1);
     assert!(idx
         .query("deep-repair-visible")
         .iter()
         .any(|meta| meta.path == file));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fast_scan_reason_merge_cannot_bypass_recursive_completion() {
+    let root = unique_tmp_dir("recursive-fast-scan-reason-merge");
+    let child = root.join("nested");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(child.join("deep.txt"), b"deep").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.enqueue_recursive_dirty_dirs(
+        vec![root.clone()],
+        DirtyReason::RotatingColdWindow { cycle_id: 91 },
+    );
+    idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::FastScanChangedDir);
+
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    assert_eq!(entry.reason, DirtyReason::FastScanChangedDir);
+    assert!(entry.requires_recursive_subtree_repair());
+    assert_eq!(entry.rotating_cold_window_cycle_id(), Some(91));
+    let first = idx.process_dirty_entry(entry, &[]);
+    assert!(!first.failed);
+    assert!(first
+        .outcomes
+        .iter()
+        .all(|outcome| !outcome.completion_ready));
+    assert_eq!(idx.dirty_queue_len(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recursive_repair_skips_ignored_child_without_losing_visible_sibling() {
+    let root = unique_tmp_dir("recursive-ignore-sibling");
+    let ignored = root.join("ignored");
+    let visible = root.join("visible/nested");
+    std::fs::create_dir_all(&ignored).unwrap();
+    std::fs::create_dir_all(&visible).unwrap();
+    std::fs::write(ignored.join("hidden.txt"), b"hidden").unwrap();
+    let visible_file = visible.join("visible.txt");
+    std::fs::write(&visible_file, b"visible").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.enqueue_recursive_dirty_dirs(
+        vec![root.clone()],
+        DirtyReason::RotatingColdWindow { cycle_id: 92 },
+    );
+    let mut completions = 0usize;
+    loop {
+        let batch = idx.dirty_queue.lock().pop_ready(u64::MAX, 1);
+        let Some(entry) = batch.into_iter().next() else {
+            break;
+        };
+        let report = idx.process_dirty_entry(entry, std::slice::from_ref(&ignored));
+        assert!(!report.failed);
+        completions += report
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.completion_ready)
+            .count();
+    }
+
+    assert_eq!(completions, 1);
+    assert!(idx
+        .query("visible.txt")
+        .iter()
+        .any(|meta| meta.path == visible_file));
+    assert!(idx.query("hidden.txt").is_empty());
+    assert!(idx.query("ignored").iter().all(|meta| meta.path != ignored));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recursive_repair_rejects_directory_mutation_between_slices() {
+    let root = unique_tmp_dir("recursive-repair-cross-slice-fence");
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..700 {
+        std::fs::write(root.join(format!("entry_{i:04}.txt")), b"entry").unwrap();
+    }
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.enqueue_recursive_dirty_dirs(
+        vec![root.clone()],
+        DirtyReason::RotatingColdWindow { cycle_id: 77 },
+    );
+    let first_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let first = idx.process_dirty_entry(first_entry, &[]);
+    assert!(!first.failed);
+    assert!(!first.outcomes[0].completion_ready);
+
+    let late = root.join("late-event.txt");
+    std::fs::write(&late, b"late").unwrap();
+    idx.apply_events(&[mk_event(10_000, EventType::Create, late)]);
+
+    let continuation = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    assert!(continuation
+        .repair_cursor
+        .as_ref()
+        .and_then(|cursor| cursor.current_dir_start_stamp())
+        .is_some());
+    let stale = idx.process_dirty_entry(continuation, &[]);
+    assert!(stale.failed);
+    assert!(stale
+        .outcomes
+        .iter()
+        .all(|outcome| !outcome.completion_ready));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recursive_repair_bypasses_parent_manifest_for_git_clone_tree() {
+    let root = unique_tmp_dir("recursive-git-clone-repair");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::PeriodicColdScan);
+    let seed = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    assert!(!idx.process_dirty_entry(seed, &[]).failed);
+
+    let readme = repo.join("git-clone-visible-README.md");
+    let main = repo.join("src/git-clone-visible-main.rs");
+    let smoke = repo.join("tests/git-clone-visible-smoke.rs");
+    std::fs::create_dir_all(main.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(smoke.parent().unwrap()).unwrap();
+    std::fs::write(&readme, b"readme").unwrap();
+    std::fs::write(&main, b"fn main() {}").unwrap();
+    std::fs::write(&smoke, b"test").unwrap();
+
+    idx.enqueue_recursive_dirty_dirs(
+        vec![root.clone()],
+        DirtyReason::RotatingColdWindow { cycle_id: 77 },
+    );
+    let mut completions = 0usize;
+    loop {
+        let entry = { idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop() };
+        let Some(entry) = entry else {
+            break;
+        };
+        assert_eq!(entry.rotating_cold_window_cycle_id(), Some(77));
+        let report = idx.process_dirty_entry(entry, &[]);
+        assert!(!report.failed);
+        completions += report
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.completion_ready)
+            .count();
+    }
+
+    assert_eq!(completions, 1);
+    for path in [readme, main, smoke] {
+        let query = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            idx.query_limit_detailed(&query, 1)
+                .iter()
+                .any(|result| result.meta.path == path),
+            "recursive repair should index {}",
+            path.display()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recursive_repair_indexes_deep_renamed_subtree_before_completion() {
+    let root = unique_tmp_dir("recursive-deep-rename-repair");
+    let old_tree = root.join("old-tree");
+    let old_file = old_tree.join("level1/level2/deep-rename-visible.txt");
+    std::fs::create_dir_all(old_file.parent().unwrap()).unwrap();
+    std::fs::write(&old_file, b"old").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.scan_dirs_immediate_deep(std::slice::from_ref(&old_tree));
+    idx.refresh_base();
+
+    let new_tree = root.join("new-tree");
+    std::fs::rename(&old_tree, &new_tree).unwrap();
+    let new_file = new_tree.join("level1/level2/deep-rename-visible.txt");
+    idx.enqueue_recursive_dirty_dirs(
+        vec![new_tree],
+        DirtyReason::RotatingColdWindow { cycle_id: 88 },
+    );
+
+    let mut completion_positions = Vec::new();
+    let mut processed = 0usize;
+    loop {
+        let entry = { idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop() };
+        let Some(entry) = entry else {
+            break;
+        };
+        let report = idx.process_dirty_entry(entry, &[]);
+        assert!(!report.failed);
+        processed += 1;
+        if report
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.completion_ready)
+        {
+            completion_positions.push(processed);
+        }
+    }
+
+    assert!(processed >= 3);
+    assert_eq!(completion_positions, vec![processed]);
+    assert!(idx
+        .query_limit_detailed("deep-rename-visible", 10)
+        .iter()
+        .any(|result| result.meta.path == new_file));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn missing_fast_scan_bootstrap_dir_is_already_converged() {
+    let root = unique_tmp_dir("missing-fast-scan-bootstrap");
+    let removed = root.join("removed-workload-tree");
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.enqueue_dirty_dirs(vec![removed], DirtyReason::FastScanBootstrapDir);
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let report = idx.process_dirty_entry(entry, &[]);
+
+    assert!(!report.failed);
+    assert_eq!(report.dirs_scanned, 0);
+    assert_eq!(idx.dirty_queue_len(), 0);
 
     let _ = std::fs::remove_dir_all(&root);
 }

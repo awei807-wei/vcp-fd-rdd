@@ -1,8 +1,9 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::core::FileKey;
 use crate::stats::DirtyQueueStats;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,11 +144,95 @@ impl DirtyPriority {
 pub struct DirtyRepairCursor {
     pub dir: PathBuf,
     pub offset: i64,
+    pending_dirs: BTreeSet<PathBuf>,
+    completed_dir_stamps: Vec<(PathBuf, FileKey, i64)>,
+    current_dir_start_stamp: Option<(FileKey, i64)>,
 }
 
 impl DirtyRepairCursor {
     pub fn new(dir: PathBuf, offset: i64) -> Self {
-        Self { dir, offset }
+        Self {
+            dir,
+            offset,
+            pending_dirs: BTreeSet::new(),
+            completed_dir_stamps: Vec::new(),
+            current_dir_start_stamp: None,
+        }
+    }
+
+    pub fn with_pending_dirs(dir: PathBuf, offset: i64, pending_dirs: Vec<PathBuf>) -> Self {
+        Self::with_recursive_state(dir, offset, pending_dirs, Vec::new(), None)
+    }
+
+    pub fn with_recursive_state(
+        dir: PathBuf,
+        offset: i64,
+        pending_dirs: Vec<PathBuf>,
+        completed_dir_stamps: Vec<(PathBuf, FileKey, i64)>,
+        current_dir_start_stamp: Option<(FileKey, i64)>,
+    ) -> Self {
+        Self {
+            dir,
+            offset,
+            pending_dirs: pending_dirs.into_iter().collect(),
+            completed_dir_stamps,
+            current_dir_start_stamp,
+        }
+    }
+
+    pub fn pending_dirs(&self) -> Vec<PathBuf> {
+        self.pending_dirs.iter().cloned().collect()
+    }
+
+    pub fn completed_dir_stamps(&self) -> &[(PathBuf, FileKey, i64)] {
+        self.completed_dir_stamps.as_slice()
+    }
+
+    pub fn current_dir_start_stamp(&self) -> Option<(FileKey, i64)> {
+        self.current_dir_start_stamp
+    }
+
+    pub(crate) fn into_recursive_collections(
+        self,
+    ) -> (PathBuf, BTreeSet<PathBuf>, Vec<(PathBuf, FileKey, i64)>) {
+        (self.dir, self.pending_dirs, self.completed_dir_stamps)
+    }
+
+    pub(crate) fn from_recursive_collections(
+        dir: PathBuf,
+        offset: i64,
+        pending_dirs: BTreeSet<PathBuf>,
+        completed_dir_stamps: Vec<(PathBuf, FileKey, i64)>,
+        current_dir_start_stamp: Option<(FileKey, i64)>,
+    ) -> Self {
+        Self {
+            dir,
+            offset,
+            pending_dirs,
+            completed_dir_stamps,
+            current_dir_start_stamp,
+        }
+    }
+
+    fn pending_dir_count(&self) -> usize {
+        self.pending_dirs.len().saturating_add(1)
+    }
+
+    fn tracked_dir_count(&self) -> usize {
+        self.pending_dir_count()
+            .saturating_add(self.completed_dir_stamps.len())
+    }
+
+    fn tracked_path_bytes(&self) -> u64 {
+        let mut bytes = self.dir.as_os_str().as_encoded_bytes().len() as u64;
+        bytes = bytes.saturating_add(
+            self.pending_dirs
+                .iter()
+                .chain(self.completed_dir_stamps.iter().map(|(path, _, _)| path))
+                .map(|path| path.as_os_str().as_encoded_bytes().len() as u64)
+                .sum(),
+        );
+        bytes
     }
 }
 
@@ -173,6 +258,21 @@ impl DirtyQueueEntry {
     pub fn rotating_cold_window_cycle_id(&self) -> Option<u64> {
         self.rotating_cold_window_cycle_id
     }
+
+    pub(crate) fn clone_without_repair_cursor(&self) -> Self {
+        Self {
+            scope: self.scope.clone(),
+            reason: self.reason,
+            recursive_subtree_repair: self.recursive_subtree_repair,
+            rotating_cold_window_cycle_id: self.rotating_cold_window_cycle_id,
+            priority: self.priority,
+            first_enqueue_ns: self.first_enqueue_ns,
+            last_enqueue_ns: self.last_enqueue_ns,
+            not_before_ns: self.not_before_ns,
+            attempts: self.attempts,
+            repair_cursor: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +281,16 @@ pub struct DirtyQueue {
     retry_base_delay_ns: u64,
     max_attempts: u32,
     entries: HashMap<DirtyScopeKey, DirtyQueueEntry>,
+}
+
+struct DirtyQueueRequest {
+    scope: DirtyScope,
+    reason: DirtyReason,
+    recursive_subtree_repair: bool,
+    rotating_cold_window_cycle_id: Option<u64>,
+    priority: DirtyPriority,
+    repair_cursor: Option<DirtyRepairCursor>,
+    attempts: u32,
 }
 
 impl Default for DirtyQueue {
@@ -227,6 +337,7 @@ impl DirtyQueue {
         let map_capacity = self.entries.capacity();
         let mut pending_dirs = 0usize;
         let mut pending_path_bytes = 0u64;
+        let mut cursor_tracked_dirs = 0usize;
         let mut all_scope_pending = false;
 
         for entry in self.entries.values() {
@@ -239,12 +350,25 @@ impl DirtyQueue {
                     pending_path_bytes = pending_path_bytes.saturating_add(path_bytes(dirs));
                 }
             }
+            if let Some(cursor) = &entry.repair_cursor {
+                pending_dirs = pending_dirs.saturating_add(cursor.pending_dir_count());
+                cursor_tracked_dirs =
+                    cursor_tracked_dirs.saturating_add(cursor.tracked_dir_count());
+                pending_path_bytes = pending_path_bytes.saturating_add(cursor.tracked_path_bytes());
+            }
         }
 
         let map_bytes = map_capacity as u64
             * (size_of::<(DirtyScopeKey, DirtyQueueEntry)>() as u64 + 1)
             + size_of::<HashMap<DirtyScopeKey, DirtyQueueEntry>>() as u64;
-        let estimated_bytes = map_bytes.saturating_add(pending_path_bytes.saturating_mul(2));
+        let cursor_node_bytes = cursor_tracked_dirs as u64
+            * (size_of::<PathBuf>()
+                + size_of::<FileKey>()
+                + size_of::<i64>()
+                + size_of::<usize>() * 3) as u64;
+        let estimated_bytes = map_bytes
+            .saturating_add(pending_path_bytes.saturating_mul(2))
+            .saturating_add(cursor_node_bytes);
 
         DirtyQueueStats {
             pending_scopes,
@@ -263,14 +387,17 @@ impl DirtyQueue {
         priority: DirtyPriority,
         now_ns: u64,
     ) {
-        self.enqueue_inner(
-            scope,
-            reason,
-            reason == DirtyReason::RecursiveSubtreeRepair,
-            priority,
+        self.enqueue_request(
+            DirtyQueueRequest {
+                scope,
+                reason,
+                recursive_subtree_repair: reason == DirtyReason::RecursiveSubtreeRepair,
+                rotating_cold_window_cycle_id: reason.rotating_cold_window_cycle_id(),
+                priority,
+                repair_cursor: None,
+                attempts: 0,
+            },
             now_ns,
-            reason.rotating_cold_window_cycle_id(),
-            None,
         );
     }
 
@@ -281,80 +408,72 @@ impl DirtyQueue {
         priority: DirtyPriority,
         now_ns: u64,
     ) {
-        self.enqueue_inner(
-            scope,
-            reason,
-            true,
-            priority,
+        self.enqueue_request(
+            DirtyQueueRequest {
+                scope,
+                reason,
+                recursive_subtree_repair: true,
+                rotating_cold_window_cycle_id: reason.rotating_cold_window_cycle_id(),
+                priority,
+                repair_cursor: None,
+                attempts: 0,
+            },
             now_ns,
-            reason.rotating_cold_window_cycle_id(),
-            None,
         );
     }
 
     pub fn enqueue_repair_slice(
         &mut self,
         scope: DirtyScope,
-        reason: DirtyReason,
-        recursive_subtree_repair: bool,
-        priority: DirtyPriority,
+        source: &DirtyQueueEntry,
         now_ns: u64,
-        rotating_cold_window_cycle_id: Option<u64>,
         cursor: DirtyRepairCursor,
     ) {
-        self.enqueue_inner(
-            scope,
-            reason,
-            recursive_subtree_repair,
-            priority,
+        self.enqueue_request(
+            DirtyQueueRequest {
+                scope,
+                reason: source.reason,
+                recursive_subtree_repair: source.recursive_subtree_repair,
+                rotating_cold_window_cycle_id: source.rotating_cold_window_cycle_id,
+                priority: source.priority,
+                repair_cursor: Some(cursor),
+                attempts: source.attempts,
+            },
             now_ns,
-            merge_rotating_cycle_id(
-                reason.rotating_cold_window_cycle_id(),
-                rotating_cold_window_cycle_id,
-            ),
-            Some(cursor),
         );
     }
 
-    fn enqueue_inner(
-        &mut self,
-        scope: DirtyScope,
-        reason: DirtyReason,
-        recursive_subtree_repair: bool,
-        priority: DirtyPriority,
-        now_ns: u64,
-        rotating_cold_window_cycle_id: Option<u64>,
-        repair_cursor: Option<DirtyRepairCursor>,
-    ) {
-        let scope = scope.normalized();
+    fn enqueue_request(&mut self, request: DirtyQueueRequest, now_ns: u64) {
+        let scope = request.scope.normalized();
         let key = DirtyScopeKey::from_scope(&scope);
         let not_before_ns = now_ns.saturating_add(self.debounce_ns);
         self.entries
             .entry(key)
             .and_modify(|entry| {
-                entry.reason = merge_reason(entry.reason, reason);
-                entry.recursive_subtree_repair |= recursive_subtree_repair;
+                entry.reason = merge_reason(entry.reason, request.reason);
+                entry.recursive_subtree_repair |= request.recursive_subtree_repair;
                 entry.rotating_cold_window_cycle_id = merge_rotating_cycle_id(
                     entry.rotating_cold_window_cycle_id,
-                    rotating_cold_window_cycle_id,
+                    request.rotating_cold_window_cycle_id,
                 );
-                entry.priority = entry.priority.max(priority);
+                entry.priority = entry.priority.max(request.priority);
                 entry.last_enqueue_ns = now_ns;
                 entry.not_before_ns = not_before_ns;
+                entry.attempts = entry.attempts.max(request.attempts);
                 entry.repair_cursor =
-                    merge_repair_cursor(entry.repair_cursor.take(), repair_cursor.clone());
+                    merge_repair_cursor(entry.repair_cursor.take(), request.repair_cursor.clone());
             })
             .or_insert_with(|| DirtyQueueEntry {
                 scope,
-                reason,
-                recursive_subtree_repair,
-                rotating_cold_window_cycle_id,
-                priority,
+                reason: request.reason,
+                recursive_subtree_repair: request.recursive_subtree_repair,
+                rotating_cold_window_cycle_id: request.rotating_cold_window_cycle_id,
+                priority: request.priority,
                 first_enqueue_ns: now_ns,
                 last_enqueue_ns: now_ns,
                 not_before_ns,
-                attempts: 0,
-                repair_cursor,
+                attempts: request.attempts,
+                repair_cursor: request.repair_cursor,
             });
     }
 
@@ -397,7 +516,9 @@ impl DirtyQueue {
         if entry.attempts > self.max_attempts {
             return false;
         }
-        entry.scope = entry.scope.expanded_for_retry();
+        if !entry.requires_recursive_subtree_repair() {
+            entry.scope = entry.scope.expanded_for_retry();
+        }
         entry.repair_cursor = None;
         let delay = self
             .retry_base_delay_ns
@@ -492,12 +613,22 @@ fn merge_repair_cursor(
     match (existing, incoming) {
         // A full rescan request is safer than any partial cursor.
         (_, None) | (None, Some(_)) => None,
-        (Some(existing), Some(incoming)) if existing.dir == incoming.dir => {
-            Some(if existing.offset <= incoming.offset {
-                existing
-            } else {
-                incoming
-            })
+        (Some(existing), Some(incoming))
+            if existing.dir == incoming.dir
+                && existing.completed_dir_stamps == incoming.completed_dir_stamps
+                && existing.current_dir_start_stamp == incoming.current_dir_start_stamp =>
+        {
+            let dir = existing.dir.clone();
+            let offset = existing.offset.min(incoming.offset);
+            let mut pending_dirs = existing.pending_dirs;
+            pending_dirs.extend(incoming.pending_dirs);
+            Some(DirtyRepairCursor::from_recursive_collections(
+                dir,
+                offset,
+                pending_dirs,
+                existing.completed_dir_stamps,
+                existing.current_dir_start_stamp,
+            ))
         }
         (Some(_), Some(_)) => None,
     }
@@ -683,6 +814,55 @@ mod tests {
     }
 
     #[test]
+    fn recursive_repair_continuation_keeps_pending_dirs_and_cycle_after_merge_and_retry() {
+        let mut q = DirtyQueue::new(Duration::ZERO).with_retry_policy(Duration::ZERO, 2);
+        let root = PathBuf::from("/tmp/rotating-recursive");
+        let scope = || DirtyScope::dirs(0, vec![root.clone()]);
+        q.enqueue_recursive(
+            scope(),
+            DirtyReason::RotatingColdWindow { cycle_id: 42 },
+            DirtyPriority::Low,
+            1,
+        );
+        q.enqueue(scope(), DirtyReason::InotifyEvent, DirtyPriority::Normal, 2);
+
+        let entry = q.pop_ready(2, 1).pop().unwrap();
+        assert_eq!(entry.reason, DirtyReason::InotifyEvent);
+        assert!(entry.requires_recursive_subtree_repair());
+        assert_eq!(entry.rotating_cold_window_cycle_id(), Some(42));
+
+        q.enqueue_repair_slice(
+            scope(),
+            &entry,
+            3,
+            DirtyRepairCursor::with_pending_dirs(root.join("child"), 0, vec![root.join("sibling")]),
+        );
+
+        let continuation = q.pop_ready(3, 1).pop().unwrap();
+        assert!(continuation.requires_recursive_subtree_repair());
+        assert_eq!(continuation.rotating_cold_window_cycle_id(), Some(42));
+        let cursor = continuation.repair_cursor.as_ref().unwrap();
+        assert_eq!(cursor.dir, root.join("child"));
+        assert_eq!(cursor.pending_dirs(), vec![root.join("sibling")]);
+
+        assert!(q.retry(continuation, 4));
+        let retry = q.pop_ready(4, 1).pop().unwrap();
+        assert!(retry.requires_recursive_subtree_repair());
+        assert_eq!(retry.rotating_cold_window_cycle_id(), Some(42));
+        assert_eq!(retry.scope.dir_paths(), std::slice::from_ref(&root));
+        assert!(retry.repair_cursor.is_none());
+
+        q.enqueue_repair_slice(
+            retry.scope.clone(),
+            &retry,
+            5,
+            DirtyRepairCursor::new(root, 512),
+        );
+        let retried_continuation = q.pop_ready(5, 1).pop().unwrap();
+        assert_eq!(retried_continuation.attempts, 1);
+    }
+
+    #[test]
     fn dirty_queue_memory_stats_counts_pending_scopes() {
         let mut q = DirtyQueue::new(Duration::ZERO);
         q.enqueue(
@@ -706,6 +886,34 @@ mod tests {
         assert!(stats.pending_path_bytes >= expected_path_bytes as u64);
         assert!(stats.map_capacity >= stats.pending_scopes);
         assert!(stats.estimated_bytes >= stats.pending_path_bytes);
+    }
+
+    #[test]
+    fn dirty_queue_memory_stats_counts_recursive_cursor_paths() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        let root = PathBuf::from("/tmp/recursive-root");
+        let scope = DirtyScope::dirs(0, vec![root.clone()]);
+        q.enqueue_recursive(
+            scope.clone(),
+            DirtyReason::RecursiveSubtreeRepair,
+            DirtyPriority::Normal,
+            1,
+        );
+        let entry = q.pop_ready(1, 1).pop().unwrap();
+        q.enqueue_repair_slice(
+            scope,
+            &entry,
+            2,
+            DirtyRepairCursor::with_pending_dirs(
+                root.join("current"),
+                0,
+                vec![root.join("pending")],
+            ),
+        );
+
+        let stats = q.memory_stats();
+        assert_eq!(stats.pending_dirs, 3);
+        assert!(stats.pending_path_bytes >= 3 * root.as_os_str().as_encoded_bytes().len() as u64);
     }
 
     #[test]
@@ -738,23 +946,28 @@ mod tests {
     fn dirty_queue_keeps_partial_repair_cursor_until_full_scan_arrives() {
         let mut q = DirtyQueue::new(Duration::ZERO);
         let dir = PathBuf::from("/tmp/sliced");
+        q.enqueue(
+            DirtyScope::dirs(0, vec![dir.clone()]),
+            DirtyReason::PeriodicColdScan,
+            DirtyPriority::Low,
+            0,
+        );
+        let source = q.pop_ready(0, 1).pop().unwrap();
+        let mut source_12 = source.clone();
+        source_12.rotating_cold_window_cycle_id = Some(12);
 
         q.enqueue_repair_slice(
             DirtyScope::dirs(0, vec![dir.clone()]),
-            DirtyReason::PeriodicColdScan,
-            false,
-            DirtyPriority::Low,
+            &source_12,
             1,
-            Some(12),
             DirtyRepairCursor::new(dir.clone(), 200),
         );
+        let mut source_13 = source.clone();
+        source_13.rotating_cold_window_cycle_id = Some(13);
         q.enqueue_repair_slice(
             DirtyScope::dirs(0, vec![dir.clone()]),
-            DirtyReason::PeriodicColdScan,
-            false,
-            DirtyPriority::Low,
+            &source_13,
             2,
-            Some(13),
             DirtyRepairCursor::new(dir.clone(), 100),
         );
 
@@ -765,13 +978,12 @@ mod tests {
         );
         assert_eq!(entry.rotating_cold_window_cycle_id(), Some(13));
 
+        let mut source_14 = source;
+        source_14.rotating_cold_window_cycle_id = Some(14);
         q.enqueue_repair_slice(
             DirtyScope::dirs(0, vec![dir.clone()]),
-            DirtyReason::PeriodicColdScan,
-            false,
-            DirtyPriority::Low,
+            &source_14,
             3,
-            Some(14),
             DirtyRepairCursor::new(dir.clone(), 300),
         );
         q.enqueue(

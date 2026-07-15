@@ -74,7 +74,21 @@ fn note_watch_exclude_rejected(runtime: &Option<Arc<TieredWatchRuntime>>) {
 fn watch_remove_error_is_already_absent(error: &notify::Error) -> bool {
     match &error.kind {
         notify::ErrorKind::PathNotFound | notify::ErrorKind::WatchNotFound => true,
-        notify::ErrorKind::Io(error) => error.kind() == std::io::ErrorKind::NotFound,
+        notify::ErrorKind::Io(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return true;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // inotify_rm_watch(2) returns EINVAL when the watch descriptor was
+                // already removed, including removal caused by deleting its path.
+                error.raw_os_error() == Some(libc::EINVAL)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        }
         _ => false,
     }
 }
@@ -646,6 +660,9 @@ fn handle_add_ephemeral_watch(
     fallback_cycle_id: Option<u64>,
 ) {
     if !rotating_ephemeral_command_is_current(ctx, path.as_path(), fallback_cycle_id) {
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.rollback_ephemeral_add(path.as_path());
+        }
         tracing::debug!(
             ?path,
             ?fallback_cycle_id,
@@ -670,16 +687,25 @@ fn handle_add_ephemeral_watch(
         );
         return;
     }
+    if !rotating_ephemeral_command_is_current(ctx, path.as_path(), fallback_cycle_id) {
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.rollback_ephemeral_add(path.as_path());
+        }
+        tracing::debug!(
+            ?path,
+            ?fallback_cycle_id,
+            "ignored ephemeral watch add that became stale before installation"
+        );
+        return;
+    }
     match ctx
         .watcher
         .watch(path.as_path(), notify::RecursiveMode::Recursive)
     {
         Ok(()) => {
-            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
-                runtime.confirm_ephemeral_added(path.as_path());
+            if finalize_ephemeral_watch_install(ctx, path.as_path(), fallback_cycle_id) {
+                schedule_ephemeral_bootstrap_scan(ctx, path, fallback_cycle_id);
             }
-            ctx.ephemeral_watches.insert(path.clone());
-            schedule_ephemeral_bootstrap_scan(ctx, path, fallback_cycle_id);
         }
         Err(e) => {
             ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
@@ -690,6 +716,65 @@ fn handle_add_ephemeral_watch(
             tracing::warn!("tiered ephemeral watcher add failed for {:?}: {}", path, e);
         }
     }
+}
+
+fn unwatch_path(
+    watcher: &mut notify::RecommendedWatcher,
+    path: &Path,
+) -> Result<(), notify::Error> {
+    match watcher.unwatch(path) {
+        Ok(()) => Ok(()),
+        Err(error) if watch_remove_error_is_already_absent(&error) => {
+            tracing::debug!(
+                ?path,
+                %error,
+                "tiered watcher already absent while removing"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn finalize_ephemeral_watch_install(
+    ctx: &mut WatchCtx<'_>,
+    path: &Path,
+    fallback_cycle_id: Option<u64>,
+) -> bool {
+    let runtime_confirmed = ctx.tiered_runtime.as_ref().map_or_else(
+        || fallback_cycle_id.is_none(),
+        |runtime| runtime.confirm_ephemeral_added_for_cycle(path, fallback_cycle_id),
+    );
+    if runtime_confirmed {
+        ctx.ephemeral_watches.insert(path.to_path_buf());
+        return true;
+    }
+
+    match unwatch_path(ctx.watcher, path) {
+        Ok(()) => {
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                runtime.rollback_ephemeral_add(path);
+            }
+            tracing::debug!(
+                ?path,
+                ?fallback_cycle_id,
+                "removed ephemeral watcher whose lease became stale during installation"
+            );
+        }
+        Err(error) => {
+            ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+            ctx.ephemeral_watches.insert(path.to_path_buf());
+            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                let _ = runtime.confirm_ephemeral_added(path);
+            }
+            tracing::warn!(
+                "tiered stale ephemeral watcher remove failed for {:?}: {}",
+                path,
+                error
+            );
+        }
+    }
+    false
 }
 
 fn rotating_ephemeral_command_is_current(
@@ -713,7 +798,7 @@ fn fallback_rotating_ephemeral_to_scan(
         return;
     };
     if runtime.downgrade_rotating_cold_window_lease_to_scan_only(path, cycle_id) {
-        ctx.index.enqueue_dirty_dirs(
+        ctx.index.enqueue_recursive_dirty_dirs(
             vec![path.to_path_buf()],
             DirtyReason::RotatingColdWindow { cycle_id },
         );
@@ -754,13 +839,20 @@ fn handle_remove_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
         .filter(|child| child.as_path() != path.as_path() && child.starts_with(&path))
         .cloned()
         .collect::<Vec<_>>();
+    let mut child_remove_failed = false;
     for child in child_watches {
-        if let Err(e) = ctx.watcher.unwatch(child.as_path()) {
-            tracing::debug!("tiered watcher child remove failed for {:?}: {}", child, e);
-        }
-        ctx.dynamic_watches.remove(&child);
-        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
-            runtime.confirm_demoted(child.as_path());
+        match unwatch_path(ctx.watcher, child.as_path()) {
+            Ok(()) => {
+                ctx.dynamic_watches.remove(&child);
+                if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                    runtime.confirm_demoted(child.as_path());
+                }
+            }
+            Err(e) => {
+                child_remove_failed = true;
+                ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!("tiered watcher child remove failed for {:?}: {}", child, e);
+            }
         }
     }
     // Remove child ephemeral watches under this path.
@@ -771,20 +863,32 @@ fn handle_remove_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
         .cloned()
         .collect::<Vec<_>>();
     for child in ephemeral_children {
-        if let Err(e) = ctx.watcher.unwatch(child.as_path()) {
-            tracing::debug!(
-                "tiered ephemeral child remove failed for {:?}: {}",
-                child,
-                e
-            );
-        }
-        ctx.ephemeral_watches.remove(&child);
-        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
-            runtime.confirm_ephemeral_removed(child.as_path());
+        match unwatch_path(ctx.watcher, child.as_path()) {
+            Ok(()) => {
+                ctx.ephemeral_watches.remove(&child);
+                if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                    runtime.confirm_ephemeral_removed(child.as_path());
+                }
+            }
+            Err(e) => {
+                child_remove_failed = true;
+                ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    "tiered ephemeral child remove failed for {:?}: {}",
+                    child,
+                    e
+                );
+            }
         }
     }
+    if child_remove_failed {
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.rollback_demote(path.as_path());
+        }
+        return;
+    }
     // Unwatch the path itself.
-    match ctx.watcher.unwatch(path.as_path()) {
+    match unwatch_path(ctx.watcher, path.as_path()) {
         Ok(()) => {
             ctx.dynamic_watches.remove(&path);
             if let Some(runtime) = ctx.tiered_runtime.as_ref() {
@@ -803,23 +907,12 @@ fn handle_remove_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
 
 /// `WatchCommand::RemoveEphemeral` — remove an ephemeral watch.
 fn handle_remove_ephemeral_watch(ctx: &mut WatchCtx<'_>, path: PathBuf) {
-    match ctx.watcher.unwatch(path.as_path()) {
+    match unwatch_path(ctx.watcher, path.as_path()) {
         Ok(()) => {
             ctx.ephemeral_watches.remove(&path);
             if let Some(runtime) = ctx.tiered_runtime.as_ref() {
                 runtime.confirm_ephemeral_removed(path.as_path());
             }
-        }
-        Err(error) if watch_remove_error_is_already_absent(&error) => {
-            ctx.ephemeral_watches.remove(&path);
-            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
-                runtime.confirm_ephemeral_removed(path.as_path());
-            }
-            tracing::debug!(
-                "tiered ephemeral watcher already absent while removing {:?}: {}",
-                path,
-                error
-            );
         }
         Err(e) => {
             ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
@@ -860,17 +953,24 @@ fn handle_replace_watch(ctx: &mut WatchCtx<'_>, demote: PathBuf, promote: PathBu
         .filter(|child| child.as_path() != demote.as_path() && child.starts_with(&demote))
         .cloned()
         .collect::<Vec<_>>();
+    let mut child_remove_failed = false;
     for child in child_watches {
-        if let Err(e) = ctx.watcher.unwatch(child.as_path()) {
-            tracing::debug!(
-                "tiered watcher replacement child remove failed for {:?}: {}",
-                child,
-                e
-            );
-        }
-        ctx.dynamic_watches.remove(&child);
-        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
-            runtime.confirm_demoted(child.as_path());
+        match unwatch_path(ctx.watcher, child.as_path()) {
+            Ok(()) => {
+                ctx.dynamic_watches.remove(&child);
+                if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                    runtime.confirm_demoted(child.as_path());
+                }
+            }
+            Err(e) => {
+                child_remove_failed = true;
+                ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    "tiered watcher replacement child remove failed for {:?}: {}",
+                    child,
+                    e
+                );
+            }
         }
     }
     // Remove child ephemeral watches under the demoted path.
@@ -881,21 +981,34 @@ fn handle_replace_watch(ctx: &mut WatchCtx<'_>, demote: PathBuf, promote: PathBu
         .cloned()
         .collect::<Vec<_>>();
     for child in ephemeral_children {
-        if let Err(e) = ctx.watcher.unwatch(child.as_path()) {
-            tracing::debug!(
-                "tiered ephemeral replacement child remove failed for {:?}: {}",
-                child,
-                e
-            );
-        }
-        ctx.ephemeral_watches.remove(&child);
-        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
-            runtime.confirm_ephemeral_removed(child.as_path());
+        match unwatch_path(ctx.watcher, child.as_path()) {
+            Ok(()) => {
+                ctx.ephemeral_watches.remove(&child);
+                if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+                    runtime.confirm_ephemeral_removed(child.as_path());
+                }
+            }
+            Err(e) => {
+                child_remove_failed = true;
+                ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    "tiered ephemeral replacement child remove failed for {:?}: {}",
+                    child,
+                    e
+                );
+            }
         }
     }
 
+    if child_remove_failed {
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.rollback_replacement(demote.as_path(), promote.as_path());
+        }
+        return;
+    }
+
     // Unwatch the demoted path.
-    match ctx.watcher.unwatch(demote.as_path()) {
+    match unwatch_path(ctx.watcher, demote.as_path()) {
         Ok(()) => {
             ctx.dynamic_watches.remove(&demote);
             if let Some(runtime) = ctx.tiered_runtime.as_ref() {
@@ -961,6 +1074,9 @@ fn handle_replace_ephemeral_watch(
     fallback_cycle_id: Option<u64>,
 ) {
     if !rotating_ephemeral_command_is_current(ctx, add.as_path(), fallback_cycle_id) {
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.rollback_ephemeral_replace(remove.as_path(), add.as_path());
+        }
         tracing::debug!(
             ?add,
             ?fallback_cycle_id,
@@ -985,8 +1101,19 @@ fn handle_replace_ephemeral_watch(
         );
         return;
     }
+    if !rotating_ephemeral_command_is_current(ctx, add.as_path(), fallback_cycle_id) {
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.rollback_ephemeral_replace(remove.as_path(), add.as_path());
+        }
+        tracing::debug!(
+            ?add,
+            ?fallback_cycle_id,
+            "ignored ephemeral watch replacement that became stale before eviction"
+        );
+        return;
+    }
     // Unwatch the removed ephemeral path.
-    match ctx.watcher.unwatch(remove.as_path()) {
+    match unwatch_path(ctx.watcher, remove.as_path()) {
         Ok(()) => {
             ctx.ephemeral_watches.remove(&remove);
             if let Some(runtime) = ctx.tiered_runtime.as_ref() {
@@ -1008,17 +1135,27 @@ fn handle_replace_ephemeral_watch(
         }
     }
 
+    if !rotating_ephemeral_command_is_current(ctx, add.as_path(), fallback_cycle_id) {
+        if let Some(runtime) = ctx.tiered_runtime.as_ref() {
+            runtime.rollback_ephemeral_add(add.as_path());
+        }
+        tracing::debug!(
+            ?add,
+            ?fallback_cycle_id,
+            "ignored ephemeral watch replacement that became stale before installation"
+        );
+        return;
+    }
+
     // Watch the new ephemeral path.
     match ctx
         .watcher
         .watch(add.as_path(), notify::RecursiveMode::Recursive)
     {
         Ok(()) => {
-            if let Some(runtime) = ctx.tiered_runtime.as_ref() {
-                runtime.confirm_ephemeral_added(add.as_path());
+            if finalize_ephemeral_watch_install(ctx, add.as_path(), fallback_cycle_id) {
+                schedule_ephemeral_bootstrap_scan(ctx, add, fallback_cycle_id);
             }
-            ctx.ephemeral_watches.insert(add.clone());
-            schedule_ephemeral_bootstrap_scan(ctx, add, fallback_cycle_id);
         }
         Err(e) => {
             ctx.watch_failures.fetch_add(1, Ordering::Relaxed);
@@ -1181,18 +1318,29 @@ fn register_dynamic_watches(raw_events: &[notify::Event], ctx: &mut WatchCtx<'_>
                             })
                             .cloned()
                             .collect::<Vec<_>>();
+                        let mut child_remove_failed = false;
                         for child in child_watches {
-                            if let Err(e) = watcher.unwatch(child.as_path()) {
-                                tracing::debug!(
-                                    "tiered dynamic replacement child remove failed for {:?}: {}",
-                                    child,
-                                    e
-                                );
+                            match unwatch_path(watcher, child.as_path()) {
+                                Ok(()) => {
+                                    dynamic_watches.remove(&child);
+                                    runtime.confirm_demoted(child.as_path());
+                                }
+                                Err(e) => {
+                                    child_remove_failed = true;
+                                    watch_failures.fetch_add(1, Ordering::Relaxed);
+                                    tracing::warn!(
+                                        "tiered dynamic replacement child remove failed for {:?}: {}",
+                                        child,
+                                        e
+                                    );
+                                }
                             }
-                            dynamic_watches.remove(&child);
-                            runtime.confirm_demoted(child.as_path());
                         }
-                        match watcher.unwatch(demote.as_path()) {
+                        if child_remove_failed {
+                            runtime.rollback_replacement(demote.as_path(), promote.as_path());
+                            continue;
+                        }
+                        match unwatch_path(watcher, demote.as_path()) {
                             Ok(()) => {
                                 dynamic_watches.remove(&demote);
                                 runtime.confirm_demoted(demote.as_path());
@@ -1206,6 +1354,7 @@ fn register_dynamic_watches(raw_events: &[notify::Event], ctx: &mut WatchCtx<'_>
                                 }
                             }
                             Err(e) => {
+                                watch_failures.fetch_add(1, Ordering::Relaxed);
                                 runtime.rollback_replacement(demote.as_path(), promote.as_path());
                                 tracing::warn!(
                                     "tiered dynamic replacement remove failed for {:?}: {}",
@@ -1635,9 +1784,270 @@ mod tests {
         assert!(watch_remove_error_is_already_absent(&notify::Error::io(
             std::io::Error::new(std::io::ErrorKind::NotFound, "gone")
         )));
+        #[cfg(target_os = "linux")]
+        assert!(watch_remove_error_is_already_absent(&notify::Error::io(
+            std::io::Error::from_raw_os_error(libc::EINVAL)
+        )));
         assert!(!watch_remove_error_is_already_absent(
             &notify::Error::generic("permission denied")
         ));
+    }
+
+    #[test]
+    fn repeated_ephemeral_remove_is_idempotent() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-repeated-ephemeral-remove-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut watcher = notify::recommended_watcher(|_| {}).unwrap();
+        watcher
+            .watch(root.as_path(), notify::RecursiveMode::Recursive)
+            .unwrap();
+        let mut dynamic_watches = HashSet::new();
+        let mut ephemeral_watches = HashSet::from([root.clone()]);
+        let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+        let tiered_runtime = None;
+        let fs_policy = None;
+        let mount_policy_counters = SharedMountPolicyCounters::default();
+        let configured_roots = vec![root.clone()];
+        let watch_failures = Arc::new(AtomicU64::new(0));
+        let ignore_filter = None;
+        let mut ctx = WatchCtx {
+            watcher: &mut watcher,
+            dynamic_watches: &mut dynamic_watches,
+            ephemeral_watches: &mut ephemeral_watches,
+            index: &index,
+            tiered_runtime: &tiered_runtime,
+            fs_policy: &fs_policy,
+            mount_policy_counters: &mount_policy_counters,
+            configured_roots: &configured_roots,
+            watch_failures: &watch_failures,
+            ignore_paths: &[],
+            exclude_dirs: &[],
+            ignore_filter: &ignore_filter,
+        };
+
+        handle_remove_ephemeral_watch(&mut ctx, root.clone());
+        handle_remove_ephemeral_watch(&mut ctx, root.clone());
+
+        assert!(ctx.ephemeral_watches.is_empty());
+        assert_eq!(ctx.watch_failures.load(Ordering::Relaxed), 0);
+
+        ctx.watcher
+            .watch(root.as_path(), notify::RecursiveMode::Recursive)
+            .unwrap();
+        ctx.dynamic_watches.insert(root.clone());
+        handle_remove_watch(&mut ctx, root.clone());
+        handle_remove_watch(&mut ctx, root.clone());
+
+        assert!(ctx.dynamic_watches.is_empty());
+        assert_eq!(ctx.watch_failures.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delayed_stale_rotating_cycle_does_not_install_ephemeral_watch() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-stale-ephemeral-cycle-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let runtime = Arc::new(TieredWatchRuntime::new_with_ephemeral(
+            Vec::new(),
+            vec![(root.clone(), 1)],
+            16,
+            5_000,
+            20,
+            4,
+        ));
+        for _ in 0..2 {
+            runtime.record_scan(
+                root.as_path(),
+                crate::index::tiered::ScanOutcome {
+                    scanned: 1,
+                    changed: 0,
+                    elapsed_ms: 1,
+                    project_roots: Vec::new(),
+                },
+            );
+            runtime.apply_scan_policy(
+                root.as_path(),
+                1,
+                2,
+                crate::config::L3ScanPolicy::Interval,
+                4,
+                1,
+                1,
+            );
+        }
+        assert_eq!(runtime.covering_tier(root.as_path()), Some(WatchTier::L3));
+
+        let tick = runtime.rotating_cold_window_tick(
+            crate::event::tiered_watch::RotatingColdWindowConfig {
+                enabled: true,
+                budget: 4,
+                ttl_secs: 60,
+                max_cost_per_root: 4,
+                max_dirs_per_tick: 4,
+            },
+        );
+        assert_eq!(tick.actions.len(), 1);
+        assert_eq!(
+            tick.actions[0].action,
+            crate::event::tiered_watch::RotatingColdWindowActionKind::EphemeralWatch
+        );
+
+        let ephemeral_config = crate::event::tiered_watch::EphemeralWatchConfig {
+            budget: 4,
+            repeat_threshold: 1,
+            max_cost_per_root: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            runtime.note_dirty_scope_with_changed(root.clone(), 1, &[], &ephemeral_config, 1,),
+            crate::event::tiered_watch::EphemeralWatchDecision::Add(root.clone())
+        );
+        assert_eq!(runtime.report().ephemeral_watch_cost, 1);
+        runtime.cancel_rotating_cold_window_lease(root.as_path());
+
+        let mut watcher = notify::recommended_watcher(|_| {}).unwrap();
+        let mut dynamic_watches = HashSet::new();
+        let mut ephemeral_watches = HashSet::new();
+        let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+        let tiered_runtime = Some(runtime.clone());
+        let fs_policy = None;
+        let mount_policy_counters = SharedMountPolicyCounters::default();
+        let configured_roots = vec![root.clone()];
+        let watch_failures = Arc::new(AtomicU64::new(0));
+        let ignore_filter = None;
+        {
+            let mut ctx = WatchCtx {
+                watcher: &mut watcher,
+                dynamic_watches: &mut dynamic_watches,
+                ephemeral_watches: &mut ephemeral_watches,
+                index: &index,
+                tiered_runtime: &tiered_runtime,
+                fs_policy: &fs_policy,
+                mount_policy_counters: &mount_policy_counters,
+                configured_roots: &configured_roots,
+                watch_failures: &watch_failures,
+                ignore_paths: &[],
+                exclude_dirs: &[],
+                ignore_filter: &ignore_filter,
+            };
+
+            ctx.watcher
+                .watch(root.as_path(), notify::RecursiveMode::Recursive)
+                .unwrap();
+            assert!(!finalize_ephemeral_watch_install(
+                &mut ctx,
+                root.as_path(),
+                Some(tick.cycle_id)
+            ));
+            handle_add_ephemeral_watch(&mut ctx, root.clone(), Some(tick.cycle_id));
+
+            assert!(ctx.ephemeral_watches.is_empty());
+            assert_eq!(ctx.watch_failures.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(runtime.report().ephemeral_watch_dirs, 0);
+        assert_eq!(runtime.report().ephemeral_watch_cost, 0);
+        let remove_error = watcher
+            .unwatch(root.as_path())
+            .expect_err("stale command must not install a watcher");
+        assert!(watch_remove_error_is_already_absent(&remove_error));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rotating_ephemeral_failure_fallback_enqueues_recursive_scan() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-ephemeral-fallback-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime = Arc::new(TieredWatchRuntime::new_with_ephemeral(
+            Vec::new(),
+            vec![(root.clone(), 1)],
+            16,
+            5_000,
+            20,
+            4,
+        ));
+        for _ in 0..2 {
+            runtime.record_scan(
+                root.as_path(),
+                crate::index::tiered::ScanOutcome {
+                    scanned: 1,
+                    changed: 0,
+                    elapsed_ms: 1,
+                    project_roots: Vec::new(),
+                },
+            );
+            runtime.apply_scan_policy(
+                root.as_path(),
+                1,
+                2,
+                crate::config::L3ScanPolicy::Interval,
+                4,
+                1,
+                1,
+            );
+        }
+        let tick = runtime.rotating_cold_window_tick(
+            crate::event::tiered_watch::RotatingColdWindowConfig {
+                enabled: true,
+                budget: 4,
+                ttl_secs: 60,
+                max_cost_per_root: 4,
+                max_dirs_per_tick: 4,
+            },
+        );
+        assert_eq!(tick.actions.len(), 1);
+
+        let mut watcher = notify::recommended_watcher(|_| {}).unwrap();
+        let mut dynamic_watches = HashSet::new();
+        let mut ephemeral_watches = HashSet::new();
+        let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+        let tiered_runtime = Some(runtime);
+        let fs_policy = None;
+        let mount_policy_counters = SharedMountPolicyCounters::default();
+        let configured_roots = vec![root.clone()];
+        let watch_failures = Arc::new(AtomicU64::new(0));
+        let ignore_filter = None;
+        let ctx = WatchCtx {
+            watcher: &mut watcher,
+            dynamic_watches: &mut dynamic_watches,
+            ephemeral_watches: &mut ephemeral_watches,
+            index: &index,
+            tiered_runtime: &tiered_runtime,
+            fs_policy: &fs_policy,
+            mount_policy_counters: &mount_policy_counters,
+            configured_roots: &configured_roots,
+            watch_failures: &watch_failures,
+            ignore_paths: &[],
+            exclude_dirs: &[],
+            ignore_filter: &ignore_filter,
+        };
+
+        fallback_rotating_ephemeral_to_scan(&ctx, root.as_path(), Some(tick.cycle_id));
+        std::thread::sleep(Duration::from_millis(260));
+        let entry = index.dirty_queue_ready_batch(1).pop().unwrap();
+        assert!(entry.requires_recursive_subtree_repair());
+        assert_eq!(entry.rotating_cold_window_cycle_id(), Some(tick.cycle_id));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn mk_event(kind: notify::EventKind, paths: Vec<PathBuf>) -> notify::Event {

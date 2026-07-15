@@ -210,6 +210,8 @@ def synthetic_leg(
             "waterline_hard_degraded_last": False,
             "dirty_queue_len_last": 0,
             "log_error_count": 0,
+            "watch_remove_failure_count": 0,
+            "dirty_queue_retry_drop_count": 0,
             "direct_v7_unsupported_count": 0,
             "background_rebuild_count": 0,
             "bootstrap_background_rebuild_count": 0,
@@ -322,6 +324,23 @@ class LegAnalysisTests(unittest.TestCase):
 
         self.assertEqual(summary["bootstrap_background_rebuild_count"], 0)
         self.assertEqual(summary["post_ready_background_rebuild_count"], 1)
+
+    def test_stability_summary_counts_cleanup_failures_and_retry_drops(self) -> None:
+        summary = falsification._stability_summary(
+            {},
+            {"ready": True},
+            "\n".join(
+                (
+                    "tiered ephemeral watcher remove failed for /tmp/root: EINVAL",
+                    "tiered watcher replacement child remove failed for /tmp/child: EINVAL",
+                    "dirty queue dropped entry after retry budget: entry",
+                    "dirty queue retry failed, entry dropped after worker task failure",
+                )
+            ),
+        )
+
+        self.assertEqual(summary["watch_remove_failure_count"], 2)
+        self.assertEqual(summary["dirty_queue_retry_drop_count"], 2)
 
     def test_protocol_fingerprint_excludes_only_the_treatment(self) -> None:
         base = {
@@ -876,6 +895,17 @@ class GateTests(unittest.TestCase):
 
         self.assertEqual(result["decision"], "fail")
         self.assertTrue(any("B 组 daemon" in reason for reason in result["reasons"]))
+
+    def test_gate_rejects_watcher_remove_failures_and_dirty_queue_drops(self) -> None:
+        legs = self.passing_legs()
+        legs[0]["stability"]["watch_remove_failure_count"] = 1
+        legs[2]["stability"]["dirty_queue_retry_drop_count"] = 1
+
+        result = gate.evaluate_suite(legs)
+
+        self.assertEqual(result["decision"], "fail")
+        self.assertTrue(any("watcher remove" in reason for reason in result["reasons"]))
+        self.assertTrue(any("dirty queue" in reason for reason in result["reasons"]))
 
     def test_gate_rejects_missing_full_run_resource_window(self) -> None:
         legs = self.passing_legs()
