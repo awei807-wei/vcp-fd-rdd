@@ -391,7 +391,9 @@ impl TieredIndex {
         expected_event_seq: u64,
     ) -> Option<u64> {
         let _snapshot_boundary = self.snapshot_event_gate.lock();
-        if self.event_seq.load(Ordering::Relaxed) != expected_event_seq {
+        if self.event_seq.load(Ordering::Relaxed) != expected_event_seq
+            && !upserted_metas_match_filesystem(metas)
+        {
             metas.clear();
             return None;
         }
@@ -423,6 +425,26 @@ impl TieredIndex {
         self.stats.record_events_applied(batch.event_count as u64);
         previous.saturating_add(batch.event_count as u64)
     }
+}
+
+fn upserted_metas_match_filesystem(metas: &[FileMeta]) -> bool {
+    metas.iter().all(|expected| {
+        std::fs::symlink_metadata(&expected.path)
+            .ok()
+            .and_then(|metadata| {
+                let file_key = crate::core::FileKey::from_path_and_metadata(
+                    expected.path.as_path(),
+                    &metadata,
+                )?;
+                Some(
+                    file_key == expected.file_key
+                        && metadata.len() == expected.size
+                        && metadata.modified().ok() == expected.mtime
+                        && FileKind::from_metadata(&metadata) == expected.kind,
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn resolve_event_target_kind(event: &EventRecord) -> Option<FileKind> {

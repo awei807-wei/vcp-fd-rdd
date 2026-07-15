@@ -1119,13 +1119,16 @@ impl TieredIndex {
                             had_failed_dir = true;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            // Fast-scan work can race workload cleanup. Once the
-                            // target directory is gone there is nothing left to
-                            // bootstrap or validate, so retrying only creates
-                            // stale I/O and an eventual retry-budget warning.
+                            // Scan work can race workload cleanup. Once a cold or
+                            // fast-scan target is gone there is no scan result to
+                            // publish, and retrying cannot restore that target.
                             if !matches!(
                                 entry.reason,
-                                DirtyReason::FastScanBootstrapDir | DirtyReason::FastScanChangedDir
+                                DirtyReason::InotifyEvent
+                                    | DirtyReason::FastScanBootstrapDir
+                                    | DirtyReason::FastScanChangedDir
+                                    | DirtyReason::PeriodicColdScan
+                                    | DirtyReason::RotatingColdWindow { .. }
                             ) {
                                 had_failed_dir = true;
                             }
@@ -1883,14 +1886,10 @@ impl TieredIndex {
             scanned = scanned.saturating_add(1);
         }
 
-        let stale_low_priority_scan = discard_if_event_seq_advances
-            && self.event_seq.load(Ordering::Relaxed) > scan_started_seq;
-        let mut dropped_stale_batch = stale_low_priority_scan;
+        let mut dropped_stale_batch = false;
         let mut alignment_started_seq = None;
-        if stale_low_priority_scan || metadata_failed {
-            tracing::debug!(
-                "discarded incomplete repair slice after event advance or metadata failure"
-            );
+        if metadata_failed {
+            tracing::debug!("discarded incomplete repair slice after metadata failure");
             changed = 0;
         } else if discard_if_event_seq_advances {
             alignment_started_seq = self.apply_upserted_metas_if_event_seq(
@@ -1973,12 +1972,13 @@ impl TieredIndex {
     /// fresh, error-free direct-child `read_dir` snapshot is required. Base/L2
     /// direct-child candidates and deep live Delta paths are projected
     /// to the first child below `dir`, so one subtree delete can invalidate all
-    /// stale descendants. The apply boundary rechecks both `event_seq` and the
-    /// directory fingerprint while holding the same gate as watcher events.
+    /// stale descendants. The apply boundary rechecks the directory fingerprint
+    /// while holding the same gate as watcher events, so unrelated event traffic
+    /// cannot starve a stable directory reconciliation.
     pub(super) fn align_missing_indexed_direct_children(
         &self,
         dir: &Path,
-        scan_started_seq: u64,
+        _scan_started_seq: u64,
     ) -> (usize, bool) {
         if self.path_is_frozen(dir) {
             return (0, true);
@@ -2073,10 +2073,6 @@ impl TieredIndex {
 
         self.io_governor.before_io();
         let _snapshot_boundary = self.snapshot_event_gate.lock();
-        if self.event_seq.load(Ordering::Relaxed) != scan_started_seq {
-            tracing::debug!("discarded stale negative alignment after newer apply seq advanced");
-            return (0, true);
-        }
         let after_fingerprint = std::fs::symlink_metadata(dir)
             .ok()
             .filter(|meta| meta.is_dir())

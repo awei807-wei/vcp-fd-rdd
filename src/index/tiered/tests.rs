@@ -568,7 +568,7 @@ fn mtime_precheck_disabled_when_clock_untrusted() {
 
 #[test]
 fn mtime_record_skipped_on_stale_scan() {
-    // stale_low_priority_scan=true 时 mtime 记录不写入
+    // 被扫描路径发生真实冲突时，mtime 记录不写入。
     let root = unique_tmp_dir("mtime-stale");
     std::fs::create_dir_all(&root).unwrap();
     // 创建大量文件使扫描耗时足够长，以便从另一线程推进 event_seq
@@ -591,12 +591,15 @@ fn mtime_record_skipped_on_stale_scan() {
         "dir mtime should change after adding file"
     );
 
-    // 第二次扫描：从另一线程推进 event_seq，触发 stale 条件
+    // 第二次扫描：扫描过程中修改目标文件并推进 event_seq，触发逐路径复验失败。
     idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::PeriodicColdScan);
     let report = std::thread::scope(|s| {
         let handle = s.spawn(|| mtime_precheck_pop_and_process(&idx, &skip_dirs).unwrap());
-        // 等扫描开始后推进 event_seq
+        // 等扫描开始后改写整个目录，确保至少一个已采集元数据的路径发生冲突。
         std::thread::sleep(std::time::Duration::from_millis(5));
+        for i in 0..400 {
+            std::fs::write(root.join(format!("file_{:04}.txt", i)), b"changed-content").unwrap();
+        }
         idx.event_seq
             .fetch_add(1_000_000, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap()
@@ -1449,6 +1452,43 @@ fn missing_fast_scan_bootstrap_dir_is_already_converged() {
 }
 
 #[test]
+fn missing_rotating_scan_target_stops_without_false_completion_or_retry() {
+    let root = unique_tmp_dir("missing-rotating-scan");
+    let removed = root.join("removed-workload-tree");
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.enqueue_recursive_dirty_dirs(
+        vec![removed],
+        DirtyReason::RotatingColdWindow { cycle_id: 93 },
+    );
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let report = idx.process_dirty_entry(entry, &[]);
+
+    assert!(!report.failed);
+    assert!(report.outcomes.is_empty());
+    assert_eq!(idx.dirty_queue_len(), 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn missing_inotify_repair_target_is_already_expressed_by_the_event() {
+    let root = unique_tmp_dir("missing-inotify-repair");
+    let removed = root.join("renamed-away");
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.enqueue_dirty_dirs(vec![removed], DirtyReason::InotifyEvent);
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let report = idx.process_dirty_entry(entry, &[]);
+
+    assert!(!report.failed);
+    assert!(report.outcomes.is_empty());
+    assert_eq!(idx.dirty_queue_len(), 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn sliced_repair_cursor_resumes_after_first_chunk() {
     let root = unique_tmp_dir("sliced-repair-cursor");
     std::fs::create_dir_all(&root).unwrap();
@@ -1595,7 +1635,7 @@ fn manual_immediate_scan_fails_closed_when_directory_is_unavailable() {
 }
 
 #[test]
-fn periodic_negative_alignment_discards_stale_event_seq() {
+fn periodic_negative_alignment_accepts_unrelated_event_seq_advance() {
     let root = unique_tmp_dir("periodic-negative-stale-seq");
     let burst_root = root.join("storm-burst");
     let stale_path = burst_root.join("deep").join("stale.txt");
@@ -1610,11 +1650,73 @@ fn periodic_negative_alignment_discards_stale_event_seq() {
 
     let (deleted, dropped_stale) =
         idx.align_missing_indexed_direct_children(&root, scan_started_seq);
-    assert_eq!(deleted, 0);
-    assert!(dropped_stale);
+    assert_eq!(deleted, 1);
+    assert!(!dropped_stale);
     let db = idx.delta_buffer.lock();
-    assert!(db.is_live(stale_path.as_os_str().as_encoded_bytes()));
-    assert!(!db.is_deleted(burst_root.as_os_str().as_encoded_bytes()));
+    assert!(db.is_deleted(burst_root.as_os_str().as_encoded_bytes()));
+    drop(db);
+    assert!(idx.query_limit_detailed("stale.txt", 1).is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn scan_upsert_accepts_unrelated_event_seq_advance_after_revalidation() {
+    let root = unique_tmp_dir("scan-upsert-unrelated-event");
+    std::fs::create_dir_all(&root).unwrap();
+    let target = root.join("target.txt");
+    let unrelated = root.join("unrelated.txt");
+    std::fs::write(&target, b"target").unwrap();
+    std::fs::write(&unrelated, b"unrelated").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    let expected_event_seq = idx.event_seq.load(Ordering::Relaxed);
+    idx.apply_events(&[mk_event(1, EventType::Create, unrelated)]);
+
+    let events = vec![mk_event(2, EventType::Modify, target.clone())];
+    let mut metas = vec![file_meta_from_path(target.clone())];
+    let applied = idx.apply_upserted_metas_if_event_seq(
+        events.as_slice(),
+        &mut metas,
+        false,
+        expected_event_seq,
+    );
+
+    assert!(applied.is_some());
+    assert!(idx
+        .query_limit_detailed("target.txt", 1)
+        .iter()
+        .any(|result| result.meta.path == target));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn scan_upsert_rejects_changed_target_after_event_seq_advance() {
+    let root = unique_tmp_dir("scan-upsert-target-conflict");
+    std::fs::create_dir_all(&root).unwrap();
+    let target = root.join("target.txt");
+    let unrelated = root.join("unrelated.txt");
+    std::fs::write(&target, b"old").unwrap();
+    std::fs::write(&unrelated, b"unrelated").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    let expected_event_seq = idx.event_seq.load(Ordering::Relaxed);
+    let events = vec![mk_event(1, EventType::Modify, target.clone())];
+    let mut metas = vec![file_meta_from_path(target.clone())];
+    std::fs::write(&target, b"new-and-longer").unwrap();
+    idx.apply_events(&[mk_event(2, EventType::Create, unrelated)]);
+
+    let applied = idx.apply_upserted_metas_if_event_seq(
+        events.as_slice(),
+        &mut metas,
+        false,
+        expected_event_seq,
+    );
+
+    assert!(applied.is_none());
+    assert!(metas.is_empty());
+    assert!(idx.query_limit_detailed("target.txt", 1).is_empty());
 
     let _ = std::fs::remove_dir_all(&root);
 }

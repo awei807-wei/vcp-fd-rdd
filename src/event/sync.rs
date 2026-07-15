@@ -398,6 +398,7 @@ impl DirtyQueue {
                 attempts: 0,
             },
             now_ns,
+            true,
         );
     }
 
@@ -419,6 +420,7 @@ impl DirtyQueue {
                 attempts: 0,
             },
             now_ns,
+            true,
         );
     }
 
@@ -440,13 +442,18 @@ impl DirtyQueue {
                 attempts: source.attempts,
             },
             now_ns,
+            false,
         );
     }
 
-    fn enqueue_request(&mut self, request: DirtyQueueRequest, now_ns: u64) {
+    fn enqueue_request(&mut self, request: DirtyQueueRequest, now_ns: u64, debounce: bool) {
         let scope = request.scope.normalized();
         let key = DirtyScopeKey::from_scope(&scope);
-        let not_before_ns = now_ns.saturating_add(self.debounce_ns);
+        let not_before_ns = if debounce {
+            now_ns.saturating_add(self.debounce_ns)
+        } else {
+            now_ns
+        };
         self.entries
             .entry(key)
             .and_modify(|entry| {
@@ -458,7 +465,11 @@ impl DirtyQueue {
                 );
                 entry.priority = entry.priority.max(request.priority);
                 entry.last_enqueue_ns = now_ns;
-                entry.not_before_ns = not_before_ns;
+                entry.not_before_ns = if debounce {
+                    not_before_ns
+                } else {
+                    entry.not_before_ns.min(not_before_ns)
+                };
                 entry.attempts = entry.attempts.max(request.attempts);
                 entry.repair_cursor =
                     merge_repair_cursor(entry.repair_cursor.take(), request.repair_cursor.clone());
@@ -860,6 +871,33 @@ mod tests {
         );
         let retried_continuation = q.pop_ready(5, 1).pop().unwrap();
         assert_eq!(retried_continuation.attempts, 1);
+    }
+
+    #[test]
+    fn repair_continuation_bypasses_normal_debounce() {
+        let mut q = DirtyQueue::new(Duration::from_millis(250));
+        let root = PathBuf::from("/tmp/immediate-repair-continuation");
+        let scope = DirtyScope::dirs(0, vec![root.clone()]);
+        let start_ns = 1_000_000_000;
+        q.enqueue_recursive(
+            scope.clone(),
+            DirtyReason::RotatingColdWindow { cycle_id: 7 },
+            DirtyPriority::Low,
+            start_ns,
+        );
+
+        assert!(q.pop_ready(start_ns + 249_999_999, 1).is_empty());
+        let source = q.pop_ready(start_ns + 250_000_000, 1).pop().unwrap();
+        let continuation_ns = start_ns + 250_000_001;
+        q.enqueue_repair_slice(
+            scope,
+            &source,
+            continuation_ns,
+            DirtyRepairCursor::new(root, 512),
+        );
+
+        let continuation = q.pop_ready(continuation_ns, 1).pop().unwrap();
+        assert_eq!(continuation.repair_cursor.unwrap().offset, 512);
     }
 
     #[test]
