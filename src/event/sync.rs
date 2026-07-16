@@ -148,6 +148,38 @@ impl DirtyPriority {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DirtyRepairProgress {
+    scanned: usize,
+    changed: usize,
+    elapsed_ms: u64,
+    project_roots: BTreeSet<PathBuf>,
+}
+
+impl DirtyRepairProgress {
+    pub(crate) fn accumulate(
+        &mut self,
+        scanned: usize,
+        changed: usize,
+        elapsed_ms: u64,
+        project_roots: &[PathBuf],
+    ) {
+        self.scanned = self.scanned.saturating_add(scanned);
+        self.changed = self.changed.saturating_add(changed);
+        self.elapsed_ms = self.elapsed_ms.saturating_add(elapsed_ms);
+        self.project_roots.extend(project_roots.iter().cloned());
+    }
+
+    pub(crate) fn into_parts(self) -> (usize, usize, u64, Vec<PathBuf>) {
+        (
+            self.scanned,
+            self.changed,
+            self.elapsed_ms,
+            self.project_roots.into_iter().collect(),
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirtyRepairCursor {
     pub dir: PathBuf,
@@ -156,6 +188,7 @@ pub struct DirtyRepairCursor {
     completed_dir_stamps: Vec<(PathBuf, DirectoryFingerprint)>,
     current_dir_start_stamp: Option<DirectoryFingerprint>,
     scan_invalidation_epoch: Option<u64>,
+    progress: DirtyRepairProgress,
 }
 
 impl DirtyRepairCursor {
@@ -167,6 +200,7 @@ impl DirtyRepairCursor {
             completed_dir_stamps: Vec::new(),
             current_dir_start_stamp: None,
             scan_invalidation_epoch: None,
+            progress: DirtyRepairProgress::default(),
         }
     }
 
@@ -188,6 +222,7 @@ impl DirtyRepairCursor {
             completed_dir_stamps,
             current_dir_start_stamp,
             scan_invalidation_epoch: None,
+            progress: DirtyRepairProgress::default(),
         }
     }
 
@@ -214,8 +249,14 @@ impl DirtyRepairCursor {
         PathBuf,
         BTreeSet<PathBuf>,
         Vec<(PathBuf, DirectoryFingerprint)>,
+        DirtyRepairProgress,
     ) {
-        (self.dir, self.pending_dirs, self.completed_dir_stamps)
+        (
+            self.dir,
+            self.pending_dirs,
+            self.completed_dir_stamps,
+            self.progress,
+        )
     }
 
     pub(crate) fn from_recursive_collections(
@@ -224,6 +265,7 @@ impl DirtyRepairCursor {
         pending_dirs: BTreeSet<PathBuf>,
         completed_dir_stamps: Vec<(PathBuf, DirectoryFingerprint)>,
         current_dir_start_stamp: Option<DirectoryFingerprint>,
+        progress: DirtyRepairProgress,
     ) -> Self {
         Self {
             dir,
@@ -232,6 +274,7 @@ impl DirtyRepairCursor {
             completed_dir_stamps,
             current_dir_start_stamp,
             scan_invalidation_epoch: None,
+            progress,
         }
     }
 
@@ -239,9 +282,10 @@ impl DirtyRepairCursor {
         self.pending_dirs.len().saturating_add(1)
     }
 
-    fn tracked_dir_count(&self) -> usize {
+    fn tracked_path_count(&self) -> usize {
         self.pending_dir_count()
             .saturating_add(self.completed_dir_stamps.len())
+            .saturating_add(self.progress.project_roots.len())
     }
 
     fn tracked_path_bytes(&self) -> u64 {
@@ -250,6 +294,13 @@ impl DirtyRepairCursor {
             self.pending_dirs
                 .iter()
                 .chain(self.completed_dir_stamps.iter().map(|(path, _)| path))
+                .map(|path| path.as_os_str().as_encoded_bytes().len() as u64)
+                .sum(),
+        );
+        bytes = bytes.saturating_add(
+            self.progress
+                .project_roots
+                .iter()
                 .map(|path| path.as_os_str().as_encoded_bytes().len() as u64)
                 .sum(),
         );
@@ -358,7 +409,7 @@ impl DirtyQueue {
         let map_capacity = self.entries.capacity();
         let mut pending_dirs = 0usize;
         let mut pending_path_bytes = 0u64;
-        let mut cursor_tracked_dirs = 0usize;
+        let mut cursor_tracked_paths = 0usize;
         let mut all_scope_pending = false;
 
         for entry in self.entries.values() {
@@ -373,8 +424,8 @@ impl DirtyQueue {
             }
             if let Some(cursor) = &entry.repair_cursor {
                 pending_dirs = pending_dirs.saturating_add(cursor.pending_dir_count());
-                cursor_tracked_dirs =
-                    cursor_tracked_dirs.saturating_add(cursor.tracked_dir_count());
+                cursor_tracked_paths =
+                    cursor_tracked_paths.saturating_add(cursor.tracked_path_count());
                 pending_path_bytes = pending_path_bytes.saturating_add(cursor.tracked_path_bytes());
             }
         }
@@ -382,7 +433,7 @@ impl DirtyQueue {
         let map_bytes = map_capacity as u64
             * (size_of::<(DirtyScopeKey, DirtyQueueEntry)>() as u64 + 1)
             + size_of::<HashMap<DirtyScopeKey, DirtyQueueEntry>>() as u64;
-        let cursor_node_bytes = cursor_tracked_dirs as u64
+        let cursor_node_bytes = cursor_tracked_paths as u64
             * (size_of::<PathBuf>()
                 + size_of::<FileKey>()
                 + size_of::<i64>()
@@ -684,7 +735,8 @@ fn merge_repair_cursor(
             if existing.dir == incoming.dir
                 && existing.completed_dir_stamps == incoming.completed_dir_stamps
                 && existing.current_dir_start_stamp == incoming.current_dir_start_stamp
-                && existing.scan_invalidation_epoch == incoming.scan_invalidation_epoch =>
+                && existing.scan_invalidation_epoch == incoming.scan_invalidation_epoch
+                && existing.progress == incoming.progress =>
         {
             let dir = existing.dir.clone();
             let offset = existing.offset.min(incoming.offset);
@@ -696,6 +748,7 @@ fn merge_repair_cursor(
                 pending_dirs,
                 existing.completed_dir_stamps,
                 existing.current_dir_start_stamp,
+                existing.progress,
             );
             merged.scan_invalidation_epoch = existing.scan_invalidation_epoch;
             Some(merged)

@@ -1474,6 +1474,110 @@ fn recursive_scan_only_repair_preserves_cycle_until_deep_subtree_completion() {
 }
 
 #[test]
+fn recursive_repair_publishes_one_root_level_aggregate_for_deep_tree() {
+    let root = unique_tmp_dir("recursive-root-aggregate-deep");
+    let repair_root = root.join("repair");
+    let deepest = repair_root.join("level1/level2");
+    std::fs::create_dir_all(&deepest).unwrap();
+    std::fs::write(repair_root.join("Cargo.toml"), b"[package]").unwrap();
+    std::fs::write(deepest.join("Cargo.toml"), b"[package]").unwrap();
+    std::fs::write(deepest.join("visible.txt"), b"visible").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let project_markers = vec!["Cargo.toml".to_string()];
+
+    idx.enqueue_recursive_dirty_dirs(
+        vec![repair_root.clone()],
+        DirtyReason::RecursiveSubtreeRepair,
+    );
+
+    let mut processed = 0usize;
+    let mut completions = Vec::new();
+    loop {
+        let entry = { idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop() };
+        let Some(entry) = entry else {
+            break;
+        };
+        let report = idx.process_dirty_entry_with_project_markers(entry, &[], &project_markers);
+        assert!(!report.failed);
+        processed = processed.saturating_add(1);
+        if idx.dirty_queue_len() > 0 {
+            assert!(
+                report.outcomes.is_empty(),
+                "continuations must not publish watcher-facing outcomes"
+            );
+        }
+        completions.extend(
+            report
+                .outcomes
+                .into_iter()
+                .filter(|outcome| outcome.completion_ready),
+        );
+    }
+
+    assert_eq!(processed, 3, "each directory should be one continuation");
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].dir, repair_root);
+    assert_eq!(completions[0].outcome.scanned, 5);
+    assert_eq!(completions[0].outcome.changed, 5);
+    assert_eq!(
+        completions[0].outcome.project_roots,
+        vec![repair_root, deepest]
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recursive_repair_publishes_one_root_level_aggregate_for_wide_tree() {
+    let root = unique_tmp_dir("recursive-root-aggregate-wide");
+    let repair_root = root.join("repair");
+    std::fs::create_dir_all(&repair_root).unwrap();
+    for i in 0..12 {
+        let child = repair_root.join(format!("child-{i:02}"));
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("visible.txt"), b"visible").unwrap();
+    }
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    idx.enqueue_recursive_dirty_dirs(
+        vec![repair_root.clone()],
+        DirtyReason::RecursiveSubtreeRepair,
+    );
+
+    let mut processed = 0usize;
+    let mut completions = Vec::new();
+    loop {
+        let entry = { idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop() };
+        let Some(entry) = entry else {
+            break;
+        };
+        let report = idx.process_dirty_entry(entry, &[]);
+        assert!(!report.failed);
+        processed = processed.saturating_add(1);
+        if idx.dirty_queue_len() > 0 {
+            assert!(
+                report.outcomes.is_empty(),
+                "continuations must not publish watcher-facing outcomes"
+            );
+        }
+        completions.extend(
+            report
+                .outcomes
+                .into_iter()
+                .filter(|outcome| outcome.completion_ready),
+        );
+    }
+
+    assert_eq!(processed, 13, "root plus twelve children should be scanned");
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].dir, repair_root);
+    assert_eq!(completions[0].outcome.scanned, 24);
+    assert_eq!(completions[0].outcome.changed, 24);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn fast_scan_reason_merge_cannot_bypass_recursive_completion() {
     let root = unique_tmp_dir("recursive-fast-scan-reason-merge");
     let child = root.join("nested");
@@ -1560,7 +1664,7 @@ fn recursive_repair_rejects_directory_mutation_between_slices() {
     let first_entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
     let first = idx.process_dirty_entry(first_entry, &[]);
     assert!(!first.failed);
-    assert!(!first.outcomes[0].completion_ready);
+    assert!(first.outcomes.is_empty());
 
     let late = root.join("late-event.txt");
     std::fs::write(&late, b"late").unwrap();

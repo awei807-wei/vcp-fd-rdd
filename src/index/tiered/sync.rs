@@ -9,7 +9,7 @@ use crate::config::L3ScanPolicy;
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta, Task};
 use crate::event::sync::{
     now_ns, DirectoryFingerprint, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyRepairCursor,
-    DirtyScope,
+    DirtyRepairProgress, DirtyScope,
 };
 use crate::fs_policy::FsPolicy;
 use crate::index::delta_buffer::SubtreeInvalidationSnapshot;
@@ -138,6 +138,7 @@ struct RepairContinuationState {
     cursor: Option<DirtyRepairCursor>,
     completion_stamps: Option<Vec<DirectoryStamp>>,
     invalidation_epoch: Option<u64>,
+    completed_outcome: Option<ScanOutcome>,
 }
 
 fn repair_continuation_cursor(
@@ -150,6 +151,7 @@ fn repair_continuation_cursor(
             cursor: None,
             completion_stamps: None,
             invalidation_epoch: None,
+            completed_outcome: None,
         };
     }
     if !recursive_subtree_repair {
@@ -157,11 +159,12 @@ fn repair_continuation_cursor(
             cursor: sliced.next_cursor.clone(),
             completion_stamps: None,
             invalidation_epoch: sliced.invalidation_epoch,
+            completed_outcome: None,
         };
     }
 
     let invalidation_epoch = sliced.invalidation_epoch;
-    let (current_dir, mut pending_dirs, mut completed_dir_stamps) = entry
+    let (current_dir, mut pending_dirs, mut completed_dir_stamps, mut progress) = entry
         .repair_cursor
         .take()
         .map(DirtyRepairCursor::into_recursive_collections)
@@ -170,8 +173,15 @@ fn repair_continuation_cursor(
                 entry.scope.dir_paths()[0].clone(),
                 Default::default(),
                 Vec::new(),
+                DirtyRepairProgress::default(),
             )
         });
+    progress.accumulate(
+        sliced.outcome.scanned,
+        sliced.outcome.changed,
+        sliced.outcome.elapsed_ms,
+        sliced.outcome.project_roots.as_slice(),
+    );
     pending_dirs.extend(sliced.child_dirs.iter().cloned());
     if sliced.completed {
         let Some(dir_start_stamp) = sliced.dir_start_stamp else {
@@ -179,6 +189,7 @@ fn repair_continuation_cursor(
                 cursor: None,
                 completion_stamps: None,
                 invalidation_epoch: None,
+                completed_outcome: None,
             };
         };
         completed_dir_stamps.push((current_dir, dir_start_stamp));
@@ -193,6 +204,7 @@ fn repair_continuation_cursor(
                     pending_dirs,
                     completed_dir_stamps,
                     sliced.dir_start_stamp,
+                    progress,
                 )
                 .with_scan_invalidation_epoch(
                     invalidation_epoch.expect("recursive scan tracks invalidation epoch"),
@@ -200,13 +212,26 @@ fn repair_continuation_cursor(
             ),
             completion_stamps: None,
             invalidation_epoch,
+            completed_outcome: None,
         };
     }
     if !sliced.completed || pending_dirs.is_empty() {
+        let completed_outcome = if sliced.completed {
+            let (scanned, changed, elapsed_ms, project_roots) = progress.into_parts();
+            Some(ScanOutcome {
+                scanned,
+                changed,
+                elapsed_ms,
+                project_roots,
+            })
+        } else {
+            None
+        };
         return RepairContinuationState {
             cursor: None,
             completion_stamps: sliced.completed.then_some(completed_dir_stamps),
             invalidation_epoch,
+            completed_outcome,
         };
     }
 
@@ -221,6 +246,7 @@ fn repair_continuation_cursor(
                 pending_dirs,
                 completed_dir_stamps,
                 None,
+                progress,
             )
             .with_scan_invalidation_epoch(
                 invalidation_epoch.expect("recursive scan tracks invalidation epoch"),
@@ -228,6 +254,7 @@ fn repair_continuation_cursor(
         ),
         completion_stamps: None,
         invalidation_epoch,
+        completed_outcome: None,
     }
 }
 
@@ -1042,6 +1069,7 @@ impl TieredIndex {
                                 dropped_stale_batch,
                                 completion_ready,
                                 scan_failed,
+                                completed_recursive_outcome,
                             ) = if entry.reason.is_cold_scan() || recursive_subtree_repair {
                                 let sliced = self.scan_dir_repair_slice_with_project_markers(
                                     dir,
@@ -1103,6 +1131,7 @@ impl TieredIndex {
                                     sliced.dropped_stale_batch,
                                     completion_ready,
                                     scan_failed,
+                                    continuation_state.completed_outcome,
                                 )
                             } else {
                                 let scanned = self
@@ -1120,6 +1149,7 @@ impl TieredIndex {
                                     scanned.dropped_stale_batch,
                                     !scanned.dropped_stale_batch,
                                     false,
+                                    None,
                                 )
                             };
                             had_failed_dir |= scan_failed;
@@ -1131,13 +1161,27 @@ impl TieredIndex {
                             report.changed = report.changed.saturating_add(outcome.changed);
                             report.elapsed_ms =
                                 report.elapsed_ms.saturating_add(outcome.elapsed_ms);
-                            report.outcomes.push(DirtyScanOutcome {
-                                dir: dir.clone(),
-                                outcome,
-                                reason: entry.reason,
-                                manifest_skipped,
-                                completion_ready,
-                            });
+                            if !recursive_subtree_repair || completion_ready {
+                                let published_dir = if recursive_subtree_repair {
+                                    entry.scope.dir_paths()[0].clone()
+                                } else {
+                                    dir.clone()
+                                };
+                                let published_outcome = if recursive_subtree_repair {
+                                    completed_recursive_outcome.expect(
+                                        "completed recursive repair publishes accumulated outcome",
+                                    )
+                                } else {
+                                    outcome
+                                };
+                                report.outcomes.push(DirtyScanOutcome {
+                                    dir: published_dir,
+                                    outcome: published_outcome,
+                                    reason: entry.reason,
+                                    manifest_skipped,
+                                    completion_ready,
+                                });
+                            }
                         }
                         Ok(_) => {
                             had_failed_dir = true;

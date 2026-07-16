@@ -58,6 +58,24 @@ pub(super) struct DirtyScopeObservation {
 }
 
 impl TieredWatchRuntime {
+    /// Returns whether an installed or reserved recursive watcher covers `path`.
+    ///
+    /// This is a cheap preflight guard. Callers must still keep the locked
+    /// coverage checks in the reservation path to close races.
+    pub fn recursive_watch_reserved_or_covers(&self, path: &Path) -> bool {
+        let formal_watch_covers = self.dirs.read().iter().any(|(root, state)| {
+            path_is_under_or_equal(path, root.as_path())
+                && (state.tier() == WatchTier::L0
+                    || state.promotion_pending.load(Ordering::Acquire))
+        });
+        if formal_watch_covers {
+            return true;
+        }
+        self.ephemeral.read().iter().any(|(root, lease)| {
+            !lease.pending_remove && path_is_under_or_equal(path, root.as_path())
+        })
+    }
+
     /// Returns whether an installed ephemeral recursive watcher covers `path`.
     pub fn confirmed_ephemeral_watch_covers(&self, path: &Path) -> bool {
         self.ephemeral.read().iter().any(|(root, lease)| {

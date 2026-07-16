@@ -1559,6 +1559,9 @@ fn spawn_dirty_queue_loop(
                         );
                     }
                     for scan in report.outcomes {
+                        if entry.requires_recursive_subtree_repair() && !scan.completion_ready {
+                            continue;
+                        }
                         let changed = scan.outcome.changed;
                         let project_roots = scan.outcome.project_roots.clone();
                         let rotating_cycle_id = entry.rotating_cold_window_cycle_id();
@@ -1569,13 +1572,11 @@ fn spawn_dirty_queue_loop(
                                 scan.manifest_skipped,
                             )
                             .unwrap_or_else(|| scan.dir.clone());
-                        if scan.completion_ready {
-                            if let Some(cycle_id) = rotating_cycle_id {
-                                runtime.record_rotating_cold_window_scan_completion(
-                                    policy_dir.as_path(),
-                                    cycle_id,
-                                );
-                            }
+                        if let Some(cycle_id) = rotating_cycle_id {
+                            runtime.record_rotating_cold_window_scan_completion(
+                                policy_dir.as_path(),
+                                cycle_id,
+                            );
                         }
                         runtime.apply_scan_policy(
                             policy_dir.as_path(),
@@ -1588,7 +1589,9 @@ fn spawn_dirty_queue_loop(
                             tiered.l1_empty_scans_to_l2,
                             tiered.l2_empty_scans_to_l3,
                         );
-                        let promotion_decision = if changed > 0 {
+                        let promotion_decision = if changed > 0
+                            && !runtime.recursive_watch_reserved_or_covers(policy_dir.as_path())
+                        {
                             send_promotion_command(runtime, &watch_command_tx, policy_dir).await
                         } else {
                             crate::event::tiered_watch::PromotionDecision::NotEligible
@@ -1624,6 +1627,9 @@ fn spawn_dirty_queue_loop(
                                 &exclude_dirs,
                                 &ignore_prefixes,
                             ) {
+                                continue;
+                            }
+                            if runtime.recursive_watch_reserved_or_covers(project_root.as_path()) {
                                 continue;
                             }
                             let watch_cost = estimate_notify_recursive_watch_count(
@@ -2043,20 +2049,10 @@ async fn maybe_send_ephemeral_watch_command(
     config: &EphemeralWatchConfig,
     fallback_cycle_id: Option<u64>,
 ) -> bool {
-    if config.budget == 0
-        || !dir.is_dir()
-        || runtime.rotating_cold_window_expired_ephemeral_covers(dir.as_path())
-    {
+    let Some(cost) = estimate_ephemeral_watch_cost(runtime, dir.as_path(), exclude_dirs, config)
+    else {
         return false;
-    }
-    if crate::util::path_has_excluded_component(dir.as_path(), exclude_dirs) {
-        runtime.note_watch_exclude_rejected();
-        return false;
-    }
-    let cost = estimate_notify_recursive_watch_count(
-        dir.as_path(),
-        config.max_cost_per_root.max(1).saturating_add(1),
-    );
+    };
     match runtime.note_dirty_scope_with_changed(dir.clone(), cost, exclude_dirs, config, changed) {
         EphemeralWatchDecision::Add(path) => {
             if watch_command_tx
@@ -2097,6 +2093,29 @@ async fn maybe_send_ephemeral_watch_command(
     }
 }
 
+fn estimate_ephemeral_watch_cost(
+    runtime: &TieredWatchRuntime,
+    dir: &std::path::Path,
+    exclude_dirs: &[String],
+    config: &EphemeralWatchConfig,
+) -> Option<usize> {
+    if config.budget == 0
+        || runtime.rotating_cold_window_expired_ephemeral_covers(dir)
+        || runtime.recursive_watch_reserved_or_covers(dir)
+        || !dir.is_dir()
+    {
+        return None;
+    }
+    if crate::util::path_has_excluded_component(dir, exclude_dirs) {
+        runtime.note_watch_exclude_rejected();
+        return None;
+    }
+    Some(estimate_notify_recursive_watch_count(
+        dir,
+        config.max_cost_per_root.max(1).saturating_add(1),
+    ))
+}
+
 fn rotating_action_needs_initial_dirty_scan(
     action: RotatingColdWindowActionKind,
     mechanism_ready: bool,
@@ -2125,6 +2144,64 @@ fn path_is_under_or_equal(path: &std::path::Path, root: &std::path::Path) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_recursive_watch_coverage_skips_ephemeral_cost_estimation() {
+        let root = temp_root("ephemeral-cost-precheck");
+        let child = root.join("child/deep");
+        std::fs::create_dir_all(&child).unwrap();
+        let config = EphemeralWatchConfig {
+            budget: 32,
+            repeat_threshold: 1,
+            max_cost_per_root: 32,
+            ..EphemeralWatchConfig::default()
+        };
+
+        let l0_runtime = TieredWatchRuntime::new_with_ephemeral(
+            vec![(root.clone(), 1)],
+            Vec::new(),
+            32,
+            5_000,
+            20,
+            32,
+        );
+        assert_eq!(
+            estimate_ephemeral_watch_cost(&l0_runtime, child.as_path(), &[], &config),
+            None
+        );
+
+        let ephemeral_runtime = TieredWatchRuntime::new_with_ephemeral(
+            Vec::new(),
+            vec![(root.clone(), 1)],
+            32,
+            5_000,
+            20,
+            32,
+        );
+        assert_eq!(
+            ephemeral_runtime.note_dirty_scope_with_changed(root.clone(), 1, &[], &config, 1,),
+            EphemeralWatchDecision::Add(root.clone())
+        );
+        assert_eq!(
+            estimate_ephemeral_watch_cost(&ephemeral_runtime, child.as_path(), &[], &config),
+            None
+        );
+
+        let uncovered_runtime = TieredWatchRuntime::new_with_ephemeral(
+            Vec::new(),
+            vec![(root.clone(), 1)],
+            32,
+            5_000,
+            20,
+            32,
+        );
+        assert!(
+            estimate_ephemeral_watch_cost(&uncovered_runtime, child.as_path(), &[], &config)
+                .is_some()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn rotating_ephemeral_dispatch_avoids_duplicate_dirty_scan() {
