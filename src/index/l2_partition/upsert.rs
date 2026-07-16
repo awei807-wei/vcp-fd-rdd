@@ -306,17 +306,24 @@ impl PersistentIndex {
         }
     }
 
-    pub fn path_freshness(&self, path: &Path, mtime_ns: i64) -> PathFreshness {
+    pub fn path_freshness(
+        &self,
+        path: &Path,
+        file_key: FileKey,
+        mtime_ns: i64,
+        kind: FileKind,
+    ) -> PathFreshness {
         let Some(docid) = self.lookup_docid_by_path(path) else {
             return PathFreshness::Missing;
         };
         if self.tombstones.read().contains(docid) {
             return PathFreshness::Missing;
         }
-        let Some(old_mtime_ns) = self.entry_mtime(docid) else {
+        let entries = self.entries.read();
+        let Some(entry) = entries.get(docid as usize) else {
             return PathFreshness::Changed;
         };
-        if old_mtime_ns == mtime_ns {
+        if entry.file_key() == file_key && entry.mtime_ns == mtime_ns && entry.kind() == kind {
             PathFreshness::Unchanged
         } else {
             PathFreshness::Changed

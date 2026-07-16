@@ -155,6 +155,7 @@ pub struct DirtyRepairCursor {
     pending_dirs: BTreeSet<PathBuf>,
     completed_dir_stamps: Vec<(PathBuf, DirectoryFingerprint)>,
     current_dir_start_stamp: Option<DirectoryFingerprint>,
+    scan_invalidation_epoch: Option<u64>,
 }
 
 impl DirtyRepairCursor {
@@ -165,6 +166,7 @@ impl DirtyRepairCursor {
             pending_dirs: BTreeSet::new(),
             completed_dir_stamps: Vec::new(),
             current_dir_start_stamp: None,
+            scan_invalidation_epoch: None,
         }
     }
 
@@ -185,6 +187,7 @@ impl DirtyRepairCursor {
             pending_dirs: pending_dirs.into_iter().collect(),
             completed_dir_stamps,
             current_dir_start_stamp,
+            scan_invalidation_epoch: None,
         }
     }
 
@@ -194,6 +197,15 @@ impl DirtyRepairCursor {
 
     pub(crate) fn current_dir_start_stamp(&self) -> Option<DirectoryFingerprint> {
         self.current_dir_start_stamp
+    }
+
+    pub(crate) fn scan_invalidation_epoch(&self) -> Option<u64> {
+        self.scan_invalidation_epoch
+    }
+
+    pub(crate) fn with_scan_invalidation_epoch(mut self, epoch: u64) -> Self {
+        self.scan_invalidation_epoch = Some(epoch);
+        self
     }
 
     pub(crate) fn into_recursive_collections(
@@ -219,6 +231,7 @@ impl DirtyRepairCursor {
             pending_dirs,
             completed_dir_stamps,
             current_dir_start_stamp,
+            scan_invalidation_epoch: None,
         }
     }
 
@@ -670,19 +683,22 @@ fn merge_repair_cursor(
         (Some(existing), Some(incoming))
             if existing.dir == incoming.dir
                 && existing.completed_dir_stamps == incoming.completed_dir_stamps
-                && existing.current_dir_start_stamp == incoming.current_dir_start_stamp =>
+                && existing.current_dir_start_stamp == incoming.current_dir_start_stamp
+                && existing.scan_invalidation_epoch == incoming.scan_invalidation_epoch =>
         {
             let dir = existing.dir.clone();
             let offset = existing.offset.min(incoming.offset);
             let mut pending_dirs = existing.pending_dirs;
             pending_dirs.extend(incoming.pending_dirs);
-            Some(DirtyRepairCursor::from_recursive_collections(
+            let mut merged = DirtyRepairCursor::from_recursive_collections(
                 dir,
                 offset,
                 pending_dirs,
                 existing.completed_dir_stamps,
                 existing.current_dir_start_stamp,
-            ))
+            );
+            merged.scan_invalidation_epoch = existing.scan_invalidation_epoch;
+            Some(merged)
         }
         (Some(_), Some(_)) => None,
     }

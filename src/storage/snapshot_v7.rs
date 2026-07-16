@@ -2888,6 +2888,74 @@ mod tests {
     }
 
     #[test]
+    fn cold_delta_writer_prunes_durable_noop_upserts() {
+        let source_path = tmp_v7_path("cold-delta-noop-source");
+        let output_path = tmp_v7_path("cold-delta-noop-output");
+        let (base, _) = cold_delta_base();
+        write_v7_snapshot_atomic(&source_path, &base).unwrap();
+        let source = load_v7_from_path(&source_path).unwrap().unwrap();
+        let plan = ColdDeltaPlan::new(
+            Vec::<Vec<u8>>::new(),
+            vec![cold_delta_meta("/tmp/tree/keep.txt", 11, 10)],
+        );
+
+        let report =
+            write_v7_cold_delta_atomic(&output_path, &source, plan, ColdDeltaLimits::default())
+                .unwrap();
+        assert_eq!(report.old_entries, 7);
+        assert_eq!(report.appended_entries, 0);
+        assert_eq!(report.live_entries, 7);
+        assert_eq!(report.tombstone_entries, 0);
+
+        let loaded = load_v7_from_path(&output_path).unwrap().unwrap();
+        assert_eq!(
+            loaded
+                .query_keys(&ExactMatcher::new("keep", false))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn cold_delta_writer_preserves_recreate_under_deleted_prefix() {
+        let source_path = tmp_v7_path("cold-delta-recreate-source");
+        let output_path = tmp_v7_path("cold-delta-recreate-output");
+        let (base, _) = cold_delta_base();
+        write_v7_snapshot_atomic(&source_path, &base).unwrap();
+        let source = load_v7_from_path(&source_path).unwrap().unwrap();
+        let plan = ColdDeltaPlan::new(
+            vec![b"/tmp/tree/keep.txt".to_vec()],
+            vec![cold_delta_meta("/tmp/tree/keep.txt", 11, 10)],
+        );
+
+        let report =
+            write_v7_cold_delta_atomic(&output_path, &source, plan, ColdDeltaLimits::default())
+                .unwrap();
+        assert_eq!(report.appended_entries, 1);
+        assert_eq!(report.live_entries, 7);
+        assert_eq!(report.tombstone_entries, 1);
+
+        let loaded = load_v7_from_path(&output_path).unwrap().unwrap();
+        assert_eq!(
+            loaded
+                .query_keys(&ExactMatcher::new("keep", false))
+                .unwrap(),
+            vec![FileKey {
+                dev: 7,
+                ino: 11,
+                generation: 0,
+            }]
+        );
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
     fn cold_delta_plan_reports_owned_overlay_shape() {
         let empty = ColdDeltaPlan::new(Vec::<Vec<u8>>::new(), Vec::<FileMeta>::new());
         assert!(empty.is_empty());

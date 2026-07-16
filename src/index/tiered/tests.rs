@@ -2,11 +2,12 @@ use super::*;
 use crate::config::{ContentIndexConfig, MmapWarmupConfig, QueryConfig, RuntimeProfile};
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta};
 use crate::diagnostics::{DiagnosticReport, DiagnosticSource};
-use crate::event::sync::{DirtyReason, DirtyScope};
+use crate::event::sync::{DirtyReason, DirtyRepairCursor, DirtyScope};
 use crate::event::tiered_watch::{FastScanLeaseKind, FastScanTickConfig, TieredWatchRuntime};
 use crate::fs_policy::{FsPolicyConfig, FsPolicyDecision, MountTable};
 use crate::index::tiered::events::event_record_estimated_bytes;
 use crate::index::tiered::sync::RebuildAdmission;
+use crate::index::PathFreshness;
 use crate::io_governor::{BackoffPolicy, IoGovernor, IoGovernorConfig, IoPressure};
 use crate::stats::{EventPipelineStats, MemorySampleDepth, SmapsRollupStats};
 use crate::storage::quarantine::{
@@ -476,6 +477,225 @@ fn mtime_precheck_unconfigured_dir() {
 }
 
 #[test]
+fn rotating_cold_scan_only_records_changed_paths() {
+    let root = unique_tmp_dir("rotating-cold-scan-changed-only");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let existing_paths = (0..8)
+        .map(|index| root.join(format!("existing-{index}.txt")))
+        .collect::<Vec<_>>();
+    for path in &existing_paths {
+        std::fs::write(path, b"stable").unwrap();
+    }
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    for path in &existing_paths {
+        idx.l2
+            .load_full()
+            .upsert_path_alias(file_meta_from_path(path.clone()));
+    }
+    idx.refresh_base();
+    assert!(idx.delta_buffer.lock().is_empty());
+
+    let added = root.join("added.txt");
+    std::fs::write(&added, b"new").unwrap();
+    let event_seq_before = idx.event_seq.load(std::sync::atomic::Ordering::Relaxed);
+    idx.enqueue_recursive_dirty_dirs(
+        vec![root.clone()],
+        DirtyReason::RotatingColdWindow { cycle_id: 101 },
+    );
+    let mut reports = Vec::new();
+    while let Some(report) = mtime_precheck_pop_and_process(&idx, &std::collections::HashSet::new())
+    {
+        reports.push(report);
+    }
+
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.outcomes[0].outcome.changed)
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.outcomes[0].outcome.scanned)
+            .sum::<usize>(),
+        9
+    );
+    let delta = idx.delta_buffer.lock();
+    assert_eq!(
+        delta.len(),
+        1,
+        "unchanged cold paths must not become snapshot upserts"
+    );
+    assert!(delta.is_live(added.as_os_str().as_encoded_bytes()));
+    assert!(existing_paths
+        .iter()
+        .all(|path| !delta.is_live(path.as_os_str().as_encoded_bytes())));
+    assert!(delta
+        .snapshot_complete_subtree_scans()
+        .contains(root.as_os_str().as_encoded_bytes()));
+    drop(delta);
+    assert_eq!(
+        idx.event_seq.load(std::sync::atomic::Ordering::Relaxed),
+        event_seq_before + 1
+    );
+
+    let event_seq_before_noop = idx.event_seq.load(std::sync::atomic::Ordering::Relaxed);
+    idx.enqueue_recursive_dirty_dirs(
+        vec![root.clone()],
+        DirtyReason::RotatingColdWindow { cycle_id: 102 },
+    );
+    let mut noop_reports = Vec::new();
+    while let Some(report) = mtime_precheck_pop_and_process(&idx, &std::collections::HashSet::new())
+    {
+        noop_reports.push(report);
+    }
+    assert_eq!(
+        noop_reports
+            .iter()
+            .map(|report| report.outcomes[0].outcome.changed)
+            .sum::<usize>(),
+        0
+    );
+    assert_eq!(idx.delta_buffer.lock().len(), 1);
+    assert_eq!(
+        idx.event_seq.load(std::sync::atomic::Ordering::Relaxed),
+        event_seq_before_noop,
+        "a no-op rotating scan must not write WAL/delta events"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn path_freshness_keeps_identity_kind_and_delete_boundaries() {
+    let root = unique_tmp_dir("path-freshness-boundaries");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("entry.txt");
+    std::fs::write(&path, b"stable").unwrap();
+    let meta = file_meta_from_path(path.clone());
+    let mtime_ns = mtime_to_ns(meta.mtime);
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.l2.load_full().upsert_path_alias(meta.clone());
+    idx.refresh_base();
+    assert_eq!(
+        idx.path_freshness(&path, meta.file_key, mtime_ns, meta.kind),
+        PathFreshness::Unchanged
+    );
+
+    let replacement_key = FileKey {
+        ino: meta.file_key.ino.wrapping_add(1),
+        ..meta.file_key
+    };
+    assert_eq!(
+        idx.path_freshness(&path, replacement_key, mtime_ns, meta.kind),
+        PathFreshness::Changed,
+        "same path and mtime with a new identity must be indexed"
+    );
+    assert_eq!(
+        idx.path_freshness(&path, meta.file_key, mtime_ns, FileKind::Directory),
+        PathFreshness::Changed,
+        "same path and mtime with a new kind must be indexed"
+    );
+
+    idx.apply_events(&[mk_event(1, EventType::Delete, path.clone())]);
+    assert_eq!(
+        idx.path_freshness(&path, meta.file_key, mtime_ns, meta.kind),
+        PathFreshness::Changed,
+        "a recreate covered by a delete boundary must not be skipped"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn path_freshness_snapshot_honors_ancestor_invalidation() {
+    let root = unique_tmp_dir("path-freshness-ancestor-invalidation");
+    let nested = root.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let path = nested.join("entry.txt");
+    std::fs::write(&path, b"stable").unwrap();
+    let meta = file_meta_from_path(path.clone());
+
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.l2.load_full().upsert_path_alias(meta.clone());
+    idx.refresh_base();
+    idx.apply_events(&[mk_event(1, EventType::Delete, nested)]);
+
+    assert_eq!(
+        idx.path_freshness(&path, meta.file_key, mtime_to_ns(meta.mtime), meta.kind),
+        PathFreshness::Changed,
+        "a parent invalidation snapshot must cover every descendant"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn stale_invalidation_snapshot_rejects_empty_scan_batch() {
+    let root = unique_tmp_dir("stale-invalidation-snapshot");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let snapshot_epoch = idx.delta_buffer.lock().invalidation_snapshot().epoch();
+
+    idx.apply_events(&[mk_event(1, EventType::Delete, root.join("entry.txt"))]);
+    let current_event_seq = idx.event_seq.load(std::sync::atomic::Ordering::Relaxed);
+    let mut metas = Vec::new();
+    assert!(
+        idx.apply_upserted_metas_if_scan_snapshot(
+            &[],
+            &mut metas,
+            true,
+            current_event_seq,
+            snapshot_epoch,
+        )
+        .is_none(),
+        "an invalidation added after filtering must reject even an empty scan batch"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn repair_slice_rejects_invalidation_epoch_from_previous_slice() {
+    let root = unique_tmp_dir("repair-slice-stale-invalidation-epoch");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("entry.txt"), b"stable").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let epoch = idx.delta_buffer.lock().invalidation_epoch();
+    let cursor = DirtyRepairCursor::new(root.clone(), 0).with_scan_invalidation_epoch(epoch);
+
+    idx.apply_events(&[mk_event(
+        1,
+        EventType::Delete,
+        root.join("deleted-between-slices.txt"),
+    )]);
+    let outcome = idx.scan_dir_repair_slice_with_project_markers(
+        &root,
+        Some(&cursor),
+        &[],
+        &[],
+        false,
+        true,
+        true,
+    );
+
+    assert!(outcome.dropped_stale_batch);
+    assert!(!outcome.completed);
+    assert!(idx
+        .delta_buffer
+        .lock()
+        .snapshot_complete_subtree_scans()
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn mtime_precheck_l0_dir() {
     // L0 tier 覆盖的目录（allow_manifest_skip=false），mtime 预检生效
     let root = unique_tmp_dir("mtime-l0");
@@ -606,6 +826,13 @@ fn mtime_record_skipped_on_stale_scan() {
     // 第一次扫描：记录 mtime
     mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
     let recorded_mtime = mtime_precheck_dir_mtime(&root);
+
+    // 让第二轮中的既有文件都成为候选 upsert。否则 changed-only 扫描会
+    // 跳过先读到的稳定文件，竞态线程可能只改到批次之外的路径。
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    for i in 0..400 {
+        std::fs::write(root.join(format!("file_{:04}.txt", i)), b"pending-change").unwrap();
+    }
 
     // 添加新文件改变目录 mtime
     std::fs::write(root.join("new_file.txt"), b"new").unwrap();
@@ -1695,15 +1922,17 @@ fn scan_upsert_accepts_unrelated_event_seq_advance_after_revalidation() {
     let idx = TieredIndex::empty(vec![root.clone()]);
 
     let expected_event_seq = idx.event_seq.load(Ordering::Relaxed);
+    let expected_invalidation_epoch = idx.delta_buffer.lock().invalidation_epoch();
     idx.apply_events(&[mk_event(1, EventType::Create, unrelated)]);
 
     let events = vec![mk_event(2, EventType::Modify, target.clone())];
     let mut metas = vec![file_meta_from_path(target.clone())];
-    let applied = idx.apply_upserted_metas_if_event_seq(
+    let applied = idx.apply_upserted_metas_if_scan_snapshot(
         events.as_slice(),
         &mut metas,
         false,
         expected_event_seq,
+        expected_invalidation_epoch,
     );
 
     assert!(applied.is_some());
@@ -1726,16 +1955,18 @@ fn scan_upsert_rejects_changed_target_after_event_seq_advance() {
     let idx = TieredIndex::empty(vec![root.clone()]);
 
     let expected_event_seq = idx.event_seq.load(Ordering::Relaxed);
+    let expected_invalidation_epoch = idx.delta_buffer.lock().invalidation_epoch();
     let events = vec![mk_event(1, EventType::Modify, target.clone())];
     let mut metas = vec![file_meta_from_path(target.clone())];
     std::fs::write(&target, b"new-and-longer").unwrap();
     idx.apply_events(&[mk_event(2, EventType::Create, unrelated)]);
 
-    let applied = idx.apply_upserted_metas_if_event_seq(
+    let applied = idx.apply_upserted_metas_if_scan_snapshot(
         events.as_slice(),
         &mut metas,
         false,
         expected_event_seq,
+        expected_invalidation_epoch,
     );
 
     assert!(applied.is_none());

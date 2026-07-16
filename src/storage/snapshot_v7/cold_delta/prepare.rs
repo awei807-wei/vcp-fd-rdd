@@ -16,19 +16,21 @@ use super::{
 
 pub(super) fn prepare_cold_delta(
     source: &ValidatedColdSource<'_>,
-    plan: ColdDeltaPlan,
+    mut plan: ColdDeltaPlan,
     limits: ColdDeltaLimits,
 ) -> anyhow::Result<PreparedColdDelta> {
-    let candidate_paths = collect_delta_candidate_paths(&plan.upserts);
-    let (path_additions, path_indices) =
-        resolve_delta_path_indices(source.path_table, source.path_layout, candidate_paths)?;
-    let tombstones = merged_tombstones(source, &plan)?;
     if !plan.structural_directory_upserts_are_proven() {
         anyhow::bail!(
             "direct_v7_unsupported: subtree move completeness is unproven; rebuild required"
         );
     }
-
+    let (tombstones, pruned_upserts) = merged_tombstones_and_prune_noops(source, &mut plan)?;
+    if pruned_upserts > 0 {
+        tracing::debug!(pruned_upserts, "pruned durable no-op cold snapshot upserts");
+    }
+    let candidate_paths = collect_delta_candidate_paths(&plan.upserts);
+    let (path_additions, path_indices) =
+        resolve_delta_path_indices(source.path_table, source.path_layout, candidate_paths)?;
     let appended_entries = build_appended_entries(source, &plan.upserts, &path_indices)?;
     let trigram_delta = build_delta_trigrams(source.old_entry_count, &plan.upserts)?;
     let parent_delta =
@@ -44,6 +46,93 @@ pub(super) fn prepare_cold_delta(
         tombstones,
         report,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DurableEntryIdentity {
+    file_key: crate::core::FileKey,
+    mtime_ns: i64,
+    kind: crate::core::FileKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DurableNoopCandidate {
+    identity: DurableEntryIdentity,
+    matched: bool,
+    protected_by_delete: bool,
+}
+
+fn merged_tombstones_and_prune_noops(
+    source: &ValidatedColdSource<'_>,
+    plan: &mut ColdDeltaPlan,
+) -> anyhow::Result<(RoaringBitmap, usize)> {
+    let tombstones = decode_tombstones(source.tombstones)?;
+    let mut candidates = plan
+        .upserts
+        .iter()
+        .map(|meta| {
+            let path = meta.path.as_os_str().as_encoded_bytes();
+            (
+                path.to_vec(),
+                DurableNoopCandidate {
+                    identity: DurableEntryIdentity {
+                        file_key: meta.file_key,
+                        mtime_ns: system_time_to_ns(meta.mtime),
+                        kind: meta.kind,
+                    },
+                    matched: false,
+                    protected_by_delete: deleted_prefix_for_path(path, &plan.deleted_paths)
+                        .is_some(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut tombstones = tombstones;
+    let mut path = Vec::new();
+    for docid in 0..source.old_entry_count {
+        let docid = docid as u32;
+        if tombstones.contains(docid) {
+            continue;
+        }
+        let entry = file_entry_at(source.entries_by_key, V7_VERSION, docid)
+            .ok_or_else(|| anyhow::anyhow!("direct_v7_corrupt: entry {} disappeared", docid))?;
+        resolve_raw_path_into(
+            source.path_table,
+            source.path_layout,
+            entry.path_index(),
+            &mut path,
+        )
+        .ok_or_else(|| anyhow::anyhow!("direct_v7_corrupt: entry path did not resolve"))?;
+        let deleted = deleted_prefix_for_path(&path, &plan.deleted_paths).is_some();
+        let candidate = candidates.get_mut(path.as_slice());
+        let has_candidate = candidate.is_some();
+        let mut durable_noop = false;
+        if let Some(candidate) = candidate {
+            if !candidate.protected_by_delete
+                && candidate.identity
+                    == (DurableEntryIdentity {
+                        file_key: entry.file_key(),
+                        mtime_ns: entry.mtime_ns,
+                        kind: entry.kind(),
+                    })
+            {
+                candidate.matched = true;
+                durable_noop = true;
+            }
+        }
+        if deleted || (has_candidate && !durable_noop) {
+            tombstones.insert(docid);
+        }
+    }
+
+    let before = plan.upserts.len();
+    plan.upserts.retain(|meta| {
+        let path = meta.path.as_os_str().as_encoded_bytes();
+        !candidates
+            .get(path)
+            .is_some_and(|candidate| candidate.matched)
+    });
+    Ok((tombstones, before.saturating_sub(plan.upserts.len())))
 }
 
 fn collect_delta_candidate_paths(upserts: &[FileMeta]) -> BTreeSet<Vec<u8>> {
@@ -119,41 +208,6 @@ fn assign_new_path_index(
     });
     indices.insert(path.to_vec(), path_idx);
     Ok(())
-}
-
-fn merged_tombstones(
-    source: &ValidatedColdSource<'_>,
-    plan: &ColdDeltaPlan,
-) -> anyhow::Result<RoaringBitmap> {
-    let mut tombstones = decode_tombstones(source.tombstones)?;
-    let upsert_paths: BTreeSet<&[u8]> = plan
-        .upserts
-        .iter()
-        .map(|meta| meta.path.as_os_str().as_encoded_bytes())
-        .collect();
-    let mut path = Vec::new();
-
-    for docid in 0..source.old_entry_count {
-        let docid = docid as u32;
-        if tombstones.contains(docid) {
-            continue;
-        }
-        let entry = file_entry_at(source.entries_by_key, V7_VERSION, docid)
-            .ok_or_else(|| anyhow::anyhow!("direct_v7_corrupt: entry {} disappeared", docid))?;
-        resolve_raw_path_into(
-            source.path_table,
-            source.path_layout,
-            entry.path_index(),
-            &mut path,
-        )
-        .ok_or_else(|| anyhow::anyhow!("direct_v7_corrupt: entry path did not resolve"))?;
-
-        let deleted = deleted_prefix_for_path(&path, &plan.deleted_paths);
-        if deleted.is_some() || upsert_paths.contains(path.as_slice()) {
-            tombstones.insert(docid);
-        }
-    }
-    Ok(tombstones)
 }
 
 fn deleted_prefix_for_path<'a>(path: &[u8], deleted: &'a BTreeSet<Vec<u8>>) -> Option<&'a [u8]> {

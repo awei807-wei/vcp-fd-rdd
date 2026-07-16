@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::entry_to_meta;
-use crate::core::{FileKey, FileMeta};
+use crate::core::{FileKey, FileKind, FileMeta};
 use crate::index::case_policy::unicode_case_fold_lookup;
 pub use crate::index::file_entry_v2::{FileEntry, FileEntryIndex};
 use crate::index::parent_index::ParentIndex;
@@ -680,6 +680,7 @@ impl BaseIndexData {
         path: &std::path::Path,
         file_key: FileKey,
         mtime_ns: i64,
+        kind: FileKind,
     ) -> PathFreshness {
         let Some(meta) = self.get_meta(file_key) else {
             return PathFreshness::Missing;
@@ -689,7 +690,7 @@ impl BaseIndexData {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .and_then(|d| i64::try_from(d.as_nanos()).ok())
             .unwrap_or(-1);
-        if meta.path == path && old_mtime_ns == mtime_ns {
+        if meta.path == path && old_mtime_ns == mtime_ns && meta.kind == kind {
             PathFreshness::Unchanged
         } else {
             PathFreshness::Changed

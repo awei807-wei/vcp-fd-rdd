@@ -389,14 +389,19 @@ impl TieredIndex {
         self.apply_upserted_metas_locked(events, metas, log_to_wal);
     }
 
-    pub(super) fn apply_upserted_metas_if_event_seq(
+    pub(super) fn apply_upserted_metas_if_scan_snapshot(
         &self,
         events: &[EventRecord],
         metas: &mut Vec<FileMeta>,
         log_to_wal: bool,
         expected_event_seq: u64,
+        expected_invalidation_epoch: u64,
     ) -> Option<u64> {
         let _snapshot_boundary = self.snapshot_event_gate.lock();
+        if self.delta_buffer.lock().invalidation_epoch() != expected_invalidation_epoch {
+            metas.clear();
+            return None;
+        }
         if self.event_seq.load(Ordering::Relaxed) != expected_event_seq
             && !upserted_metas_match_filesystem(metas)
         {

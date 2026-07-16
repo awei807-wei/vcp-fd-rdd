@@ -12,6 +12,7 @@ use crate::event::sync::{
     DirtyScope,
 };
 use crate::fs_policy::FsPolicy;
+use crate::index::delta_buffer::SubtreeInvalidationSnapshot;
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
 use crate::index::PathFreshness;
 use crate::io_governor::IoGovernor;
@@ -119,15 +120,16 @@ struct BudgetedScanOutcome {
 }
 
 #[derive(Debug)]
-struct SlicedScanOutcome {
+pub(super) struct SlicedScanOutcome {
     outcome: ScanOutcome,
     manifest_skipped: bool,
-    completed: bool,
+    pub(super) completed: bool,
     next_cursor: Option<DirtyRepairCursor>,
     child_dirs: Vec<PathBuf>,
-    dropped_stale_batch: bool,
+    pub(super) dropped_stale_batch: bool,
     failed: bool,
     dir_start_stamp: Option<DirectoryFingerprint>,
+    invalidation_epoch: Option<u64>,
 }
 
 type DirectoryStamp = (PathBuf, DirectoryFingerprint);
@@ -135,6 +137,7 @@ type DirectoryStamp = (PathBuf, DirectoryFingerprint);
 struct RepairContinuationState {
     cursor: Option<DirtyRepairCursor>,
     completion_stamps: Option<Vec<DirectoryStamp>>,
+    invalidation_epoch: Option<u64>,
 }
 
 fn repair_continuation_cursor(
@@ -146,15 +149,18 @@ fn repair_continuation_cursor(
         return RepairContinuationState {
             cursor: None,
             completion_stamps: None,
+            invalidation_epoch: None,
         };
     }
     if !recursive_subtree_repair {
         return RepairContinuationState {
             cursor: sliced.next_cursor.clone(),
             completion_stamps: None,
+            invalidation_epoch: sliced.invalidation_epoch,
         };
     }
 
+    let invalidation_epoch = sliced.invalidation_epoch;
     let (current_dir, mut pending_dirs, mut completed_dir_stamps) = entry
         .repair_cursor
         .take()
@@ -172,6 +178,7 @@ fn repair_continuation_cursor(
             return RepairContinuationState {
                 cursor: None,
                 completion_stamps: None,
+                invalidation_epoch: None,
             };
         };
         completed_dir_stamps.push((current_dir, dir_start_stamp));
@@ -179,20 +186,27 @@ fn repair_continuation_cursor(
 
     if let Some(cursor) = &sliced.next_cursor {
         return RepairContinuationState {
-            cursor: Some(DirtyRepairCursor::from_recursive_collections(
-                cursor.dir.clone(),
-                cursor.offset,
-                pending_dirs,
-                completed_dir_stamps,
-                sliced.dir_start_stamp,
-            )),
+            cursor: Some(
+                DirtyRepairCursor::from_recursive_collections(
+                    cursor.dir.clone(),
+                    cursor.offset,
+                    pending_dirs,
+                    completed_dir_stamps,
+                    sliced.dir_start_stamp,
+                )
+                .with_scan_invalidation_epoch(
+                    invalidation_epoch.expect("recursive scan tracks invalidation epoch"),
+                ),
+            ),
             completion_stamps: None,
+            invalidation_epoch,
         };
     }
     if !sliced.completed || pending_dirs.is_empty() {
         return RepairContinuationState {
             cursor: None,
             completion_stamps: sliced.completed.then_some(completed_dir_stamps),
+            invalidation_epoch,
         };
     }
 
@@ -200,14 +214,20 @@ fn repair_continuation_cursor(
         .pop_first()
         .expect("pending dir checked non-empty");
     RepairContinuationState {
-        cursor: Some(DirtyRepairCursor::from_recursive_collections(
-            next_dir,
-            0,
-            pending_dirs,
-            completed_dir_stamps,
-            None,
-        )),
+        cursor: Some(
+            DirtyRepairCursor::from_recursive_collections(
+                next_dir,
+                0,
+                pending_dirs,
+                completed_dir_stamps,
+                None,
+            )
+            .with_scan_invalidation_epoch(
+                invalidation_epoch.expect("recursive scan tracks invalidation epoch"),
+            ),
+        ),
         completion_stamps: None,
+        invalidation_epoch,
     }
 }
 
@@ -1049,7 +1069,13 @@ impl TieredIndex {
                                         .completion_stamps
                                         .as_deref()
                                         .is_some_and(|stamps| {
-                                            self.record_complete_subtree_scan(proof_root, stamps)
+                                            self.record_complete_subtree_scan(
+                                                proof_root,
+                                                stamps,
+                                                continuation_state.invalidation_epoch.expect(
+                                                    "recursive completion tracks invalidation epoch",
+                                                ),
+                                            )
                                         });
                                     if !proof_recorded {
                                         completion_ready = false;
@@ -1152,8 +1178,16 @@ impl TieredIndex {
         report
     }
 
-    fn record_complete_subtree_scan(&self, root: &Path, stamps: &[DirectoryStamp]) -> bool {
+    fn record_complete_subtree_scan(
+        &self,
+        root: &Path,
+        stamps: &[DirectoryStamp],
+        expected_invalidation_epoch: u64,
+    ) -> bool {
         let _event_boundary = self.snapshot_event_gate.lock();
+        if self.delta_buffer.lock().invalidation_epoch() != expected_invalidation_epoch {
+            return false;
+        }
         if !recursive_completion_stable(stamps) {
             return false;
         }
@@ -1332,7 +1366,9 @@ impl TieredIndex {
                 };
                 let mtime = meta.modified().ok();
                 let mtime_ns = mtime_to_ns(mtime);
-                if self.path_freshness(&path, file_key, mtime_ns) == PathFreshness::Unchanged {
+                let kind = FileKind::from_metadata(&meta);
+                if self.path_freshness(&path, file_key, mtime_ns, kind) == PathFreshness::Unchanged
+                {
                     continue;
                 }
                 seq = seq.wrapping_add(1);
@@ -1343,7 +1379,7 @@ impl TieredIndex {
                     mtime,
                     ctime: meta.created().ok(),
                     atime: meta.accessed().ok(),
-                    kind: FileKind::from_metadata(&meta),
+                    kind,
                 });
                 upsert_events.push(EventRecord {
                     seq,
@@ -1454,6 +1490,8 @@ impl TieredIndex {
     ) -> BudgetedScanOutcome {
         let start = Instant::now();
         let scan_started_seq = self.event_seq.load(Ordering::Relaxed);
+        let invalidations =
+            discard_if_event_seq_advances.then(|| self.delta_buffer.lock().invalidation_snapshot());
 
         let mut upsert_events: Vec<EventRecord> = Vec::new();
         let mut upsert_metas: Vec<FileMeta> = Vec::new();
@@ -1564,9 +1602,18 @@ impl TieredIndex {
                 };
                 let mtime = meta.modified().ok();
                 let mtime_ns = mtime_to_ns(mtime);
-                if self.path_freshness(&path, file_key, mtime_ns) != PathFreshness::Unchanged {
-                    changed += 1;
+                let kind = FileKind::from_metadata(&meta);
+                scanned += 1;
+                let freshness = invalidations.as_ref().map_or_else(
+                    || self.path_freshness(&path, file_key, mtime_ns, kind),
+                    |snapshot| {
+                        self.path_freshness_from_snapshot(&path, file_key, mtime_ns, kind, snapshot)
+                    },
+                );
+                if freshness == PathFreshness::Unchanged {
+                    continue;
                 }
+                changed += 1;
                 seq = seq.wrapping_add(1);
                 upsert_metas.push(FileMeta {
                     file_key,
@@ -1575,7 +1622,7 @@ impl TieredIndex {
                     mtime,
                     ctime: meta.created().ok(),
                     atime: meta.accessed().ok(),
-                    kind: FileKind::from_metadata(&meta),
+                    kind,
                 });
                 upsert_events.push(EventRecord {
                     seq,
@@ -1584,24 +1631,33 @@ impl TieredIndex {
                     id: FileIdentifier::Path(path),
                     path_hint: None,
                 });
-                scanned += 1;
             }
             if budget_exhausted {
                 break;
             }
         }
 
-        let stale_low_priority_scan = discard_if_event_seq_advances
-            && self.event_seq.load(Ordering::Relaxed) > scan_started_seq;
-        if stale_low_priority_scan {
-            tracing::debug!(
-                "discarded stale low-priority scan result after newer apply seq advanced"
-            );
-            changed = 0;
+        let applied = if let Some(snapshot) = invalidations.as_ref() {
+            self.apply_upserted_metas_if_scan_snapshot(
+                upsert_events.as_slice(),
+                &mut upsert_metas,
+                true,
+                scan_started_seq,
+                snapshot.epoch(),
+            )
         } else {
             if !upsert_events.is_empty() {
                 self.apply_upserted_metas_inner(upsert_events.as_slice(), &mut upsert_metas, true);
             }
+            Some(self.event_seq.load(Ordering::Relaxed))
+        };
+        let stale_low_priority_scan = applied.is_none();
+        if stale_low_priority_scan {
+            tracing::debug!(
+                "discarded stale low-priority scan result after its scan snapshot advanced"
+            );
+            changed = 0;
+        } else {
             self.update_directory_manifests_for_dirs(dirs, project_markers);
         }
 
@@ -1621,7 +1677,7 @@ impl TieredIndex {
         }
     }
 
-    fn scan_dir_repair_slice_with_project_markers(
+    pub(super) fn scan_dir_repair_slice_with_project_markers(
         &self,
         dir: &PathBuf,
         cursor: Option<&DirtyRepairCursor>,
@@ -1681,6 +1737,7 @@ impl TieredIndex {
                                         dropped_stale_batch: false,
                                         failed: false,
                                         dir_start_stamp,
+                                        invalidation_epoch: None,
                                     };
                                 }
                                 Some(false) => {
@@ -1741,6 +1798,7 @@ impl TieredIndex {
                         dropped_stale_batch: false,
                         failed: false,
                         dir_start_stamp,
+                        invalidation_epoch: None,
                     };
                 }
                 self.directory_manifests
@@ -1779,6 +1837,7 @@ impl TieredIndex {
                             dropped_stale_batch: false,
                             failed: false,
                             dir_start_stamp,
+                            invalidation_epoch: None,
                         };
                     }
                 }
@@ -1787,6 +1846,30 @@ impl TieredIndex {
 
         let start = Instant::now();
         let scan_started_seq = self.event_seq.load(Ordering::Relaxed);
+        let invalidations =
+            discard_if_event_seq_advances.then(|| self.delta_buffer.lock().invalidation_snapshot());
+        let invalidation_epoch = invalidations.as_ref().map(|snapshot| {
+            cursor
+                .and_then(DirtyRepairCursor::scan_invalidation_epoch)
+                .unwrap_or_else(|| snapshot.epoch())
+        });
+        if invalidations
+            .as_ref()
+            .zip(invalidation_epoch)
+            .is_some_and(|(snapshot, expected)| snapshot.epoch() != expected)
+        {
+            return SlicedScanOutcome {
+                outcome: ScanOutcome::default(),
+                manifest_skipped: false,
+                completed: false,
+                next_cursor: None,
+                child_dirs: Vec::new(),
+                dropped_stale_batch: true,
+                failed: false,
+                dir_start_stamp,
+                invalidation_epoch,
+            };
+        }
         let start_offset = cursor
             .filter(|cursor| cursor.dir == *dir)
             .map(|cursor| cursor.offset.max(0))
@@ -1813,6 +1896,7 @@ impl TieredIndex {
                     dropped_stale_batch: false,
                     failed: true,
                     dir_start_stamp,
+                    invalidation_epoch,
                 };
             }
         };
@@ -1869,9 +1953,18 @@ impl TieredIndex {
             };
             let mtime = meta.modified().ok();
             let mtime_ns = mtime_to_ns(mtime);
-            if self.path_freshness(&path, file_key, mtime_ns) != PathFreshness::Unchanged {
-                changed = changed.saturating_add(1);
+            let kind = FileKind::from_metadata(&meta);
+            scanned = scanned.saturating_add(1);
+            let freshness = invalidations.as_ref().map_or_else(
+                || self.path_freshness(&path, file_key, mtime_ns, kind),
+                |snapshot| {
+                    self.path_freshness_from_snapshot(&path, file_key, mtime_ns, kind, snapshot)
+                },
+            );
+            if freshness == PathFreshness::Unchanged {
+                continue;
             }
+            changed = changed.saturating_add(1);
             seq = seq.wrapping_add(1);
             upsert_metas.push(FileMeta {
                 file_key,
@@ -1880,7 +1973,7 @@ impl TieredIndex {
                 mtime,
                 ctime: meta.created().ok(),
                 atime: meta.accessed().ok(),
-                kind: FileKind::from_metadata(&meta),
+                kind,
             });
             upsert_events.push(EventRecord {
                 seq,
@@ -1889,7 +1982,6 @@ impl TieredIndex {
                 id: FileIdentifier::Path(path),
                 path_hint: None,
             });
-            scanned = scanned.saturating_add(1);
         }
 
         let mut dropped_stale_batch = false;
@@ -1898,11 +1990,12 @@ impl TieredIndex {
             tracing::debug!("discarded incomplete repair slice after metadata failure");
             changed = 0;
         } else if discard_if_event_seq_advances {
-            alignment_started_seq = self.apply_upserted_metas_if_event_seq(
+            alignment_started_seq = self.apply_upserted_metas_if_scan_snapshot(
                 upsert_events.as_slice(),
                 &mut upsert_metas,
                 true,
                 scan_started_seq,
+                invalidation_epoch.expect("low-priority scan tracks invalidation epoch"),
             );
             if alignment_started_seq.is_none() {
                 dropped_stale_batch = true;
@@ -1963,12 +2056,18 @@ impl TieredIndex {
                 let offset = slice.next_offset.unwrap_or_else(|| {
                     start_offset.saturating_add(REPAIR_SLICE_MAX_ENTRIES as i64)
                 });
-                Some(DirtyRepairCursor::new(dir.clone(), offset))
+                let cursor = DirtyRepairCursor::new(dir.clone(), offset);
+                Some(if let Some(epoch) = invalidation_epoch {
+                    cursor.with_scan_invalidation_epoch(epoch)
+                } else {
+                    cursor
+                })
             },
             child_dirs,
             dropped_stale_batch,
             failed: metadata_failed,
             dir_start_stamp,
+            invalidation_epoch,
         }
     }
 
@@ -2383,12 +2482,49 @@ impl TieredIndex {
         path: &std::path::Path,
         file_key: FileKey,
         mtime_ns: i64,
+        kind: FileKind,
     ) -> PathFreshness {
-        match self.l2.load_full().path_freshness(path, mtime_ns) {
+        if self
+            .delta_buffer
+            .lock()
+            .invalidation_covering_path(path)
+            .is_some()
+        {
+            return PathFreshness::Changed;
+        }
+        self.path_freshness_from_indexes(path, file_key, mtime_ns, kind)
+    }
+
+    fn path_freshness_from_snapshot(
+        &self,
+        path: &std::path::Path,
+        file_key: FileKey,
+        mtime_ns: i64,
+        kind: FileKind,
+        invalidations: &SubtreeInvalidationSnapshot,
+    ) -> PathFreshness {
+        if invalidations.covers(path) {
+            return PathFreshness::Changed;
+        }
+        self.path_freshness_from_indexes(path, file_key, mtime_ns, kind)
+    }
+
+    fn path_freshness_from_indexes(
+        &self,
+        path: &std::path::Path,
+        file_key: FileKey,
+        mtime_ns: i64,
+        kind: FileKind,
+    ) -> PathFreshness {
+        match self
+            .l2
+            .load_full()
+            .path_freshness(path, file_key, mtime_ns, kind)
+        {
             PathFreshness::Missing => self
                 .base
                 .load_full()
-                .path_freshness(path, file_key, mtime_ns),
+                .path_freshness(path, file_key, mtime_ns, kind),
             known => known,
         }
     }

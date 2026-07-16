@@ -1,6 +1,25 @@
 use crate::core::{EventRecord, EventType, FileKind};
 use std::collections::{BTreeSet, HashMap};
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SubtreeInvalidationSnapshot {
+    prefixes: BTreeSet<Vec<u8>>,
+    epoch: u64,
+}
+
+impl SubtreeInvalidationSnapshot {
+    pub(crate) fn covers(&self, path: &std::path::Path) -> bool {
+        path.ancestors().any(|ancestor| {
+            self.prefixes
+                .contains(ancestor.as_os_str().as_encoded_bytes())
+        })
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
 /// 统一增量缓冲区，替代 overlay_state + pending_events
 #[derive(Debug, Clone)]
 pub struct DeltaBuffer {
@@ -15,6 +34,7 @@ pub struct DeltaBuffer {
     /// This survives a later Live state at the same path so delete→recreate
     /// cannot resurrect cold children.
     subtree_invalidations: std::collections::HashSet<Vec<u8>>,
+    subtree_invalidation_epoch: u64,
     /// Recursively scanned subtree roots whose descendants were stable at the
     /// scan boundary. Direct v7 persistence may use these proofs to distinguish
     /// a complete subtree move/recreate from a lone directory event.
@@ -47,6 +67,7 @@ impl DeltaBuffer {
             max_capacity: cap,
             base_max_capacity: cap,
             subtree_invalidations: std::collections::HashSet::new(),
+            subtree_invalidation_epoch: 0,
             complete_subtree_scans: std::collections::HashSet::new(),
             structural_upsert_targets: std::collections::HashSet::new(),
             overflowed: false,
@@ -61,6 +82,7 @@ impl DeltaBuffer {
             max_capacity,
             base_max_capacity: max_capacity,
             subtree_invalidations: std::collections::HashSet::new(),
+            subtree_invalidation_epoch: 0,
             complete_subtree_scans: std::collections::HashSet::new(),
             structural_upsert_targets: std::collections::HashSet::new(),
             overflowed: false,
@@ -96,7 +118,7 @@ impl DeltaBuffer {
                 {
                     return false;
                 }
-                self.subtree_invalidations.insert(path_bytes.clone());
+                self.note_subtree_invalidation(path_bytes.clone());
                 self.entries.insert(path_bytes, DeltaState::Deleted);
                 true
             }
@@ -141,7 +163,7 @@ impl DeltaBuffer {
                 }
 
                 if let Some(fb) = from_bytes {
-                    self.subtree_invalidations.insert(fb.clone());
+                    self.note_subtree_invalidation(fb.clone());
                     self.entries.insert(fb, DeltaState::Deleted);
                 }
                 self.structural_upsert_targets.insert(path_bytes.clone());
@@ -185,6 +207,17 @@ impl DeltaBuffer {
         self.subtree_invalidations.iter().cloned().collect()
     }
 
+    pub(crate) fn invalidation_snapshot(&self) -> SubtreeInvalidationSnapshot {
+        SubtreeInvalidationSnapshot {
+            prefixes: self.snapshot_subtree_invalidations(),
+            epoch: self.subtree_invalidation_epoch,
+        }
+    }
+
+    pub(crate) fn invalidation_epoch(&self) -> u64 {
+        self.subtree_invalidation_epoch
+    }
+
     /// Return the most specific delete/rename source that covers `path`.
     ///
     /// Snapshot capture uses this only after a Live record can no longer be
@@ -202,7 +235,7 @@ impl DeltaBuffer {
     }
 
     pub fn clear_subtree_invalidations(&mut self) {
-        self.subtree_invalidations.clear();
+        self.clear_subtree_invalidations_inner();
     }
 
     pub(crate) fn note_complete_subtree_scan(&mut self, path: Vec<u8>) {
@@ -344,7 +377,7 @@ impl DeltaBuffer {
         self.structural_replay_unproven = false;
         // The full scan starts after this boundary and therefore proves all
         // pre-boundary subtree state from the filesystem itself.
-        self.subtree_invalidations.clear();
+        self.clear_subtree_invalidations_inner();
         self.complete_subtree_scans.clear();
         self.structural_upsert_targets.clear();
         let ceiling = self.base_max_capacity.max(MAX_RECOVERY_CAPACITY);
@@ -360,7 +393,7 @@ impl DeltaBuffer {
     /// or a complete full rebuild.
     pub fn reset_complete_generation(&mut self) {
         self.clear();
-        self.subtree_invalidations.clear();
+        self.clear_subtree_invalidations_inner();
         self.complete_subtree_scans.clear();
         self.structural_upsert_targets.clear();
         self.overflowed = false;
@@ -417,6 +450,19 @@ impl DeltaBuffer {
                 .iter()
                 .map(|path| path.capacity() + size_of::<Vec<u8>>() + 16)
                 .sum::<usize>()
+    }
+
+    fn note_subtree_invalidation(&mut self, path: Vec<u8>) {
+        if self.subtree_invalidations.insert(path) {
+            self.subtree_invalidation_epoch = self.subtree_invalidation_epoch.wrapping_add(1);
+        }
+    }
+
+    fn clear_subtree_invalidations_inner(&mut self) {
+        if !self.subtree_invalidations.is_empty() {
+            self.subtree_invalidations.clear();
+            self.subtree_invalidation_epoch = self.subtree_invalidation_epoch.wrapping_add(1);
+        }
     }
 }
 
