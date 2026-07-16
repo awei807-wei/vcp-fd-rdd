@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- **M2 递归 repair watcher 后处理根级收敛**：continuation 仅负责扫描、累计变更和完成证明；完整 root 才执行一次 scan policy、promotion 与 ephemeral watcher 决策。递归 watcher 成本估算前新增 L0/临时 watcher 覆盖短路，bootstrap 保留 cycle completion 但不再反馈进入 watcher 安装/淘汰链路。848912a 的 clean focused probe 见 `/tmp/fd-rdd-m2-runs/focused-root-aggregation-848912a/REPORT.md`；正式 4 block/8 leg A/B 尚待使用 848912a provenance 复跑，旧 `/home/shiyi/Downloads/vcp-FD/logs/REPORT.md` 绑定 4d7f68e，不作为本次性能验收。
+
 - 修复正式 M2 八腿报告暴露的多根因果与成本放大：falsification 腿延长为 1500 秒，六个 burst 使用 180 秒 cadence，并以整腿共享的 160 秒等待预算保证每次写入前租约至少剩余 125 秒；rotating watcher 命令在副作用前校验 active cycle，失败才降级到同 cycle scan-only，旧命令不能再污染新租约。Ephemeral bootstrap 与冷目录 rename 统一进入有界递归 DirtyQueue，递归属性和 cycle provenance 在合并、重试及后代任务中独立保留，避免成功路径重复深扫和 scan-only 因果丢失。
 - 修复 subtree rename 与 snapshot 收敛边界：冷目录结构变更逐层扫描新子树并可信对齐旧前缀，超时未配对的 Rename From 会修复源父目录；仅对目录 Create/rename 目标执行消失路径 `NotFound -> Delete` 归一化，普通 Modify 继续 fail-closed，减少 treatment 独有 metadata syscall。waterline soft 告警改为连续三次超限才降级，恢复阈值允许精确边界，配置强制 recover pct 小于 trigger pct 且 SLA 不低于 fast-scan service target，避免 5001-5003ms 调度抖动长期压低轮转预算。
 - 修复 M2 rotating cold-window watcher 生命周期竞态：活跃 scan-only lease 不再粗暴阻断普通 watcher（保留深层 subtree rename 可见性）；所有被 rotating lease 覆盖的新建/刷新 ephemeral lease 继承其剩余 TTL，`EphemeralWatch`/`ScanOnly` lease 过期至下一轮 rotation 前禁止普通路径重建。scan-only follow-up 限制为租约内两次有界扫描，并保留 rotating cycle provenance；冻结 L3 探针与离线复算均已通过五阶段门禁。

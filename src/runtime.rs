@@ -2110,11 +2110,17 @@ fn estimate_ephemeral_watch_cost(
         runtime.note_watch_exclude_rejected();
         return None;
     }
+    #[cfg(test)]
+    EPHEMERAL_WATCH_COST_ESTIMATE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(estimate_notify_recursive_watch_count(
         dir,
         config.max_cost_per_root.max(1).saturating_add(1),
     ))
 }
+
+#[cfg(test)]
+static EPHEMERAL_WATCH_COST_ESTIMATE_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn rotating_action_needs_initial_dirty_scan(
     action: RotatingColdWindowActionKind,
@@ -2145,8 +2151,12 @@ fn path_is_under_or_equal(path: &std::path::Path, root: &std::path::Path) -> boo
 mod tests {
     use super::*;
 
-    #[test]
-    fn existing_recursive_watch_coverage_skips_ephemeral_cost_estimation() {
+    static COST_ESTIMATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn existing_recursive_watch_coverage_skips_ephemeral_cost_estimation() {
+        let _counter_guard = COST_ESTIMATION_TEST_LOCK.lock().await;
+        EPHEMERAL_WATCH_COST_ESTIMATE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
         let root = temp_root("ephemeral-cost-precheck");
         let child = root.join("child/deep");
         std::fs::create_dir_all(&child).unwrap();
@@ -2186,6 +2196,28 @@ mod tests {
             estimate_ephemeral_watch_cost(&ephemeral_runtime, child.as_path(), &[], &config),
             None
         );
+        let (watch_command_tx, mut watch_command_rx) = tokio::sync::mpsc::channel(2);
+        let ephemeral_runtime = Arc::new(ephemeral_runtime);
+        assert!(
+            !maybe_send_ephemeral_watch_command(
+                &ephemeral_runtime,
+                &watch_command_tx,
+                child.clone(),
+                1,
+                &[],
+                &config,
+                None,
+            )
+            .await
+        );
+        assert_eq!(
+            EPHEMERAL_WATCH_COST_ESTIMATE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(watch_command_rx.try_recv().is_err());
+        let watcher_report = ephemeral_runtime.report();
+        assert_eq!(watcher_report.ephemeral_watch_created, 0);
+        assert_eq!(watcher_report.ephemeral_watch_evicted, 0);
 
         let uncovered_runtime = TieredWatchRuntime::new_with_ephemeral(
             Vec::new(),
@@ -2201,6 +2233,102 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn recursive_repair_limits_watcher_decisions_for_deep_and_wide_trees() {
+        let _counter_guard = COST_ESTIMATION_TEST_LOCK.lock().await;
+        for shape in ["deep", "wide"] {
+            EPHEMERAL_WATCH_COST_ESTIMATE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+            let root = temp_root(&format!("recursive-watcher-bound-{shape}"));
+            let repair_root = root.join("repair");
+            match shape {
+                "deep" => {
+                    let deepest = repair_root.join("level1/level2/level3");
+                    std::fs::create_dir_all(&deepest).unwrap();
+                    std::fs::write(deepest.join("visible.txt"), b"visible").unwrap();
+                }
+                "wide" => {
+                    std::fs::create_dir_all(&repair_root).unwrap();
+                    for i in 0..16 {
+                        let child = repair_root.join(format!("child-{i:02}"));
+                        std::fs::create_dir_all(&child).unwrap();
+                        std::fs::write(child.join("visible.txt"), b"visible").unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+
+            let index = TieredIndex::empty(vec![root.clone()]);
+            index.enqueue_recursive_dirty_dirs(
+                vec![repair_root.clone()],
+                DirtyReason::RecursiveSubtreeRepair,
+            );
+            std::thread::sleep(Duration::from_millis(260));
+            let runtime = Arc::new(TieredWatchRuntime::new_with_ephemeral(
+                Vec::new(),
+                Vec::new(),
+                128,
+                5_000,
+                20,
+                128,
+            ));
+            let config = EphemeralWatchConfig {
+                budget: 128,
+                repeat_threshold: 1,
+                max_cost_per_root: 128,
+                ..EphemeralWatchConfig::default()
+            };
+            let (watch_command_tx, mut watch_command_rx) = tokio::sync::mpsc::channel(4);
+            let mut watcher_decisions = 0usize;
+
+            loop {
+                let Some(entry) = index.dirty_queue_ready_batch(1).into_iter().next() else {
+                    break;
+                };
+                let report = index.process_dirty_entry(entry, &[]);
+                assert!(
+                    !report.failed,
+                    "{shape} recursive repair failed: {report:?}"
+                );
+                for scan in report.outcomes {
+                    assert!(scan.completion_ready);
+                    watcher_decisions = watcher_decisions.saturating_add(1);
+                    assert!(
+                        maybe_send_ephemeral_watch_command(
+                            &runtime,
+                            &watch_command_tx,
+                            scan.dir,
+                            scan.outcome.changed,
+                            &[],
+                            &config,
+                            None,
+                        )
+                        .await
+                    );
+                }
+            }
+
+            assert_eq!(watcher_decisions, 1, "{shape} repair decision count");
+            assert_eq!(
+                EPHEMERAL_WATCH_COST_ESTIMATE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "{shape} repair cost count"
+            );
+            let command = watch_command_rx.try_recv().unwrap();
+            let added = match command {
+                WatchCommand::AddEphemeral { path, .. } => path,
+                other => panic!("unexpected {shape} watcher command: {other:?}"),
+            };
+            assert_eq!(added, repair_root);
+            assert!(watch_command_rx.try_recv().is_err());
+            assert!(runtime.confirm_ephemeral_added(added.as_path()));
+            let watcher_report = runtime.report();
+            assert_eq!(watcher_report.ephemeral_watch_created, 1);
+            assert_eq!(watcher_report.ephemeral_watch_evicted, 0);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
