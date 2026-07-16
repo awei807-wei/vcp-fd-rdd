@@ -36,6 +36,8 @@ pub(in crate::storage::snapshot_v7) fn validate_cold_delta_source(
 pub struct ColdDeltaPlan {
     deleted_paths: BTreeSet<Vec<u8>>,
     upserts: Vec<FileMeta>,
+    complete_subtrees: BTreeSet<Vec<u8>>,
+    structural_directory_targets: BTreeSet<Vec<u8>>,
 }
 
 impl ColdDeltaPlan {
@@ -49,10 +51,33 @@ impl ColdDeltaPlan {
         for meta in upserts {
             upserts_by_path.insert(meta.path.as_os_str().as_encoded_bytes().to_vec(), meta);
         }
+        let structural_directory_targets = upserts_by_path
+            .iter()
+            .filter(|(_, meta)| meta.kind.is_directory())
+            .map(|(path, _)| path.clone())
+            .collect();
         Self {
             deleted_paths,
             upserts: upserts_by_path.into_values().collect(),
+            complete_subtrees: BTreeSet::new(),
+            structural_directory_targets,
         }
+    }
+
+    pub(crate) fn with_complete_subtrees<I>(mut self, complete_subtrees: I) -> Self
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        self.complete_subtrees = complete_subtrees.into_iter().collect();
+        self
+    }
+
+    pub(crate) fn with_structural_directory_targets<I>(mut self, targets: I) -> Self
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        self.structural_directory_targets = targets.into_iter().collect();
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -67,9 +92,34 @@ impl ColdDeltaPlan {
         self.upserts.len()
     }
 
+    pub(crate) fn structural_directory_upserts_are_proven(&self) -> bool {
+        self.structural_directory_targets.iter().all(|target| {
+            self.complete_subtrees
+                .iter()
+                .any(|prefix| encoded_path_is_same_or_descendant(target, prefix))
+        })
+    }
+
     pub(crate) fn into_parts(self) -> (BTreeSet<Vec<u8>>, Vec<FileMeta>) {
         (self.deleted_paths, self.upserts)
     }
+}
+
+fn encoded_path_is_same_or_descendant(path: &[u8], prefix: &[u8]) -> bool {
+    if path == prefix {
+        return true;
+    }
+    if prefix.is_empty() || !path.starts_with(prefix) {
+        return false;
+    }
+    if prefix
+        .last()
+        .is_some_and(|byte| std::path::is_separator(char::from(*byte)))
+    {
+        return true;
+    }
+    path.get(prefix.len())
+        .is_some_and(|byte| std::path::is_separator(char::from(*byte)))
 }
 
 #[derive(Clone, Copy, Debug)]

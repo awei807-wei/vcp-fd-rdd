@@ -22,8 +22,8 @@ pub(super) fn prepare_cold_delta(
     let candidate_paths = collect_delta_candidate_paths(&plan.upserts);
     let (path_additions, path_indices) =
         resolve_delta_path_indices(source.path_table, source.path_layout, candidate_paths)?;
-    let (tombstones, subtree_delete_matched) = merged_tombstones(source, &plan)?;
-    if subtree_delete_matched && plan.upserts.iter().any(|meta| meta.kind.is_directory()) {
+    let tombstones = merged_tombstones(source, &plan)?;
+    if !plan.structural_directory_upserts_are_proven() {
         anyhow::bail!(
             "direct_v7_unsupported: subtree move completeness is unproven; rebuild required"
         );
@@ -124,7 +124,7 @@ fn assign_new_path_index(
 fn merged_tombstones(
     source: &ValidatedColdSource<'_>,
     plan: &ColdDeltaPlan,
-) -> anyhow::Result<(RoaringBitmap, bool)> {
+) -> anyhow::Result<RoaringBitmap> {
     let mut tombstones = decode_tombstones(source.tombstones)?;
     let upsert_paths: BTreeSet<&[u8]> = plan
         .upserts
@@ -132,7 +132,6 @@ fn merged_tombstones(
         .map(|meta| meta.path.as_os_str().as_encoded_bytes())
         .collect();
     let mut path = Vec::new();
-    let mut subtree_delete_matched = false;
 
     for docid in 0..source.old_entry_count {
         let docid = docid as u32;
@@ -153,12 +152,8 @@ fn merged_tombstones(
         if deleted.is_some() || upsert_paths.contains(path.as_slice()) {
             tombstones.insert(docid);
         }
-        if let Some(prefix) = deleted {
-            subtree_delete_matched |= path.as_slice() != prefix;
-            subtree_delete_matched |= entry.kind().is_directory();
-        }
     }
-    Ok((tombstones, subtree_delete_matched))
+    Ok(tombstones)
 }
 
 fn deleted_prefix_for_path<'a>(path: &[u8], deleted: &'a BTreeSet<Vec<u8>>) -> Option<&'a [u8]> {

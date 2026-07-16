@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -116,7 +117,20 @@ fn capture_snapshot_input(idx: &TieredIndex) -> anyhow::Result<SnapshotInput> {
             "snapshot converged stale Live records using delete/rename evidence"
         );
     }
-    let plan = ColdDeltaPlan::new(deleted_paths, upserts);
+    let complete_subtrees = db.snapshot_complete_subtree_scans();
+    let directory_upsert_paths = upserts
+        .iter()
+        .filter(|meta| meta.kind.is_directory())
+        .map(|meta| meta.path.as_os_str().as_encoded_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    let structural_directory_targets = db
+        .snapshot_structural_upsert_targets()
+        .into_iter()
+        .filter(|target| directory_upsert_paths.contains(target))
+        .collect::<Vec<_>>();
+    let plan = ColdDeltaPlan::new(deleted_paths, upserts)
+        .with_complete_subtrees(complete_subtrees)
+        .with_structural_directory_targets(structural_directory_targets);
     if let Some(generation) = idx.pending_snapshot_generation.lock().take() {
         idx.owned_snapshot_telemetry.lock().lifecycle =
             super::super::OwnedSnapshotLifecycle::Writing;

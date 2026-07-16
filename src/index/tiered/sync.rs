@@ -8,7 +8,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use crate::config::L3ScanPolicy;
 use crate::core::{EventRecord, EventType, FileIdentifier, FileKey, FileKind, FileMeta, Task};
 use crate::event::sync::{
-    now_ns, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyRepairCursor, DirtyScope,
+    now_ns, DirectoryFingerprint, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyRepairCursor,
+    DirtyScope,
 };
 use crate::fs_policy::FsPolicy;
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
@@ -126,10 +127,10 @@ struct SlicedScanOutcome {
     child_dirs: Vec<PathBuf>,
     dropped_stale_batch: bool,
     failed: bool,
-    dir_start_stamp: Option<(FileKey, i64)>,
+    dir_start_stamp: Option<DirectoryFingerprint>,
 }
 
-type DirectoryStamp = (PathBuf, FileKey, i64);
+type DirectoryStamp = (PathBuf, DirectoryFingerprint);
 
 struct RepairContinuationState {
     cursor: Option<DirtyRepairCursor>,
@@ -167,13 +168,13 @@ fn repair_continuation_cursor(
         });
     pending_dirs.extend(sliced.child_dirs.iter().cloned());
     if sliced.completed {
-        let Some((file_key, dir_start_mtime_ns)) = sliced.dir_start_stamp else {
+        let Some(dir_start_stamp) = sliced.dir_start_stamp else {
             return RepairContinuationState {
                 cursor: None,
                 completion_stamps: None,
             };
         };
-        completed_dir_stamps.push((current_dir, file_key, dir_start_mtime_ns));
+        completed_dir_stamps.push((current_dir, dir_start_stamp));
     }
 
     if let Some(cursor) = &sliced.next_cursor {
@@ -211,19 +212,13 @@ fn repair_continuation_cursor(
 }
 
 fn recursive_completion_stable(stamps: &[DirectoryStamp]) -> bool {
-    stamps
-        .iter()
-        .all(|(dir, expected_file_key, expected_mtime_ns)| {
-            std::fs::symlink_metadata(dir)
-                .ok()
-                .filter(|meta| meta.is_dir())
-                .and_then(|meta| {
-                    let file_key = FileKey::from_path_and_metadata(dir, &meta)?;
-                    let mtime_ns = mtime_to_ns(meta.modified().ok());
-                    Some(file_key == *expected_file_key && mtime_ns == *expected_mtime_ns)
-                })
-                .unwrap_or(false)
-        })
+    stamps.iter().all(|(dir, expected_fingerprint)| {
+        std::fs::symlink_metadata(dir)
+            .ok()
+            .filter(|meta| meta.is_dir())
+            .and_then(|meta| directory_read_fingerprint(dir, &meta))
+            .is_some_and(|fingerprint| fingerprint == *expected_fingerprint)
+    })
 }
 
 #[derive(Debug)]
@@ -1048,15 +1043,18 @@ impl TieredIndex {
                                     && !sliced.failed
                                     && continuation.is_none();
                                 let mut scan_failed = sliced.failed;
-                                if completion_ready
-                                    && recursive_subtree_repair
-                                    && !continuation_state
+                                if completion_ready && recursive_subtree_repair {
+                                    let proof_root = entry.scope.dir_paths()[0].as_path();
+                                    let proof_recorded = continuation_state
                                         .completion_stamps
                                         .as_deref()
-                                        .is_some_and(recursive_completion_stable)
-                                {
-                                    completion_ready = false;
-                                    scan_failed = true;
+                                        .is_some_and(|stamps| {
+                                            self.record_complete_subtree_scan(proof_root, stamps)
+                                        });
+                                    if !proof_recorded {
+                                        completion_ready = false;
+                                        scan_failed = true;
+                                    }
                                 }
                                 if let Some(cursor) = continuation {
                                     let continuation_scope = if recursive_subtree_repair {
@@ -1152,6 +1150,17 @@ impl TieredIndex {
         }
 
         report
+    }
+
+    fn record_complete_subtree_scan(&self, root: &Path, stamps: &[DirectoryStamp]) -> bool {
+        let _event_boundary = self.snapshot_event_gate.lock();
+        if !recursive_completion_stable(stamps) {
+            return false;
+        }
+        self.delta_buffer
+            .lock()
+            .note_complete_subtree_scan(root.as_os_str().as_encoded_bytes().to_vec());
+        true
     }
 
     fn enqueue_dirty_repair_slice(
@@ -1628,10 +1637,7 @@ impl TieredIndex {
                 std::fs::symlink_metadata(dir)
                     .ok()
                     .filter(|meta| meta.is_dir())
-                    .and_then(|meta| {
-                        let file_key = FileKey::from_path_and_metadata(dir, &meta)?;
-                        Some((file_key, mtime_to_ns(meta.modified().ok())))
-                    })
+                    .and_then(|meta| directory_read_fingerprint(dir, &meta))
             });
 
         // Phase 3：标记 mtime 预检是否判定为"变了或首次扫描"（Some(false) 或 None）。
@@ -2535,22 +2541,14 @@ fn first_direct_child(root: &Path, path: &Path) -> Option<PathBuf> {
     Some(root.join(name))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DirectoryReadFingerprint {
-    file_key: FileKey,
-    mtime_ns: i128,
-    ctime_ns: i128,
-    nlink: u64,
-}
-
 #[cfg(unix)]
 fn directory_read_fingerprint(
     path: &Path,
     meta: &std::fs::Metadata,
-) -> Option<DirectoryReadFingerprint> {
+) -> Option<DirectoryFingerprint> {
     use std::os::unix::fs::MetadataExt;
 
-    Some(DirectoryReadFingerprint {
+    Some(DirectoryFingerprint {
         file_key: FileKey::from_path_and_metadata(path, meta)?,
         mtime_ns: i128::from(meta.mtime())
             .saturating_mul(1_000_000_000)
@@ -2566,14 +2564,14 @@ fn directory_read_fingerprint(
 fn directory_read_fingerprint(
     path: &Path,
     meta: &std::fs::Metadata,
-) -> Option<DirectoryReadFingerprint> {
+) -> Option<DirectoryFingerprint> {
     let mtime_ns = meta
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos().min(i128::MAX as u128) as i128)
         .unwrap_or(0);
-    Some(DirectoryReadFingerprint {
+    Some(DirectoryFingerprint {
         file_key: FileKey::from_path_and_metadata(path, meta)?,
         mtime_ns,
         ctime_ns: mtime_ns,

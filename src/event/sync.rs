@@ -6,6 +6,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::core::FileKey;
 use crate::stats::DirtyQueueStats;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirectoryFingerprint {
+    pub(crate) file_key: FileKey,
+    pub(crate) mtime_ns: i128,
+    pub(crate) ctime_ns: i128,
+    pub(crate) nlink: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirtyScope {
     /// 无法定位具体目录（例如严重风暴/采样上限触发），按全局 dirty 处理。
@@ -145,8 +153,8 @@ pub struct DirtyRepairCursor {
     pub dir: PathBuf,
     pub offset: i64,
     pending_dirs: BTreeSet<PathBuf>,
-    completed_dir_stamps: Vec<(PathBuf, FileKey, i64)>,
-    current_dir_start_stamp: Option<(FileKey, i64)>,
+    completed_dir_stamps: Vec<(PathBuf, DirectoryFingerprint)>,
+    current_dir_start_stamp: Option<DirectoryFingerprint>,
 }
 
 impl DirtyRepairCursor {
@@ -164,12 +172,12 @@ impl DirtyRepairCursor {
         Self::with_recursive_state(dir, offset, pending_dirs, Vec::new(), None)
     }
 
-    pub fn with_recursive_state(
+    pub(crate) fn with_recursive_state(
         dir: PathBuf,
         offset: i64,
         pending_dirs: Vec<PathBuf>,
-        completed_dir_stamps: Vec<(PathBuf, FileKey, i64)>,
-        current_dir_start_stamp: Option<(FileKey, i64)>,
+        completed_dir_stamps: Vec<(PathBuf, DirectoryFingerprint)>,
+        current_dir_start_stamp: Option<DirectoryFingerprint>,
     ) -> Self {
         Self {
             dir,
@@ -184,17 +192,17 @@ impl DirtyRepairCursor {
         self.pending_dirs.iter().cloned().collect()
     }
 
-    pub fn completed_dir_stamps(&self) -> &[(PathBuf, FileKey, i64)] {
-        self.completed_dir_stamps.as_slice()
-    }
-
-    pub fn current_dir_start_stamp(&self) -> Option<(FileKey, i64)> {
+    pub(crate) fn current_dir_start_stamp(&self) -> Option<DirectoryFingerprint> {
         self.current_dir_start_stamp
     }
 
     pub(crate) fn into_recursive_collections(
         self,
-    ) -> (PathBuf, BTreeSet<PathBuf>, Vec<(PathBuf, FileKey, i64)>) {
+    ) -> (
+        PathBuf,
+        BTreeSet<PathBuf>,
+        Vec<(PathBuf, DirectoryFingerprint)>,
+    ) {
         (self.dir, self.pending_dirs, self.completed_dir_stamps)
     }
 
@@ -202,8 +210,8 @@ impl DirtyRepairCursor {
         dir: PathBuf,
         offset: i64,
         pending_dirs: BTreeSet<PathBuf>,
-        completed_dir_stamps: Vec<(PathBuf, FileKey, i64)>,
-        current_dir_start_stamp: Option<(FileKey, i64)>,
+        completed_dir_stamps: Vec<(PathBuf, DirectoryFingerprint)>,
+        current_dir_start_stamp: Option<DirectoryFingerprint>,
     ) -> Self {
         Self {
             dir,
@@ -228,7 +236,7 @@ impl DirtyRepairCursor {
         bytes = bytes.saturating_add(
             self.pending_dirs
                 .iter()
-                .chain(self.completed_dir_stamps.iter().map(|(path, _, _)| path))
+                .chain(self.completed_dir_stamps.iter().map(|(path, _)| path))
                 .map(|path| path.as_os_str().as_encoded_bytes().len() as u64)
                 .sum(),
         );
@@ -409,19 +417,54 @@ impl DirtyQueue {
         priority: DirtyPriority,
         now_ns: u64,
     ) {
-        self.enqueue_request(
-            DirtyQueueRequest {
-                scope,
-                reason,
-                recursive_subtree_repair: true,
-                rotating_cold_window_cycle_id: reason.rotating_cold_window_cycle_id(),
-                priority,
-                repair_cursor: None,
-                attempts: 0,
-            },
-            now_ns,
-            true,
-        );
+        let cycle_id = reason.rotating_cold_window_cycle_id();
+        let mut request = DirtyQueueRequest {
+            scope: scope.normalized(),
+            reason,
+            recursive_subtree_repair: true,
+            rotating_cold_window_cycle_id: cycle_id,
+            priority,
+            repair_cursor: None,
+            attempts: 0,
+        };
+        let request_dir = request.scope.dir_paths().first().cloned();
+        if request.scope.dir_paths().len() == 1 {
+            if let Some(ancestor_scope) = request_dir.as_ref().and_then(|dir| {
+                self.entries.values().find_map(|entry| {
+                    let existing_dirs = entry.scope.dir_paths();
+                    (entry.recursive_subtree_repair
+                        && entry.repair_cursor.is_none()
+                        && entry.rotating_cold_window_cycle_id == cycle_id
+                        && existing_dirs.len() == 1
+                        && dir.starts_with(&existing_dirs[0]))
+                    .then(|| entry.scope.clone())
+                })
+            }) {
+                request.scope = ancestor_scope;
+            } else if let Some(dir) = request_dir.as_ref() {
+                let descendants = self
+                    .entries
+                    .iter()
+                    .filter_map(|(key, entry)| {
+                        let existing_dirs = entry.scope.dir_paths();
+                        (entry.recursive_subtree_repair
+                            && entry.repair_cursor.is_none()
+                            && entry.rotating_cold_window_cycle_id == cycle_id
+                            && existing_dirs.len() == 1
+                            && existing_dirs[0].starts_with(dir))
+                        .then(|| key.clone())
+                    })
+                    .collect::<Vec<_>>();
+                for key in descendants {
+                    if let Some(entry) = self.entries.remove(&key) {
+                        request.reason = merge_reason(request.reason, entry.reason);
+                        request.priority = request.priority.max(entry.priority);
+                        request.attempts = request.attempts.max(entry.attempts);
+                    }
+                }
+            }
+        }
+        self.enqueue_request(request, now_ns, true);
     }
 
     pub fn enqueue_repair_slice(
@@ -822,6 +865,83 @@ mod tests {
         let entry = q.pop_ready(1, 1).pop().unwrap();
         assert!(entry.requires_recursive_subtree_repair());
         assert_eq!(entry.rotating_cold_window_cycle_id(), Some(42));
+    }
+
+    #[test]
+    fn recursive_queue_coalesces_same_cycle_ancestor_and_descendants() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        let reason = DirtyReason::RotatingColdWindow { cycle_id: 42 };
+        q.enqueue_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/repo")]),
+            reason,
+            reason.default_priority(),
+            1,
+        );
+        q.enqueue_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/repo/src/deep")]),
+            reason,
+            reason.default_priority(),
+            2,
+        );
+
+        assert_eq!(q.len(), 1);
+        let entry = q.pop_ready(2, 1).pop().unwrap();
+        assert_eq!(entry.scope.dir_paths(), [PathBuf::from("/tmp/repo")]);
+        assert_eq!(entry.rotating_cold_window_cycle_id(), Some(42));
+    }
+
+    #[test]
+    fn recursive_queue_replaces_same_cycle_descendants_with_later_ancestor() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        let reason = DirtyReason::RecursiveSubtreeRepair;
+        q.enqueue_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/repo/src")]),
+            reason,
+            reason.default_priority(),
+            1,
+        );
+        q.enqueue_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/repo/tests")]),
+            reason,
+            reason.default_priority(),
+            2,
+        );
+        q.enqueue_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/repo")]),
+            reason,
+            reason.default_priority(),
+            3,
+        );
+
+        assert_eq!(q.len(), 1);
+        let entry = q.pop_ready(3, 1).pop().unwrap();
+        assert_eq!(entry.scope.dir_paths(), [PathBuf::from("/tmp/repo")]);
+    }
+
+    #[test]
+    fn recursive_queue_keeps_different_cycles_separate() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        q.enqueue_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/repo")]),
+            DirtyReason::RotatingColdWindow { cycle_id: 41 },
+            DirtyPriority::Low,
+            1,
+        );
+        q.enqueue_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/repo/src")]),
+            DirtyReason::RotatingColdWindow { cycle_id: 42 },
+            DirtyPriority::Low,
+            2,
+        );
+
+        assert_eq!(q.len(), 2);
+        let entries = q.pop_ready(2, 2);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.rotating_cold_window_cycle_id() == Some(41)));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.rotating_cold_window_cycle_id() == Some(42)));
     }
 
     #[test]

@@ -2955,6 +2955,85 @@ mod tests {
     }
 
     #[test]
+    fn cold_delta_writer_allows_unrelated_directory_upsert_after_subtree_delete() {
+        let source_path = tmp_v7_path("cold-delta-unrelated-dir-source");
+        let output_path = tmp_v7_path("cold-delta-unrelated-dir-output");
+        let (base, _) = cold_delta_base();
+        write_v7_snapshot_atomic(&source_path, &base).unwrap();
+        let source = load_v7_from_path(&source_path).unwrap().unwrap();
+        let mut unrelated = cold_delta_meta("/tmp/other/new-dir", 201, 1);
+        unrelated.kind = FileKind::Directory;
+        let plan = ColdDeltaPlan::new(vec![b"/tmp/tree/sub".to_vec()], vec![unrelated])
+            .with_complete_subtrees(vec![b"/tmp/other/new-dir".to_vec()]);
+
+        write_v7_cold_delta_atomic(&output_path, &source, plan, ColdDeltaLimits::default())
+            .unwrap();
+        let reloaded = load_v7_from_path(&output_path).unwrap().unwrap();
+        assert!(reloaded
+            .query_keys(&ExactMatcher::new("child.txt", false))
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn cold_delta_writer_accepts_classified_nonstructural_directory_refresh() {
+        let source_path = tmp_v7_path("cold-delta-directory-refresh-source");
+        let output_path = tmp_v7_path("cold-delta-directory-refresh-output");
+        let (base, _) = cold_delta_base();
+        write_v7_snapshot_atomic(&source_path, &base).unwrap();
+        let source = load_v7_from_path(&source_path).unwrap().unwrap();
+        let mut directory = cold_delta_meta("/tmp/tree/sub", 14, 99);
+        directory.kind = FileKind::Directory;
+        let plan = ColdDeltaPlan::new(Vec::<Vec<u8>>::new(), vec![directory])
+            .with_structural_directory_targets(Vec::<Vec<u8>>::new());
+
+        write_v7_cold_delta_atomic(&output_path, &source, plan, ColdDeltaLimits::default())
+            .unwrap();
+        let reloaded = load_v7_from_path(&output_path).unwrap().unwrap();
+        assert!(reloaded
+            .query_metas(&ExactMatcher::new("sub", false))
+            .unwrap()
+            .iter()
+            .any(|meta| meta.kind.is_directory()));
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn cold_delta_writer_accepts_proven_complete_subtree_rename() {
+        let source_path = tmp_v7_path("cold-delta-proven-subtree-source");
+        let output_path = tmp_v7_path("cold-delta-proven-subtree-output");
+        let (base, _) = cold_delta_base();
+        write_v7_snapshot_atomic(&source_path, &base).unwrap();
+        let source = load_v7_from_path(&source_path).unwrap().unwrap();
+        let mut moved_dir = cold_delta_meta("/tmp/tree/moved", 14, 1);
+        moved_dir.kind = FileKind::Directory;
+        let moved_child = cold_delta_meta("/tmp/tree/moved/child.txt", 15, 2);
+        let plan = ColdDeltaPlan::new(
+            vec![b"/tmp/tree/sub".to_vec()],
+            vec![moved_dir, moved_child],
+        )
+        .with_complete_subtrees(vec![b"/tmp/tree/moved".to_vec()])
+        .with_structural_directory_targets(vec![b"/tmp/tree/moved".to_vec()]);
+
+        write_v7_cold_delta_atomic(&output_path, &source, plan, ColdDeltaLimits::default())
+            .unwrap();
+        let reloaded = load_v7_from_path(&output_path).unwrap().unwrap();
+        let matches = reloaded
+            .query_metas(&ExactMatcher::new("child.txt", false))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, PathBuf::from("/tmp/tree/moved/child.txt"));
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[test]
     fn cold_delta_writer_rejects_legacy_entry_layout() {
         let source_path = tmp_v7_path("cold-delta-legacy-source");
         let output_path = tmp_v7_path("cold-delta-legacy-output");

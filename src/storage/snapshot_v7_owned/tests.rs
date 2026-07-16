@@ -29,6 +29,75 @@ fn meta(path: impl Into<PathBuf>, ino: u64) -> FileMeta {
     }
 }
 
+fn directory_meta(path: impl Into<PathBuf>, ino: u64) -> FileMeta {
+    FileMeta {
+        kind: FileKind::Directory,
+        ..meta(path, ino)
+    }
+}
+
+fn owned_subtree_move_source() -> PersistentIndex {
+    let index = PersistentIndex::new_with_roots(vec![PathBuf::from("/tmp/owned")]);
+    index.upsert_path_alias(directory_meta("/tmp/owned/old-tree", 10));
+    index.upsert_path_alias(meta("/tmp/owned/old-tree/nested/child.txt", 11));
+    index
+}
+
+fn owned_subtree_move_plan(proven: bool) -> ColdDeltaPlan {
+    let plan = ColdDeltaPlan::new(
+        vec![b"/tmp/owned/old-tree".to_vec()],
+        vec![
+            directory_meta("/tmp/owned/moved-tree", 10),
+            meta("/tmp/owned/moved-tree/nested/child.txt", 11),
+        ],
+    );
+    if proven {
+        plan.with_complete_subtrees(vec![b"/tmp/owned/moved-tree".to_vec()])
+    } else {
+        plan
+    }
+}
+
+#[test]
+fn owned_writer_rejects_unproven_structural_target() {
+    let path = tmp_path("unproven-subtree");
+    let error = write_v7_owned_index_atomic(
+        &path,
+        owned_subtree_move_source(),
+        owned_subtree_move_plan(false),
+        OwnedV7WriteOptions::default(),
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("subtree move completeness is unproven"));
+    assert!(!path.exists());
+}
+
+#[test]
+fn owned_writer_accepts_proven_complete_subtree() {
+    let path = tmp_path("proven-subtree");
+    write_v7_owned_index_atomic(
+        &path,
+        owned_subtree_move_source(),
+        owned_subtree_move_plan(true),
+        OwnedV7WriteOptions::default(),
+    )
+    .unwrap();
+
+    let loaded = load_v7_from_path(&path).unwrap().unwrap();
+    let matches = loaded
+        .query_metas(&ExactMatcher::new("child.txt", false))
+        .unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(
+        matches[0].path,
+        PathBuf::from("/tmp/owned/moved-tree/nested/child.txt")
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn owned_writer_compacts_generation_and_uses_bounded_external_runs() {
     let path = tmp_path("roundtrip");

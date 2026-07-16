@@ -214,7 +214,8 @@ impl TieredIndex {
         // 若 rebuild 在进行：先缓冲 pending 事件；并在持锁期间捕获当前 l2 指针，
         // 避免切换窗口导致"事件已缓冲但应用到了新索引"而重复回放。
         let (l2, rebuild_in_progress) = self.capture_l2_for_apply(events);
-        let target_kinds = rebuild_in_progress.then(|| {
+        let tracks_complete_subtrees = self.delta_buffer.lock().has_complete_subtree_scans();
+        let target_kinds = (rebuild_in_progress || tracks_complete_subtrees).then(|| {
             events
                 .iter()
                 .enumerate()
@@ -230,7 +231,12 @@ impl TieredIndex {
         let all_applied = db.apply_events(events);
         if let Some(target_kinds) = target_kinds {
             for (event, target_kind) in events.iter().zip(target_kinds) {
-                db.note_rebuild_event_target(event, target_kind);
+                if rebuild_in_progress {
+                    db.note_rebuild_event_target(event, target_kind);
+                }
+                if tracks_complete_subtrees {
+                    db.invalidate_complete_subtree_scans_for_event(event, target_kind);
+                }
             }
         }
         let overlay_paths = db.len();

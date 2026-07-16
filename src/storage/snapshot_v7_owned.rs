@@ -158,14 +158,12 @@ pub fn write_v7_owned_index_atomic(
     overlay: ColdDeltaPlan,
     options: OwnedV7WriteOptions,
 ) -> anyhow::Result<OwnedV7WriteReport> {
-    let (deleted_paths, mut upserts) = overlay.into_parts();
-    if upserts.iter().any(|meta| meta.kind.is_directory())
-        && index.snapshot_prefixes_match_descendants(&deleted_paths)
-    {
+    if !overlay.structural_directory_upserts_are_proven() {
         anyhow::bail!(
             "direct_v7_unsupported: subtree move completeness is unproven; rebuild required"
         );
     }
+    let (deleted_paths, mut upserts) = overlay.into_parts();
     index.tombstone_snapshot_prefixes(&deleted_paths);
     for meta in upserts.drain(..) {
         index.upsert_path_alias(meta);

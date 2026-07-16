@@ -1228,11 +1228,10 @@ fn register_dynamic_watches(raw_events: &[notify::Event], ctx: &mut WatchCtx<'_>
     let ignore_filter = ctx.ignore_filter;
 
     let mut changed_dirs: Vec<PathBuf> = Vec::new();
+    let mut cold_recursive_candidates = Vec::new();
     for ev in raw_events {
         let (dir_paths, deep_scan_when_cold): (&[PathBuf], bool) = match ev.kind {
-            notify::EventKind::Create(notify::event::CreateKind::Folder) => {
-                (ev.paths.as_slice(), false)
-            }
+            notify::EventKind::Create(_) => (ev.paths.as_slice(), true),
             notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => (
                 ev.paths.last().map(std::slice::from_ref).unwrap_or(&[]),
                 true,
@@ -1282,7 +1281,7 @@ fn register_dynamic_watches(raw_events: &[notify::Event], ctx: &mut WatchCtx<'_>
                             .rotating_cold_window_active_cycle_for_path(path.as_path())
                             .map(|cycle_id| DirtyReason::RotatingColdWindow { cycle_id })
                             .unwrap_or(DirtyReason::RecursiveSubtreeRepair);
-                        index.enqueue_recursive_dirty_dirs(vec![path.clone()], reason);
+                        cold_recursive_candidates.push((path.clone(), reason));
                     } else {
                         index.enqueue_dirty_dirs(vec![path.clone()], DirtyReason::InotifyEvent);
                     }
@@ -1397,7 +1396,39 @@ fn register_dynamic_watches(raw_events: &[notify::Event], ctx: &mut WatchCtx<'_>
             changed_dirs.push(path.clone());
         }
     }
+    for (reason, dirs) in topmost_recursive_dirs_by_reason(cold_recursive_candidates) {
+        index.enqueue_recursive_dirty_dirs(dirs, reason);
+    }
     changed_dirs
+}
+
+fn topmost_recursive_dirs_by_reason(
+    candidates: Vec<(PathBuf, DirtyReason)>,
+) -> Vec<(DirtyReason, Vec<PathBuf>)> {
+    let mut grouped = HashMap::<DirtyReason, Vec<PathBuf>>::new();
+    for (path, reason) in candidates {
+        grouped.entry(reason).or_default().push(path);
+    }
+
+    let mut groups = grouped.into_iter().collect::<Vec<_>>();
+    groups.sort_by_key(|(reason, _)| format!("{reason:?}"));
+    for (_, paths) in &mut groups {
+        paths.sort_by(|left, right| {
+            left.components()
+                .count()
+                .cmp(&right.components().count())
+                .then_with(|| left.cmp(right))
+        });
+        let mut topmost = Vec::<PathBuf>::new();
+        for path in std::mem::take(paths) {
+            if topmost.iter().any(|root| path.starts_with(root)) {
+                continue;
+            }
+            topmost.push(path);
+        }
+        *paths = topmost;
+    }
+    groups
 }
 
 /// Fast path: if all events are Create for distinct paths (≤ 10), apply
@@ -1443,7 +1474,7 @@ fn structural_live_paths(raw_events: &[notify::Event]) -> HashSet<PathBuf> {
     let mut paths = HashSet::new();
     for event in raw_events {
         match event.kind {
-            notify::EventKind::Create(notify::event::CreateKind::Folder) => {
+            notify::EventKind::Create(_) => {
                 paths.extend(event.paths.iter().cloned());
             }
             notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
@@ -2059,6 +2090,161 @@ mod tests {
     }
 
     #[test]
+    fn recursive_create_candidates_keep_only_topmost_roots_per_reason() {
+        let root = PathBuf::from("/tmp/repo");
+        let cycle = DirtyReason::RotatingColdWindow { cycle_id: 7 };
+        let groups = topmost_recursive_dirs_by_reason(vec![
+            (root.join("src/deep"), cycle),
+            (root.clone(), cycle),
+            (root.join("tests"), cycle),
+            (root.join("other"), DirtyReason::RecursiveSubtreeRepair),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+        assert!(groups
+            .iter()
+            .any(|(reason, paths)| { *reason == cycle && paths.as_slice() == [root.clone()] }));
+        assert!(groups.iter().any(|(reason, paths)| {
+            *reason == DirtyReason::RecursiveSubtreeRepair
+                && paths.as_slice() == [root.join("other")]
+        }));
+    }
+
+    #[test]
+    fn unknown_directory_create_under_ephemeral_cycle_enqueues_one_recursive_root() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-ephemeral-create-repair-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime = Arc::new(TieredWatchRuntime::new_with_ephemeral(
+            Vec::new(),
+            vec![(root.clone(), 1)],
+            16,
+            5_000,
+            20,
+            4,
+        ));
+        for _ in 0..2 {
+            runtime.record_scan(
+                root.as_path(),
+                crate::index::tiered::ScanOutcome {
+                    scanned: 1,
+                    changed: 0,
+                    elapsed_ms: 1,
+                    project_roots: Vec::new(),
+                },
+            );
+            runtime.apply_scan_policy(
+                root.as_path(),
+                1,
+                2,
+                crate::config::L3ScanPolicy::Interval,
+                4,
+                1,
+                1,
+            );
+        }
+        let tick = runtime.rotating_cold_window_tick(
+            crate::event::tiered_watch::RotatingColdWindowConfig {
+                enabled: true,
+                budget: 4,
+                ttl_secs: 60,
+                max_cost_per_root: 4,
+                max_dirs_per_tick: 4,
+            },
+        );
+        assert_eq!(tick.actions.len(), 1);
+        let ephemeral_config = crate::event::tiered_watch::EphemeralWatchConfig {
+            budget: 4,
+            repeat_threshold: 1,
+            max_cost_per_root: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            runtime.note_dirty_scope_with_changed(root.clone(), 1, &[], &ephemeral_config, 1,),
+            crate::event::tiered_watch::EphemeralWatchDecision::Add(root.clone())
+        );
+
+        let mut watcher = notify::recommended_watcher(|_| {}).unwrap();
+        let mut dynamic_watches = HashSet::new();
+        let mut ephemeral_watches = HashSet::new();
+        let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+        let tiered_runtime = Some(runtime);
+        let fs_policy = None;
+        let mount_policy_counters = SharedMountPolicyCounters::default();
+        let configured_roots = vec![root.clone()];
+        let watch_failures = Arc::new(AtomicU64::new(0));
+        let ignore_filter = None;
+        let mut ctx = WatchCtx {
+            watcher: &mut watcher,
+            dynamic_watches: &mut dynamic_watches,
+            ephemeral_watches: &mut ephemeral_watches,
+            index: &index,
+            tiered_runtime: &tiered_runtime,
+            fs_policy: &fs_policy,
+            mount_policy_counters: &mount_policy_counters,
+            configured_roots: &configured_roots,
+            watch_failures: &watch_failures,
+            ignore_paths: &[],
+            exclude_dirs: &[],
+            ignore_filter: &ignore_filter,
+        };
+        handle_add_ephemeral_watch(&mut ctx, root.clone(), Some(tick.cycle_id));
+        assert!(ctx.ephemeral_watches.contains(&root));
+        std::thread::sleep(Duration::from_millis(260));
+        let mut bootstrap = index.dirty_queue_ready_batch(1).into_iter().next();
+        let mut bootstrap_completions = 0usize;
+        while let Some(entry) = bootstrap.take() {
+            let report = index.process_dirty_entry(entry, &[]);
+            assert!(!report.failed, "ephemeral bootstrap failed: {report:?}");
+            bootstrap_completions += report
+                .outcomes
+                .iter()
+                .filter(|outcome| outcome.completion_ready)
+                .count();
+            bootstrap = index.dirty_queue_ready_batch(1).into_iter().next();
+        }
+        assert_eq!(bootstrap_completions, 1);
+
+        let repo = root.join("repo");
+        let src = repo.join("src");
+        let tests = repo.join("tests");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&tests).unwrap();
+        let raw_events = vec![mk_event(
+            notify::EventKind::Create(notify::event::CreateKind::Any),
+            vec![repo.clone(), src, tests],
+        )];
+        assert!(register_dynamic_watches(&raw_events, &mut ctx).is_empty());
+
+        std::thread::sleep(Duration::from_millis(260));
+        let first = index.dirty_queue_ready_batch(1).pop().unwrap();
+        assert_eq!(first.scope.dir_paths(), [repo.as_path()]);
+        assert!(first.requires_recursive_subtree_repair());
+        assert_eq!(first.rotating_cold_window_cycle_id(), Some(tick.cycle_id));
+        let mut pending = Some(first);
+        let mut completions = 0usize;
+        while let Some(entry) = pending.take() {
+            let report = index.process_dirty_entry(entry, &[]);
+            assert!(!report.failed, "recursive create repair failed: {report:?}");
+            completions += report
+                .outcomes
+                .iter()
+                .filter(|outcome| outcome.completion_ready)
+                .count();
+            pending = index.dirty_queue_ready_batch(1).into_iter().next();
+        }
+        assert_eq!(completions, 1);
+
+        handle_remove_ephemeral_watch(&mut ctx, root.clone());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn create_not_overwritten_by_modify() {
         let mut seq: u64 = 0;
         let mut raw: Vec<notify::Event> = Vec::new();
@@ -2368,6 +2554,101 @@ mod tests {
             "renamed cold subtree was not indexed at its destination: {results:?}"
         );
         assert!(results.iter().all(|meta| meta.path != old_file));
+
+        drop(pipeline);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn cold_directory_create_recovers_files_created_before_recursive_watch() {
+        let root = std::env::temp_dir().join(format!(
+            "fd-rdd-cold-directory-create-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+        let runtime = Arc::new(TieredWatchRuntime::new(
+            Vec::new(),
+            vec![(root.clone(), 1)],
+            16,
+            5_000,
+            20,
+        ));
+        for _ in 0..2 {
+            runtime.record_scan(
+                root.as_path(),
+                crate::index::tiered::ScanOutcome {
+                    scanned: 1,
+                    changed: 0,
+                    elapsed_ms: 1,
+                    project_roots: Vec::new(),
+                },
+            );
+            runtime.apply_scan_policy(
+                root.as_path(),
+                1,
+                2,
+                crate::config::L3ScanPolicy::Interval,
+                4,
+                1,
+                1,
+            );
+        }
+        assert_eq!(runtime.covering_tier(root.as_path()), Some(WatchTier::L3));
+
+        let pipeline = EventPipeline::new_with_config(index.clone(), 5, 1024)
+            .with_watch_roots(vec![root.clone()])
+            .with_tiered_runtime(Some(runtime));
+        pipeline.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let repo = root.join("repo");
+        let readme = repo.join("clone-visible-README.md");
+        let main = repo.join("src/clone-visible-main.rs");
+        let smoke = repo.join("tests/clone-visible-smoke.rs");
+        std::fs::create_dir_all(main.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(smoke.parent().unwrap()).unwrap();
+        std::fs::write(&readme, b"readme").unwrap();
+        std::fs::write(&main, b"fn main() {}").unwrap();
+        std::fs::write(&smoke, b"test").unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut saw_recursive_repair = false;
+        while tokio::time::Instant::now() < deadline {
+            for entry in index.dirty_queue_ready_batch(16) {
+                saw_recursive_repair |= entry.requires_recursive_subtree_repair();
+                let report = index.process_dirty_entry(entry, &[]);
+                assert!(!report.failed, "cold create repair failed: {report:?}");
+            }
+            if [&readme, &main, &smoke].iter().all(|path| {
+                index
+                    .query(path.file_name().unwrap().to_str().unwrap())
+                    .iter()
+                    .any(|meta| meta.path == **path)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            saw_recursive_repair,
+            "cold directory create must schedule recursive repair"
+        );
+        for path in [readme, main, smoke] {
+            assert!(
+                index
+                    .query(path.file_name().unwrap().to_str().unwrap())
+                    .iter()
+                    .any(|meta| meta.path == path),
+                "new cold subtree file was not recovered: {}",
+                path.display()
+            );
+        }
 
         drop(pipeline);
         let _ = std::fs::remove_dir_all(&root);

@@ -15,6 +15,14 @@ pub struct DeltaBuffer {
     /// This survives a later Live state at the same path so delete→recreate
     /// cannot resurrect cold children.
     subtree_invalidations: std::collections::HashSet<Vec<u8>>,
+    /// Recursively scanned subtree roots whose descendants were stable at the
+    /// scan boundary. Direct v7 persistence may use these proofs to distinguish
+    /// a complete subtree move/recreate from a lone directory event.
+    complete_subtree_scans: std::collections::HashSet<Vec<u8>>,
+    /// Rename targets and delete-then-recreate targets that may contain an
+    /// unobserved subtree. This association survives later scan upserts at the
+    /// same path until the generation is durably closed.
+    structural_upsert_targets: std::collections::HashSet<Vec<u8>>,
     /// Once a path has been rejected, this generation is no longer a complete
     /// description of the mutable L2. A direct snapshot must fail closed and
     /// rebuild from the filesystem instead of persisting a partial delta.
@@ -39,6 +47,8 @@ impl DeltaBuffer {
             max_capacity: cap,
             base_max_capacity: cap,
             subtree_invalidations: std::collections::HashSet::new(),
+            complete_subtree_scans: std::collections::HashSet::new(),
+            structural_upsert_targets: std::collections::HashSet::new(),
             overflowed: false,
             structural_replay_unproven: false,
         }
@@ -51,6 +61,8 @@ impl DeltaBuffer {
             max_capacity,
             base_max_capacity: max_capacity,
             subtree_invalidations: std::collections::HashSet::new(),
+            complete_subtree_scans: std::collections::HashSet::new(),
+            structural_upsert_targets: std::collections::HashSet::new(),
             overflowed: false,
             structural_replay_unproven: false,
         }
@@ -94,6 +106,15 @@ impl DeltaBuffer {
                 {
                     return false;
                 }
+                if matches!(&event.event_type, EventType::Create)
+                    || matches!(&event.event_type, EventType::Modify)
+                        && self
+                            .subtree_invalidations
+                            .iter()
+                            .any(|prefix| encoded_path_is_same_or_descendant(&path_bytes, prefix))
+                {
+                    self.structural_upsert_targets.insert(path_bytes.clone());
+                }
                 self.entries.insert(path_bytes, DeltaState::Live(event));
                 true
             }
@@ -123,6 +144,7 @@ impl DeltaBuffer {
                     self.subtree_invalidations.insert(fb.clone());
                     self.entries.insert(fb, DeltaState::Deleted);
                 }
+                self.structural_upsert_targets.insert(path_bytes.clone());
                 self.entries.insert(path_bytes, DeltaState::Live(event));
                 true
             }
@@ -181,6 +203,55 @@ impl DeltaBuffer {
 
     pub fn clear_subtree_invalidations(&mut self) {
         self.subtree_invalidations.clear();
+    }
+
+    pub(crate) fn note_complete_subtree_scan(&mut self, path: Vec<u8>) {
+        if self
+            .complete_subtree_scans
+            .iter()
+            .any(|existing| encoded_path_is_same_or_descendant(&path, existing))
+        {
+            return;
+        }
+        self.complete_subtree_scans
+            .retain(|existing| !encoded_path_is_same_or_descendant(existing, &path));
+        self.complete_subtree_scans.insert(path);
+    }
+
+    pub(crate) fn has_complete_subtree_scans(&self) -> bool {
+        !self.complete_subtree_scans.is_empty()
+    }
+
+    pub(crate) fn snapshot_complete_subtree_scans(&self) -> BTreeSet<Vec<u8>> {
+        self.complete_subtree_scans.iter().cloned().collect()
+    }
+
+    pub(crate) fn snapshot_structural_upsert_targets(&self) -> BTreeSet<Vec<u8>> {
+        self.structural_upsert_targets.iter().cloned().collect()
+    }
+
+    pub(crate) fn invalidate_complete_subtree_scans_for_event(
+        &mut self,
+        event: &EventRecord,
+        target_kind: Option<FileKind>,
+    ) {
+        let invalidating_target = match &event.event_type {
+            EventType::Rename { .. } | EventType::Create
+                if !matches!(target_kind, Some(FileKind::File)) =>
+            {
+                event.best_path()
+            }
+            EventType::Modify if !matches!(target_kind, Some(FileKind::File)) => event.best_path(),
+            _ => None,
+        };
+        let Some(target) = invalidating_target else {
+            return;
+        };
+        let target = target.as_os_str().as_encoded_bytes();
+        self.complete_subtree_scans.retain(|proof| {
+            !encoded_path_is_same_or_descendant(target, proof)
+                && !encoded_path_is_same_or_descendant(proof, target)
+        });
     }
 
     /// Record the resolved target type for an event that crossed an active
@@ -274,6 +345,8 @@ impl DeltaBuffer {
         // The full scan starts after this boundary and therefore proves all
         // pre-boundary subtree state from the filesystem itself.
         self.subtree_invalidations.clear();
+        self.complete_subtree_scans.clear();
+        self.structural_upsert_targets.clear();
         let ceiling = self.base_max_capacity.max(MAX_RECOVERY_CAPACITY);
         let with_headroom = self.entries.len().saturating_add(self.base_max_capacity);
         self.max_capacity = self
@@ -288,6 +361,8 @@ impl DeltaBuffer {
     pub fn reset_complete_generation(&mut self) {
         self.clear();
         self.subtree_invalidations.clear();
+        self.complete_subtree_scans.clear();
+        self.structural_upsert_targets.clear();
         self.overflowed = false;
         self.structural_replay_unproven = false;
         self.max_capacity = self.base_max_capacity;
@@ -297,6 +372,8 @@ impl DeltaBuffer {
     /// completely. The caller must have checked `is_complete()` first.
     pub fn finish_full_rebuild_generation(&mut self) {
         debug_assert!(self.is_complete());
+        self.complete_subtree_scans.clear();
+        self.structural_upsert_targets.clear();
         self.max_capacity = self.base_max_capacity;
     }
 
@@ -327,6 +404,16 @@ impl DeltaBuffer {
                 * size_of::<(Vec<u8>, DeltaState)>()
             + self
                 .subtree_invalidations
+                .iter()
+                .map(|path| path.capacity() + size_of::<Vec<u8>>() + 16)
+                .sum::<usize>()
+            + self
+                .complete_subtree_scans
+                .iter()
+                .map(|path| path.capacity() + size_of::<Vec<u8>>() + 16)
+                .sum::<usize>()
+            + self
+                .structural_upsert_targets
                 .iter()
                 .map(|path| path.capacity() + size_of::<Vec<u8>>() + 16)
                 .sum::<usize>()
@@ -443,6 +530,72 @@ mod tests {
         assert!(db
             .invalidation_covering_path(std::path::Path::new("/tmp/other-tree/child.txt"))
             .is_none());
+    }
+
+    #[test]
+    fn modify_below_deleted_subtree_remains_a_structural_target() {
+        let mut db = DeltaBuffer::with_capacity(1024);
+        db.apply_events(&[make_event(1, EventType::Delete, "/tmp/old-tree")]);
+        db.apply_events(&[make_event(2, EventType::Modify, "/tmp/old-tree/recreated")]);
+
+        assert_eq!(
+            db.snapshot_structural_upsert_targets(),
+            BTreeSet::from([b"/tmp/old-tree/recreated".to_vec()])
+        );
+    }
+
+    #[test]
+    fn exact_delete_preserves_complete_subtree_proof() {
+        let mut db = DeltaBuffer::with_capacity(1024);
+        db.note_complete_subtree_scan(b"/tmp/tree".to_vec());
+
+        let delete = make_event(1, EventType::Delete, "/tmp/tree/nested");
+        db.invalidate_complete_subtree_scans_for_event(&delete, None);
+
+        assert_eq!(
+            db.snapshot_complete_subtree_scans(),
+            BTreeSet::from([b"/tmp/tree".to_vec()])
+        );
+    }
+
+    #[test]
+    fn unknown_modify_invalidates_complete_subtree_proof() {
+        let mut db = DeltaBuffer::with_capacity(1024);
+        db.note_complete_subtree_scan(b"/tmp/tree".to_vec());
+
+        let modify = make_event(1, EventType::Modify, "/tmp/tree/nested");
+        db.invalidate_complete_subtree_scans_for_event(&modify, None);
+
+        assert!(db.snapshot_complete_subtree_scans().is_empty());
+    }
+
+    #[test]
+    fn complete_subtree_scan_proof_is_invalidated_by_later_directory_create() {
+        let mut db = DeltaBuffer::with_capacity(1024);
+        db.note_complete_subtree_scan(b"/tmp/tree".to_vec());
+        assert_eq!(
+            db.snapshot_complete_subtree_scans(),
+            BTreeSet::from([b"/tmp/tree".to_vec()])
+        );
+
+        let create = make_event(1, EventType::Create, "/tmp/tree/imported");
+        db.invalidate_complete_subtree_scans_for_event(&create, Some(FileKind::Directory));
+
+        assert!(db.snapshot_complete_subtree_scans().is_empty());
+    }
+
+    #[test]
+    fn complete_subtree_scan_proof_survives_exact_file_changes() {
+        let mut db = DeltaBuffer::with_capacity(1024);
+        db.note_complete_subtree_scan(b"/tmp/tree".to_vec());
+
+        let modify = make_event(1, EventType::Modify, "/tmp/tree/file.txt");
+        db.invalidate_complete_subtree_scans_for_event(&modify, Some(FileKind::File));
+
+        assert_eq!(
+            db.snapshot_complete_subtree_scans(),
+            BTreeSet::from([b"/tmp/tree".to_vec()])
+        );
     }
 
     #[test]

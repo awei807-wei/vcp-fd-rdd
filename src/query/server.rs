@@ -1063,6 +1063,25 @@ mod tests {
             test_event(1, EventType::Create, old_dir.clone()),
             test_event(2, EventType::Create, old_child),
         ]);
+        index.enqueue_recursive_dirty_dirs(
+            vec![old_dir.clone()],
+            crate::event::sync::DirtyReason::RecursiveSubtreeRepair,
+        );
+        tokio::time::sleep(Duration::from_millis(260)).await;
+        let mut completions = 0usize;
+        loop {
+            let Some(entry) = index.dirty_queue_ready_batch(1).into_iter().next() else {
+                break;
+            };
+            let report = index.process_dirty_entry(entry, &[]);
+            anyhow::ensure!(!report.failed, "initial recursive proof failed");
+            completions += report
+                .outcomes
+                .iter()
+                .filter(|outcome| outcome.completion_ready)
+                .count();
+        }
+        anyhow::ensure!(completions == 1, "initial recursive proof incomplete");
         index.snapshot_now(store.clone()).await?;
 
         let moved_dir = content_root.join("moved-tree");

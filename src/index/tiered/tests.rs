@@ -52,6 +52,30 @@ fn file_meta_from_path(path: PathBuf) -> FileMeta {
     }
 }
 
+fn complete_recursive_proof(idx: &TieredIndex, root: PathBuf) -> usize {
+    idx.enqueue_recursive_dirty_dirs(vec![root], DirtyReason::RecursiveSubtreeRepair);
+    let mut completions = 0usize;
+    loop {
+        let Some(entry) = idx
+            .dirty_queue
+            .lock()
+            .pop_ready(u64::MAX, 1)
+            .into_iter()
+            .next()
+        else {
+            break;
+        };
+        let report = idx.process_dirty_entry(entry, &[]);
+        assert!(!report.failed, "recursive proof failed: {report:?}");
+        completions += report
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.completion_ready)
+            .count();
+    }
+    completions
+}
+
 fn unix_secs_for_test() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3429,6 +3453,7 @@ async fn unsupported_directory_rename_retains_delta_and_sealed_wal() -> anyhow::
         mk_event(1, EventType::Create, old_dir.clone()),
         mk_event(2, EventType::Create, old_child),
     ]);
+    assert_eq!(complete_recursive_proof(&idx, old_dir.clone()), 1);
     idx.snapshot_now(store.clone()).await?;
 
     let moved_dir = content_root.join("moved-tree");
@@ -3454,6 +3479,74 @@ async fn unsupported_directory_rename_retains_delta_and_sealed_wal() -> anyhow::
         replay.events[0].event_type,
         EventType::Rename { .. }
     ));
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recursively_proven_directory_rename_persists_without_rebuild() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("snapshot-directory-rename-proven");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let old_dir = content_root.join("old-tree");
+    let old_child = old_dir.join("nested/child-visible.txt");
+    std::fs::create_dir_all(old_child.parent().unwrap())?;
+    std::fs::create_dir_all(&state_root)?;
+    std::fs::write(&old_child, b"child")?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.attach_wal(store.as_ref())?;
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, old_dir.clone()),
+        mk_event(2, EventType::Create, old_child.clone()),
+    ]);
+    assert_eq!(complete_recursive_proof(&idx, old_dir.clone()), 1);
+    idx.snapshot_now(store.clone()).await?;
+
+    let moved_dir = content_root.join("moved-tree");
+    let moved_child = moved_dir.join("nested/child-visible.txt");
+    std::fs::rename(&old_dir, &moved_dir)?;
+    idx.apply_events(&[mk_event(
+        3,
+        EventType::Rename {
+            from: FileIdentifier::Path(old_dir.clone()),
+            from_path_hint: Some(old_dir.clone()),
+        },
+        moved_dir.clone(),
+    )]);
+    idx.enqueue_recursive_dirty_dirs(vec![moved_dir.clone()], DirtyReason::RecursiveSubtreeRepair);
+
+    let mut completions = 0usize;
+    loop {
+        let Some(entry) = idx
+            .dirty_queue
+            .lock()
+            .pop_ready(u64::MAX, 1)
+            .into_iter()
+            .next()
+        else {
+            break;
+        };
+        let report = idx.process_dirty_entry(entry, &[]);
+        assert!(!report.failed, "recursive rename repair failed: {report:?}");
+        completions += report
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.completion_ready)
+            .count();
+    }
+    assert_eq!(completions, 1);
+
+    idx.snapshot_now(store.clone()).await?;
+    assert!(!idx.rebuild_in_progress());
+    assert!(!idx.rebuild_snapshot_pending.load(Ordering::Acquire));
+
+    let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    let results = reloaded.query("child-visible");
+    assert!(results.iter().any(|meta| meta.path == moved_child));
+    assert!(results.iter().all(|meta| meta.path != old_child));
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -3858,6 +3951,84 @@ async fn subtree_delete_persists_cold_child_tombstones_across_snapshot() -> anyh
 }
 
 #[tokio::test]
+async fn subtree_cleanup_and_unrelated_directory_upsert_snapshot_directly() -> anyhow::Result<()> {
+    let root = unique_tmp_dir("cold-cleanup-unrelated-dir");
+    let content_root = root.join("content");
+    let state_root = root.join("state");
+    let old_tree = content_root.join("finished-workload");
+    let old_child = old_tree.join("nested/old-child.txt");
+    std::fs::create_dir_all(old_child.parent().unwrap())?;
+    std::fs::create_dir_all(&state_root)?;
+    std::fs::write(&old_child, b"old")?;
+
+    let store = Arc::new(SnapshotStore::new(state_root.join("index.db")));
+    let idx = Arc::new(TieredIndex::empty(vec![content_root.clone()]));
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, old_tree.clone()),
+        mk_event(2, EventType::Create, old_child.clone()),
+    ]);
+    idx.enqueue_recursive_dirty_dirs(vec![old_tree.clone()], DirtyReason::RecursiveSubtreeRepair);
+    let mut initial_completions = 0usize;
+    loop {
+        let Some(entry) = idx
+            .dirty_queue
+            .lock()
+            .pop_ready(u64::MAX, 1)
+            .into_iter()
+            .next()
+        else {
+            break;
+        };
+        let report = idx.process_dirty_entry(entry, &[]);
+        assert!(!report.failed, "initial directory proof failed: {report:?}");
+        initial_completions += report
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.completion_ready)
+            .count();
+    }
+    assert_eq!(initial_completions, 1);
+    idx.snapshot_now(store.clone()).await?;
+
+    std::fs::remove_dir_all(&old_tree)?;
+    idx.apply_events(&[mk_event(3, EventType::Delete, old_tree)]);
+    let unrelated = content_root.join("next-workload");
+    std::fs::create_dir_all(&unrelated)?;
+    idx.apply_events(&[mk_event(4, EventType::Create, unrelated.clone())]);
+    idx.enqueue_recursive_dirty_dirs(vec![unrelated.clone()], DirtyReason::RecursiveSubtreeRepair);
+    let entry = idx
+        .dirty_queue
+        .lock()
+        .pop_ready(u64::MAX, 1)
+        .into_iter()
+        .next()
+        .expect("recursive proof entry");
+    let report = idx.process_dirty_entry(entry, &[]);
+    assert!(
+        !report.failed,
+        "unrelated directory proof failed: {report:?}"
+    );
+    assert!(report
+        .outcomes
+        .iter()
+        .any(|outcome| outcome.completion_ready));
+
+    idx.snapshot_now(store.clone()).await?;
+    assert!(!idx.rebuild_in_progress());
+    assert!(!idx.rebuild_snapshot_pending.load(Ordering::Acquire));
+
+    let reloaded = TieredIndex::load_or_empty(&*store, vec![content_root.clone()]).await?;
+    assert!(reloaded.query("old-child").is_empty());
+    assert!(reloaded
+        .query("next-workload")
+        .iter()
+        .any(|meta| meta.path == unrelated));
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn directory_delete_recreate_rebuilds_without_resurrecting_old_children() -> anyhow::Result<()>
 {
     let root = unique_tmp_dir("cold-directory-recreate");
@@ -3876,6 +4047,7 @@ async fn directory_delete_recreate_rebuilds_without_resurrecting_old_children() 
         mk_event(1, EventType::Create, tree.clone()),
         mk_event(2, EventType::Create, old_child),
     ]);
+    assert_eq!(complete_recursive_proof(&idx, tree.clone()), 1);
     idx.snapshot_now(store.clone()).await?;
 
     std::fs::remove_dir_all(&tree)?;
