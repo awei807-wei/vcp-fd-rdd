@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = 3
+SCHEMA = 4
 CARGO_ARGS = [
     "cargo",
     "build",
@@ -95,6 +95,7 @@ def create_build_receipt(
     binary: Path,
     pre_build_git_sha: str,
     post_build_git_sha: str,
+    planned_git_sha: str = "",
 ) -> dict[str, Any]:
     """Describe one successful locked release build without trusting path metadata."""
     return {
@@ -103,7 +104,9 @@ def create_build_receipt(
         "built_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
             "+00:00", "Z"
         ),
-        "source_git_sha": pre_build_git_sha,
+        "planned_git_sha": planned_git_sha or pre_build_git_sha,
+        "executed_git_sha": post_build_git_sha,
+        "source_git_sha": post_build_git_sha,
         "pre_build_git_sha": pre_build_git_sha,
         "post_build_git_sha": post_build_git_sha,
         "build_worktree_clean": True,
@@ -128,6 +131,7 @@ def validate_build_receipt(
     repo: Path,
     binary: Path,
     source_git_sha: str,
+    planned_git_sha: str = "",
 ) -> list[str]:
     """Recompute every receipt identity field and return stable failure reasons."""
     if not receipt_path.exists():
@@ -138,10 +142,29 @@ def validate_build_receipt(
 
     cargo_lock_sha256 = sha256_file(repo / "Cargo.lock")
     binary_sha256 = sha256_file(binary)
+    schema = receipt.get("schema")
+    receipt_source_git_sha = str(receipt.get("source_git_sha", ""))
+    receipt_planned_git_sha = str(
+        receipt.get("planned_git_sha") or receipt_source_git_sha
+    )
+    receipt_executed_git_sha = str(
+        receipt.get("executed_git_sha") or receipt_source_git_sha
+    )
     checks = (
-        (receipt.get("schema") == SCHEMA, "receipt_schema_mismatch"),
+        (schema in {3, SCHEMA}, "receipt_schema_mismatch"),
         (receipt.get("build_succeeded") is True, "build_not_succeeded"),
         (receipt.get("build_worktree_clean") is True, "build_worktree_not_clean"),
+        (
+            receipt_planned_git_sha
+            == (planned_git_sha or source_git_sha)
+            and bool(planned_git_sha or source_git_sha),
+            "planned_git_sha_mismatch",
+        ),
+        (
+            receipt_executed_git_sha == source_git_sha
+            and bool(source_git_sha),
+            "executed_git_sha_mismatch",
+        ),
         (
             receipt.get("source_git_sha") == source_git_sha and bool(source_git_sha),
             "source_git_sha_mismatch",

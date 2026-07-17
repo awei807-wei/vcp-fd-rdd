@@ -294,6 +294,26 @@ fn fast_scan_registry_restore_trust_gate_controls_backfill() {
     assert_eq!(untrusted_report.fast_scan_initial_backfill_pending, 1);
     assert!(!untrusted_report.fast_scan_local_strict_ok);
 
+    let mut query_disabled_cfg = cfg.clone();
+    query_disabled_cfg.l1_l2_fast_scan_query_leases_enabled = false;
+    let query_disabled = TieredWatchRuntime::new(Vec::new(), vec![(hot.clone(), 1)], 16, 5_000, 20);
+    query_disabled.apply_fast_scan_config(&query_disabled_cfg);
+    let query_disabled_restore = query_disabled.restore_fast_scan_registry(
+        &snapshot,
+        &query_disabled_cfg,
+        true,
+        "stable",
+        42,
+        &table,
+    );
+    assert!(query_disabled_restore.trusted);
+    assert_eq!(query_disabled_restore.rejected_entries, 1);
+    assert_eq!(query_disabled_restore.restored_active, 0);
+    assert_eq!(query_disabled_restore.restored_unknown, 0);
+    let query_disabled_report = query_disabled.report();
+    assert_eq!(query_disabled_report.fast_scan_hotset_lease_count, 0);
+    assert_eq!(query_disabled_report.fast_scan_hotset_sentinel_count, 0);
+
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2000,8 +2020,101 @@ fn rotating_cold_window_selects_cold_dirs_without_tier_swap() {
     }
     let report = rt.report();
     assert_eq!(report.rotating_cold_window_active_dirs, 3);
+    assert_eq!(report.rotating_cold_window_last_tick_ephemeral_dirs, 1);
+    assert_eq!(
+        report.rotating_cold_window_last_tick_ephemeral_estimated_cost,
+        4
+    );
+    assert_eq!(
+        report.rotating_cold_window_last_tick_fast_scan_lease_dirs,
+        1
+    );
+    assert_eq!(
+        report.rotating_cold_window_last_tick_fast_scan_lease_estimated_cost,
+        80
+    );
+    assert_eq!(report.rotating_cold_window_last_tick_scan_only_dirs, 1);
+    assert_eq!(
+        report.rotating_cold_window_last_tick_scan_only_estimated_cost,
+        700
+    );
+    assert_eq!(report.rotating_cold_window_ephemeral_estimated_cost, 4);
+    assert_eq!(report.rotating_cold_window_ephemeral_selected_dirs, 1);
+    assert_eq!(
+        report.rotating_cold_window_fast_scan_lease_estimated_cost,
+        80
+    );
+    assert_eq!(report.rotating_cold_window_fast_scan_lease_selected_dirs, 1);
+    assert_eq!(report.rotating_cold_window_scan_only_estimated_cost, 700);
+    assert_eq!(report.rotating_cold_window_scan_only_selected_dirs, 1);
     assert_eq!(report.l0_dirs, 1);
     assert_eq!(report.l3_dirs, 3);
+}
+
+#[test]
+fn rotating_cold_window_reports_adjacent_cycle_reselection_and_action_switch() {
+    let cold = PathBuf::from("/tmp/cold-reselection");
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(cold.clone(), 4)], 16, 5_000, 20);
+    let state = rt.state(&cold).expect("cold dir should exist");
+    state.tier.store(WatchTier::L3.as_u8(), Ordering::Release);
+    state
+        .last_scan_unix_secs
+        .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
+
+    let cfg = RotatingColdWindowConfig {
+        enabled: true,
+        budget: 1,
+        ttl_secs: 60,
+        max_cost_per_root: 64,
+        max_dirs_per_tick: 1,
+    };
+    let first_tick = rt.rotating_cold_window_tick(cfg.clone());
+    assert_eq!(first_tick.actions.len(), 1);
+    assert_eq!(first_tick.telemetry.ephemeral.selected_dirs, 1);
+    assert_eq!(first_tick.telemetry.ephemeral.estimated_cost, 4);
+    assert_eq!(first_tick.telemetry.adjacent_cycle_reselected_dirs, 0);
+    assert_eq!(first_tick.telemetry.adjacent_cycle_action_switches, 0);
+
+    if let Some(lease) = rt.rotating_cold_window_leases.write().get_mut(&cold) {
+        lease.expires_unix_secs = unix_secs().saturating_sub(1);
+    }
+    state.watch_cost.store(80, Ordering::Relaxed);
+
+    let second_tick = rt.rotating_cold_window_tick(cfg);
+    assert_eq!(second_tick.cycle_id, first_tick.cycle_id.saturating_add(1));
+    assert_eq!(second_tick.actions.len(), 1);
+    assert_eq!(second_tick.telemetry.fast_scan_lease.selected_dirs, 1);
+    assert_eq!(second_tick.telemetry.fast_scan_lease.estimated_cost, 80);
+    assert_eq!(second_tick.telemetry.adjacent_cycle_reselected_dirs, 1);
+    assert_eq!(second_tick.telemetry.adjacent_cycle_action_switches, 1);
+
+    let report = rt.report();
+    assert_eq!(
+        report.rotating_cold_window_last_tick_adjacent_cycle_reselected_dirs,
+        1
+    );
+    assert_eq!(
+        report.rotating_cold_window_last_tick_adjacent_cycle_action_switches,
+        1
+    );
+    assert_eq!(
+        report.rotating_cold_window_adjacent_cycle_reselected_dirs,
+        1
+    );
+    assert_eq!(
+        report.rotating_cold_window_adjacent_cycle_action_switches,
+        1
+    );
+    let debug = rt.debug_dump(Some("/tmp/cold-reselection"));
+    let dir = debug.dirs.first().expect("selected dir should be present");
+    assert_eq!(
+        dir.rotating_cold_window_last_selected_cycle_id,
+        Some(second_tick.cycle_id)
+    );
+    assert_eq!(
+        dir.rotating_cold_window_last_selected_action,
+        "fast_scan_lease"
+    );
 }
 
 #[test]
@@ -2044,8 +2157,17 @@ fn rotating_cold_window_downgrade_keeps_lease_as_scan_only() {
     );
 
     assert!(rt.downgrade_rotating_cold_window_lease_to_scan_only(cold.as_path(), tick.cycle_id));
-    assert_eq!(rt.report().rotating_cold_window_active_dirs, 1);
-    assert_eq!(rt.report().rotating_cold_window_scan_only_dirs, 1);
+    let downgraded_report = rt.report();
+    assert_eq!(downgraded_report.rotating_cold_window_active_dirs, 1);
+    assert_eq!(downgraded_report.rotating_cold_window_scan_only_dirs, 1);
+    assert_eq!(
+        downgraded_report.rotating_cold_window_ephemeral_selected_dirs,
+        1
+    );
+    assert_eq!(
+        downgraded_report.rotating_cold_window_scan_only_selected_dirs,
+        0
+    );
 
     assert!(rt.downgrade_rotating_cold_window_lease_to_scan_only(cold.as_path(), tick.cycle_id));
     assert_eq!(rt.report().rotating_cold_window_scan_only_dirs, 1);

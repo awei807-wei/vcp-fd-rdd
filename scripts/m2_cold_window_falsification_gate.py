@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from m2_cold_window_falsification_validation import (
+    block_protocol_invalid_reasons,
     leg_label,
     validate_a_correctness,
     validate_leg,
@@ -380,6 +381,8 @@ def evaluate_suite(legs: list[dict[str, Any]]) -> dict[str, Any]:
         reasons.append(f"suite 必须精确包含 8 腿，实际 {len(legs)}")
     validate_suite_audit(legs, reasons)
     by_block: dict[int, dict[str, dict[str, Any]]] = {}
+    pairing_by_block: dict[int, dict[str, dict[str, Any]]] = {}
+    invalid_protocol_blocks: list[int] = []
     seen_legs: set[tuple[int, str]] = set()
     for leg in legs:
         block = int(leg["block"])
@@ -394,8 +397,17 @@ def evaluate_suite(legs: list[dict[str, Any]]) -> dict[str, Any]:
         if not leg.get("valid"):
             reasons.append(f"{leg_label(leg)}运行无效")
         validate_leg(leg, reasons)
+    for block, pair in by_block.items():
+        protocol_reasons = block_protocol_invalid_reasons(list(pair.values()))
+        if protocol_reasons:
+            invalid_protocol_blocks.append(block)
+            reasons.extend(
+                reason for reason in protocol_reasons if reason not in reasons
+            )
+        else:
+            pairing_by_block[block] = pair
     _validate_block_sequence(legs, by_block, reasons)
-    pairs, benefit_blocks = _evaluate_pairs(by_block, reasons)
+    pairs, benefit_blocks = _evaluate_pairs(pairing_by_block, reasons)
     medians = _median_ratios(pairs)
     if benefit_blocks < MIN_BENEFIT_BLOCKS:
         reasons.append(f"收益仅在 {benefit_blocks}/4 个配对块复现")
@@ -412,6 +424,7 @@ def evaluate_suite(legs: list[dict[str, Any]]) -> dict[str, Any]:
         "decision": "pass" if not reasons else "fail",
         "reasons": reasons,
         "benefit_blocks": benefit_blocks,
+        "invalid_protocol_blocks": sorted(invalid_protocol_blocks),
         "paired": strict_pairs,
         **strict_medians,
     }

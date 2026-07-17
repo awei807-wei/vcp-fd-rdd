@@ -300,11 +300,32 @@ pub struct RotatingColdWindowAction {
     pub expires_unix_secs: u64,
 }
 
+/// Cost proxy recorded for one rotating cold-window action in a scheduler tick.
+///
+/// `estimated_cost` uses the directory's existing `watch_cost` estimate. It is
+/// intentionally telemetry-only for now: production admission still uses the
+/// configured directory-count budget until benchmark data validates weights.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RotatingColdWindowActionTelemetry {
+    pub selected_dirs: u64,
+    pub estimated_cost: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RotatingColdWindowTickTelemetry {
+    pub ephemeral: RotatingColdWindowActionTelemetry,
+    pub fast_scan_lease: RotatingColdWindowActionTelemetry,
+    pub scan_only: RotatingColdWindowActionTelemetry,
+    pub adjacent_cycle_reselected_dirs: u64,
+    pub adjacent_cycle_action_switches: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RotatingColdWindowTick {
     pub cycle_id: u64,
     pub actions: Vec<RotatingColdWindowAction>,
     pub budget_blocked: bool,
+    pub telemetry: RotatingColdWindowTickTelemetry,
 }
 
 #[derive(Clone, Debug)]
@@ -361,6 +382,8 @@ pub struct TieredWatchDebugDir {
     pub rotating_cold_window_last_scan_cycle_id: u64,
     pub rotating_cold_window_last_event_seq: u64,
     pub rotating_cold_window_last_event_cycle_id: u64,
+    pub rotating_cold_window_last_selected_cycle_id: Option<u64>,
+    pub rotating_cold_window_last_selected_action: String,
     pub nearest_ancestor_root: Option<String>,
     pub descendant_roots: Vec<String>,
     pub l0_covering_root: Option<String>,

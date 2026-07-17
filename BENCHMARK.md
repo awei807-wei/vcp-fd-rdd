@@ -49,6 +49,12 @@ python3 scripts/m2-cold-window-ab.py b  # 关闭 M2
 python3 scripts/m2-cold-window-falsification.py
 ```
 
+隔离 Query Fast Scan lease 对 treatment 的反馈时使用：
+
+```bash
+python3 scripts/m2-cold-window-falsification.py --no-query-fast-scan-leases
+```
+
 套件固定运行 4 个配对 block（`2×AB + 2×BA`，共 8 腿），每腿 1500 秒。fixture 额外提供
 `cold-storm-01` 至 `cold-storm-06` 六个 daemon 已登记的独立冷根；每根带一个纳入 fixture 身份的
 `seed/sentinel.txt`，使 watch cost 明确超过 L0 上限。240 秒预热后，每个根只承载一个
@@ -64,8 +70,9 @@ snapshot、水位线和 DirtyQueue 进入 fail-closed 门禁。唯一主收益�
 正向主断言路径，且收益至少分布在 3 个 burst 和 2 类 workload；visibility 仅作正确性/SLA 诊断，A 的总体与各 workload p95 均须 ≤35 秒；至少 3/4 block 复现主收益。CPU、read bytes/read
 syscall 的中位和每块比值均不超过 1.10，write bytes/write syscall 的中位和每块比值均不超过 1.25，
 才允许进入规模矩阵；报告同时给出每找回一个正向路径的增量成本。通过不等于生产发布。完整阈值、
-续跑方式和产物说明见 `helloagents/wiki/m2-cold-window-vm-benchmark.md`。suite 首次启动只构建一次并写出
-schema v3 `build-provenance.json`；Cargo 在 suite 私有 target dir 构建并由 JSON compiler-artifact 消息证明
+续跑方式和产物说明见 `helloagents/wiki/m2-cold-window-vm-benchmark.md`。协议不完整的腿会使整个 block
+被废弃并从第一腿有界重跑，默认最多 3 次；废弃 block 不进入配对统计。suite 首次启动只构建一次并写出
+schema v4 `build-provenance.json`，分别记录 planned、built/source 与 executed Git SHA；Cargo 在 suite 私有 target dir 构建并由 JSON compiler-artifact 消息证明
 产物身份，构建前后必须是同一 Git HEAD 且工作区均为 clean。八腿虽然使用 `--build never`，但每腿都会
 重新核对 clean worktree、Git、Cargo.lock 和 binary SHA256，再复制为腿私有只读执行文件。旧 schema、
 回执缺失、被篡改或与当前 checkout 不符时直接拒绝运行。falsification profile 关闭会反复阻塞等待的

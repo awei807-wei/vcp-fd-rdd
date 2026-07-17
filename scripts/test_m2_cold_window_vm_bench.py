@@ -28,6 +28,23 @@ def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
     )
 
 
+class QueryLeaseConfigTests(unittest.TestCase):
+    def test_disabled_query_fast_scan_leases_are_written_to_tiered_config(self) -> None:
+        args = BENCH.parse_args(
+            [
+                "--root",
+                "/fixture/root",
+                "--no-query-fast-scan-leases",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BENCH.write_config(args, Path(tmp))
+            text = config.read_text(encoding="utf-8")
+
+        self.assertIn("l1_l2_fast_scan_query_leases_enabled = false", text)
+        self.assertFalse(args.query_fast_scan_leases)
+
+
 def memory_sample(
     elapsed_secs: float,
     *,

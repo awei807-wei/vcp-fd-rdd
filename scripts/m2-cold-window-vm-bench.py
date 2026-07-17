@@ -60,6 +60,7 @@ AB_PARAMETER_FINGERPRINT_IGNORED_ARGS = frozenset(
         "port",
         "sweep_config",
         "artifact_provenance_receipt",
+        "planned_git_sha",
     }
 )
 
@@ -3686,6 +3687,8 @@ def write_config(args: argparse.Namespace, config_home: Path) -> Path:
         f"l1_empty_scans_to_l2 = {args.l1_empty_scans_to_l2}",
         f"l2_empty_scans_to_l3 = {args.l2_empty_scans_to_l3}",
         f"l1_l2_fast_scan_enabled = {str(args.fast_scan).lower()}",
+        "l1_l2_fast_scan_query_leases_enabled = "
+        f"{str(args.query_fast_scan_leases).lower()}",
         "",
         "[proc_sampler]",
         f"enabled = {str(args.proc_sampler).lower()}",
@@ -3701,6 +3704,7 @@ def build_if_needed(
     build: str,
     source_git_sha: str,
     artifact_provenance_receipt: Path | None = None,
+    planned_git_sha: str = "",
 ) -> dict[str, Any]:
     cargo_lock = repo / "Cargo.lock"
     provenance: dict[str, Any] = {
@@ -3708,6 +3712,8 @@ def build_if_needed(
         "build_mode": build,
         "built_this_run": False,
         "source_git_sha": source_git_sha,
+        "planned_git_sha": planned_git_sha or source_git_sha,
+        "executed_git_sha": source_git_sha,
         "cargo_lock_sha256": sha256_file(cargo_lock),
         "cargo_args": list(BUILD_CARGO_ARGS),
     }
@@ -3719,6 +3725,7 @@ def build_if_needed(
                 repo,
                 binary,
                 source_git_sha,
+                planned_git_sha,
             )
             current_dirty = git_worktree_dirty(repo)
             if current_dirty is not False:
@@ -3744,6 +3751,14 @@ def build_if_needed(
                         receipt.get("compiler_artifact", "")
                     ),
                     "cargo_args": list(receipt.get("cargo_args", []) or []),
+                    "planned_git_sha": str(
+                        receipt.get("planned_git_sha")
+                        or receipt.get("source_git_sha", "")
+                    ),
+                    "executed_git_sha": str(
+                        receipt.get("executed_git_sha")
+                        or receipt.get("source_git_sha", "")
+                    ),
                 }
             )
         return provenance
@@ -5421,7 +5436,7 @@ Scale-aware metrics for realistic 1M-file testing: total indexed files/dirs, col
     (run_dir / "REPORT.md").write_text(report, encoding="utf-8")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="fd-rdd M2 cold-window VM benchmark runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -5505,6 +5520,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fast-scan", dest="fast_scan", action="store_true", default=True)
     parser.add_argument("--no-fast-scan", dest="fast_scan", action="store_false")
+    parser.add_argument(
+        "--query-fast-scan-leases",
+        dest="query_fast_scan_leases",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no-query-fast-scan-leases",
+        dest="query_fast_scan_leases",
+        action="store_false",
+    )
     parser.add_argument("--proc-sampler", dest="proc_sampler", action="store_true", default=True)
     parser.add_argument("--no-proc-sampler", dest="proc_sampler", action="store_false")
     parser.add_argument("--canary-root", default="")
@@ -5738,7 +5764,8 @@ def parse_args() -> argparse.Namespace:
         help="maximum seconds for the pre-SIGTERM snapshot/rebuild barrier, "
         "and separately for the final snapshot after SIGTERM",
     )
-    return parser.parse_args()
+    parser.add_argument("--planned-git-sha", default="")
+    return parser.parse_args(argv)
 
 
 def _update_manifest(
@@ -5822,6 +5849,8 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
         "created_at": utc_now(),
         "repo": str(repo),
         "git_sha": checkout_git_sha,
+        "planned_git_sha": args.planned_git_sha or checkout_git_sha,
+        "executed_git_sha": checkout_git_sha,
         "git_dirty": checkout_git_dirty,
         "run_dir": str(run_dir),
         "run_dir_preexisting": run_dir_preexisting,
@@ -5893,6 +5922,7 @@ def _run_single_prepared(
             if args.artifact_provenance_receipt
             else None
         ),
+        args.planned_git_sha,
     )
     if not source_binary.exists():
         raise SystemExit(f"binary not found: {source_binary}")

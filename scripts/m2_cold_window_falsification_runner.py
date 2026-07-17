@@ -45,6 +45,10 @@ from m2_cold_window_falsification import (
 )
 from m2_cold_window_falsification_gate import evaluate_suite
 from m2_cold_window_falsification_report import render_report
+from m2_cold_window_falsification_validation import (
+    block_protocol_invalid_reasons,
+    protocol_invalid_reasons,
+)
 from m2_cold_window_evidence_bundle import (
     BUILD_RECEIPT_NAME,
     EVIDENCE_ATTEMPT_FILES,
@@ -68,6 +72,7 @@ BUILD_TARGET_NAME = "build-target"
 WRAPPER_TERMINATION_TIMEOUT_SECS = 420.0
 ORPHAN_TERMINATION_TIMEOUT_SECS = 10.0
 MAX_REUSABLE_BLOCK_START_GAP_SECS = 1800.0
+DEFAULT_MAX_BLOCK_ATTEMPTS = 3
 
 
 def utc_stamp() -> str:
@@ -208,8 +213,10 @@ def leg_command(
     run_dir: Path,
     receipt_path: Path,
     binary: Path,
+    query_fast_scan_leases_enabled: bool = True,
+    planned_git_sha: str = "",
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(AB_DRIVER),
         spec.variant,
@@ -222,6 +229,14 @@ def leg_command(
         "--artifact-provenance-receipt",
         str(receipt_path),
     ]
+    command.append(
+        "--query-fast-scan-leases"
+        if query_fast_scan_leases_enabled
+        else "--no-query-fast-scan-leases"
+    )
+    if planned_git_sha:
+        command.extend(("--planned-git-sha", planned_git_sha))
+    return command
 
 
 def run_wrapper_process(command: list[str]) -> int:
@@ -328,7 +343,12 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     temp.replace(path)
 
 
-def _resume_error(suite_dir: Path, seed: int) -> str:
+def _resume_error(
+    suite_dir: Path,
+    seed: int,
+    planned_git_sha: str = "",
+    query_fast_scan_leases_enabled: bool = True,
+) -> str:
     manifest_path = suite_dir / "manifest.json"
     if not manifest_path.exists():
         return ""
@@ -342,10 +362,33 @@ def _resume_error(suite_dir: Path, seed: int) -> str:
         return f"已有 suite 的 sequence_seed 无效：{previous_seed!r}"
     if parsed_seed is not None and parsed_seed != seed:
         return f"已有 suite 的 sequence_seed={previous_seed}，不能改为 {seed} 续跑"
+    previous_planned_git_sha = str(manifest.get("planned_git_sha", "")).strip()
+    if (
+        previous_planned_git_sha
+        and planned_git_sha
+        and previous_planned_git_sha != planned_git_sha
+    ):
+        return (
+            f"已有 suite 的 planned_git_sha={previous_planned_git_sha}，"
+            f"不能改为 {planned_git_sha} 续跑"
+        )
+    if "query_fast_scan_leases_enabled" in manifest and bool(
+        manifest.get("query_fast_scan_leases_enabled")
+    ) != bool(query_fast_scan_leases_enabled):
+        previous_mode = bool(manifest.get("query_fast_scan_leases_enabled"))
+        return (
+            "已有 suite 的 Query Fast Scan lease 模式为 "
+            f"{'enabled' if previous_mode else 'disabled'}，不能切换后续跑"
+        )
     return ""
 
 
-def _write_running_manifest(suite_dir: Path, seed: int) -> None:
+def _write_running_manifest(
+    suite_dir: Path,
+    seed: int,
+    planned_git_sha: str = "",
+    query_fast_scan_leases_enabled: bool = True,
+) -> None:
     _atomic_json(
         suite_dir / "manifest.json",
         {
@@ -354,6 +397,8 @@ def _write_running_manifest(suite_dir: Path, seed: int) -> None:
             "decision": "pending",
             "suite_dir": str(suite_dir),
             "sequence_seed": seed,
+            "planned_git_sha": planned_git_sha,
+            "query_fast_scan_leases_enabled": query_fast_scan_leases_enabled,
             "completed_legs": 0,
         },
     )
@@ -386,16 +431,43 @@ def _recover_completed_legs(
     except OSError:
         return _progress_legs(suite_dir)
     legs: list[dict[str, Any]] = []
+    suite_manifest = _read_json(suite_dir / "manifest.json")
+    expected_query_mode = bool(
+        suite_manifest.get("query_fast_scan_leases_enabled", True)
+    )
+    expected_planned_git_sha = str(
+        suite_manifest.get("planned_git_sha", "")
+    )
     for block in range(1, 5):
         block_specs = [spec for spec in specs if spec.block == block]
+        if not block_specs:
+            continue
         reusable = _reusable_block_attempts(
             block_specs, receipt_sha256, binary_sha256
         )
         if len(reusable) != 2:
             break
-        legs.extend(
+        block_legs = [
             analyze_leg(spec, reusable[spec.base_dir]) for spec in block_specs
-        )
+        ]
+        if any(
+            bool(
+                leg.get("protocol", {}).get(
+                    "query_fast_scan_leases_enabled", True
+                )
+            )
+            != expected_query_mode
+            or (
+                expected_planned_git_sha
+                and str(leg.get("audit", {}).get("planned_git_sha", ""))
+                != expected_planned_git_sha
+            )
+            for leg in block_legs
+        ):
+            break
+        if block_protocol_invalid_reasons(block_legs):
+            break
+        legs.extend(block_legs)
     return legs
 
 
@@ -405,17 +477,48 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sequence-seed", type=int, default=42)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--planned-git-sha", default="")
+    parser.add_argument(
+        "--query-fast-scan-leases",
+        dest="query_fast_scan_leases",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no-query-fast-scan-leases",
+        dest="query_fast_scan_leases",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--max-block-attempts",
+        type=int,
+        default=DEFAULT_MAX_BLOCK_ATTEMPTS,
+    )
     return parser.parse_args(argv)
 
 
-def _print_plan(specs: list[LegSpec], skip_build: bool, receipt_path: Path) -> None:
+def _print_plan(
+    specs: list[LegSpec],
+    skip_build: bool,
+    receipt_path: Path,
+    *,
+    query_fast_scan_leases_enabled: bool = True,
+    planned_git_sha: str = "",
+) -> None:
     binary = suite_binary(receipt_path.parent)
     build_command = cargo_args_for_target(binary.parent.parent)
     print("build: skipped" if skip_build else f"build: {shlex.join(build_command)}")
     print(f"build_receipt: {receipt_path}")
     for spec in specs:
         command = shlex.join(
-            leg_command(spec, spec.base_dir / "attempt-01", receipt_path, binary)
+            leg_command(
+                spec,
+                spec.base_dir / "attempt-01",
+                receipt_path,
+                binary,
+                query_fast_scan_leases_enabled,
+                planned_git_sha,
+            )
         )
         print(
             f"block={spec.block} order={spec.order} position={spec.position} {command}"
@@ -426,28 +529,93 @@ def _run_legs(
     specs: list[LegSpec],
     suite_dir: Path,
     receipt_path: Path,
+    *,
+    query_fast_scan_leases_enabled: bool = True,
+    planned_git_sha: str = "",
+    max_block_attempts: int = DEFAULT_MAX_BLOCK_ATTEMPTS,
 ) -> tuple[list[dict[str, Any]], str]:
     legs: list[dict[str, Any]] = []
+    discarded_blocks: list[dict[str, Any]] = []
     binary = suite_binary(suite_dir)
     receipt_sha256 = sha256_file(receipt_path)
     binary_sha256 = sha256_file(binary)
     for block in range(1, 5):
         block_specs = [spec for spec in specs if spec.block == block]
+        if not block_specs:
+            continue
         reusable = _reusable_block_attempts(
             block_specs, receipt_sha256, binary_sha256
         )
-        block_legs: list[dict[str, Any]] = []
-        for spec in block_specs:
-            attempt = reusable.get(spec.base_dir)
-            if attempt is None:
+        block_legs = (
+            [analyze_leg(spec, reusable[spec.base_dir]) for spec in block_specs]
+            if len(reusable) == len(block_specs)
+            else []
+        )
+        reusable_identity_reasons: list[str] = []
+        for leg in block_legs:
+            leg_query_mode = bool(
+                leg.get("protocol", {}).get(
+                    "query_fast_scan_leases_enabled", True
+                )
+            )
+            if leg_query_mode != query_fast_scan_leases_enabled:
+                reusable_identity_reasons.append(
+                    f"{leg.get('run_dir', '')} 的 Query Fast Scan lease 模式与本次 suite 不一致"
+                )
+            leg_planned_git_sha = str(
+                leg.get("audit", {}).get("planned_git_sha", "")
+            )
+            if planned_git_sha and leg_planned_git_sha != planned_git_sha:
+                reusable_identity_reasons.append(
+                    f"{leg.get('run_dir', '')} 的 planned Git SHA 与本次 suite 不一致"
+                )
+        reusable_reasons = block_protocol_invalid_reasons(block_legs) if block_legs else []
+        reusable_reasons.extend(reusable_identity_reasons)
+        if reusable_reasons:
+            discarded_blocks.append(
+                {
+                    "block": block,
+                    "attempt": "reused",
+                    "run_dirs": [leg.get("run_dir", "") for leg in block_legs],
+                    "reasons": reusable_reasons,
+                }
+            )
+            block_legs = []
+
+        for block_attempt in range(1, max(1, max_block_attempts) + 1):
+            if block_legs:
+                break
+            candidate_legs: list[dict[str, Any]] = []
+            retryable_reasons: list[str] = []
+            for spec in block_specs:
                 attempt = next_attempt(spec.base_dir)
                 attempt.parent.mkdir(parents=True, exist_ok=True)
                 return_code = run_wrapper_process(
-                    leg_command(spec, attempt, receipt_path, binary)
+                    leg_command(
+                        spec,
+                        attempt,
+                        receipt_path,
+                        binary,
+                        query_fast_scan_leases_enabled,
+                        planned_git_sha,
+                    )
                 )
+                leg = analyze_leg(spec, attempt)
+                candidate_legs.append(leg)
+                leg_protocol_reasons = protocol_invalid_reasons(leg)
                 if return_code != 0:
-                    _atomic_json(suite_dir / "progress.json", {"legs": legs})
-                    return [*legs, analyze_leg(spec, attempt)], (
+                    has_protocol_evidence = any(
+                        int(leg.get("protocol", {}).get(field, 0) or 0) > 0
+                        for field in ("physical_bursts", "checks")
+                    ) or int(leg.get("resources", {}).get("sample_count", 0) or 0) > 0
+                    if leg_protocol_reasons and has_protocol_evidence:
+                        retryable_reasons.extend(leg_protocol_reasons)
+                        break
+                    _atomic_json(
+                        suite_dir / "progress.json",
+                        {"legs": legs, "discarded_blocks": discarded_blocks},
+                    )
+                    return [*legs, leg], (
                         f"block {spec.block} {spec.variant.upper()} 组退出码 "
                         f"{return_code}"
                     )
@@ -457,14 +625,46 @@ def _run_legs(
                     receipt_sha256,
                     binary_sha256,
                 ) != attempt:
-                    _atomic_json(suite_dir / "progress.json", {"legs": legs})
-                    return [*legs, analyze_leg(spec, attempt)], (
+                    _atomic_json(
+                        suite_dir / "progress.json",
+                        {"legs": legs, "discarded_blocks": discarded_blocks},
+                    )
+                    return [*legs, leg], (
                         f"block {spec.block} {spec.variant.upper()} wrapper 返回 0，"
                         "但终态不可恢复"
                     )
-            block_legs.append(analyze_leg(spec, attempt))
+            retryable_reasons.extend(block_protocol_invalid_reasons(candidate_legs))
+            retryable_reasons = list(dict.fromkeys(retryable_reasons))
+            if retryable_reasons:
+                discarded_blocks.append(
+                    {
+                        "block": block,
+                        "attempt": block_attempt,
+                        "run_dirs": [leg.get("run_dir", "") for leg in candidate_legs],
+                        "reasons": retryable_reasons,
+                    }
+                )
+                _atomic_json(
+                    suite_dir / "progress.json",
+                    {"legs": legs, "discarded_blocks": discarded_blocks},
+                )
+                continue
+            block_legs = candidate_legs
+
+        if not block_legs:
+            _atomic_json(
+                suite_dir / "progress.json",
+                {"legs": legs, "discarded_blocks": discarded_blocks},
+            )
+            return legs, (
+                f"block {block} 协议连续 {max(1, max_block_attempts)} 次无效，"
+                "已废弃且未进入配对统计"
+            )
         legs.extend(block_legs)
-        _atomic_json(suite_dir / "progress.json", {"legs": legs})
+        _atomic_json(
+            suite_dir / "progress.json",
+            {"legs": legs, "discarded_blocks": discarded_blocks},
+        )
     return legs, ""
 
 
@@ -473,15 +673,32 @@ def _suite_summary(
     seed: int,
     legs: list[dict[str, Any]],
     infrastructure_error: str,
+    planned_git_sha: str = "",
+    query_fast_scan_leases_enabled: bool = True,
 ) -> dict[str, Any]:
     gate = evaluate_suite(legs)
     if infrastructure_error:
         gate["decision"] = "fail"
         gate["reasons"].append(infrastructure_error)
+    executed_values = {
+        str(leg.get("audit", {}).get("executed_git_sha", ""))
+        for leg in legs
+        if str(leg.get("audit", {}).get("executed_git_sha", ""))
+    }
+    progress = _read_json(suite_dir / "progress.json")
+    discarded = progress.get("discarded_blocks", [])
     return {
         "schema": 1,
         "suite_dir": str(suite_dir),
         "sequence_seed": seed,
+        "planned_git_sha": planned_git_sha,
+        "executed_git_sha": (
+            next(iter(executed_values)) if len(executed_values) == 1 else ""
+        ),
+        "planned_executed_sha_match": bool(planned_git_sha)
+        and executed_values == {planned_git_sha},
+        "query_fast_scan_leases_enabled": query_fast_scan_leases_enabled,
+        "discarded_blocks": discarded if isinstance(discarded, list) else [],
         "orders": ["".join(order) for order in balanced_block_orders(seed)],
         "legs": legs,
         "infrastructure_error": infrastructure_error,
@@ -508,6 +725,11 @@ def _write_output_documents(suite_dir: Path, summary: dict[str, Any]) -> None:
             "decision": summary["gate"]["decision"],
             "suite_dir": str(suite_dir),
             "sequence_seed": summary["sequence_seed"],
+            "planned_git_sha": summary.get("planned_git_sha", ""),
+            "executed_git_sha": summary.get("executed_git_sha", ""),
+            "query_fast_scan_leases_enabled": summary.get(
+                "query_fast_scan_leases_enabled", True
+            ),
             "completed_legs": sum(
                 1 for leg in summary["legs"] if leg.get("valid") is True
             ),
@@ -637,7 +859,11 @@ def _write_outputs(suite_dir: Path, summary: dict[str, Any]) -> Path | None:
             return None
 
 
-def _validate_build_receipt(receipt_path: Path, binary: Path) -> str:
+def _validate_build_receipt(
+    receipt_path: Path,
+    binary: Path,
+    planned_git_sha: str = "",
+) -> str:
     dirty = _git_worktree_dirty(REPO_ROOT)
     if dirty is not False:
         state = "不干净" if dirty else "状态不可用"
@@ -647,17 +873,23 @@ def _validate_build_receipt(receipt_path: Path, binary: Path) -> str:
         REPO_ROOT,
         binary,
         _git_head_sha(REPO_ROOT),
+        planned_git_sha,
     )
     if not errors:
         return ""
     return f"{BUILD_RECEIPT_NAME} 无效：{', '.join(errors)}"
 
 
-def _build_release(suite_dir: Path) -> str:
+def _build_release(suite_dir: Path, planned_git_sha: str = "") -> str:
     pre_build_git_sha = _git_head_sha(REPO_ROOT)
     pre_build_dirty = _git_worktree_dirty(REPO_ROOT)
     if not pre_build_git_sha:
         return "release binary 构建前无法读取 Git HEAD"
+    if planned_git_sha and pre_build_git_sha != planned_git_sha:
+        return (
+            f"planned Git SHA {planned_git_sha} 与实际执行 HEAD "
+            f"{pre_build_git_sha} 不一致"
+        )
     if pre_build_dirty is not False:
         state = "不干净" if pre_build_dirty else "状态不可用"
         return f"release binary 构建前 Git 工作区{state}"
@@ -691,27 +923,42 @@ def _build_release(suite_dir: Path) -> str:
             binary,
             pre_build_git_sha,
             post_build_git_sha,
+            planned_git_sha,
         ),
     )
-    return _validate_build_receipt(receipt_path, binary)
+    return _validate_build_receipt(receipt_path, binary, planned_git_sha)
 
 
-def _prepare_build(suite_dir: Path, skip_build: bool) -> str:
+def _prepare_build(
+    suite_dir: Path,
+    skip_build: bool,
+    planned_git_sha: str = "",
+) -> str:
     receipt_path = suite_dir / BUILD_RECEIPT_NAME
     binary = suite_binary(suite_dir)
     if receipt_path.exists():
-        return _validate_build_receipt(receipt_path, binary)
+        return _validate_build_receipt(receipt_path, binary, planned_git_sha)
     if any(suite_dir.glob("block-*/**/attempt-*")):
         return f"已有 attempt 但缺少 {BUILD_RECEIPT_NAME}，拒绝混用二进制续跑"
     if skip_build:
         return f"--skip-build 需要已有且有效的 {BUILD_RECEIPT_NAME}"
-    return _build_release(suite_dir)
+    return _build_release(suite_dir, planned_git_sha)
 
 
-def _prepare_suite_resume(suite_dir: Path, sequence_seed: int) -> str:
+def _prepare_suite_resume(
+    suite_dir: Path,
+    sequence_seed: int,
+    planned_git_sha: str = "",
+    query_fast_scan_leases_enabled: bool = True,
+) -> str:
     previous_manifest = _read_json(suite_dir / "manifest.json")
     previous_summary = _read_json(suite_dir / "summary.json")
-    error = _resume_error(suite_dir, sequence_seed)
+    error = _resume_error(
+        suite_dir,
+        sequence_seed,
+        planned_git_sha,
+        query_fast_scan_leases_enabled,
+    )
     if error:
         _persist_resume_rejection(
             suite_dir,
@@ -733,19 +980,47 @@ def _run_suite(
 ) -> int:
     suite_dir.mkdir(parents=True, exist_ok=True)
     interrupted_exit_code = 0
-    infrastructure_error = _prepare_suite_resume(suite_dir, args.sequence_seed)
+    planned_git_sha = str(getattr(args, "planned_git_sha", ""))
+    query_leases = bool(getattr(args, "query_fast_scan_leases", True))
+    infrastructure_error = _prepare_suite_resume(
+        suite_dir,
+        args.sequence_seed,
+        planned_git_sha,
+        query_leases,
+    )
     if infrastructure_error:
         print(f"M2 快速证伪拒绝续跑：{infrastructure_error}", file=sys.stderr)
         return 1
     legs: list[dict[str, Any]] = []
     try:
-        _write_running_manifest(suite_dir, args.sequence_seed)
-        infrastructure_error = _prepare_build(suite_dir, args.skip_build)
+        _write_running_manifest(
+            suite_dir,
+            args.sequence_seed,
+            planned_git_sha,
+            query_leases,
+        )
+        infrastructure_error = _prepare_build(
+            suite_dir,
+            args.skip_build,
+            planned_git_sha,
+        )
         if not infrastructure_error:
+            raw_max_block_attempts = getattr(
+                args, "max_block_attempts", DEFAULT_MAX_BLOCK_ATTEMPTS
+            )
+            max_block_attempts = (
+                raw_max_block_attempts
+                if isinstance(raw_max_block_attempts, int)
+                and not isinstance(raw_max_block_attempts, bool)
+                else DEFAULT_MAX_BLOCK_ATTEMPTS
+            )
             legs, infrastructure_error = _run_legs(
                 specs,
                 suite_dir,
                 receipt_path,
+                query_fast_scan_leases_enabled=query_leases,
+                planned_git_sha=planned_git_sha,
+                max_block_attempts=max_block_attempts,
             )
     except (KeyboardInterrupt, TerminationRequested) as exc:
         legs = _recover_completed_legs(specs, suite_dir, receipt_path)
@@ -766,6 +1041,8 @@ def _run_suite(
         args.sequence_seed,
         legs,
         infrastructure_error,
+        str(getattr(args, "planned_git_sha", "")),
+        bool(getattr(args, "query_fast_scan_leases", True)),
     )
     evidence_bundle = _write_outputs(suite_dir, summary)
     print(f"suite_dir: {suite_dir}")
@@ -786,6 +1063,7 @@ def _run_suite(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    args.planned_git_sha = str(args.planned_git_sha).strip().lower()
     suite_dir = (
         args.run_dir.expanduser().resolve()
         if args.run_dir is not None
@@ -794,8 +1072,20 @@ def main(argv: list[str] | None = None) -> int:
     specs = build_leg_specs(suite_dir, args.sequence_seed)
     receipt_path = suite_dir / BUILD_RECEIPT_NAME
     if args.dry_run:
-        _print_plan(specs, args.skip_build, receipt_path)
+        _print_plan(
+            specs,
+            args.skip_build,
+            receipt_path,
+            query_fast_scan_leases_enabled=args.query_fast_scan_leases,
+            planned_git_sha=args.planned_git_sha or "<current-head-at-execution>",
+        )
         return 0
+    args.planned_git_sha = args.planned_git_sha or _git_head_sha(REPO_ROOT)
+    if len(args.planned_git_sha) != 40 or any(
+        character not in "0123456789abcdef" for character in args.planned_git_sha
+    ):
+        print("planned Git SHA 无效或无法从当前 checkout 解析", file=sys.stderr)
+        return 1
     suite_dir.mkdir(parents=True, exist_ok=True)
     try:
         with sigterm_as_exception():
@@ -810,6 +1100,8 @@ def main(argv: list[str] | None = None) -> int:
             args.sequence_seed,
             legs,
             f"suite 被{source}中断，可用同一 --run-dir 续跑",
+            args.planned_git_sha,
+            args.query_fast_scan_leases,
         )
         _write_outputs(suite_dir, summary)
         return exit_code

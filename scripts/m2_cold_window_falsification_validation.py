@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime
 from typing import Any
 
 from m2_cold_window_ab_command import FALSIFICATION_EVENT_ROOT_NAMES
@@ -31,6 +32,63 @@ EXPECTED_PROBES_PER_BURST = {
     "git_clone": 3,
     "subtree_rename": 8,
 }
+
+
+def _timestamp(value: str) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def protocol_invalid_reasons(leg: dict[str, Any]) -> list[str]:
+    """Return retryable protocol failures without mixing in product correctness."""
+    label = leg_label(leg)
+    protocol = leg.get("protocol", {})
+    resources = leg.get("resources", {})
+    reasons: list[str] = []
+    physical_bursts = int(protocol.get("physical_bursts", 0) or 0)
+    checks = int(protocol.get("checks", 0) or 0)
+    if physical_bursts != 6 or checks != 6:
+        reasons.append(
+            f"{label}未完成 6 个 burst/check（{physical_bursts}/6, {checks}/6）"
+        )
+    if (
+        resources.get("window_source") != "full_run"
+        or int(resources.get("sample_count", 0) or 0) < 2
+        or int(resources.get("event_window_sample_count", 0) or 0) < 2
+    ):
+        reasons.append(f"{label}资源采样窗口不完整")
+    coverage = float(resources.get("sample_coverage_ratio", 0.0) or 0.0)
+    if coverage < MIN_PROCESS_SAMPLE_COVERAGE:
+        reasons.append(f"{label}process 采样覆盖率低于 95%（{coverage:.4f}）")
+    max_gap = float(resources.get("sample_max_gap_secs", 0.0) or 0.0)
+    if max_gap > MAX_PROCESS_SAMPLE_GAP_SECS:
+        reasons.append(f"{label}process 采样最大间隔超过 3 秒（{max_gap:.3f}s）")
+    audit = leg.get("audit", {})
+    started = _timestamp(str(audit.get("daemon_started_at", "")))
+    finished = _timestamp(str(audit.get("finished_at", "")))
+    if started is None or finished is None or finished <= started:
+        reasons.append(f"{label}缺少有效实际 start/end 时间")
+    return reasons
+
+
+def block_protocol_invalid_reasons(legs: list[dict[str, Any]]) -> list[str]:
+    reasons = [reason for leg in legs for reason in protocol_invalid_reasons(leg)]
+    if len(legs) != 2:
+        reasons.append(f"block 协议必须包含完整 A/B 两腿，实际 {len(legs)}")
+        return reasons
+    starts = [
+        _timestamp(str(leg.get("audit", {}).get("daemon_started_at", "")))
+        for leg in legs
+    ]
+    if all(start is not None for start in starts):
+        gap = abs(float(starts[1]) - float(starts[0]))
+        if gap > 1800.0:
+            reasons.append(f"block 两腿启动间隔超过 30 分钟（{gap:.3f}s）")
+    return reasons
 
 
 def leg_label(leg: dict[str, Any]) -> str:
@@ -332,6 +390,8 @@ def _validate_event_counts(
 def validate_suite_audit(legs: list[dict[str, Any]], reasons: list[str]) -> None:
     labels = {
         "git_sha": "Git SHA",
+        "planned_git_sha": "planned Git SHA",
+        "executed_git_sha": "executed Git SHA",
         "binary_sha256": "binary SHA256",
         "receipt_sha256": "构建回执 SHA256",
         "cargo_lock_sha256": "Cargo.lock SHA256",
@@ -350,6 +410,20 @@ def validate_suite_audit(legs: list[dict[str, Any]], reasons: list[str]) -> None
         missing = any(not str(leg.get("audit", {}).get(field, "")) for leg in legs)
         if missing or len(values) != 1:
             reasons.append(f"跨腿 {label} 不一致或缺失")
+    planned = {
+        str(leg.get("audit", {}).get("planned_git_sha", "")) for leg in legs
+    }
+    executed = {
+        str(leg.get("audit", {}).get("executed_git_sha", "")) for leg in legs
+    }
+    if planned != executed:
+        reasons.append("planned Git SHA 与 executed Git SHA 不一致")
+    query_modes = {
+        bool(leg.get("protocol", {}).get("query_fast_scan_leases_enabled", True))
+        for leg in legs
+    }
+    if len(query_modes) != 1:
+        reasons.append("跨腿 Query Fast Scan lease 隔离变量不一致")
 
 
 def validate_leg(leg: dict[str, Any], reasons: list[str]) -> None:

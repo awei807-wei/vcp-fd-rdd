@@ -179,6 +179,28 @@ class CommandTests(unittest.TestCase):
         )
         self.assertGreaterEqual(rotating_dirs_per_tick, len(cold_roots))
 
+    def test_query_fast_scan_lease_is_an_explicit_shared_isolation_variable(self) -> None:
+        run_dir = Path("/tmp/fd-rdd-m2-runs/query-lease-off")
+        command_a = ab.build_command(
+            "a",
+            run_dir,
+            self.roots,
+            profile="falsification",
+            query_fast_scan_leases_enabled=False,
+        )
+        command_b = ab.build_command(
+            "b",
+            run_dir,
+            self.roots,
+            profile="falsification",
+            query_fast_scan_leases_enabled=False,
+        )
+
+        self.assertIn("--no-query-fast-scan-leases", command_a)
+        self.assertIn("--no-query-fast-scan-leases", command_b)
+        self.assertNotIn("--query-fast-scan-leases", command_a)
+        self.assertEqual(command_a[:-1], command_b[:-1])
+
     def test_falsification_profile_assigns_one_independent_root_per_burst(self) -> None:
         profile = ab.PROFILES["falsification"]
         required_duration_secs = (

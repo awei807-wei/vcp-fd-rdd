@@ -936,12 +936,18 @@ fn serve_queries(
     report_interval_secs: u64,
 ) {
     // 6) 启动 HTTP 查询服务
+    if !cfg.tiered_watch.l1_l2_fast_scan_query_leases_enabled {
+        tracing::info!(
+            "query-derived fast scan leases disabled by tiered_watch.l1_l2_fast_scan_query_leases_enabled"
+        );
+    }
     let query_server = QueryServer::new(index.clone())
         .with_snapshot_store(store.clone())
         .with_health_provider(health_provider.clone())
         .with_stats_provider(stats_provider.clone())
         .with_watch_state_provider(watch_state_provider.clone())
         .with_tiered_watch_debug_provider(tiered_watch_debug_provider)
+        .with_query_fast_scan_leases_enabled(cfg.tiered_watch.l1_l2_fast_scan_query_leases_enabled)
         .with_fast_scan_lease_provider({
             let tiered_runtime = tiered_runtime.clone();
             Arc::new(move |dirs, kind| {

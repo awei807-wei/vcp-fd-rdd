@@ -96,6 +96,7 @@ max_watch_dirs = 16
     assert_eq!(cfg.tiered_watch.ephemeral_idle_secs, 120);
     assert_eq!(cfg.tiered_watch.ephemeral_max_cost_per_root, 64);
     assert!(cfg.tiered_watch.l1_l2_fast_scan_enabled);
+    assert!(cfg.tiered_watch.l1_l2_fast_scan_query_leases_enabled);
     assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_target_secs, 5);
     assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_tick_ms, 1_000);
     assert_eq!(
@@ -125,6 +126,7 @@ max_watch_dirs = 16
     assert!(toml.contains("ephemeral_idle_secs"));
     assert!(toml.contains("ephemeral_max_cost_per_root"));
     assert!(toml.contains("l1_l2_fast_scan_enabled"));
+    assert!(toml.contains("l1_l2_fast_scan_query_leases_enabled"));
     assert!(toml.contains("l1_l2_fast_scan_target_secs"));
     assert!(toml.contains("network_fast_scan_mode"));
     assert!(toml.contains("project_markers"));
@@ -242,6 +244,7 @@ watch_mode = "tiered"
 
 [tiered_watch]
 l1_l2_fast_scan_enabled = false
+l1_l2_fast_scan_query_leases_enabled = false
 l1_l2_fast_scan_target_secs = 7
 l1_l2_fast_scan_tick_ms = 250
 l1_l2_fast_scan_stat_budget_per_tick = 111
@@ -260,6 +263,7 @@ network_fast_scan_readdir_budget_per_tick = 5
     .expect("fast scan config should parse");
 
     assert!(!cfg.tiered_watch.l1_l2_fast_scan_enabled);
+    assert!(!cfg.tiered_watch.l1_l2_fast_scan_query_leases_enabled);
     assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_target_secs, 7);
     assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_tick_ms, 250);
     assert_eq!(cfg.tiered_watch.l1_l2_fast_scan_stat_budget_per_tick, 111);

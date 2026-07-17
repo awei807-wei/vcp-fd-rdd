@@ -619,6 +619,37 @@ fn rotating_scan_follow_up_interval_secs(ttl_secs: u64) -> u64 {
     quotient.saturating_add(u64::from(remainder != 0)).max(1)
 }
 
+fn record_rotating_cold_window_selection(
+    state: &DirState,
+    cycle_id: u64,
+    action: RotatingColdWindowActionKind,
+) -> (bool, bool) {
+    let mut progress = state.rotating_cold_window_progress.write();
+    let adjacent_cycle = progress
+        .last_selected_cycle_id
+        .is_some_and(|previous| previous.checked_add(1) == Some(cycle_id));
+    let action_switched = adjacent_cycle && progress.last_selected_action != Some(action);
+    progress.last_selected_cycle_id = Some(cycle_id);
+    progress.last_selected_action = Some(action);
+    (adjacent_cycle, action_switched)
+}
+
+fn add_rotating_cold_window_action_telemetry(
+    telemetry: &mut RotatingColdWindowTickTelemetry,
+    action: RotatingColdWindowActionKind,
+    estimated_cost: u64,
+) {
+    let action_telemetry = match action {
+        RotatingColdWindowActionKind::EphemeralWatch => &mut telemetry.ephemeral,
+        RotatingColdWindowActionKind::FastScanLease => &mut telemetry.fast_scan_lease,
+        RotatingColdWindowActionKind::ScanOnly => &mut telemetry.scan_only,
+    };
+    action_telemetry.selected_dirs = action_telemetry.selected_dirs.saturating_add(1);
+    action_telemetry.estimated_cost = action_telemetry
+        .estimated_cost
+        .saturating_add(estimated_cost);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Waterline alarm — adaptive L3 scan degradation
 // ════════════════════════════════════════════════════════════════════════════
@@ -847,6 +878,37 @@ impl WaterlineAlarm {
 }
 
 impl TieredWatchRuntime {
+    fn finish_rotating_cold_window_tick(
+        &self,
+        tick: RotatingColdWindowTick,
+    ) -> RotatingColdWindowTick {
+        let telemetry = tick.telemetry;
+        self.rotating_cold_window_promoted_to_ephemeral
+            .fetch_add(telemetry.ephemeral.selected_dirs, Ordering::Relaxed);
+        self.rotating_cold_window_fast_scan_lease_dirs
+            .fetch_add(telemetry.fast_scan_lease.selected_dirs, Ordering::Relaxed);
+        self.rotating_cold_window_scan_only_dirs
+            .fetch_add(telemetry.scan_only.selected_dirs, Ordering::Relaxed);
+        self.rotating_cold_window_ephemeral_selected_dirs
+            .fetch_add(telemetry.ephemeral.selected_dirs, Ordering::Relaxed);
+        self.rotating_cold_window_fast_scan_lease_selected_dirs
+            .fetch_add(telemetry.fast_scan_lease.selected_dirs, Ordering::Relaxed);
+        self.rotating_cold_window_scan_only_selected_dirs
+            .fetch_add(telemetry.scan_only.selected_dirs, Ordering::Relaxed);
+        self.rotating_cold_window_ephemeral_estimated_cost
+            .fetch_add(telemetry.ephemeral.estimated_cost, Ordering::Relaxed);
+        self.rotating_cold_window_fast_scan_lease_estimated_cost
+            .fetch_add(telemetry.fast_scan_lease.estimated_cost, Ordering::Relaxed);
+        self.rotating_cold_window_scan_only_estimated_cost
+            .fetch_add(telemetry.scan_only.estimated_cost, Ordering::Relaxed);
+        self.rotating_cold_window_adjacent_cycle_reselected_dirs
+            .fetch_add(telemetry.adjacent_cycle_reselected_dirs, Ordering::Relaxed);
+        self.rotating_cold_window_adjacent_cycle_action_switches
+            .fetch_add(telemetry.adjacent_cycle_action_switches, Ordering::Relaxed);
+        *self.rotating_cold_window_last_tick_telemetry.write() = telemetry;
+        tick
+    }
+
     pub fn apply_rotating_cold_window_config(&self, config: &TieredWatchConfig) {
         self.rotating_cold_window_enabled
             .store(config.rotating_cold_window_enabled, Ordering::Relaxed);
@@ -1007,7 +1069,7 @@ impl TieredWatchRuntime {
         config: RotatingColdWindowConfig,
     ) -> RotatingColdWindowTick {
         if !config.enabled {
-            return RotatingColdWindowTick::default();
+            return self.finish_rotating_cold_window_tick(RotatingColdWindowTick::default());
         }
 
         let now = unix_secs();
@@ -1027,11 +1089,11 @@ impl TieredWatchRuntime {
         if active_count >= budget {
             self.rotating_cold_window_budget_blocked
                 .fetch_add(1, Ordering::Relaxed);
-            return RotatingColdWindowTick {
+            return self.finish_rotating_cold_window_tick(RotatingColdWindowTick {
                 cycle_id: self.rotating_cold_window_cycle_id.load(Ordering::Relaxed),
                 budget_blocked: true,
                 ..RotatingColdWindowTick::default()
-            };
+            });
         }
 
         let capacity = budget.saturating_sub(active_count).min(max_dirs_per_tick);
@@ -1086,16 +1148,16 @@ impl TieredWatchRuntime {
                     .saturating_add(freshness_bonus)
                     .saturating_add(tier_bonus);
                 let watch_cost = state.watch_cost.load(Ordering::Relaxed);
-                candidates.push((path.clone(), watch_cost, score, scan_age));
+                candidates.push((path.clone(), state.clone(), watch_cost, score, scan_age));
             }
             (cold_paths, candidates)
         };
 
         if cold_paths.is_empty() || candidates.is_empty() {
-            return RotatingColdWindowTick {
+            return self.finish_rotating_cold_window_tick(RotatingColdWindowTick {
                 cycle_id: self.rotating_cold_window_cycle_id.load(Ordering::Relaxed),
                 ..RotatingColdWindowTick::default()
-            };
+            });
         }
 
         let mut seen = self.rotating_cold_window_seen.write();
@@ -1108,9 +1170,9 @@ impl TieredWatchRuntime {
 
         let has_unseen_candidate = candidates
             .iter()
-            .any(|(path, _, _, _)| !seen.contains(path));
+            .any(|(path, _, _, _, _)| !seen.contains(path));
         if has_unseen_candidate {
-            candidates.retain(|(path, _, _, _)| !seen.contains(path));
+            candidates.retain(|(path, _, _, _, _)| !seen.contains(path));
         } else {
             seen.clear();
             self.rotating_cold_window_cycle_id
@@ -1118,8 +1180,8 @@ impl TieredWatchRuntime {
         }
 
         candidates.sort_by(|a, b| {
-            b.2.cmp(&a.2)
-                .then_with(|| b.3.cmp(&a.3))
+            b.3.cmp(&a.3)
+                .then_with(|| b.4.cmp(&a.4))
                 .then_with(|| a.0.cmp(&b.0))
         });
 
@@ -1133,8 +1195,10 @@ impl TieredWatchRuntime {
             .checked_add(Duration::from_secs(follow_up_interval_secs))
             .unwrap_or(now_instant);
         let mut actions = Vec::new();
+        let mut selection_progress = Vec::new();
+        let mut telemetry = RotatingColdWindowTickTelemetry::default();
         let mut leases = self.rotating_cold_window_leases.write();
-        for (path, watch_cost, score, _) in candidates.into_iter().take(capacity) {
+        for (path, state, watch_cost, score, _) in candidates.into_iter().take(capacity) {
             let action = rotating_cold_window_action_for_cost(
                 watch_cost,
                 max_ephemeral_cost,
@@ -1155,20 +1219,8 @@ impl TieredWatchRuntime {
                 },
             );
             seen.insert(path.clone());
-            match action {
-                RotatingColdWindowActionKind::EphemeralWatch => {
-                    self.rotating_cold_window_promoted_to_ephemeral
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                RotatingColdWindowActionKind::FastScanLease => {
-                    self.rotating_cold_window_fast_scan_lease_dirs
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                RotatingColdWindowActionKind::ScanOnly => {
-                    self.rotating_cold_window_scan_only_dirs
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
+            add_rotating_cold_window_action_telemetry(&mut telemetry, action, watch_cost);
+            selection_progress.push((state, action));
             actions.push(RotatingColdWindowAction {
                 path,
                 action,
@@ -1180,23 +1232,38 @@ impl TieredWatchRuntime {
         drop(leases);
         drop(seen);
 
+        for (state, action) in selection_progress {
+            let (adjacent_cycle, action_switched) =
+                record_rotating_cold_window_selection(state.as_ref(), cycle_id, action);
+            if adjacent_cycle {
+                telemetry.adjacent_cycle_reselected_dirs =
+                    telemetry.adjacent_cycle_reselected_dirs.saturating_add(1);
+            }
+            if action_switched {
+                telemetry.adjacent_cycle_action_switches =
+                    telemetry.adjacent_cycle_action_switches.saturating_add(1);
+            }
+        }
+
         if actions.is_empty() {
             self.rotating_cold_window_budget_blocked
                 .fetch_add(1, Ordering::Relaxed);
-            return RotatingColdWindowTick {
+            return self.finish_rotating_cold_window_tick(RotatingColdWindowTick {
                 cycle_id,
                 budget_blocked: true,
                 actions,
-            };
+                telemetry,
+            });
         }
 
         self.rotating_cold_window_last_tick_unix_secs
             .store(now, Ordering::Relaxed);
-        RotatingColdWindowTick {
+        self.finish_rotating_cold_window_tick(RotatingColdWindowTick {
             cycle_id,
             actions,
             budget_blocked: false,
-        }
+            telemetry,
+        })
     }
 
     pub fn take_due_rotating_cold_window_scans(&self) -> Vec<(PathBuf, u64)> {

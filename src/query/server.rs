@@ -343,6 +343,7 @@ struct QueryServerState {
     watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
     tiered_watch_debug_provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync>,
     fast_scan_lease_provider: Arc<dyn Fn(Vec<PathBuf>, FastScanLeaseKind) + Send + Sync>,
+    query_fast_scan_leases_enabled: bool,
     scan_reject_count: Arc<AtomicU64>,
     http_policy: HttpPolicy,
 }
@@ -356,6 +357,7 @@ pub struct QueryServer {
     watch_state_provider: Arc<dyn Fn() -> WatchStateReport + Send + Sync>,
     tiered_watch_debug_provider: Arc<dyn Fn(Option<String>) -> TieredWatchDebugDump + Send + Sync>,
     fast_scan_lease_provider: Arc<dyn Fn(Vec<PathBuf>, FastScanLeaseKind) + Send + Sync>,
+    query_fast_scan_leases_enabled: bool,
     scan_reject_count: Arc<AtomicU64>,
     http_policy: HttpPolicy,
 }
@@ -371,6 +373,7 @@ impl QueryServer {
             watch_state_provider: Arc::new(WatchStateReport::default),
             tiered_watch_debug_provider: Arc::new(|_| TieredWatchDebugDump::default()),
             fast_scan_lease_provider: Arc::new(|_, _| {}),
+            query_fast_scan_leases_enabled: true,
             scan_reject_count: Arc::new(AtomicU64::new(0)),
             http_policy: effective_http_policy(None, RunningIdentity::current()),
         }
@@ -422,6 +425,15 @@ impl QueryServer {
         self
     }
 
+    /// Enable or disable the query-derived fast-scan lease source.
+    ///
+    /// Disabling this does not alter query execution or result serialization;
+    /// it only suppresses the post-query lease callback.
+    pub fn with_query_fast_scan_leases_enabled(mut self, enabled: bool) -> Self {
+        self.query_fast_scan_leases_enabled = enabled;
+        self
+    }
+
     pub fn with_http_policy(mut self, policy: HttpPolicy) -> Self {
         self.http_policy = policy;
         self
@@ -438,6 +450,7 @@ impl QueryServer {
             watch_state_provider: self.watch_state_provider,
             tiered_watch_debug_provider: self.tiered_watch_debug_provider,
             fast_scan_lease_provider: self.fast_scan_lease_provider,
+            query_fast_scan_leases_enabled: self.query_fast_scan_leases_enabled,
             scan_reject_count: self.scan_reject_count,
             http_policy: self.http_policy,
         }
@@ -538,9 +551,11 @@ async fn search_handler(
     state
         .index
         .record_query_metric(query_started.elapsed().as_micros() as u64);
-    let lease_dirs = query_hotset_dirs(&results);
-    if !lease_dirs.is_empty() {
-        (state.fast_scan_lease_provider)(lease_dirs, FastScanLeaseKind::Query);
+    if state.query_fast_scan_leases_enabled {
+        let lease_dirs = query_hotset_dirs(&results);
+        if !lease_dirs.is_empty() {
+            (state.fast_scan_lease_provider)(lease_dirs, FastScanLeaseKind::Query);
+        }
     }
 
     let config = ScoreConfig::from_query(&keyword);
@@ -1275,6 +1290,71 @@ mod tests {
         assert_eq!(value["deleted"], 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn disabling_query_fast_scan_leases_preserves_search_response() {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fd-rdd-query-lease-{nanos}"));
+        let path = root.join("lease-target.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&path, b"target").unwrap();
+
+        let index = Arc::new(TieredIndex::empty(vec![root.clone()]));
+        index.apply_events(&[test_event(1, EventType::Create, path.clone())]);
+
+        let granted_dirs = Arc::new(AtomicU64::new(0));
+        let provider = {
+            let granted_dirs = granted_dirs.clone();
+            Arc::new(move |dirs: Vec<PathBuf>, kind| {
+                assert_eq!(kind, FastScanLeaseKind::Query);
+                granted_dirs.fetch_add(dirs.len() as u64, Ordering::Relaxed);
+            })
+        };
+        let enabled_state = QueryServer::new(index.clone())
+            .with_fast_scan_lease_provider(provider.clone())
+            .into_state();
+        let Json(enabled_response) = search_handler(
+            Query(SearchParams {
+                q: "lease-target".to_string(),
+                limit: None,
+                mode: None,
+                sort: None,
+                order: None,
+            }),
+            State(enabled_state),
+        )
+        .await
+        .unwrap();
+        assert_eq!(granted_dirs.load(Ordering::Relaxed), 1);
+
+        let disabled_state = QueryServer::new(index)
+            .with_fast_scan_lease_provider(provider)
+            .with_query_fast_scan_leases_enabled(false)
+            .into_state();
+        let Json(disabled_response) = search_handler(
+            Query(SearchParams {
+                q: "lease-target".to_string(),
+                limit: None,
+                mode: None,
+                sort: None,
+                order: None,
+            }),
+            State(disabled_state),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(granted_dirs.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            serde_json::to_value(enabled_response).unwrap(),
+            serde_json::to_value(disabled_response).unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

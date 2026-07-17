@@ -395,6 +395,8 @@ pub struct TieredWatchConfig {
     pub rotating_cold_window_max_dirs_per_tick: usize,
     /// Enable the lease-hotset fast scan lane for directories outside L0.
     pub l1_l2_fast_scan_enabled: bool,
+    /// Allow successful queries to grant or renew automatic fast-scan leases.
+    pub l1_l2_fast_scan_query_leases_enabled: bool,
     /// Target coverage window for local trusted lease-hotset directories.
     pub l1_l2_fast_scan_target_secs: u64,
     /// Fast scan scheduler tick interval.
@@ -690,6 +692,7 @@ impl Default for TieredWatchConfig {
             rotating_cold_window_max_cost_per_root: 64,
             rotating_cold_window_max_dirs_per_tick: 8,
             l1_l2_fast_scan_enabled: true,
+            l1_l2_fast_scan_query_leases_enabled: true,
             l1_l2_fast_scan_target_secs: 5,
             l1_l2_fast_scan_tick_ms: 1_000,
             l1_l2_fast_scan_stat_budget_per_tick: 5_000,
@@ -751,6 +754,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             rotating_cold_window_max_cost_per_root: usize,
             rotating_cold_window_max_dirs_per_tick: usize,
             l1_l2_fast_scan_enabled: bool,
+            l1_l2_fast_scan_query_leases_enabled: bool,
             l1_l2_fast_scan_target_secs: u64,
             l1_l2_fast_scan_tick_ms: Option<u64>,
             l1_l2_fast_scan_stat_budget_per_tick: Option<usize>,
@@ -808,6 +812,8 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
                     rotating_cold_window_max_dirs_per_tick: defaults
                         .rotating_cold_window_max_dirs_per_tick,
                     l1_l2_fast_scan_enabled: defaults.l1_l2_fast_scan_enabled,
+                    l1_l2_fast_scan_query_leases_enabled: defaults
+                        .l1_l2_fast_scan_query_leases_enabled,
                     l1_l2_fast_scan_target_secs: defaults.l1_l2_fast_scan_target_secs,
                     l1_l2_fast_scan_tick_ms: None,
                     l1_l2_fast_scan_stat_budget_per_tick: None,
@@ -889,6 +895,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             rotating_cold_window_max_cost_per_root: raw.rotating_cold_window_max_cost_per_root,
             rotating_cold_window_max_dirs_per_tick: raw.rotating_cold_window_max_dirs_per_tick,
             l1_l2_fast_scan_enabled: raw.l1_l2_fast_scan_enabled,
+            l1_l2_fast_scan_query_leases_enabled: raw.l1_l2_fast_scan_query_leases_enabled,
             l1_l2_fast_scan_target_secs: raw.l1_l2_fast_scan_target_secs,
             l1_l2_fast_scan_tick_ms,
             l1_l2_fast_scan_stat_budget_per_tick,

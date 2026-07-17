@@ -124,6 +124,12 @@ impl TieredWatchRuntime {
             );
         let mut state = self.fast_scan_state.write();
         for entry in registry.entries.into_iter().take(max_entries) {
+            if entry.lease_kind == FastScanLeaseKind::Query
+                && !config.l1_l2_fast_scan_query_leases_enabled
+            {
+                report.rejected_entries = report.rejected_entries.saturating_add(1);
+                continue;
+            }
             let path = normalize_fast_scan_dir(entry.path);
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 report.rejected_entries = report.rejected_entries.saturating_add(1);

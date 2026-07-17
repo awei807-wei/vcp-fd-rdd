@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from m2_causal_evidence import target_m2_causal, target_m2_fence_valid
+from m2_cold_window_falsification_validation import protocol_invalid_reasons
 
 
 PROTOCOL_TREATMENT_KEYS = frozenset({"rotating_cold_window"})
@@ -307,6 +308,9 @@ def _protocol_summary(
         "deterministic_event_plan": bool(
             runner_args.get("event_storm_deterministic_plan")
         ),
+        "query_fast_scan_leases_enabled": bool(
+            runner_args.get("query_fast_scan_leases", True)
+        ),
         "event_plan_sha256": plan_sha256,
     }
 
@@ -451,7 +455,7 @@ def _stability_summary(
         or "dirty queue retry failed, entry dropped after worker task failure" in line
         for line in log_lines
     )
-    return {
+    leg = {
         "snapshot_rebuild_observed": bool(snapshot.get("rebuild_observed")),
         "snapshot_ready": bool(snapshot.get("ready")),
         "snapshot_last_daemon_error": str(snapshot.get("last_daemon_error", "")),
@@ -487,6 +491,7 @@ def _stability_summary(
             "waterline alarm: soft degradation recovered"
         ),
     }
+    return leg
 
 
 def _run_valid(manifest: dict[str, Any], summary: dict[str, Any]) -> bool:
@@ -513,7 +518,7 @@ def analyze_leg(spec: LegSpec, run_dir: Path) -> dict[str, Any]:
     provenance = _mapping(manifest, "artifact_provenance")
     watch = _mapping(summary, "watch_state")
     protocol = _protocol_summary(manifest, events)
-    return {
+    leg = {
         "block": spec.block,
         "position": spec.position,
         "order": spec.order,
@@ -531,6 +536,15 @@ def analyze_leg(spec: LegSpec, run_dir: Path) -> dict[str, Any]:
         ),
         "audit": {
             "git_sha": str(manifest.get("git_sha", "")),
+            "planned_git_sha": str(
+                manifest.get("planned_git_sha")
+                or provenance.get("planned_git_sha", "")
+            ),
+            "executed_git_sha": str(
+                manifest.get("executed_git_sha")
+                or provenance.get("executed_git_sha")
+                or manifest.get("git_sha", "")
+            ),
             "binary_sha256": str(manifest.get("binary_sha256", "")),
             "receipt_sha256": str(provenance.get("receipt_sha256", "")),
             "cargo_lock_sha256": str(
@@ -552,3 +566,6 @@ def analyze_leg(spec: LegSpec, run_dir: Path) -> dict[str, Any]:
             ),
         },
     }
+    leg["protocol_invalid_reasons"] = protocol_invalid_reasons(leg)
+    leg["protocol_valid"] = not leg["protocol_invalid_reasons"]
+    return leg

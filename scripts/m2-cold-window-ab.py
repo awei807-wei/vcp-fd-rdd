@@ -67,6 +67,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, default=None)
     parser.add_argument("--binary", type=Path, default=BINARY)
     parser.add_argument("--artifact-provenance-receipt", type=Path, default=None)
+    parser.add_argument("--planned-git-sha", default="")
+    parser.add_argument(
+        "--query-fast-scan-leases",
+        dest="query_fast_scan_leases",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no-query-fast-scan-leases",
+        dest="query_fast_scan_leases",
+        action="store_false",
+    )
     parser.add_argument("--dry-run", action="store_true", help="仅打印固定路径和完整命令")
     return parser.parse_args(argv)
 
@@ -157,6 +169,8 @@ def _run_locked(
             profile=args.profile,
             artifact_provenance_receipt=args.artifact_provenance_receipt,
             binary=binary,
+            query_fast_scan_leases_enabled=args.query_fast_scan_leases,
+            planned_git_sha=args.planned_git_sha,
         )
         process, capture = start_runner_process(
             command, REPO_ROOT, runner_log_path(run_dir)
@@ -247,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
         profile=args.profile,
         artifact_provenance_receipt=args.artifact_provenance_receipt,
         binary=binary,
+        query_fast_scan_leases_enabled=args.query_fast_scan_leases,
+        planned_git_sha=args.planned_git_sha,
     )
 
     print(f"variant: {args.variant} ({label})")

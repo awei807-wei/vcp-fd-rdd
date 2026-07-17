@@ -116,6 +116,10 @@ def render_report(summary: dict[str, Any]) -> str:
         "# M2 快速证伪 A/B 报告",
         "",
         f"- 判定：`{gate['decision']}`",
+        f"- Planned Git SHA：`{summary.get('planned_git_sha', '') or 'unknown'}`",
+        f"- Executed Git SHA：`{summary.get('executed_git_sha', '') or 'unknown'}`",
+        "- Query Fast Scan lease："
+        f"`{'enabled' if summary.get('query_fast_scan_leases_enabled', True) else 'disabled'}`",
         f"- 收益复现：`{gate['benefit_blocks']}/4` 个配对块",
         "- 实验单位：4 个配对 block（2×AB、2×BA），共 8 腿",
         "- 单腿协议：6 个 burst、806 个唯一主断言、38 个可见性探针",
@@ -143,6 +147,17 @@ def render_report(summary: dict[str, Any]) -> str:
         "## 腿级结果",
         "",
         *_leg_result_lines(summary["legs"]),
+        "",
+        "## 自动废弃的协议无效 block",
+        "",
+        *(
+            [
+                f"- block {row.get('block')} attempt {row.get('attempt')}: "
+                + "; ".join(str(reason) for reason in row.get("reasons", []))
+                for row in summary.get("discarded_blocks", [])
+            ]
+            or ["- 无"]
+        ),
         "",
         "## 解释边界",
         "",

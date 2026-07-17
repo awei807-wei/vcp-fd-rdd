@@ -302,6 +302,7 @@ L3 是最终一致层，不代表实时 watcher 覆盖。`/debug/tiered-watch` �
 | `tiered_watch.rotating_cold_window_max_cost_per_root` | `usize` | `64` | 可尝试 Ephemeral Watch 的单根递归 watch 成本上限 |
 | `tiered_watch.rotating_cold_window_max_dirs_per_tick` | `usize` | `8` | 每 tick 最多选择的冷目录数 |
 | `tiered_watch.l1_l2_fast_scan_enabled` | `bool` | `true` | 启用 lease-hotset fast scan lane |
+| `tiered_watch.l1_l2_fast_scan_query_leases_enabled` | `bool` | `true` | 允许查询命中授予或续租 Query fast-scan lease；关闭时不改变查询结果与验真 |
 | `tiered_watch.l1_l2_fast_scan_target_secs` | `u64` | `5` | 本地可信 active hotset 目录 strict 覆盖目标 |
 | `tiered_watch.l1_l2_fast_scan_tick_ms` | `u64` | `1000` | fast scan 调度 tick |
 | `tiered_watch.l1_l2_fast_scan_stat_budget_per_tick` | `usize` | `5000` | 每 tick 本地可信 hotset sentinel stat 预算 |

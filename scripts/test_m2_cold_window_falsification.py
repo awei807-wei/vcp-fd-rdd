@@ -224,6 +224,8 @@ def synthetic_leg(
         },
         "audit": {
             "git_sha": "a" * 40,
+            "planned_git_sha": "a" * 40,
+            "executed_git_sha": "a" * 40,
             "binary_sha256": "b" * 64,
             "receipt_sha256": "f" * 64,
             "cargo_lock_sha256": "1" * 64,
@@ -1360,6 +1362,76 @@ class DriverTests(unittest.TestCase):
         binary_index = command.index("--binary")
         self.assertEqual(command[binary_index + 1], str(binary))
 
+    def test_leg_command_forwards_query_lease_mode_and_planned_sha(self) -> None:
+        spec = falsification.build_leg_specs(Path("/tmp/suite"), seed=42)[0]
+        command = runner.leg_command(
+            spec,
+            spec.base_dir / "attempt-01",
+            Path("/tmp/suite/build-provenance.json"),
+            runner.suite_binary(Path("/tmp/suite")),
+            query_fast_scan_leases_enabled=False,
+            planned_git_sha="a" * 40,
+        )
+
+        self.assertIn("--no-query-fast-scan-leases", command)
+        planned_index = command.index("--planned-git-sha")
+        self.assertEqual(command[planned_index + 1], "a" * 40)
+
+    def test_protocol_invalid_second_leg_discards_and_reruns_the_whole_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            suite_dir = Path(tmp)
+            receipt = suite_dir / "build-provenance.json"
+            binary = runner.suite_binary(suite_dir)
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"binary")
+            receipt.write_text("{}", encoding="utf-8")
+            specs = falsification.build_leg_specs(suite_dir, 42)[:2]
+            analyzed: list[dict[str, object]] = []
+            for index, spec in enumerate((*specs, *specs)):
+                leg = synthetic_leg(
+                    spec.block,
+                    spec.variant,
+                    visibility_rate=1.0 if spec.variant == "a" else 0.0,
+                    positive_rate=1.0 if spec.variant == "a" else 0.8,
+                )
+                if index == 1:
+                    leg["protocol"]["checks"] = 1
+                analyzed.append(leg)
+
+            def fake_run(command: list[str]) -> int:
+                Path(command[command.index("--run-dir") + 1]).mkdir(parents=True)
+                return 0
+
+            def fake_analyze(_spec: object, run_dir: Path) -> dict[str, object]:
+                leg = analyzed.pop(0)
+                leg["run_dir"] = str(run_dir)
+                return leg
+
+            with mock.patch.object(
+                runner, "_reusable_block_attempts", return_value={}
+            ), mock.patch.object(
+                runner, "run_wrapper_process", side_effect=fake_run
+            ), mock.patch.object(
+                runner, "completed_attempt", side_effect=lambda base, *_args: max(base.glob("attempt-*"))
+            ), mock.patch.object(
+                runner, "analyze_leg", side_effect=fake_analyze
+            ):
+                legs, error = runner._run_legs(
+                    specs,
+                    suite_dir,
+                    receipt,
+                    max_block_attempts=2,
+                )
+
+            self.assertEqual(error, "")
+            self.assertEqual(len(legs), 2)
+            self.assertTrue(all("attempt-02" in leg["run_dir"] for leg in legs))
+            progress = json.loads(
+                (suite_dir / "progress.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(progress["discarded_blocks"]), 1)
+            self.assertIn("未完成 6 个 burst/check", progress["discarded_blocks"][0]["reasons"][0])
+
     def test_wrapper_process_forwards_sigterm_before_propagating_interrupt(self) -> None:
         process = mock.Mock()
         process.wait.side_effect = [
@@ -1449,12 +1521,35 @@ class DriverTests(unittest.TestCase):
 
         self.assertEqual(stale, {})
 
+    def test_resume_rejects_query_lease_mode_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            suite_dir = Path(tmp)
+            runner._atomic_json(
+                suite_dir / "manifest.json",
+                {
+                    "sequence_seed": 42,
+                    "planned_git_sha": "a" * 40,
+                    "query_fast_scan_leases_enabled": True,
+                },
+            )
+
+            error = runner._resume_error(
+                suite_dir,
+                42,
+                "a" * 40,
+                False,
+            )
+
+            self.assertIn("不能切换后续跑", error)
+
     def test_interrupted_suite_preserves_completed_legs_from_progress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             suite_dir = Path(tmp)
             completed = synthetic_leg(1, "a", visibility_rate=1.0)
 
-            def interrupt_with_progress(*_args: object) -> object:
+            def interrupt_with_progress(
+                *_args: object, **_kwargs: object
+            ) -> object:
                 runner._atomic_json(
                     suite_dir / "progress.json", {"legs": [completed]}
                 )
@@ -1531,12 +1626,15 @@ class DriverTests(unittest.TestCase):
             ), mock.patch.object(
                 runner.subprocess, "run", return_value=completed
             ):
-                error = runner._build_release(suite_dir)
+                error = runner._build_release(suite_dir, planned_git_sha="a" * 40)
 
                 receipt = suite_dir / "build-provenance.json"
                 self.assertEqual(error, "")
                 self.assertTrue(receipt.is_file())
                 self.assertEqual(runner._validate_build_receipt(receipt, binary), "")
+                payload = json.loads(receipt.read_text(encoding="utf-8"))
+                self.assertEqual(payload["planned_git_sha"], "a" * 40)
+                self.assertEqual(payload["executed_git_sha"], "a" * 40)
 
     def test_build_release_rejects_cargo_success_without_the_private_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

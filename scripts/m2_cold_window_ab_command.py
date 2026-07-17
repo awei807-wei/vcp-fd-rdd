@@ -166,7 +166,7 @@ def _base_args(
     return args
 
 
-def _tiered_args() -> list[str]:
+def _tiered_args(query_fast_scan_leases_enabled: bool) -> list[str]:
     return [
         "--rotating-budget", "128",
         "--rotating-tick-secs", "30",
@@ -181,6 +181,11 @@ def _tiered_args() -> list[str]:
         "--l1-empty-scans-to-l2", "1",
         "--l2-empty-scans-to-l3", "2",
         "--fast-scan",
+        (
+            "--query-fast-scan-leases"
+            if query_fast_scan_leases_enabled
+            else "--no-query-fast-scan-leases"
+        ),
         "--proc-sampler",
     ]
 
@@ -279,6 +284,8 @@ def build_command(
     profile: str = "standard",
     artifact_provenance_receipt: Path | None = None,
     binary: Path = BINARY,
+    query_fast_scan_leases_enabled: bool = True,
+    planned_git_sha: str = "",
 ) -> list[str]:
     selected = PROFILES[profile]
     command = _base_args(run_dir, roots, selected, binary)
@@ -289,7 +296,9 @@ def build_command(
                 str(artifact_provenance_receipt),
             )
         )
-    command.extend(_tiered_args())
+    if planned_git_sha:
+        command.extend(("--planned-git-sha", planned_git_sha))
+    command.extend(_tiered_args(query_fast_scan_leases_enabled))
     command.extend(_canary_args(roots, selected))
     command.extend(_event_storm_args(roots, selected))
     command.extend(

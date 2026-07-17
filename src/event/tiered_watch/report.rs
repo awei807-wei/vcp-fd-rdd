@@ -360,6 +360,8 @@ impl TieredWatchRuntime {
         let rotating_cold_window_enabled =
             self.rotating_cold_window_enabled.load(Ordering::Relaxed);
         let rotating_cold_window_active_dirs = self.rotating_cold_window_leases.read().len();
+        let rotating_cold_window_last_tick_telemetry =
+            *self.rotating_cold_window_last_tick_telemetry.read();
         let rotating_seen = self.rotating_cold_window_seen.read().len();
         let rotating_total_cold = tc.l2_dirs.saturating_add(tc.l3_dirs);
         let rotating_cold_window_cycle_progress_pct = if rotating_total_cold == 0 {
@@ -448,6 +450,29 @@ impl TieredWatchRuntime {
                 rotating_cold_window_cycle_progress_pct
             ));
             notes.push("rotating cold window never swaps formal L0/L1/L2/L3 tiers; it issues ephemeral, fast-scan, or scan-only leases".to_string());
+            notes.push(format!(
+                "rotating cold window last tick dirs/cost ephemeral={}/{} fast_scan_lease={}/{} scan_only={}/{} adjacent_reselected={} action_switches={}",
+                rotating_cold_window_last_tick_telemetry
+                    .ephemeral
+                    .selected_dirs,
+                rotating_cold_window_last_tick_telemetry
+                    .ephemeral
+                    .estimated_cost,
+                rotating_cold_window_last_tick_telemetry
+                    .fast_scan_lease
+                    .selected_dirs,
+                rotating_cold_window_last_tick_telemetry
+                    .fast_scan_lease
+                    .estimated_cost,
+                rotating_cold_window_last_tick_telemetry
+                    .scan_only
+                    .selected_dirs,
+                rotating_cold_window_last_tick_telemetry
+                    .scan_only
+                    .estimated_cost,
+                rotating_cold_window_last_tick_telemetry.adjacent_cycle_reselected_dirs,
+                rotating_cold_window_last_tick_telemetry.adjacent_cycle_action_switches,
+            ));
         }
         if fs.fast_scan_budget_degraded && !fs.fast_scan_last_degraded_reason.is_empty() {
             notes.push(format!(
@@ -563,6 +588,56 @@ impl TieredWatchRuntime {
             rotating_cold_window_scan_only_dirs: self
                 .rotating_cold_window_scan_only_dirs
                 .load(Ordering::Relaxed),
+            rotating_cold_window_ephemeral_selected_dirs: self
+                .rotating_cold_window_ephemeral_selected_dirs
+                .load(Ordering::Relaxed),
+            rotating_cold_window_fast_scan_lease_selected_dirs: self
+                .rotating_cold_window_fast_scan_lease_selected_dirs
+                .load(Ordering::Relaxed),
+            rotating_cold_window_scan_only_selected_dirs: self
+                .rotating_cold_window_scan_only_selected_dirs
+                .load(Ordering::Relaxed),
+            rotating_cold_window_ephemeral_estimated_cost: self
+                .rotating_cold_window_ephemeral_estimated_cost
+                .load(Ordering::Relaxed),
+            rotating_cold_window_fast_scan_lease_estimated_cost: self
+                .rotating_cold_window_fast_scan_lease_estimated_cost
+                .load(Ordering::Relaxed),
+            rotating_cold_window_scan_only_estimated_cost: self
+                .rotating_cold_window_scan_only_estimated_cost
+                .load(Ordering::Relaxed),
+            rotating_cold_window_last_tick_ephemeral_dirs: rotating_cold_window_last_tick_telemetry
+                .ephemeral
+                .selected_dirs,
+            rotating_cold_window_last_tick_ephemeral_estimated_cost:
+                rotating_cold_window_last_tick_telemetry
+                    .ephemeral
+                    .estimated_cost,
+            rotating_cold_window_last_tick_fast_scan_lease_dirs:
+                rotating_cold_window_last_tick_telemetry
+                    .fast_scan_lease
+                    .selected_dirs,
+            rotating_cold_window_last_tick_fast_scan_lease_estimated_cost:
+                rotating_cold_window_last_tick_telemetry
+                    .fast_scan_lease
+                    .estimated_cost,
+            rotating_cold_window_last_tick_scan_only_dirs: rotating_cold_window_last_tick_telemetry
+                .scan_only
+                .selected_dirs,
+            rotating_cold_window_last_tick_scan_only_estimated_cost:
+                rotating_cold_window_last_tick_telemetry
+                    .scan_only
+                    .estimated_cost,
+            rotating_cold_window_adjacent_cycle_reselected_dirs: self
+                .rotating_cold_window_adjacent_cycle_reselected_dirs
+                .load(Ordering::Relaxed),
+            rotating_cold_window_adjacent_cycle_action_switches: self
+                .rotating_cold_window_adjacent_cycle_action_switches
+                .load(Ordering::Relaxed),
+            rotating_cold_window_last_tick_adjacent_cycle_reselected_dirs:
+                rotating_cold_window_last_tick_telemetry.adjacent_cycle_reselected_dirs,
+            rotating_cold_window_last_tick_adjacent_cycle_action_switches:
+                rotating_cold_window_last_tick_telemetry.adjacent_cycle_action_switches,
             rotating_cold_window_budget_blocked: self
                 .rotating_cold_window_budget_blocked
                 .load(Ordering::Relaxed),
@@ -773,6 +848,13 @@ impl TieredWatchRuntime {
                 rotating_cold_window_last_scan_cycle_id: rotating_progress.last_scan_cycle_id,
                 rotating_cold_window_last_event_seq: rotating_progress.last_event_seq,
                 rotating_cold_window_last_event_cycle_id: rotating_progress.last_event_cycle_id,
+                rotating_cold_window_last_selected_cycle_id: rotating_progress
+                    .last_selected_cycle_id,
+                rotating_cold_window_last_selected_action: rotating_progress
+                    .last_selected_action
+                    .map(RotatingColdWindowActionKind::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
                 nearest_ancestor_root,
                 descendant_roots,
                 l0_covering_root,
