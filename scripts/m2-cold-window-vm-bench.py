@@ -1272,6 +1272,8 @@ def process_sampler(pid: int) -> Any:
 class ProcessSampleRunner:
     """Sample procfs independently so slow HTTP endpoints cannot hide RSS peaks."""
 
+    PROCFS_EXIT_CONFIRMATION_SECS = 0.25
+
     def __init__(
         self,
         pid: int,
@@ -1287,6 +1289,7 @@ class ProcessSampleRunner:
         self.process_running = process_running
         self.error = ""
         self._stop = threading.Event()
+        self._process_exit_expected = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -1303,11 +1306,26 @@ class ProcessSampleRunner:
             self._thread.join(timeout=5.0)
             self._thread = None
 
+    def expect_process_exit(self) -> None:
+        """Allow procfs teardown races after the runner begins planned shutdown."""
+        self._process_exit_expected.set()
+
     def _loop(self) -> None:
         sampler = process_sampler(self.pid)
         try:
             while not self._stop.is_set():
-                sample = next(sampler)
+                try:
+                    sample = next(sampler)
+                except Exception as exc:  # noqa: BLE001 - classify procfs teardown only
+                    if self._is_procfs_exit_race(exc):
+                        if not self._daemon_is_running():
+                            return
+                        if (
+                            self._process_exit_expected.is_set()
+                            and self._confirm_expected_process_exit()
+                        ):
+                            return
+                    raise
                 if not sample and not self._daemon_is_running():
                     return
                 record = {
@@ -1319,8 +1337,6 @@ class ProcessSampleRunner:
                 if self._stop.wait(self.interval_secs):
                     return
         except Exception as exc:  # noqa: BLE001 - surfaced in the run summary
-            if self._is_procfs_exit_race(exc) and not self._daemon_is_running():
-                return
             self.error = repr(exc)
 
     def _daemon_is_running(self) -> bool:
@@ -1330,6 +1346,14 @@ class ProcessSampleRunner:
             except Exception:  # noqa: BLE001 - do not hide a real sampler error
                 return True
         return Path(f"/proc/{self.pid}").exists()
+
+    def _confirm_expected_process_exit(self) -> bool:
+        deadline = time.monotonic() + self.PROCFS_EXIT_CONFIRMATION_SECS
+        while time.monotonic() < deadline:
+            if not self._daemon_is_running():
+                return True
+            time.sleep(0.01)
+        return not self._daemon_is_running()
 
     @staticmethod
     def _is_procfs_exit_race(exc: Exception) -> bool:
@@ -6330,6 +6354,7 @@ def _run_single_prepared(
                     f"shutdown_snapshot_quiesce_record: {exc!r}"
                 )
             signal_elapsed = round(time.monotonic() - started_at, 6)
+            process_samples.expect_process_exit()
             try:
                 proc.send_signal(signal.SIGTERM)
             except Exception as exc:  # noqa: BLE001 - continue sampler/log cleanup

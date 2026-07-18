@@ -1969,6 +1969,77 @@ class ProcessSampleRunnerTests(unittest.TestCase):
 
             self.assertIn("PermissionError", runner.error)
 
+    def test_process_sampler_ignores_procfs_exit_race_during_planned_shutdown(self) -> None:
+        def failed_sampler(_pid: int):
+            raise PermissionError(13, "permission denied")
+            yield {}  # pragma: no cover - makes this a generator
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            BENCH, "process_sampler", failed_sampler
+        ):
+            running_checks = iter((True, False))
+            runner = BENCH.ProcessSampleRunner(
+                999_999,
+                Path(tmp) / "process-samples.jsonl",
+                time.monotonic(),
+                0.01,
+                process_running=lambda: next(running_checks, False),
+            )
+            runner.expect_process_exit()
+            runner.start()
+            time.sleep(0.03)
+            runner.stop()
+
+            self.assertEqual(runner.error, "")
+
+    def test_planned_shutdown_keeps_procfs_permission_errors_fatal_while_live(self) -> None:
+        def failed_sampler(_pid: int):
+            raise PermissionError(13, "permission denied")
+            yield {}  # pragma: no cover - makes this a generator
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            BENCH, "process_sampler", failed_sampler
+        ):
+            runner = BENCH.ProcessSampleRunner(
+                999_999,
+                Path(tmp) / "process-samples.jsonl",
+                time.monotonic(),
+                0.01,
+                process_running=lambda: True,
+            )
+            runner.expect_process_exit()
+            runner.start()
+            time.sleep(0.03)
+            runner.stop()
+
+            self.assertIn("PermissionError", runner.error)
+
+    def test_planned_shutdown_keeps_sample_output_permission_errors_fatal(self) -> None:
+        def successful_sampler(_pid: int):
+            while True:
+                yield {"vmrss_bytes": 1}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            BENCH, "process_sampler", successful_sampler
+        ), mock.patch.object(
+            BENCH,
+            "json_line",
+            side_effect=PermissionError(13, "permission denied"),
+        ):
+            runner = BENCH.ProcessSampleRunner(
+                999_999,
+                Path(tmp) / "process-samples.jsonl",
+                time.monotonic(),
+                0.01,
+                process_running=lambda: True,
+            )
+            runner.expect_process_exit()
+            runner.start()
+            time.sleep(0.03)
+            runner.stop()
+
+            self.assertIn("PermissionError", runner.error)
+
 
 class EventStormFixtureTests(unittest.TestCase):
     @staticmethod

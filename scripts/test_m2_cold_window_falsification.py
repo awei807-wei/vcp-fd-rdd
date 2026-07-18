@@ -1432,6 +1432,100 @@ class DriverTests(unittest.TestCase):
             self.assertEqual(len(progress["discarded_blocks"]), 1)
             self.assertIn("未完成 6 个 burst/check", progress["discarded_blocks"][0]["reasons"][0])
 
+    def test_planned_shutdown_sampler_failure_reruns_the_whole_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            suite_dir = Path(tmp)
+            receipt = suite_dir / "build-provenance.json"
+            binary = runner.suite_binary(suite_dir)
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"binary")
+            receipt.write_text("{}", encoding="utf-8")
+            specs = falsification.build_leg_specs(suite_dir, 42)[:2]
+            analyzed = [
+                synthetic_leg(
+                    specs[0].block,
+                    specs[0].variant,
+                    visibility_rate=1.0 if specs[0].variant == "a" else 0.0,
+                    positive_rate=1.0 if specs[0].variant == "a" else 0.8,
+                ),
+                *[
+                    synthetic_leg(
+                        spec.block,
+                        spec.variant,
+                        visibility_rate=1.0 if spec.variant == "a" else 0.0,
+                        positive_rate=1.0 if spec.variant == "a" else 0.8,
+                    )
+                    for spec in specs
+                ],
+            ]
+            analyzed[0]["valid"] = False
+            return_codes = iter((1, 0, 0))
+
+            def fake_run(command: list[str]) -> int:
+                Path(command[command.index("--run-dir") + 1]).mkdir(parents=True)
+                return next(return_codes)
+
+            def fake_analyze(_spec: object, run_dir: Path) -> dict[str, object]:
+                leg = analyzed.pop(0)
+                leg["run_dir"] = str(run_dir)
+                if not leg["valid"]:
+                    sampler_error = "PermissionError(13, 'Permission denied')"
+                    runner._atomic_json(
+                        run_dir / "manifest.json",
+                        {
+                            "run_state": "failed",
+                            "completion_reason": "duration_elapsed",
+                            "fd_rdd_exit_code": 0,
+                            "fatal_error": f"process sampler failed: {sampler_error}",
+                            "process_sampler_error": sampler_error,
+                            "cleanup_errors": [],
+                            "shutdown_signal_elapsed_secs": 1500.8,
+                            "execution": {
+                                "duration_completed": True,
+                                "completion_reason": "duration_elapsed",
+                                "exit_code": 0,
+                                "fatal_error": f"process sampler failed: {sampler_error}",
+                                "process_sampler_error": sampler_error,
+                                "cleanup_errors": [],
+                            },
+                        },
+                    )
+                return leg
+
+            with mock.patch.object(
+                runner, "_reusable_block_attempts", return_value={}
+            ), mock.patch.object(
+                runner, "run_wrapper_process", side_effect=fake_run
+            ), mock.patch.object(
+                runner,
+                "completed_attempt",
+                side_effect=lambda base, *_args: max(base.glob("attempt-*")),
+            ), mock.patch.object(
+                runner, "analyze_leg", side_effect=fake_analyze
+            ):
+                legs, error = runner._run_legs(
+                    specs,
+                    suite_dir,
+                    receipt,
+                    max_block_attempts=2,
+                )
+
+            self.assertEqual(error, "")
+            self.assertEqual(len(legs), 2)
+            self.assertIn("attempt-02", legs[0]["run_dir"])
+            self.assertNotEqual(
+                legs[0]["run_dir"],
+                str(specs[0].base_dir / "attempt-01"),
+            )
+            progress = json.loads(
+                (suite_dir / "progress.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(progress["discarded_blocks"]), 1)
+            self.assertIn(
+                "process sampler 在计划关机阶段失败",
+                progress["discarded_blocks"][0]["reasons"][0],
+            )
+
     def test_wrapper_process_forwards_sigterm_before_propagating_interrupt(self) -> None:
         process = mock.Mock()
         process.wait.side_effect = [

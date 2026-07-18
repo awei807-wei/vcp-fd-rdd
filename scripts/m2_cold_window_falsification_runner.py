@@ -525,6 +525,43 @@ def _print_plan(
         )
 
 
+def _planned_shutdown_sampler_failure_reason(
+    spec: LegSpec,
+    attempt: Path,
+) -> str:
+    """Return a retry reason for a full-duration leg lost only to sampler teardown."""
+    manifest = _read_json(attempt / "manifest.json")
+    execution = manifest.get("execution", {})
+    execution = execution if isinstance(execution, dict) else {}
+    sampler_error = str(
+        manifest.get("process_sampler_error")
+        or execution.get("process_sampler_error", "")
+    )
+    fatal_error = str(manifest.get("fatal_error") or execution.get("fatal_error", ""))
+    cleanup_errors = manifest.get("cleanup_errors", execution.get("cleanup_errors", []))
+    if not isinstance(cleanup_errors, list):
+        cleanup_errors = [cleanup_errors]
+    exact_sampler_fatal = bool(sampler_error) and fatal_error == (
+        f"process sampler failed: {sampler_error}"
+    )
+    if not (
+        manifest.get("run_state") == "failed"
+        and manifest.get("completion_reason") == "duration_elapsed"
+        and manifest.get("fd_rdd_exit_code") == 0
+        and execution.get("duration_completed") is True
+        and execution.get("completion_reason") == "duration_elapsed"
+        and execution.get("exit_code") == 0
+        and exact_sampler_fatal
+        and not cleanup_errors
+        and manifest.get("shutdown_signal_elapsed_secs") is not None
+    ):
+        return ""
+    return (
+        f"block {spec.block} {spec.variant.upper()} 组 process sampler "
+        f"在计划关机阶段失败，整块重跑：{sampler_error}"
+    )
+
+
 def _run_legs(
     specs: list[LegSpec],
     suite_dir: Path,
@@ -611,6 +648,13 @@ def _run_legs(
                     if leg_protocol_reasons and has_protocol_evidence:
                         retryable_reasons.extend(leg_protocol_reasons)
                         break
+                    sampler_retry_reason = _planned_shutdown_sampler_failure_reason(
+                        spec,
+                        attempt,
+                    )
+                    if sampler_retry_reason:
+                        retryable_reasons.append(sampler_retry_reason)
+                        break
                     _atomic_json(
                         suite_dir / "progress.json",
                         {"legs": legs, "discarded_blocks": discarded_blocks},
@@ -657,7 +701,8 @@ def _run_legs(
                 {"legs": legs, "discarded_blocks": discarded_blocks},
             )
             return legs, (
-                f"block {block} 协议连续 {max(1, max_block_attempts)} 次无效，"
+                f"block {block} 协议或可重试基础设施连续 "
+                f"{max(1, max_block_attempts)} 次无效，"
                 "已废弃且未进入配对统计"
             )
         legs.extend(block_legs)
