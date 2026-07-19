@@ -291,6 +291,10 @@ impl Default for RotatingColdWindowConfig {
     }
 }
 
+pub(crate) fn rotating_cold_window_fast_scan_max_cost(max_ephemeral_cost: usize) -> usize {
+    max_ephemeral_cost.max(1).saturating_mul(8)
+}
+
 #[derive(Clone, Debug)]
 pub struct RotatingColdWindowAction {
     pub path: PathBuf,

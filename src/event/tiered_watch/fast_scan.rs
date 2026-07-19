@@ -385,6 +385,29 @@ impl TieredWatchRuntime {
         true
     }
 
+    /// Grant or renew a fast-scan lease and report whether coverage is active afterward.
+    pub(crate) fn ensure_fast_scan_lease(
+        &self,
+        path: PathBuf,
+        kind: FastScanLeaseKind,
+        ttl_secs: Option<u64>,
+        source_score: u64,
+    ) -> bool {
+        if !self.fast_scan_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.grant_fast_scan_lease(path.clone(), kind, ttl_secs, source_score) {
+            return true;
+        }
+        let path = normalize_fast_scan_dir(path);
+        let now = unix_secs();
+        self.fast_scan_state
+            .read()
+            .leases
+            .get(path.as_path())
+            .is_some_and(|lease| !lease.expired(now))
+    }
+
     pub(super) fn default_fast_scan_lease_ttl(&self, kind: FastScanLeaseKind) -> u64 {
         match kind {
             FastScanLeaseKind::Explicit => self

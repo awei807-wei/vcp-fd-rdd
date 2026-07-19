@@ -1078,7 +1078,8 @@ impl TieredWatchRuntime {
         let ttl_secs = config.ttl_secs.max(1);
         let max_dirs_per_tick = config.max_dirs_per_tick.max(1);
         let max_ephemeral_cost = config.max_cost_per_root.max(1) as u64;
-        let max_fast_scan_cost = max_ephemeral_cost.saturating_mul(8).max(max_ephemeral_cost);
+        let max_fast_scan_cost =
+            rotating_cold_window_fast_scan_max_cost(config.max_cost_per_root) as u64;
 
         {
             let mut leases = self.rotating_cold_window_leases.write();
@@ -1390,7 +1391,59 @@ impl TieredWatchRuntime {
         }
         if lease.action != RotatingColdWindowActionKind::ScanOnly {
             lease.action = RotatingColdWindowActionKind::ScanOnly;
+            lease.follow_up_scans_remaining = 2;
+            lease.next_follow_up_at = Instant::now()
+                .checked_add(Duration::from_secs(lease.follow_up_interval_secs))
+                .unwrap_or_else(Instant::now);
             self.rotating_cold_window_scan_only_dirs
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// Cache a runtime-observed watch cost for the active rotating lease and future cycles.
+    pub(crate) fn record_rotating_cold_window_watch_cost(
+        &self,
+        path: &Path,
+        expected_cycle_id: u64,
+        watch_cost: usize,
+    ) -> bool {
+        {
+            let mut leases = self.rotating_cold_window_leases.write();
+            let Some(lease) = leases.get_mut(path) else {
+                return false;
+            };
+            if lease.cycle_id != expected_cycle_id || !lease.is_active(unix_secs(), Instant::now())
+            {
+                return false;
+            }
+            lease.watch_cost = lease.watch_cost.max(watch_cost as u64);
+        }
+        if let Some(state) = self.dirs.read().get(path) {
+            state
+                .watch_cost
+                .fetch_max(watch_cost as u64, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// Convert an active rotating lease to fast-scan and disable scan-only follow-ups.
+    pub(crate) fn reclassify_rotating_cold_window_lease_to_fast_scan(
+        &self,
+        path: &Path,
+        expected_cycle_id: u64,
+    ) -> bool {
+        let mut leases = self.rotating_cold_window_leases.write();
+        let Some(lease) = leases.get_mut(path) else {
+            return false;
+        };
+        if lease.cycle_id != expected_cycle_id || !lease.is_active(unix_secs(), Instant::now()) {
+            return false;
+        }
+        if lease.action != RotatingColdWindowActionKind::FastScanLease {
+            lease.action = RotatingColdWindowActionKind::FastScanLease;
+            lease.follow_up_scans_remaining = 0;
+            self.rotating_cold_window_fast_scan_lease_dirs
                 .fetch_add(1, Ordering::Relaxed);
         }
         true

@@ -15,7 +15,8 @@ use crate::event::proc_sampler::{
 };
 use crate::event::sync::{DirtyReason, DirtyScope};
 use crate::event::tiered_watch::{
-    EphemeralWatchConfig, EphemeralWatchDecision, FastScanLeaseKind, RotatingColdWindowActionKind,
+    rotating_cold_window_fast_scan_max_cost, EphemeralWatchConfig, EphemeralWatchDecision,
+    FastScanLeaseKind, RotatingColdWindowAction, RotatingColdWindowActionKind,
     TieredWatchDebugDump, TieredWatchDebugSummary, WatchTier,
 };
 use crate::event::watcher::check_inotify_limit;
@@ -1299,7 +1300,7 @@ fn build_tiered_watch_plan(
     let mut estimated_total = 0usize;
     let max_watch_dirs = tiered.max_watch_dirs.max(1);
     let l0_max_cost_per_root = effective_l0_max_cost_per_root(tiered);
-    let estimate_cap = max_watch_dirs.min(l0_max_cost_per_root);
+    let estimate_cap = tiered_watch_plan_estimate_cap(tiered, l0_max_cost_per_root);
     let system_max_user_watches = usize::try_from(check_inotify_limit(0).unwrap_or(0)).unwrap_or(0);
     let mut strict_uncovered_dirs = Vec::new();
     let mut required_watch_cost = 0u64;
@@ -1430,6 +1431,19 @@ fn effective_l0_max_cost_per_root(tiered: &crate::config::TieredWatchConfig) -> 
     } else {
         tiered.l0_max_cost_per_root.clamp(1, max_watch_dirs)
     }
+}
+
+fn tiered_watch_plan_estimate_cap(
+    tiered: &crate::config::TieredWatchConfig,
+    l0_max_cost_per_root: usize,
+) -> usize {
+    let l0_cap = tiered.max_watch_dirs.max(1).min(l0_max_cost_per_root);
+    if !tiered.rotating_cold_window_enabled {
+        return l0_cap;
+    }
+    let rotating_fast_scan_cap =
+        rotating_cold_window_fast_scan_max_cost(tiered.rotating_cold_window_max_cost_per_root);
+    l0_cap.max(rotating_fast_scan_cap)
 }
 
 fn strict_required_candidates(
@@ -1747,7 +1761,7 @@ fn spawn_ephemeral_watch_maintenance_loop(
         loop {
             tokio::time::sleep(interval).await;
             for (path, cycle_id) in runtime.take_due_rotating_cold_window_scans() {
-                enqueue_rotating_scan_only(&index, vec![path], cycle_id);
+                enqueue_rotating_recursive_scan(&index, vec![path], cycle_id);
             }
             for removal in runtime.expire_ephemeral_watches(
                 tiered.ephemeral_idle_secs,
@@ -1847,7 +1861,7 @@ fn spawn_rotating_cold_window_loop(
                 continue;
             }
 
-            let mut scan_only_dirs = Vec::new();
+            let mut initial_scan_dirs = Vec::new();
             for action in tick.actions {
                 runtime.constrain_ephemeral_watch_ttl(
                     action.path.as_path(),
@@ -1855,38 +1869,29 @@ fn spawn_rotating_cold_window_loop(
                 );
                 match action.action {
                     RotatingColdWindowActionKind::EphemeralWatch => {
-                        let mechanism_ready = ensure_rotating_ephemeral_watch_coverage(
+                        if activate_rotating_ephemeral_action(
                             &runtime,
                             &watch_command_tx,
-                            action.path.clone(),
+                            &action,
                             &exclude_dirs,
                             &ephemeral_config,
+                            tiered.rotating_cold_window_ttl_secs.max(1),
                             tick.cycle_id,
                         )
-                        .await;
-                        if rotating_action_needs_initial_dirty_scan(action.action, mechanism_ready)
+                        .await
                         {
-                            tracing::debug!(
-                                "rotating cold window ephemeral lease unavailable, falling back to scan-only for {:?}",
-                                action.path
-                            );
-                            if runtime.downgrade_rotating_cold_window_lease_to_scan_only(
-                                action.path.as_path(),
-                                tick.cycle_id,
-                            ) {
-                                scan_only_dirs.push(action.path);
-                            }
+                            initial_scan_dirs.push(action.path);
                         }
                     }
                     RotatingColdWindowActionKind::FastScanLease => {
-                        let granted = runtime.grant_fast_scan_lease(
+                        let ready = runtime.ensure_fast_scan_lease(
                             action.path.clone(),
                             FastScanLeaseKind::RotatingColdWindow,
                             Some(tiered.rotating_cold_window_ttl_secs.max(1)),
                             action.score.max(1),
                         );
-                        if granted {
-                            scan_only_dirs.push(action.path);
+                        if ready {
+                            initial_scan_dirs.push(action.path);
                         } else {
                             tracing::debug!(
                                 "rotating cold window fast-scan lease unavailable, falling back to scan-only for {:?}",
@@ -1896,24 +1901,24 @@ fn spawn_rotating_cold_window_loop(
                                 action.path.as_path(),
                                 tick.cycle_id,
                             ) {
-                                scan_only_dirs.push(action.path);
+                                initial_scan_dirs.push(action.path);
                             }
                         }
                     }
                     RotatingColdWindowActionKind::ScanOnly => {
-                        scan_only_dirs.push(action.path);
+                        initial_scan_dirs.push(action.path);
                     }
                 }
             }
 
-            if !scan_only_dirs.is_empty() {
-                enqueue_rotating_scan_only(&index, scan_only_dirs, tick.cycle_id);
+            if !initial_scan_dirs.is_empty() {
+                enqueue_rotating_recursive_scan(&index, initial_scan_dirs, tick.cycle_id);
             }
         }
     });
 }
 
-fn enqueue_rotating_scan_only(index: &TieredIndex, dirs: Vec<PathBuf>, cycle_id: u64) {
+fn enqueue_rotating_recursive_scan(index: &TieredIndex, dirs: Vec<PathBuf>, cycle_id: u64) {
     index.enqueue_recursive_dirty_dirs(dirs, DirtyReason::RotatingColdWindow { cycle_id });
 }
 
@@ -2055,10 +2060,36 @@ async fn maybe_send_ephemeral_watch_command(
     config: &EphemeralWatchConfig,
     fallback_cycle_id: Option<u64>,
 ) -> bool {
+    if config.budget == 0 {
+        return false;
+    }
     let Some(cost) = estimate_ephemeral_watch_cost(runtime, dir.as_path(), exclude_dirs, config)
     else {
         return false;
     };
+    send_ephemeral_watch_command_with_cost(
+        runtime,
+        watch_command_tx,
+        dir,
+        cost,
+        changed,
+        exclude_dirs,
+        config,
+        fallback_cycle_id,
+    )
+    .await
+}
+
+async fn send_ephemeral_watch_command_with_cost(
+    runtime: &Arc<TieredWatchRuntime>,
+    watch_command_tx: &tokio::sync::mpsc::Sender<WatchCommand>,
+    dir: PathBuf,
+    cost: usize,
+    changed: usize,
+    exclude_dirs: &[String],
+    config: &EphemeralWatchConfig,
+    fallback_cycle_id: Option<u64>,
+) -> bool {
     match runtime.note_dirty_scope_with_changed(dir.clone(), cost, exclude_dirs, config, changed) {
         EphemeralWatchDecision::Add(path) => {
             if watch_command_tx
@@ -2106,24 +2137,116 @@ async fn ensure_rotating_ephemeral_watch_coverage(
     exclude_dirs: &[String],
     config: &EphemeralWatchConfig,
     cycle_id: u64,
-) -> bool {
+) -> RotatingEphemeralCoverage {
     if confirmed_recursive_watch_covers(runtime, dir.as_path()) {
-        return true;
+        return RotatingEphemeralCoverage::Ready;
     }
-    if maybe_send_ephemeral_watch_command(
+    if config.budget == 0 {
+        return RotatingEphemeralCoverage::Unavailable;
+    }
+    let max_fast_scan_cost = rotating_cold_window_fast_scan_max_cost(config.max_cost_per_root);
+    let Some(cost) = estimate_ephemeral_watch_cost_up_to(
+        runtime,
+        dir.as_path(),
+        exclude_dirs,
+        max_fast_scan_cost,
+    ) else {
+        return if confirmed_recursive_watch_covers(runtime, dir.as_path()) {
+            RotatingEphemeralCoverage::Ready
+        } else {
+            RotatingEphemeralCoverage::Unavailable
+        };
+    };
+    if cost > config.max_cost_per_root.max(1) {
+        return RotatingEphemeralCoverage::TooLarge { watch_cost: cost };
+    }
+    if send_ephemeral_watch_command_with_cost(
         runtime,
         watch_command_tx,
         dir.clone(),
+        cost,
         1,
         exclude_dirs,
         config,
         Some(cycle_id),
     )
     .await
+        || confirmed_recursive_watch_covers(runtime, dir.as_path())
     {
-        return true;
+        RotatingEphemeralCoverage::Ready
+    } else {
+        RotatingEphemeralCoverage::Unavailable
     }
-    confirmed_recursive_watch_covers(runtime, dir.as_path())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RotatingEphemeralCoverage {
+    Ready,
+    TooLarge { watch_cost: usize },
+    Unavailable,
+}
+
+async fn activate_rotating_ephemeral_action(
+    runtime: &Arc<TieredWatchRuntime>,
+    watch_command_tx: &tokio::sync::mpsc::Sender<WatchCommand>,
+    action: &RotatingColdWindowAction,
+    exclude_dirs: &[String],
+    config: &EphemeralWatchConfig,
+    ttl_secs: u64,
+    cycle_id: u64,
+) -> bool {
+    match ensure_rotating_ephemeral_watch_coverage(
+        runtime,
+        watch_command_tx,
+        action.path.clone(),
+        exclude_dirs,
+        config,
+        cycle_id,
+    )
+    .await
+    {
+        RotatingEphemeralCoverage::Ready => false,
+        RotatingEphemeralCoverage::TooLarge { watch_cost } => {
+            runtime.record_rotating_cold_window_watch_cost(
+                action.path.as_path(),
+                cycle_id,
+                watch_cost,
+            );
+            let fast_scan_eligible =
+                watch_cost <= rotating_cold_window_fast_scan_max_cost(config.max_cost_per_root);
+            let reclassified = fast_scan_eligible
+                && runtime.reclassify_rotating_cold_window_lease_to_fast_scan(
+                    action.path.as_path(),
+                    cycle_id,
+                );
+            if reclassified
+                && runtime.ensure_fast_scan_lease(
+                    action.path.clone(),
+                    FastScanLeaseKind::RotatingColdWindow,
+                    Some(ttl_secs),
+                    action.score.max(1),
+                )
+            {
+                return true;
+            }
+            downgrade_rotating_action_to_scan_only(runtime, action, cycle_id)
+        }
+        RotatingEphemeralCoverage::Unavailable => {
+            downgrade_rotating_action_to_scan_only(runtime, action, cycle_id)
+        }
+    }
+}
+
+fn downgrade_rotating_action_to_scan_only(
+    runtime: &TieredWatchRuntime,
+    action: &RotatingColdWindowAction,
+    cycle_id: u64,
+) -> bool {
+    tracing::debug!(
+        "rotating cold window coverage unavailable, falling back to scan-only for {:?}",
+        action.path
+    );
+    runtime.downgrade_rotating_cold_window_lease_to_scan_only(action.path.as_path(), cycle_id)
 }
 
 fn confirmed_recursive_watch_covers(runtime: &TieredWatchRuntime, dir: &std::path::Path) -> bool {
@@ -2137,8 +2260,24 @@ fn estimate_ephemeral_watch_cost(
     exclude_dirs: &[String],
     config: &EphemeralWatchConfig,
 ) -> Option<usize> {
-    if config.budget == 0
-        || runtime.rotating_cold_window_expired_ephemeral_covers(dir)
+    if config.budget == 0 {
+        return None;
+    }
+    estimate_ephemeral_watch_cost_up_to(
+        runtime,
+        dir,
+        exclude_dirs,
+        config.max_cost_per_root.max(1).saturating_add(1),
+    )
+}
+
+fn estimate_ephemeral_watch_cost_up_to(
+    runtime: &TieredWatchRuntime,
+    dir: &std::path::Path,
+    exclude_dirs: &[String],
+    estimate_cap: usize,
+) -> Option<usize> {
+    if runtime.rotating_cold_window_expired_ephemeral_covers(dir)
         || runtime.recursive_watch_reserved_or_covers(dir)
         || !dir.is_dir()
     {
@@ -2152,7 +2291,7 @@ fn estimate_ephemeral_watch_cost(
     EPHEMERAL_WATCH_COST_ESTIMATE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(estimate_notify_recursive_watch_count(
         dir,
-        config.max_cost_per_root.max(1).saturating_add(1),
+        estimate_cap.max(1),
     ))
 }
 
@@ -2160,6 +2299,7 @@ fn estimate_ephemeral_watch_cost(
 static EPHEMERAL_WATCH_COST_ESTIMATE_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
 fn rotating_action_needs_initial_dirty_scan(
     action: RotatingColdWindowActionKind,
     mechanism_ready: bool,
@@ -2256,20 +2396,7 @@ mod tests {
         let watcher_report = ephemeral_runtime.report();
         assert_eq!(watcher_report.ephemeral_watch_created, 0);
         assert_eq!(watcher_report.ephemeral_watch_evicted, 0);
-        assert!(
-            !ensure_rotating_ephemeral_watch_coverage(
-                &ephemeral_runtime,
-                &watch_command_tx,
-                child.clone(),
-                &[],
-                &config,
-                7,
-            )
-            .await
-        );
-        assert!(ephemeral_runtime.confirm_ephemeral_added(root.as_path()));
-
-        assert!(
+        assert_eq!(
             ensure_rotating_ephemeral_watch_coverage(
                 &ephemeral_runtime,
                 &watch_command_tx,
@@ -2278,7 +2405,22 @@ mod tests {
                 &config,
                 7,
             )
-            .await
+            .await,
+            RotatingEphemeralCoverage::Unavailable
+        );
+        assert!(ephemeral_runtime.confirm_ephemeral_added(root.as_path()));
+
+        assert_eq!(
+            ensure_rotating_ephemeral_watch_coverage(
+                &ephemeral_runtime,
+                &watch_command_tx,
+                child.clone(),
+                &[],
+                &config,
+                7,
+            )
+            .await,
+            RotatingEphemeralCoverage::Ready
         );
         assert!(watch_command_rx.try_recv().is_err());
         assert_eq!(
@@ -2300,6 +2442,133 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn rotating_ephemeral_cost_overflow_is_classified_for_fast_scan() {
+        let _counter_guard = COST_ESTIMATION_TEST_LOCK.lock().await;
+        let root = temp_root("rotating-ephemeral-too-large");
+        for index in 0..300 {
+            std::fs::create_dir_all(root.join(format!("d{index:03}"))).unwrap();
+        }
+        let runtime = Arc::new(TieredWatchRuntime::new_with_ephemeral(
+            Vec::new(),
+            vec![(root.clone(), 2)],
+            8,
+            5_000,
+            20,
+            8,
+        ));
+        let config = EphemeralWatchConfig {
+            budget: 8,
+            repeat_threshold: 1,
+            max_cost_per_root: 64,
+            ..EphemeralWatchConfig::default()
+        };
+        let (watch_command_tx, mut watch_command_rx) = tokio::sync::mpsc::channel(1);
+
+        assert_eq!(
+            ensure_rotating_ephemeral_watch_coverage(
+                &runtime,
+                &watch_command_tx,
+                root.clone(),
+                &[],
+                &config,
+                9,
+            )
+            .await,
+            RotatingEphemeralCoverage::TooLarge { watch_cost: 301 }
+        );
+        assert!(watch_command_rx.try_recv().is_err());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn rotating_ephemeral_too_large_dispatches_fast_scan_without_scan_only() {
+        let _counter_guard = COST_ESTIMATION_TEST_LOCK.lock().await;
+        let root = temp_root("rotating-ephemeral-fast-scan-fallback");
+        for index in 0..300 {
+            std::fs::create_dir_all(root.join(format!("d{index:03}"))).unwrap();
+        }
+        let runtime = Arc::new(TieredWatchRuntime::new_with_ephemeral(
+            Vec::new(),
+            vec![(root.clone(), 2)],
+            8,
+            5_000,
+            20,
+            8,
+        ));
+        runtime.record_scan_for_path(
+            root.as_path(),
+            crate::index::tiered::ScanOutcome {
+                scanned: 1,
+                changed: 0,
+                elapsed_ms: 1,
+                project_roots: Vec::new(),
+            },
+        );
+        runtime.apply_scan_policy(
+            root.as_path(),
+            1,
+            1,
+            crate::config::L3ScanPolicy::Disabled,
+            1,
+            1,
+            1,
+        );
+        let tick = runtime.rotating_cold_window_tick(
+            crate::event::tiered_watch::RotatingColdWindowConfig {
+                enabled: true,
+                budget: 1,
+                ttl_secs: 5,
+                max_cost_per_root: 64,
+                max_dirs_per_tick: 1,
+            },
+        );
+        assert_eq!(tick.actions.len(), 1);
+        assert_eq!(
+            tick.actions[0].action,
+            RotatingColdWindowActionKind::EphemeralWatch
+        );
+
+        let config = EphemeralWatchConfig {
+            budget: 8,
+            repeat_threshold: 1,
+            max_cost_per_root: 64,
+            ..EphemeralWatchConfig::default()
+        };
+        let (watch_command_tx, mut watch_command_rx) = tokio::sync::mpsc::channel(1);
+        assert!(runtime.grant_fast_scan_lease(
+            root.clone(),
+            FastScanLeaseKind::RotatingColdWindow,
+            Some(5),
+            1,
+        ));
+        assert!(
+            activate_rotating_ephemeral_action(
+                &runtime,
+                &watch_command_tx,
+                &tick.actions[0],
+                &[],
+                &config,
+                5,
+                tick.cycle_id,
+            )
+            .await
+        );
+        assert!(watch_command_rx.try_recv().is_err());
+
+        let report = runtime.report();
+        assert_eq!(report.fast_scan_hotset_lease_count, 1);
+        assert_eq!(report.fast_scan_lease_renewals, 1);
+        assert_eq!(report.rotating_cold_window_fast_scan_lease_dirs, 1);
+        assert_eq!(report.rotating_cold_window_scan_only_dirs, 0);
+        let debug = runtime.debug_dump(root.to_str());
+        assert_eq!(debug.dirs[0].rotating_cold_window_action, "fast_scan_lease");
+        assert!(runtime.take_due_rotating_cold_window_scans().is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -2423,7 +2692,7 @@ mod tests {
         let root = temp_root("rotating-scan-only-recursive");
         let index = TieredIndex::empty(vec![root.clone()]);
 
-        enqueue_rotating_scan_only(&index, vec![root.clone()], 42);
+        enqueue_rotating_recursive_scan(&index, vec![root.clone()], 42);
         std::thread::sleep(Duration::from_millis(260));
 
         let entry = index.dirty_queue_ready_batch(1).pop().unwrap();
@@ -2671,6 +2940,36 @@ mod tests {
             .l1_roots
             .iter()
             .any(|(path, cost)| path == &documents && *cost == 4));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rotating_watch_plan_preserves_cost_needed_for_m2_action_classification() {
+        let root = temp_root("rotating-watch-plan-cost");
+        for index in 0..300 {
+            std::fs::create_dir_all(root.join(format!("d{index:03}"))).unwrap();
+        }
+
+        let mut cfg = crate::config::TieredWatchConfig {
+            max_watch_dirs: 8,
+            l0_max_cost_per_root: 1,
+            rotating_cold_window_enabled: true,
+            rotating_cold_window_max_cost_per_root: 64,
+            ..crate::config::TieredWatchConfig::default()
+        };
+        cfg.hot_dirs.clear();
+
+        let plan = build_tiered_watch_plan(std::slice::from_ref(&root), &cfg, &[]);
+        let (_, watch_cost) = plan
+            .l1_roots
+            .iter()
+            .find(|(path, _)| path == &root)
+            .expect("large root should remain outside L0");
+        assert_eq!(*watch_cost, 301);
+
+        assert!(*watch_cost > cfg.rotating_cold_window_max_cost_per_root);
+        assert!(*watch_cost <= cfg.rotating_cold_window_max_cost_per_root.saturating_mul(8));
 
         let _ = std::fs::remove_dir_all(root);
     }

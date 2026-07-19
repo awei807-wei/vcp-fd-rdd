@@ -2347,6 +2347,49 @@ fn rotating_cold_window_downgrade_keeps_lease_as_scan_only() {
 }
 
 #[test]
+fn rotating_too_large_reclassification_uses_fast_scan_without_follow_ups() {
+    let cold = PathBuf::from("/tmp/cold-too-large-for-ephemeral");
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(cold.clone(), 2)], 16, 5_000, 20);
+    let state = rt.state(&cold).expect("cold dir should exist");
+    state.tier.store(WatchTier::L3.as_u8(), Ordering::Release);
+    state
+        .last_scan_unix_secs
+        .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
+
+    let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
+        enabled: true,
+        budget: 1,
+        ttl_secs: 5,
+        max_cost_per_root: 64,
+        max_dirs_per_tick: 1,
+    });
+    assert_eq!(
+        tick.actions[0].action,
+        RotatingColdWindowActionKind::EphemeralWatch
+    );
+
+    assert!(rt.record_rotating_cold_window_watch_cost(cold.as_path(), tick.cycle_id, 301));
+    assert!(rt.reclassify_rotating_cold_window_lease_to_fast_scan(cold.as_path(), tick.cycle_id));
+    assert_eq!(state.watch_cost.load(Ordering::Relaxed), 301);
+    assert_eq!(rt.report().rotating_cold_window_fast_scan_lease_dirs, 1);
+    assert_eq!(rt.report().rotating_cold_window_scan_only_dirs, 0);
+
+    if let Some(lease) = rt.rotating_cold_window_leases.write().get_mut(&cold) {
+        lease.next_follow_up_at = std::time::Instant::now();
+    }
+    assert!(rt.take_due_rotating_cold_window_scans().is_empty());
+
+    assert!(rt.downgrade_rotating_cold_window_lease_to_scan_only(cold.as_path(), tick.cycle_id));
+    if let Some(lease) = rt.rotating_cold_window_leases.write().get_mut(&cold) {
+        lease.next_follow_up_at = std::time::Instant::now();
+    }
+    assert_eq!(
+        rt.take_due_rotating_cold_window_scans(),
+        vec![(cold, tick.cycle_id)]
+    );
+}
+
+#[test]
 fn rotating_cold_window_budget_and_ttl_gate_selection() {
     let first = PathBuf::from("/tmp/cold-first");
     let second = PathBuf::from("/tmp/cold-second");
