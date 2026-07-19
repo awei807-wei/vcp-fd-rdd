@@ -409,13 +409,32 @@ impl TieredWatchRuntime {
             .filter_map(|(path, lease)| lease.expired(now).then_some(path.clone()))
             .collect::<Vec<_>>();
         for path in expired {
-            state.leases.remove(path.as_path());
-            state.sentinels.remove(path.as_path());
-            remove_queued_path(&mut state.initial_backfill_queue, path.as_path());
-            remove_queued_path(&mut state.changed_dir_queue, path.as_path());
-            self.fast_scan_lease_evictions
-                .fetch_add(1, Ordering::Relaxed);
+            self.remove_fast_scan_lease_locked(state, path.as_path());
         }
+    }
+
+    fn evict_unavailable_auto_fast_scan_lease_locked(
+        &self,
+        state: &mut FastScanState,
+        path: &Path,
+    ) -> bool {
+        let should_evict = state
+            .leases
+            .get(path)
+            .is_some_and(|lease| !lease.lease_kind.is_explicit());
+        if should_evict {
+            self.remove_fast_scan_lease_locked(state, path);
+        }
+        should_evict
+    }
+
+    fn remove_fast_scan_lease_locked(&self, state: &mut FastScanState, path: &Path) {
+        state.leases.remove(path);
+        state.sentinels.remove(path);
+        remove_queued_path(&mut state.initial_backfill_queue, path);
+        remove_queued_path(&mut state.changed_dir_queue, path);
+        self.fast_scan_lease_evictions
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn evict_one_fast_scan_lease_locked(&self, state: &mut FastScanState) -> bool {
@@ -436,12 +455,7 @@ impl TieredWatchRuntime {
         else {
             return false;
         };
-        state.leases.remove(victim.as_path());
-        state.sentinels.remove(victim.as_path());
-        remove_queued_path(&mut state.initial_backfill_queue, victim.as_path());
-        remove_queued_path(&mut state.changed_dir_queue, victim.as_path());
-        self.fast_scan_lease_evictions
-            .fetch_add(1, Ordering::Relaxed);
+        self.remove_fast_scan_lease_locked(state, victim.as_path());
         true
     }
 
@@ -509,10 +523,21 @@ impl TieredWatchRuntime {
             if matches!(self.covering_tier(path.as_path()), Some(WatchTier::L0)) {
                 continue;
             }
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    self.evict_unavailable_auto_fast_scan_lease_locked(&mut state, path.as_path());
+                    continue;
+                }
+                Err(_) => continue,
             };
             if !meta.is_dir() {
+                self.evict_unavailable_auto_fast_scan_lease_locked(&mut state, path.as_path());
                 continue;
             }
             let (mount_id, fstype, class) = fast_scan_mount_info(path.as_path(), mount_table);

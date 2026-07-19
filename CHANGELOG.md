@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 修复
 
+- 修复 M2 完整报告暴露的两类重复工作：fast-scan bootstrap 遇到 `ENOENT`、`ENOTDIR` 或非目录目标时立即淘汰自动 lease，Explicit lease 仍保留等待路径恢复；rotating EphemeralWatch 可复用已确认的递归 watcher，活跃 cycle 会暂时固定其生命周期，pending watcher 或安装失败仍走同 cycle scan-only 回退。快速证伪 runner 同时改为默认关闭 Query Fast Scan lease，显式 `--query-fast-scan-leases` 才测试查询反馈的复合成本。
 - 修复 M2 benchmark 计划关机后的 `/proc` sampler 竞态：SIGTERM 后仅在 250ms 内确认 daemon 已实际退出时，才将 `ENOENT`/`EACCES`/`ESRCH` 视为 teardown；运行期权限错误、daemon 仍存活或采样文件写入错误继续 fail-closed。falsification suite 对“完整跑满、daemon 退出 0、仅 sampler 收尾失败”的腿改为有界废弃并整块重跑，避免单个收尾竞态生成 7/8 腿终态。
 - **M2 递归 repair watcher 后处理根级收敛**：continuation 仅负责扫描、累计变更和完成证明；完整 root 才执行一次 scan policy、promotion 与 ephemeral watcher 决策。递归 watcher 成本估算前新增 L0/临时 watcher 覆盖短路，bootstrap 保留 cycle completion 但不再反馈进入 watcher 安装/淘汰链路。正式 4 block/8 leg 报告 `/home/shiyi/Downloads/vcp-FD/logs/REPORT.md` 已由 `build-provenance.json` 绑定 clean `f18d634` release build：A 腿正确性与 M2 因果门通过，B 腿证明收益来自 M2；但排除 protocol-invalid 的 block 3 后，CPU 仍约 7.3–9.4×、read syscall 约 4.42–4.48×、minor fault 约 6×，结论为“功能有效但成本不经济”。下一步先隔离 Query Fast Scan lease 的查询反馈，再决定是否重构成本加权预算与扫描路径。
 

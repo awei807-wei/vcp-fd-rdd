@@ -213,7 +213,7 @@ def leg_command(
     run_dir: Path,
     receipt_path: Path,
     binary: Path,
-    query_fast_scan_leases_enabled: bool = True,
+    query_fast_scan_leases_enabled: bool = False,
     planned_git_sha: str = "",
 ) -> list[str]:
     command = [
@@ -347,7 +347,7 @@ def _resume_error(
     suite_dir: Path,
     seed: int,
     planned_git_sha: str = "",
-    query_fast_scan_leases_enabled: bool = True,
+    query_fast_scan_leases_enabled: bool = False,
 ) -> str:
     manifest_path = suite_dir / "manifest.json"
     if not manifest_path.exists():
@@ -387,7 +387,7 @@ def _write_running_manifest(
     suite_dir: Path,
     seed: int,
     planned_git_sha: str = "",
-    query_fast_scan_leases_enabled: bool = True,
+    query_fast_scan_leases_enabled: bool = False,
 ) -> None:
     _atomic_json(
         suite_dir / "manifest.json",
@@ -482,12 +482,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--query-fast-scan-leases",
         dest="query_fast_scan_leases",
         action="store_true",
-        default=True,
+        default=False,
+        help="启用 Query Fast Scan lease，测试 M2 与查询反馈的复合成本",
     )
     parser.add_argument(
         "--no-query-fast-scan-leases",
         dest="query_fast_scan_leases",
         action="store_false",
+        help="关闭 Query Fast Scan lease（默认），隔离 M2 调度成本",
     )
     parser.add_argument(
         "--max-block-attempts",
@@ -502,7 +504,7 @@ def _print_plan(
     skip_build: bool,
     receipt_path: Path,
     *,
-    query_fast_scan_leases_enabled: bool = True,
+    query_fast_scan_leases_enabled: bool = False,
     planned_git_sha: str = "",
 ) -> None:
     binary = suite_binary(receipt_path.parent)
@@ -567,7 +569,7 @@ def _run_legs(
     suite_dir: Path,
     receipt_path: Path,
     *,
-    query_fast_scan_leases_enabled: bool = True,
+    query_fast_scan_leases_enabled: bool = False,
     planned_git_sha: str = "",
     max_block_attempts: int = DEFAULT_MAX_BLOCK_ATTEMPTS,
 ) -> tuple[list[dict[str, Any]], str]:
@@ -719,7 +721,7 @@ def _suite_summary(
     legs: list[dict[str, Any]],
     infrastructure_error: str,
     planned_git_sha: str = "",
-    query_fast_scan_leases_enabled: bool = True,
+    query_fast_scan_leases_enabled: bool = False,
 ) -> dict[str, Any]:
     gate = evaluate_suite(legs)
     if infrastructure_error:
@@ -994,7 +996,7 @@ def _prepare_suite_resume(
     suite_dir: Path,
     sequence_seed: int,
     planned_git_sha: str = "",
-    query_fast_scan_leases_enabled: bool = True,
+    query_fast_scan_leases_enabled: bool = False,
 ) -> str:
     previous_manifest = _read_json(suite_dir / "manifest.json")
     previous_summary = _read_json(suite_dir / "summary.json")
@@ -1026,7 +1028,7 @@ def _run_suite(
     suite_dir.mkdir(parents=True, exist_ok=True)
     interrupted_exit_code = 0
     planned_git_sha = str(getattr(args, "planned_git_sha", ""))
-    query_leases = bool(getattr(args, "query_fast_scan_leases", True))
+    query_leases = bool(getattr(args, "query_fast_scan_leases", False))
     infrastructure_error = _prepare_suite_resume(
         suite_dir,
         args.sequence_seed,
@@ -1087,7 +1089,7 @@ def _run_suite(
         legs,
         infrastructure_error,
         str(getattr(args, "planned_git_sha", "")),
-        bool(getattr(args, "query_fast_scan_leases", True)),
+        bool(getattr(args, "query_fast_scan_leases", False)),
     )
     evidence_bundle = _write_outputs(suite_dir, summary)
     print(f"suite_dir: {suite_dir}")

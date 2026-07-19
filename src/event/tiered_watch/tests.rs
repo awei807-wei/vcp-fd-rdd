@@ -160,6 +160,81 @@ fn fast_scan_bootstrap_is_driven_by_uncovered_hotset_leases() {
 }
 
 #[test]
+fn fast_scan_bootstrap_evicts_missing_automatic_lease() {
+    let root = temp_root("fast-scan-missing-auto-lease");
+    let target = root.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let table = mount_table_for(root.as_path(), "ext4");
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(target.clone(), 1)], 16, 5_000, 20);
+
+    assert!(rt.grant_fast_scan_lease(target.clone(), FastScanLeaseKind::Query, None, 1));
+    std::fs::remove_dir(&target).unwrap();
+
+    assert_eq!(rt.bootstrap_fast_scan_dirs(vec![target], &table, 1), 0);
+    let report = rt.report();
+    assert_eq!(report.fast_scan_hotset_lease_count, 0);
+    assert_eq!(report.fast_scan_lease_evictions, 1);
+    assert!(!rt.should_bootstrap_fast_scan_dirs(1));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn fast_scan_bootstrap_keeps_missing_explicit_lease() {
+    let root = temp_root("fast-scan-missing-explicit-lease");
+    let target = root.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let table = mount_table_for(root.as_path(), "ext4");
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(target.clone(), 1)], 16, 5_000, 20);
+
+    assert!(rt.grant_fast_scan_lease(target.clone(), FastScanLeaseKind::Explicit, None, 1,));
+    std::fs::remove_dir(&target).unwrap();
+
+    assert_eq!(rt.bootstrap_fast_scan_dirs(vec![target], &table, 1), 0);
+    let report = rt.report();
+    assert_eq!(report.fast_scan_hotset_lease_count, 1);
+    assert_eq!(report.fast_scan_explicit_lease_count, 1);
+    assert_eq!(report.fast_scan_lease_evictions, 0);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn fast_scan_bootstrap_evicts_automatic_leases_for_non_directories() {
+    let root = temp_root("fast-scan-auto-lease-not-directory");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("file");
+    let child_of_file = file.join("child");
+    std::fs::write(&file, b"not a directory").unwrap();
+    let table = mount_table_for(root.as_path(), "ext4");
+    let rt = TieredWatchRuntime::new(
+        Vec::new(),
+        vec![(file.clone(), 1), (child_of_file.clone(), 1)],
+        16,
+        5_000,
+        20,
+    );
+
+    assert!(rt.grant_fast_scan_lease(file.clone(), FastScanLeaseKind::Query, None, 1));
+    assert!(rt.grant_fast_scan_lease(
+        child_of_file.clone(),
+        FastScanLeaseKind::ProjectMarker,
+        None,
+        1,
+    ));
+
+    assert_eq!(
+        rt.bootstrap_fast_scan_dirs(vec![file, child_of_file], &table, 2),
+        0
+    );
+    let report = rt.report();
+    assert_eq!(report.fast_scan_hotset_lease_count, 0);
+    assert_eq!(report.fast_scan_lease_evictions, 2);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn fast_scan_bootstrap_exhaustion_adds_retry_cooldown() {
     let warm = PathBuf::from("/tmp/warm");
     let rt = TieredWatchRuntime::new(Vec::new(), vec![(warm, 1)], 16, 5_000, 20);
@@ -1871,6 +1946,65 @@ fn rotating_scan_only_constrains_existing_ephemeral_watch_deadline() {
     assert_eq!(removals.len(), 1);
     assert_eq!(removals[0].reason, EphemeralWatchExpiry::Ttl);
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn active_rotating_lease_retains_confirmed_ancestor_watcher() {
+    let root = temp_root("retain-rotating-ancestor-watcher");
+    let cold = root.join("cold");
+    std::fs::create_dir_all(&cold).unwrap();
+    let rt = TieredWatchRuntime::new_with_ephemeral(
+        Vec::new(),
+        vec![(cold.clone(), 4)],
+        1,
+        5_000,
+        20,
+        16,
+    );
+    let cold_state = rt.state(&cold).expect("cold dir should exist");
+    cold_state
+        .tier
+        .store(WatchTier::L3.as_u8(), Ordering::Release);
+    cold_state
+        .last_scan_unix_secs
+        .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
+    let watcher_cfg = EphemeralWatchConfig {
+        budget: 16,
+        ttl_secs: 20,
+        repeat_threshold: 1,
+        max_cost_per_root: 16,
+        ..EphemeralWatchConfig::default()
+    };
+    assert_eq!(
+        rt.note_dirty_scope_at(root.clone(), 1, &[], &watcher_cfg, 100, 1),
+        EphemeralWatchDecision::Add(root.clone())
+    );
+    assert!(rt.confirm_ephemeral_added(root.as_path()));
+
+    let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
+        enabled: true,
+        budget: 1,
+        ttl_secs: 20,
+        max_cost_per_root: 64,
+        max_dirs_per_tick: 1,
+    });
+    assert_eq!(tick.actions.len(), 1);
+    assert_eq!(tick.actions[0].path, cold);
+    assert_eq!(
+        tick.actions[0].action,
+        RotatingColdWindowActionKind::EphemeralWatch
+    );
+
+    assert!(rt.expire_ephemeral_watches_at(131, 1, 20, 1).is_empty());
+    if let Some(lease) = rt.rotating_cold_window_leases.write().get_mut(&cold) {
+        lease.expires_unix_secs = 0;
+    }
+    let removals = rt.expire_ephemeral_watches_at(131, 1, 20, 1);
+    assert_eq!(removals.len(), 1);
+    assert_eq!(removals[0].path, root);
+    assert_eq!(removals[0].reason, EphemeralWatchExpiry::Ttl);
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

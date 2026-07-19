@@ -1855,17 +1855,17 @@ fn spawn_rotating_cold_window_loop(
                 );
                 match action.action {
                     RotatingColdWindowActionKind::EphemeralWatch => {
-                        let sent = maybe_send_ephemeral_watch_command(
+                        let mechanism_ready = ensure_rotating_ephemeral_watch_coverage(
                             &runtime,
                             &watch_command_tx,
                             action.path.clone(),
-                            1,
                             &exclude_dirs,
                             &ephemeral_config,
-                            Some(tick.cycle_id),
+                            tick.cycle_id,
                         )
                         .await;
-                        if rotating_action_needs_initial_dirty_scan(action.action, sent) {
+                        if rotating_action_needs_initial_dirty_scan(action.action, mechanism_ready)
+                        {
                             tracing::debug!(
                                 "rotating cold window ephemeral lease unavailable, falling back to scan-only for {:?}",
                                 action.path
@@ -2099,6 +2099,38 @@ async fn maybe_send_ephemeral_watch_command(
     }
 }
 
+async fn ensure_rotating_ephemeral_watch_coverage(
+    runtime: &Arc<TieredWatchRuntime>,
+    watch_command_tx: &tokio::sync::mpsc::Sender<WatchCommand>,
+    dir: PathBuf,
+    exclude_dirs: &[String],
+    config: &EphemeralWatchConfig,
+    cycle_id: u64,
+) -> bool {
+    if confirmed_recursive_watch_covers(runtime, dir.as_path()) {
+        return true;
+    }
+    if maybe_send_ephemeral_watch_command(
+        runtime,
+        watch_command_tx,
+        dir.clone(),
+        1,
+        exclude_dirs,
+        config,
+        Some(cycle_id),
+    )
+    .await
+    {
+        return true;
+    }
+    confirmed_recursive_watch_covers(runtime, dir.as_path())
+}
+
+fn confirmed_recursive_watch_covers(runtime: &TieredWatchRuntime, dir: &std::path::Path) -> bool {
+    matches!(runtime.covering_tier(dir), Some(WatchTier::L0))
+        || runtime.confirmed_ephemeral_watch_covers(dir)
+}
+
 fn estimate_ephemeral_watch_cost(
     runtime: &TieredWatchRuntime,
     dir: &std::path::Path,
@@ -2224,6 +2256,35 @@ mod tests {
         let watcher_report = ephemeral_runtime.report();
         assert_eq!(watcher_report.ephemeral_watch_created, 0);
         assert_eq!(watcher_report.ephemeral_watch_evicted, 0);
+        assert!(
+            !ensure_rotating_ephemeral_watch_coverage(
+                &ephemeral_runtime,
+                &watch_command_tx,
+                child.clone(),
+                &[],
+                &config,
+                7,
+            )
+            .await
+        );
+        assert!(ephemeral_runtime.confirm_ephemeral_added(root.as_path()));
+
+        assert!(
+            ensure_rotating_ephemeral_watch_coverage(
+                &ephemeral_runtime,
+                &watch_command_tx,
+                child.clone(),
+                &[],
+                &config,
+                7,
+            )
+            .await
+        );
+        assert!(watch_command_rx.try_recv().is_err());
+        assert_eq!(
+            EPHEMERAL_WATCH_COST_ESTIMATE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
 
         let uncovered_runtime = TieredWatchRuntime::new_with_ephemeral(
             Vec::new(),

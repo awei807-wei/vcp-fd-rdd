@@ -1153,6 +1153,12 @@ class GateTests(unittest.TestCase):
 
 
 class DriverTests(unittest.TestCase):
+    def test_query_fast_scan_leases_are_isolated_by_default(self) -> None:
+        self.assertFalse(runner.parse_args([]).query_fast_scan_leases)
+        self.assertTrue(
+            runner.parse_args(["--query-fast-scan-leases"]).query_fast_scan_leases
+        )
+
     def test_suite_outputs_include_a_bounded_single_file_evidence_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             suite_dir = Path(tmp) / "suite"

@@ -398,10 +398,28 @@ impl TieredWatchRuntime {
                 })
                 .collect::<Vec<_>>()
         };
+        let active_rotating_ephemeral_roots = {
+            let monotonic_now = Instant::now();
+            self.rotating_cold_window_leases
+                .read()
+                .iter()
+                .filter_map(|(path, lease)| {
+                    (lease.action == RotatingColdWindowActionKind::EphemeralWatch
+                        && lease.is_active(now, monotonic_now))
+                    .then_some(path.clone())
+                })
+                .collect::<Vec<_>>()
+        };
         let mut removals = Vec::new();
         let mut ephemeral = self.ephemeral.write();
         for lease in ephemeral.values_mut() {
             if lease.pending_add || lease.pending_remove {
+                continue;
+            }
+            if active_rotating_ephemeral_roots
+                .iter()
+                .any(|path| path_is_under_or_equal(path.as_path(), lease.path.as_path()))
+            {
                 continue;
             }
             let reason = if l0_roots

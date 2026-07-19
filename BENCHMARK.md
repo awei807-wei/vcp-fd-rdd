@@ -49,10 +49,10 @@ python3 scripts/m2-cold-window-ab.py b  # 关闭 M2
 python3 scripts/m2-cold-window-falsification.py
 ```
 
-隔离 Query Fast Scan lease 对 treatment 的反馈时使用：
+默认命令会关闭 Query Fast Scan lease，隔离 M2 调度本身的成本。需要测试 M2 与查询命中反馈的复合行为时显式使用：
 
 ```bash
-python3 scripts/m2-cold-window-falsification.py --no-query-fast-scan-leases
+python3 scripts/m2-cold-window-falsification.py --query-fast-scan-leases
 ```
 
 套件固定运行 4 个配对 block（`2×AB + 2×BA`，共 8 腿），每腿 1500 秒。fixture 额外提供
