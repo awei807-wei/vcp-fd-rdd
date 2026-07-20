@@ -359,6 +359,19 @@ class SummarySemanticsTests(unittest.TestCase):
                             "waterline_effective_rotating_budget": 128,
                         },
                     },
+                    {
+                        "ok": True,
+                        "endpoint": "/metrics",
+                        "elapsed_secs": 3.0,
+                        "data": {
+                            "queries_total": 5000,
+                            "queries_avg_us": 2000,
+                            "query_guard_hold_count": 5000,
+                            "query_guard_hold_avg_us": 1800,
+                            "query_guard_hold_max_us": 9000,
+                            "query_guard_slow_count": 12,
+                        },
+                    },
                 ],
             )
             write_jsonl(
@@ -403,6 +416,12 @@ class SummarySemanticsTests(unittest.TestCase):
             self.assertFalse(watch["waterline_soft_degraded_last"])
             self.assertEqual(watch["waterline_hard_degraded_samples"], 0)
             self.assertEqual(watch["waterline_effective_rotating_budget_last"], 128)
+            query_work = summary["query_work"]
+            self.assertEqual(query_work["metrics_sample_count"], 1)
+            self.assertEqual(query_work["queries_total_us_estimate"], 10_000_000)
+            self.assertEqual(
+                query_work["query_guard_hold_total_us_estimate"], 9_000_000
+            )
 
             BENCH.write_report(run_dir, summary)
             report = (run_dir / "REPORT.md").read_text(encoding="utf-8")
@@ -416,6 +435,8 @@ class SummarySemanticsTests(unittest.TestCase):
                 "waterline soft degraded ratio",
                 "waterline effective rotating budget last",
                 "event storm visibility success rate",
+                "query total time estimate",
+                "query guard hold time estimate",
             ):
                 self.assertIn(metric, report)
 

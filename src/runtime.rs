@@ -1476,9 +1476,13 @@ fn spawn_dirty_queue_loop(
         loop {
             let batch = index.dirty_queue_ready_batch(DIRTY_QUEUE_BATCH_SIZE);
             if batch.is_empty() {
+                let idle_delay = Duration::from_millis(DIRTY_QUEUE_IDLE_POLL_MS);
+                let wake_delay = index
+                    .dirty_queue_next_ready_delay()
+                    .map_or(idle_delay, |delay| delay.min(idle_delay));
                 tokio::select! {
                     _ = index.wait_for_dirty_queue() => {}
-                    _ = tokio::time::sleep(Duration::from_millis(DIRTY_QUEUE_IDLE_POLL_MS)) => {}
+                    _ = tokio::time::sleep(wake_delay) => {}
                 }
                 continue;
             }
@@ -1927,7 +1931,7 @@ fn spawn_rotating_cold_window_loop(
 }
 
 fn enqueue_rotating_recursive_scan(index: &TieredIndex, dirs: Vec<PathBuf>, cycle_id: u64) {
-    index.enqueue_recursive_dirty_dirs(dirs, DirtyReason::RotatingColdWindow { cycle_id });
+    index.enqueue_paced_recursive_dirty_dirs(dirs, DirtyReason::RotatingColdWindow { cycle_id });
 }
 
 fn rotating_fast_scan_lease_ttl_secs(

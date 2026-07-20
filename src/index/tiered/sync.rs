@@ -889,6 +889,28 @@ impl TieredIndex {
         self.dirty_notify.notify_one();
     }
 
+    pub(crate) fn enqueue_paced_recursive_dirty_dirs(
+        &self,
+        dirs: Vec<PathBuf>,
+        reason: DirtyReason,
+    ) {
+        if dirs.is_empty() {
+            return;
+        }
+        {
+            let mut queue = self.dirty_queue.lock();
+            for dir in dirs {
+                queue.enqueue_paced_recursive(
+                    DirtyScope::dirs(now_ns(), vec![dir]),
+                    reason,
+                    reason.default_priority(),
+                    now_ns(),
+                );
+            }
+        }
+        self.dirty_notify.notify_one();
+    }
+
     pub fn set_cold_sweep_period_estimate_from_tiered_policy(
         &self,
         l2_scan_interval_secs: u64,
@@ -943,6 +965,11 @@ impl TieredIndex {
 
     pub fn dirty_queue_ready_batch(&self, limit: usize) -> Vec<DirtyQueueEntry> {
         self.dirty_queue.lock().pop_ready(now_ns(), limit)
+    }
+
+    /// Returns the precise wake delay for a paced dirty-queue continuation.
+    pub fn dirty_queue_next_ready_delay(&self) -> Option<Duration> {
+        self.dirty_queue.lock().next_ready_delay(now_ns())
     }
 
     pub fn retry_dirty_entry(&self, entry: DirtyQueueEntry) -> bool {
@@ -1953,6 +1980,7 @@ impl TieredIndex {
         let mut changed = 0usize;
         let mut metadata_failed = false;
         let mut seq = 0u64;
+        let mut scanned_manifest = DirectoryManifestBuilder::default();
         let hidden_markers_enabled = project_markers.iter().any(|marker| marker.starts_with('.'));
 
         for child in &slice.entries {
@@ -1998,6 +2026,7 @@ impl TieredIndex {
             let mtime = meta.modified().ok();
             let mtime_ns = mtime_to_ns(mtime);
             let kind = FileKind::from_metadata(&meta);
+            scanned_manifest.push_child(path.as_path(), kind, mtime_ns);
             scanned = scanned.saturating_add(1);
             let freshness = invalidations.as_ref().map_or_else(
                 || self.path_freshness(&path, file_key, mtime_ns, kind),
@@ -2062,11 +2091,17 @@ impl TieredIndex {
             dropped_stale_batch |= dropped_stale;
         }
         if completed && !dropped_stale_batch && !metadata_failed {
-            if let Some((summary, true)) = self.directory_manifest_summary_bounded(
-                dir,
-                project_markers,
-                REPAIR_SLICE_MAX_ENTRIES,
-            ) {
+            let summary = if start_offset == 0 {
+                Some(scanned_manifest.finish())
+            } else {
+                self.directory_manifest_summary_bounded(
+                    dir,
+                    project_markers,
+                    REPAIR_SLICE_MAX_ENTRIES,
+                )
+                .and_then(|(summary, complete)| complete.then_some(summary))
+            };
+            if let Some(summary) = summary {
                 self.directory_manifests.update(
                     dir.clone(),
                     summary,

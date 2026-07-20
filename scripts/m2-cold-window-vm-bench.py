@@ -4259,6 +4259,40 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         for item in endpoint_samples
         if item.get("ok") and item.get("endpoint") == "/health" and isinstance(item.get("data"), dict)
     ]
+    metrics_rows = [
+        item
+        for item in endpoint_samples
+        if item.get("ok")
+        and item.get("endpoint") == "/metrics"
+        and isinstance(item.get("data"), dict)
+    ]
+    last_metrics = metrics_rows[-1]["data"] if metrics_rows else {}
+
+    def metric_int(key: str) -> int:
+        return int(last_metrics.get(key, 0) or 0)
+
+    queries_total = metric_int("queries_total")
+    queries_avg_us = metric_int("queries_avg_us")
+    query_guard_hold_count = metric_int("query_guard_hold_count")
+    query_guard_hold_avg_us = metric_int("query_guard_hold_avg_us")
+    query_work = {
+        "metrics_sample_count": len(metrics_rows),
+        "last_sample_elapsed_secs": float(
+            metrics_rows[-1].get("elapsed_secs", 0.0) or 0.0
+        )
+        if metrics_rows
+        else 0.0,
+        "queries_total": queries_total,
+        "queries_avg_us": queries_avg_us,
+        "queries_total_us_estimate": queries_total * queries_avg_us,
+        "query_guard_hold_count": query_guard_hold_count,
+        "query_guard_hold_avg_us": query_guard_hold_avg_us,
+        "query_guard_hold_total_us_estimate": (
+            query_guard_hold_count * query_guard_hold_avg_us
+        ),
+        "query_guard_hold_max_us": metric_int("query_guard_hold_max_us"),
+        "query_guard_slow_count": metric_int("query_guard_slow_count"),
+    }
 
     def nums(samples: list[dict[str, Any]], key: str) -> list[float]:
         return [float(s.get(key, 0) or 0) for s in samples]
@@ -4849,6 +4883,7 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         "sample_counts": {
             "process": len(process_samples),
             "endpoint": len(endpoint_samples),
+            "metrics": len(metrics_rows),
             "watch_state": len(watch_samples),
             "memory": len(memory_samples),
             "health": len(health_samples),
@@ -4893,6 +4928,7 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         },
         "process_after_first_burst": process_after_first_burst,
         "process_after_event_storm_start": process_after_event_storm_start,
+        "query_work": query_work,
         "watch_state": {
             "dirty_queue_len_max": int(max(nums(watch_samples, "dirty_queue_len") or [0])),
             "dirty_queue_len_last": int(
@@ -5259,6 +5295,11 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | process write syscalls delta | {summary["process"]["write_syscalls_delta"]} |
 | process minor faults delta | {summary["process"]["minor_faults_delta"]} |
 | process major faults delta | {summary["process"]["major_faults_delta"]} |
+| query metrics samples | {summary["query_work"]["metrics_sample_count"]} |
+| query count / average us | {summary["query_work"]["queries_total"]} / {summary["query_work"]["queries_avg_us"]} |
+| query total time estimate | {summary["query_work"]["queries_total_us_estimate"] / 1_000_000:.6f} s |
+| query guard hold count / average us | {summary["query_work"]["query_guard_hold_count"]} / {summary["query_work"]["query_guard_hold_avg_us"]} |
+| query guard hold time estimate | {summary["query_work"]["query_guard_hold_total_us_estimate"] / 1_000_000:.6f} s |
 | event-storm-window samples | {summary["process_after_event_storm_start"]["sample_count"]} |
 | event-storm-window CPU core seconds | {summary["process_after_event_storm_start"]["cpu_core_seconds"]} |
 | event-storm-window read bytes delta | {summary["process_after_event_storm_start"]["read_bytes_delta"]} |

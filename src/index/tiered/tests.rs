@@ -5310,6 +5310,47 @@ fn periodic_cold_scan_skips_unchanged_directory_manifest() {
 }
 
 #[test]
+fn recursive_single_slice_reuses_scanned_metadata_for_manifest() {
+    let root = unique_tmp_dir("recursive-single-pass-manifest");
+    std::fs::create_dir_all(&root).unwrap();
+    for index in 0..8 {
+        std::fs::write(root.join(format!("file-{index}.txt")), b"stable").unwrap();
+    }
+
+    let governor = Arc::new(IoGovernor::new(true, 1_000_000));
+    let idx = TieredIndex::new_with_base_and_io_governor(
+        L1Cache::with_capacity(1000),
+        Arc::new(PersistentIndex::new_with_roots(vec![root.clone()])),
+        IndexBuilder::new(vec![root.clone()]),
+        vec![root.clone()],
+        false,
+        true,
+        false,
+        Vec::new(),
+        None,
+        governor,
+    );
+    idx.enqueue_recursive_dirty_dirs(
+        vec![root.clone()],
+        DirtyReason::RotatingColdWindow { cycle_id: 1 },
+    );
+    let entry = idx.dirty_queue.lock().pop_ready(u64::MAX, 1).pop().unwrap();
+    let before = idx.io_governor.operations();
+    let report = idx.process_dirty_entry(entry, &[]);
+    let io_operations = idx.io_governor.operations().saturating_sub(before);
+
+    assert!(!report.failed);
+    assert_eq!(report.outcomes.len(), 1);
+    assert_eq!(idx.directory_manifest_report().dirs, 1);
+    assert!(
+        io_operations <= 12,
+        "single-slice recursive scan repeated child metadata work: {io_operations}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn periodic_cold_scan_detects_directory_manifest_hash_change() {
     let root = unique_tmp_dir("manifest-hash-change");
     std::fs::create_dir_all(&root).unwrap();

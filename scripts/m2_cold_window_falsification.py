@@ -371,6 +371,28 @@ def _resource_summary(summary: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _query_work_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    query_work = _mapping(summary, "query_work")
+    integer_fields = (
+        "metrics_sample_count",
+        "queries_total",
+        "queries_avg_us",
+        "queries_total_us_estimate",
+        "query_guard_hold_count",
+        "query_guard_hold_avg_us",
+        "query_guard_hold_total_us_estimate",
+        "query_guard_hold_max_us",
+        "query_guard_slow_count",
+    )
+    result = {
+        field: int(query_work.get(field, 0) or 0) for field in integer_fields
+    }
+    result["last_sample_elapsed_secs"] = float(
+        query_work.get("last_sample_elapsed_secs", 0.0) or 0.0
+    )
+    return result
+
+
 def _mechanism_summary(watch: dict[str, Any]) -> dict[str, int]:
     fields = {
         "rotating_active_dirs_max": "rotating_cold_window_active_dirs_max",
@@ -528,6 +550,7 @@ def analyze_leg(spec: LegSpec, run_dir: Path) -> dict[str, Any]:
         "correctness": _analyze_correctness(events),
         "protocol": protocol,
         "resources": _resource_summary(summary),
+        "query_work": _query_work_summary(summary),
         "mechanism": _mechanism_summary(watch),
         "stability": _stability_summary(
             watch,

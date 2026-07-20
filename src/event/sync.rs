@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::core::FileKey;
 use crate::stats::DirtyQueueStats;
 
+const ROTATING_REPAIR_SLICE_DELAY: Duration = Duration::from_millis(10);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DirectoryFingerprint {
     pub(crate) file_key: FileKey,
@@ -314,6 +316,7 @@ pub struct DirtyQueueEntry {
     pub reason: DirtyReason,
     recursive_subtree_repair: bool,
     rotating_cold_window_cycle_id: Option<u64>,
+    pace_repair_slices: bool,
     pub priority: DirtyPriority,
     pub first_enqueue_ns: u64,
     pub last_enqueue_ns: u64,
@@ -337,6 +340,7 @@ impl DirtyQueueEntry {
             reason: self.reason,
             recursive_subtree_repair: self.recursive_subtree_repair,
             rotating_cold_window_cycle_id: self.rotating_cold_window_cycle_id,
+            pace_repair_slices: self.pace_repair_slices,
             priority: self.priority,
             first_enqueue_ns: self.first_enqueue_ns,
             last_enqueue_ns: self.last_enqueue_ns,
@@ -350,6 +354,7 @@ impl DirtyQueueEntry {
 #[derive(Clone, Debug)]
 pub struct DirtyQueue {
     debounce_ns: u64,
+    rotating_repair_slice_delay_ns: u64,
     retry_base_delay_ns: u64,
     max_attempts: u32,
     entries: HashMap<DirtyScopeKey, DirtyQueueEntry>,
@@ -360,6 +365,7 @@ struct DirtyQueueRequest {
     reason: DirtyReason,
     recursive_subtree_repair: bool,
     rotating_cold_window_cycle_id: Option<u64>,
+    pace_repair_slices: bool,
     priority: DirtyPriority,
     repair_cursor: Option<DirtyRepairCursor>,
     attempts: u32,
@@ -375,6 +381,7 @@ impl DirtyQueue {
     pub fn new(debounce: Duration) -> Self {
         Self {
             debounce_ns: duration_ns(debounce),
+            rotating_repair_slice_delay_ns: duration_ns(ROTATING_REPAIR_SLICE_DELAY),
             retry_base_delay_ns: duration_ns(Duration::from_secs(1)),
             max_attempts: 3,
             entries: HashMap::new(),
@@ -400,6 +407,15 @@ impl DirtyQueue {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Returns how long the worker should wait until the earliest queued entry is ready.
+    pub fn next_ready_delay(&self, now_ns: u64) -> Option<Duration> {
+        self.entries
+            .values()
+            .map(|entry| entry.not_before_ns.saturating_sub(now_ns))
+            .min()
+            .map(Duration::from_nanos)
     }
 
     pub fn memory_stats(&self) -> DirtyQueueStats {
@@ -465,6 +481,7 @@ impl DirtyQueue {
                 reason,
                 recursive_subtree_repair: reason == DirtyReason::RecursiveSubtreeRepair,
                 rotating_cold_window_cycle_id: reason.rotating_cold_window_cycle_id(),
+                pace_repair_slices: false,
                 priority,
                 repair_cursor: None,
                 attempts: 0,
@@ -481,12 +498,34 @@ impl DirtyQueue {
         priority: DirtyPriority,
         now_ns: u64,
     ) {
+        self.enqueue_recursive_with_pacing(scope, reason, priority, now_ns, false);
+    }
+
+    pub(crate) fn enqueue_paced_recursive(
+        &mut self,
+        scope: DirtyScope,
+        reason: DirtyReason,
+        priority: DirtyPriority,
+        now_ns: u64,
+    ) {
+        self.enqueue_recursive_with_pacing(scope, reason, priority, now_ns, true);
+    }
+
+    fn enqueue_recursive_with_pacing(
+        &mut self,
+        scope: DirtyScope,
+        reason: DirtyReason,
+        priority: DirtyPriority,
+        now_ns: u64,
+        pace_repair_slices: bool,
+    ) {
         let cycle_id = reason.rotating_cold_window_cycle_id();
         let mut request = DirtyQueueRequest {
             scope: scope.normalized(),
             reason,
             recursive_subtree_repair: true,
             rotating_cold_window_cycle_id: cycle_id,
+            pace_repair_slices,
             priority,
             repair_cursor: None,
             attempts: 0,
@@ -524,6 +563,7 @@ impl DirtyQueue {
                         request.reason = merge_reason(request.reason, entry.reason);
                         request.priority = request.priority.max(entry.priority);
                         request.attempts = request.attempts.max(entry.attempts);
+                        request.pace_repair_slices &= entry.pace_repair_slices;
                     }
                 }
             }
@@ -538,29 +578,39 @@ impl DirtyQueue {
         now_ns: u64,
         cursor: DirtyRepairCursor,
     ) {
-        self.enqueue_request(
+        let pace_rotating_scan = source.pace_repair_slices && source.priority == DirtyPriority::Low;
+        self.enqueue_request_with_delay(
             DirtyQueueRequest {
                 scope,
                 reason: source.reason,
                 recursive_subtree_repair: source.recursive_subtree_repair,
                 rotating_cold_window_cycle_id: source.rotating_cold_window_cycle_id,
+                pace_repair_slices: source.pace_repair_slices,
                 priority: source.priority,
                 repair_cursor: Some(cursor),
                 attempts: source.attempts,
             },
             now_ns,
-            false,
+            pace_rotating_scan.then_some(self.rotating_repair_slice_delay_ns),
+            pace_rotating_scan,
         );
     }
 
     fn enqueue_request(&mut self, request: DirtyQueueRequest, now_ns: u64, debounce: bool) {
+        let delay_ns = debounce.then_some(self.debounce_ns);
+        self.enqueue_request_with_delay(request, now_ns, delay_ns, false);
+    }
+
+    fn enqueue_request_with_delay(
+        &mut self,
+        request: DirtyQueueRequest,
+        now_ns: u64,
+        delay_ns: Option<u64>,
+        pacing_delay: bool,
+    ) {
         let scope = request.scope.normalized();
         let key = DirtyScopeKey::from_scope(&scope);
-        let not_before_ns = if debounce {
-            now_ns.saturating_add(self.debounce_ns)
-        } else {
-            now_ns
-        };
+        let not_before_ns = now_ns.saturating_add(delay_ns.unwrap_or(0));
         self.entries
             .entry(key)
             .and_modify(|entry| {
@@ -570,9 +620,14 @@ impl DirtyQueue {
                     entry.rotating_cold_window_cycle_id,
                     request.rotating_cold_window_cycle_id,
                 );
+                entry.pace_repair_slices &= request.pace_repair_slices;
                 entry.priority = entry.priority.max(request.priority);
                 entry.last_enqueue_ns = now_ns;
-                entry.not_before_ns = if debounce {
+                let pacing_survives_merge =
+                    entry.pace_repair_slices && entry.priority == DirtyPriority::Low;
+                entry.not_before_ns = if pacing_delay && !pacing_survives_merge {
+                    entry.not_before_ns.min(not_before_ns)
+                } else if delay_ns.is_some() {
                     not_before_ns
                 } else {
                     entry.not_before_ns.min(not_before_ns)
@@ -586,6 +641,7 @@ impl DirtyQueue {
                 reason: request.reason,
                 recursive_subtree_repair: request.recursive_subtree_repair,
                 rotating_cold_window_cycle_id: request.rotating_cold_window_cycle_id,
+                pace_repair_slices: request.pace_repair_slices,
                 priority: request.priority,
                 first_enqueue_ns: now_ns,
                 last_enqueue_ns: now_ns,
@@ -653,6 +709,7 @@ impl DirtyQueue {
                     existing.rotating_cold_window_cycle_id,
                     entry.rotating_cold_window_cycle_id,
                 );
+                existing.pace_repair_slices &= entry.pace_repair_slices;
                 existing.priority = existing.priority.max(entry.priority);
                 existing.last_enqueue_ns = existing.last_enqueue_ns.max(entry.last_enqueue_ns);
                 existing.not_before_ns = existing.not_before_ns.min(entry.not_before_ns);
@@ -1063,12 +1120,12 @@ mod tests {
     }
 
     #[test]
-    fn repair_continuation_bypasses_normal_debounce() {
+    fn rotating_cold_window_continuation_is_paced_below_normal_debounce() {
         let mut q = DirtyQueue::new(Duration::from_millis(250));
-        let root = PathBuf::from("/tmp/immediate-repair-continuation");
+        let root = PathBuf::from("/tmp/paced-rotating-continuation");
         let scope = DirtyScope::dirs(0, vec![root.clone()]);
         let start_ns = 1_000_000_000;
-        q.enqueue_recursive(
+        q.enqueue_paced_recursive(
             scope.clone(),
             DirtyReason::RotatingColdWindow { cycle_id: 7 },
             DirtyPriority::Low,
@@ -1085,8 +1142,65 @@ mod tests {
             DirtyRepairCursor::new(root, 512),
         );
 
-        let continuation = q.pop_ready(continuation_ns, 1).pop().unwrap();
+        assert!(q.pop_ready(continuation_ns + 9_999_999, 1).is_empty());
+        assert_eq!(
+            q.next_ready_delay(continuation_ns),
+            Some(Duration::from_millis(10))
+        );
+        let continuation = q.pop_ready(continuation_ns + 10_000_000, 1).pop().unwrap();
         assert_eq!(continuation.repair_cursor.unwrap().offset, 512);
+    }
+
+    #[test]
+    fn event_merge_disables_rotating_continuation_pacing() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        let root = PathBuf::from("/tmp/event-promoted-rotating-continuation");
+        let scope = DirtyScope::dirs(0, vec![root.clone()]);
+        q.enqueue_paced_recursive(
+            scope.clone(),
+            DirtyReason::RotatingColdWindow { cycle_id: 7 },
+            DirtyPriority::Low,
+            1,
+        );
+        q.enqueue(
+            scope.clone(),
+            DirtyReason::InotifyEvent,
+            DirtyPriority::Normal,
+            2,
+        );
+
+        let source = q.pop_ready(2, 1).pop().unwrap();
+        assert_eq!(source.reason, DirtyReason::InotifyEvent);
+        q.enqueue_repair_slice(scope, &source, 3, DirtyRepairCursor::new(root, 512));
+
+        let continuation = q.pop_ready(3, 1).pop().unwrap();
+        assert_eq!(continuation.repair_cursor.unwrap().offset, 512);
+    }
+
+    #[test]
+    fn paced_continuation_does_not_delay_an_already_ready_event() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        let root = PathBuf::from("/tmp/ready-event-before-paced-continuation");
+        let scope = DirtyScope::dirs(0, vec![root.clone()]);
+        q.enqueue_paced_recursive(
+            scope.clone(),
+            DirtyReason::RotatingColdWindow { cycle_id: 7 },
+            DirtyPriority::Low,
+            1,
+        );
+        let paced_source = q.pop_ready(1, 1).pop().unwrap();
+        q.enqueue(
+            scope.clone(),
+            DirtyReason::InotifyEvent,
+            DirtyPriority::Normal,
+            2,
+        );
+
+        q.enqueue_repair_slice(scope, &paced_source, 3, DirtyRepairCursor::new(root, 512));
+
+        let merged = q.pop_ready(3, 1).pop().unwrap();
+        assert_eq!(merged.reason, DirtyReason::InotifyEvent);
+        assert_eq!(merged.priority, DirtyPriority::Normal);
     }
 
     #[test]

@@ -44,6 +44,45 @@ def _symmetric_ratio(left: float, right: float) -> float:
     return max(_ratio(left, right), _ratio(right, left))
 
 
+def _query_time_ratio(a: dict[str, Any], b: dict[str, Any]) -> float | None:
+    if int(a.get("metrics_sample_count", 0) or 0) <= 0:
+        return None
+    if int(b.get("metrics_sample_count", 0) or 0) <= 0:
+        return None
+    return _symmetric_ratio(
+        int(a.get("queries_total_us_estimate", 0) or 0),
+        int(b.get("queries_total_us_estimate", 0) or 0),
+    )
+
+
+def _query_work_pair_fields(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "a_query_count": int(a.get("queries_total", 0) or 0),
+        "b_query_count": int(b.get("queries_total", 0) or 0),
+        "a_query_avg_us": int(a.get("queries_avg_us", 0) or 0),
+        "b_query_avg_us": int(b.get("queries_avg_us", 0) or 0),
+        "a_query_total_seconds_estimate": round(
+            int(a.get("queries_total_us_estimate", 0) or 0) / 1_000_000,
+            6,
+        ),
+        "b_query_total_seconds_estimate": round(
+            int(b.get("queries_total_us_estimate", 0) or 0) / 1_000_000,
+            6,
+        ),
+        "query_time_estimate_ratio": _query_time_ratio(a, b),
+        "a_query_guard_avg_us": int(a.get("query_guard_hold_avg_us", 0) or 0),
+        "b_query_guard_avg_us": int(b.get("query_guard_hold_avg_us", 0) or 0),
+        "a_query_guard_seconds_estimate": round(
+            int(a.get("query_guard_hold_total_us_estimate", 0) or 0) / 1_000_000,
+            6,
+        ),
+        "b_query_guard_seconds_estimate": round(
+            int(b.get("query_guard_hold_total_us_estimate", 0) or 0) / 1_000_000,
+            6,
+        ),
+    }
+
+
 def _benefit_units(
     a: dict[str, Any], b: dict[str, Any]
 ) -> tuple[list[str], list[str]]:
@@ -108,6 +147,8 @@ def _pair_row(block: int, a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any
     bc = b["correctness"]
     ar = a["resources"]
     br = b["resources"]
+    aq = a.get("query_work", {})
+    bq = b.get("query_work", {})
     recovered = max(0, int(ac["positive_ok"]) - int(bc["positive_ok"]))
     cpu_delta = float(ar["cpu_core_seconds"]) - float(br["cpu_core_seconds"])
     read_delta = int(ar["read_bytes_delta"]) - int(br["read_bytes_delta"])
@@ -135,6 +176,7 @@ def _pair_row(block: int, a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any
             int(a["protocol"]["visibility_poll_count"]),
             int(b["protocol"]["visibility_poll_count"]),
         ),
+        **_query_work_pair_fields(aq, bq),
         "a_cpu_core_seconds": float(ar["cpu_core_seconds"]),
         "b_cpu_core_seconds": float(br["cpu_core_seconds"]),
         "incremental_cpu_core_seconds": round(cpu_delta, 6),

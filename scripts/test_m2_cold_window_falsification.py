@@ -193,6 +193,18 @@ def synthetic_leg(
             "event_window_major_faults_delta": 0,
             "event_window_rss_bytes_p95": 20_000_000,
         },
+        "query_work": {
+            "metrics_sample_count": 1,
+            "last_sample_elapsed_secs": 1200.0,
+            "queries_total": 5000 if variant == "a" else 5100,
+            "queries_avg_us": 2000 if variant == "a" else 200,
+            "queries_total_us_estimate": 10_000_000 if variant == "a" else 1_020_000,
+            "query_guard_hold_count": 5000 if variant == "a" else 5100,
+            "query_guard_hold_avg_us": 1800 if variant == "a" else 80,
+            "query_guard_hold_total_us_estimate": 9_000_000 if variant == "a" else 408_000,
+            "query_guard_hold_max_us": 9000 if variant == "a" else 1000,
+            "query_guard_slow_count": 12 if variant == "a" else 0,
+        },
         "mechanism": {
             "rotating_active_dirs_max": 1 if variant == "a" else 0,
             "rotating_cycle_progress_pct_max": 100 if variant == "a" else 0,
@@ -422,6 +434,18 @@ class LegAnalysisTests(unittest.TestCase):
                             "major_faults_delta": 0,
                             "rss_bytes_p95": 18,
                         },
+                        "query_work": {
+                            "metrics_sample_count": 1,
+                            "last_sample_elapsed_secs": 1200.0,
+                            "queries_total": 100,
+                            "queries_avg_us": 250,
+                            "queries_total_us_estimate": 25000,
+                            "query_guard_hold_count": 100,
+                            "query_guard_hold_avg_us": 200,
+                            "query_guard_hold_total_us_estimate": 20000,
+                            "query_guard_hold_max_us": 500,
+                            "query_guard_slow_count": 0,
+                        },
                         "watch_state": {
                             "waterline_soft_degraded_ratio": 0.0,
                             "waterline_soft_degraded_last": False,
@@ -492,6 +516,7 @@ class LegAnalysisTests(unittest.TestCase):
             self.assertEqual(result["protocol"]["checks"], 1)
             self.assertEqual(result["resources"]["window_source"], "full_run")
             self.assertEqual(result["resources"]["cpu_core_seconds"], 2.5)
+            self.assertEqual(result["query_work"]["queries_total_us_estimate"], 25000)
 
     def test_transport_failure_cannot_count_as_a_correct_negative_result(self) -> None:
         result = falsification._analyze_correctness(
@@ -934,12 +959,16 @@ class GateTests(unittest.TestCase):
     def test_gate_reports_paired_resource_and_roi_observations(self) -> None:
         result = gate.evaluate_suite(self.passing_legs())
 
+        self.assertEqual(result["decision"], "pass")
         self.assertEqual(result["median_rss_p95_ratio"], 1.0)
         self.assertEqual(result["median_write_bytes_ratio"], 1.0)
         self.assertEqual(result["median_minor_faults_ratio"], 1.0)
         self.assertEqual(result["median_query_poll_load_ratio"], 1.0)
         self.assertEqual(result["paired"][0]["recovered_primary_paths"], 81)
         self.assertEqual(result["paired"][0]["cpu_seconds_per_recovered_path"], 0.0)
+        self.assertEqual(result["paired"][0]["a_query_total_seconds_estimate"], 10.0)
+        self.assertEqual(result["paired"][0]["b_query_total_seconds_estimate"], 1.02)
+        self.assertGreater(result["paired"][0]["query_time_estimate_ratio"], 9.0)
 
     def test_gate_rejects_write_or_query_load_asymmetry(self) -> None:
         legs = self.passing_legs()
@@ -2173,6 +2202,9 @@ class ReportTests(unittest.TestCase):
         self.assertIn("CPU 使用 service time", rendered)
         self.assertIn("write A/B", rendered)
         self.assertIn("incremental write / recovered path", rendered)
+        self.assertIn("配对查询工作诊断", rendered)
+        self.assertIn("不参与成本硬门", rendered)
+        self.assertIn("10.000/1.020", rendered)
         self.assertIn("2000/2000", rendered)
         self.assertIn("主收益端点", rendered)
         self.assertIn("rebuild total:bootstrap:quiesce:unattributed", rendered)

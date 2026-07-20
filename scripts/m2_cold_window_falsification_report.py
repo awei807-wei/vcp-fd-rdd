@@ -56,6 +56,25 @@ def _paired_cost_lines(gate: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _paired_query_work_lines(gate: dict[str, Any]) -> list[str]:
+    lines = [
+        "| block | query count A/B | avg us A/B | estimated query time A/B (s) | estimated ratio | guard avg us A/B | estimated guard time A/B (s) |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in gate["paired"]:
+        lines.append(
+            f"| {row['block']} | {row['a_query_count']}/{row['b_query_count']} | "
+            f"{row['a_query_avg_us']}/{row['b_query_avg_us']} | "
+            f"{row['a_query_total_seconds_estimate']:.3f}/"
+            f"{row['b_query_total_seconds_estimate']:.3f} | "
+            f"{_ratio_text(row['query_time_estimate_ratio'])} | "
+            f"{row['a_query_guard_avg_us']}/{row['b_query_guard_avg_us']} | "
+            f"{row['a_query_guard_seconds_estimate']:.3f}/"
+            f"{row['b_query_guard_seconds_estimate']:.3f} |"
+        )
+    return lines
+
+
 def _leg_result_lines(legs: list[dict[str, Any]]) -> list[str]:
     lines = [
         "| block | order | leg | valid | bursts/expected records | unique assertions | positive/negative | visibility (p95 s / transport errors) | polls | target M2 seen/active/causal | sampling coverage/max gap | tier before | soft ratio/end | errors / watcher-remove / dirty-drop / rebuild total:bootstrap:quiesce:unattributed / window |",
@@ -143,6 +162,12 @@ def render_report(summary: dict[str, Any]) -> str:
         "> `process_after_event_storm_start` 事件风暴窗口包含起点前一个基准样本，用于诊断注入阶段；它不包含预热期 M2 成本，因此不替代完整运行门禁。旧 `process_after_first_burst` 仅保留兼容观测。",
         "",
         "> 主收益端点只使用 `recovered_primary_paths`：A 相对 B 至少多找回 5% 的正向主断言路径，并分布在至少 3 个 burst、2 类 workload，才算该 block 有收益。visibility 成功率与延迟仅作正确性/SLA 诊断，不会单独把 block 判成有收益。单位收益成本用完整运行 A-B 增量除以找回路径数，负值表示 A 同时节省资源。",
+        "",
+        "## 配对查询工作诊断",
+        "",
+        *_paired_query_work_lines(gate),
+        "",
+        "> 查询时间来自最后一个成功 `/metrics` 累计值，按 count × 已截断 avg 估算；guard wall time 不等于 CPU time。本表用于解释 A 命中与 B 未命中的工作量差异，不参与成本硬门。",
         "",
         "## 腿级结果",
         "",
