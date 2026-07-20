@@ -1836,6 +1836,14 @@ fn spawn_rotating_cold_window_loop(
 ) {
     tokio::spawn(async move {
         let interval = Duration::from_secs(tiered.rotating_cold_window_tick_secs.max(1));
+        // Keep the FastScan sentinel alive across the next rotation. The rotating
+        // lease is intentionally shorter, but expiring both at the same boundary
+        // causes an avoidable lease/sentinel bootstrap before the next selection.
+        let fast_scan_lease_ttl_secs = rotating_fast_scan_lease_ttl_secs(
+            tiered.rotating_cold_window_ttl_secs.max(1),
+            tiered.l1_l2_fast_scan_lease_ttl_secs.max(1),
+            interval,
+        );
         let ephemeral_config = EphemeralWatchConfig {
             budget: tiered.ephemeral_watch_budget,
             ttl_secs: tiered.rotating_cold_window_ttl_secs.max(1),
@@ -1875,7 +1883,7 @@ fn spawn_rotating_cold_window_loop(
                             &action,
                             &exclude_dirs,
                             &ephemeral_config,
-                            tiered.rotating_cold_window_ttl_secs.max(1),
+                            fast_scan_lease_ttl_secs,
                             tick.cycle_id,
                         )
                         .await
@@ -1887,7 +1895,7 @@ fn spawn_rotating_cold_window_loop(
                         let ready = runtime.ensure_fast_scan_lease(
                             action.path.clone(),
                             FastScanLeaseKind::RotatingColdWindow,
-                            Some(tiered.rotating_cold_window_ttl_secs.max(1)),
+                            Some(fast_scan_lease_ttl_secs),
                             action.score.max(1),
                         );
                         if ready {
@@ -1920,6 +1928,18 @@ fn spawn_rotating_cold_window_loop(
 
 fn enqueue_rotating_recursive_scan(index: &TieredIndex, dirs: Vec<PathBuf>, cycle_id: u64) {
     index.enqueue_recursive_dirty_dirs(dirs, DirtyReason::RotatingColdWindow { cycle_id });
+}
+
+fn rotating_fast_scan_lease_ttl_secs(
+    rotating_ttl_secs: u64,
+    fast_scan_ttl_secs: u64,
+    tick: Duration,
+) -> u64 {
+    fast_scan_ttl_secs.max(
+        rotating_ttl_secs
+            .max(1)
+            .saturating_add(tick.as_secs().max(1).saturating_mul(2)),
+    )
 }
 
 fn spawn_proc_sampler_loop(
@@ -2699,6 +2719,18 @@ mod tests {
         assert!(entry.requires_recursive_subtree_repair());
         assert_eq!(entry.rotating_cold_window_cycle_id(), Some(42));
         assert_eq!(entry.scope.dir_paths(), &[root]);
+    }
+
+    #[test]
+    fn rotating_fast_scan_lease_ttl_spans_rotation_boundary() {
+        assert_eq!(
+            rotating_fast_scan_lease_ttl_secs(180, 1_800, Duration::from_secs(30)),
+            1_800
+        );
+        assert_eq!(
+            rotating_fast_scan_lease_ttl_secs(1, 1, Duration::from_millis(1)),
+            3
+        );
     }
 
     fn temp_root(tag: &str) -> PathBuf {
