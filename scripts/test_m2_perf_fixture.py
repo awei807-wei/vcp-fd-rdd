@@ -52,6 +52,23 @@ class WindowDetectionTests(unittest.TestCase):
         self.assertEqual(first, (20, 24))
         self.assertEqual(second, (45, 47))
 
+    def test_detects_window_from_fault_spike_when_reads_are_quiet(self) -> None:
+        # mountinfo 缓存后读尖峰消失，窗口必须仍能从缺页信号识别。
+        rows = [_sample(0.0, 0, 0, 0, 0)]
+        reads = faults = 0
+        elapsed = 0.0
+        fault_plan = [2] * 10 + [1800, 500, 450, 120] + [2] * 10
+        for delta_faults in fault_plan:
+            elapsed += 0.5
+            reads += 9
+            faults += delta_faults
+            rows.append(_sample(elapsed, reads, 0, faults, 0))
+
+        deltas = analysis.sample_deltas(rows)
+        windows = analysis.detect_scan_windows(deltas)
+
+        self.assertEqual(windows, [(10, 13)])
+
     def test_partition_separates_startup_window(self) -> None:
         plan = [5] * 4 + [7000, 300] + [5] * 100 + [6000, 200] + [5] * 10
         deltas = analysis.sample_deltas(_cumulative_samples(plan))

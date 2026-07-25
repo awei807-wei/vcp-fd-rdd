@@ -4,8 +4,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// 挂载表缓存 TTL：挂载变更最多延迟这么久被扫描/查询路径感知。
+const MOUNT_TABLE_CACHE_TTL: Duration = Duration::from_secs(2);
+
+type MountTableCacheSlot = Option<(Instant, Arc<MountTable>)>;
+
+fn mount_table_cache() -> &'static Mutex<MountTableCacheSlot> {
+    static CACHE: OnceLock<Mutex<MountTableCacheSlot>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountEntry {
@@ -75,6 +85,30 @@ impl MountTable {
 
     pub fn current() -> std::io::Result<Self> {
         std::fs::read_to_string("/proc/self/mountinfo").map(|s| Self::parse(&s))
+    }
+
+    /// TTL 进程级缓存的挂载表。
+    ///
+    /// 递归扫描按目录、查询路径按请求重建 FsPolicy，逐次全量重读并解析
+    /// /proc/self/mountinfo 是扫描窗口读 syscall 与分配的主要来源之一；
+    /// 缓存后挂载变更最多延迟一个 TTL 生效，与逐次读取固有的 TOCTOU 同级。
+    /// 读取失败时返回 None 并保留旧缓存条目（已过期，下次调用会重试）。
+    pub fn current_cached() -> Option<Arc<Self>> {
+        Self::current_cached_with_ttl(MOUNT_TABLE_CACHE_TTL)
+    }
+
+    pub fn current_cached_with_ttl(ttl: Duration) -> Option<Arc<Self>> {
+        let mut cache = mount_table_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((stamp, table)) = cache.as_ref() {
+            if stamp.elapsed() < ttl {
+                return Some(Arc::clone(table));
+            }
+        }
+        let table = Arc::new(Self::current().ok()?);
+        *cache = Some((Instant::now(), Arc::clone(&table)));
+        Some(table)
     }
 
     pub fn best_match<'a>(&'a self, path: &Path) -> Option<&'a MountEntry> {
@@ -382,13 +416,16 @@ impl MountProbeCache {
 
 #[derive(Clone, Debug)]
 pub struct FsPolicy {
-    table: MountTable,
+    table: Arc<MountTable>,
     config: FsPolicyConfig,
 }
 
 impl FsPolicy {
     pub fn new(table: MountTable, config: FsPolicyConfig) -> Self {
-        Self { table, config }
+        Self {
+            table: Arc::new(table),
+            config,
+        }
     }
 
     pub fn current_default() -> Option<Self> {
@@ -396,9 +433,7 @@ impl FsPolicy {
     }
 
     pub fn current_with_config(config: FsPolicyConfig) -> Option<Self> {
-        MountTable::current()
-            .ok()
-            .map(|table| Self::new(table, config))
+        MountTable::current_cached().map(|table| Self { table, config })
     }
 
     pub fn check_path(&self, path: &Path, scan_root: Option<&Path>) -> FsPolicyDecision {
@@ -595,6 +630,30 @@ mod tests {
         let m = table.best_match(Path::new("/home/user/remote/a")).unwrap();
         assert_eq!(m.fstype, "nfs");
         assert_eq!(m.mount_point, PathBuf::from("/home/user/remote"));
+    }
+
+    #[test]
+    fn mount_table_cache_reuses_within_ttl_and_refreshes_after_expiry() {
+        // 长 TTL 内共享同一 Arc；TTL 归零强制重读。并发下 2s 默认缓存可能
+        // 被其他测试刷新，这里用超长 TTL 保证同批取样命中同一份。
+        let mut hit_same = false;
+        for _ in 0..3 {
+            let first = MountTable::current_cached_with_ttl(Duration::from_secs(3600))
+                .expect("mountinfo readable");
+            let second = MountTable::current_cached_with_ttl(Duration::from_secs(3600))
+                .expect("mountinfo readable");
+            if Arc::ptr_eq(&first, &second) {
+                hit_same = true;
+                break;
+            }
+        }
+        assert!(hit_same, "long-TTL consecutive reads must share one Arc");
+
+        let before = MountTable::current_cached_with_ttl(Duration::from_secs(3600))
+            .expect("mountinfo readable");
+        let refreshed =
+            MountTable::current_cached_with_ttl(Duration::ZERO).expect("mountinfo readable");
+        assert!(!Arc::ptr_eq(&before, &refreshed));
     }
 
     #[test]

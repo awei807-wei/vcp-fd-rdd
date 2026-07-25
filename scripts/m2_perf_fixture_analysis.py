@@ -19,6 +19,18 @@ DEFAULT_GATED_METRICS = ("read_syscalls_per_cycle", "minor_faults_per_cycle")
 DEFAULT_SPIKE_THRESHOLD = 1000.0
 DEFAULT_TAIL_THRESHOLD = 50.0
 DEFAULT_TAIL_GAP_SAMPLES = 4
+# 复合窗口检测：读 syscall 被优化掉之后（mountinfo 缓存），轮转扫描窗口仍以
+# 缺页与 CPU tick 形态存在；任一信号过阈即判定，避免优化后窗口"消失"。
+DEFAULT_SPIKE_THRESHOLDS: dict[str, float] = {
+    "read_syscalls": DEFAULT_SPIKE_THRESHOLD,
+    "minor_faults": 800.0,
+    "cpu_ticks": 25.0,
+}
+DEFAULT_TAIL_THRESHOLDS: dict[str, float] = {
+    "read_syscalls": DEFAULT_TAIL_THRESHOLD,
+    "minor_faults": 100.0,
+    "cpu_ticks": 5.0,
+}
 
 _DELTA_KEYS = ("read_syscalls", "write_syscalls", "minor_faults", "cpu_ticks")
 
@@ -43,22 +55,29 @@ def detect_scan_windows(
     tail_threshold: float = DEFAULT_TAIL_THRESHOLD,
     tail_gap_samples: int = DEFAULT_TAIL_GAP_SAMPLES,
 ) -> list[tuple[int, int]]:
-    """按读差分尖峰识别递归扫描窗口，返回差分序列上的闭区间索引。
+    """按读/缺页/CPU 复合尖峰识别递归扫描窗口，返回差分序列上的闭区间索引。
 
-    onset 为单样本读差分 >= spike_threshold；随后活动尾（>= tail_threshold）
-    延展窗口，最多容忍 tail_gap_samples 个静默样本的间隙。
+    onset 为任一信号差分过尖峰阈值；随后任一信号超过尾阈值即延展窗口，
+    最多容忍 tail_gap_samples 个静默样本的间隙。spike_threshold/tail_threshold
+    参数覆盖 read_syscalls 一路的阈值（兼容旧调用），其余信号用默认表。
     """
+    spikes = dict(DEFAULT_SPIKE_THRESHOLDS, read_syscalls=spike_threshold)
+    tails = dict(DEFAULT_TAIL_THRESHOLDS, read_syscalls=tail_threshold)
+
+    def over(row: dict[str, float], thresholds: dict[str, float]) -> bool:
+        return any(row.get(key, 0.0) >= limit for key, limit in thresholds.items())
+
     windows: list[tuple[int, int]] = []
     index = 0
     while index < len(deltas):
-        if deltas[index]["read_syscalls"] < spike_threshold:
+        if not over(deltas[index], spikes):
             index += 1
             continue
         end = index
         gap = 0
         cursor = index + 1
         while cursor < len(deltas) and gap < tail_gap_samples:
-            if deltas[cursor]["read_syscalls"] >= tail_threshold:
+            if over(deltas[cursor], tails):
                 end = cursor
                 gap = 0
             else:
