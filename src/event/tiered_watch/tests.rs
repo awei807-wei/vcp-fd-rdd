@@ -1923,6 +1923,79 @@ fn rotating_reuse_shortens_existing_ephemeral_watch_deadline() {
 }
 
 #[test]
+fn rotating_reselection_renews_ephemeral_watch_ttl_across_cycle_boundary() {
+    let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 10);
+    let path = temp_root("rotating-renew-ephemeral-ttl");
+    std::fs::create_dir_all(&path).unwrap();
+    let cfg = EphemeralWatchConfig {
+        budget: 10,
+        ttl_secs: 45,
+        repeat_threshold: 1,
+        max_cost_per_root: 2,
+        ..EphemeralWatchConfig::default()
+    };
+
+    assert_eq!(
+        rt.note_dirty_scope_at(path.clone(), 1, &[], &cfg, 100, 1),
+        EphemeralWatchDecision::Add(path.clone())
+    );
+    rt.confirm_ephemeral_added(path.as_path());
+    // 首个轮转周期把到期约束到窗口末尾（100+45=145）。
+    assert!(rt.constrain_ephemeral_watch_ttl_at(path.as_path(), 45, 100));
+    // 下一周期再次选中：续期必须延展到 144+45=189，而不是停留在 145。
+    assert!(rt.renew_ephemeral_watch_ttl_at(path.as_path(), 45, 144));
+
+    assert!(
+        rt.expire_ephemeral_watches_at(160, 1_000, 600, 3)
+            .is_empty(),
+        "renewed watcher must survive the old cycle boundary"
+    );
+    // 续期不允许把更晚的到期时间提前。
+    assert!(rt.renew_ephemeral_watch_ttl_at(path.as_path(), 10, 150));
+    assert!(rt
+        .expire_ephemeral_watches_at(170, 1_000, 600, 3)
+        .is_empty());
+
+    let removals = rt.expire_ephemeral_watches_at(190, 1_000, 600, 3);
+    assert_eq!(removals.len(), 1);
+    assert_eq!(removals[0].reason, EphemeralWatchExpiry::Ttl);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rotating_full_sweep_due_follows_completed_cycle_distance() {
+    let cold = PathBuf::from("/tmp/cold-sweep-due");
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(cold.clone(), 4)], 16, 5_000, 20);
+    let state = rt.state(&cold).expect("cold dir should exist");
+    state.tier.store(WatchTier::L3.as_u8(), Ordering::Release);
+    state
+        .last_scan_unix_secs
+        .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
+
+    let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
+        enabled: true,
+        budget: 1,
+        ttl_secs: 60,
+        max_cost_per_root: 64,
+        max_dirs_per_tick: 1,
+    });
+    assert_eq!(tick.actions.len(), 1);
+
+    // 从未完成过 sweep：fail-closed 判 due；未知目录同理。
+    assert!(rt.rotating_cold_window_sweep_due(cold.as_path(), tick.cycle_id, 10));
+    assert!(rt.rotating_cold_window_sweep_due(Path::new("/tmp/never-seen-root"), 5, 10));
+
+    assert!(rt.record_rotating_cold_window_scan_completion(cold.as_path(), tick.cycle_id));
+    // 同周期不重复 due（即使 K=1）。
+    assert!(!rt.rotating_cold_window_sweep_due(cold.as_path(), tick.cycle_id, 1));
+    // K=1：下一周期即 due（旧的每周期行为）。
+    assert!(rt.rotating_cold_window_sweep_due(cold.as_path(), tick.cycle_id + 1, 1));
+    // K=10：距离不足不 due，达到即 due。
+    assert!(!rt.rotating_cold_window_sweep_due(cold.as_path(), tick.cycle_id + 9, 10));
+    assert!(rt.rotating_cold_window_sweep_due(cold.as_path(), tick.cycle_id + 10, 10));
+}
+
+#[test]
 fn rotating_scan_only_constrains_existing_ephemeral_watch_deadline() {
     let rt = TieredWatchRuntime::new_with_ephemeral(Vec::new(), Vec::new(), 1, 5_000, 20, 10);
     let path = temp_root("scan-only-shorten-existing-lease");

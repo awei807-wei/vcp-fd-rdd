@@ -1004,6 +1004,32 @@ impl TieredWatchRuntime {
         true
     }
 
+    /// 完整递归 sweep 是否到期：按最近一次已完成 sweep 的周期距离判定。
+    ///
+    /// 从未完成过（或该目录无状态）时 fail-closed 判 due；同周期内不重复 due。
+    /// 完成记录本身绑定当前活跃 lease 的 cycle_id（见上），因此这里读到的
+    /// 距离总是真实扫描进展的距离，不可能被伪造的 completion 推进。
+    pub fn rotating_cold_window_sweep_due(
+        &self,
+        path: &Path,
+        current_cycle_id: u64,
+        sweep_every_cycles: u64,
+    ) -> bool {
+        let Some(state) = self.state(path) else {
+            return true;
+        };
+        let progress = state.rotating_cold_window_progress.read();
+        // last_scan_seq 从 1 起：0 即从未有过绑定活跃 lease 的完成记录。
+        // cycle_id 本身 0 起始，不能用作 never 标记。
+        if progress.last_scan_seq == 0 {
+            return true;
+        }
+        if current_cycle_id <= progress.last_scan_cycle_id {
+            return false;
+        }
+        current_cycle_id - progress.last_scan_cycle_id >= sweep_every_cycles.max(1)
+    }
+
     pub(super) fn record_rotating_cold_window_event_progress(
         &self,
         paths: &[&PathBuf],

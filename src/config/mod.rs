@@ -397,6 +397,10 @@ pub struct TieredWatchConfig {
     pub rotating_cold_window_max_cost_per_root: usize,
     /// Maximum cold directories selected by one rotating cold-window tick.
     pub rotating_cold_window_max_dirs_per_tick: usize,
+    /// 完整递归 sweep 周期（秒）：FastScanLease 覆盖下的深层原地修改一致性
+    /// 兜底节奏；0 = 每个轮转周期都 sweep（旧行为）。周期之间的可见性由
+    /// sentinel/watcher 事件快路径维持。
+    pub rotating_full_sweep_period_secs: u64,
     /// Enable the lease-hotset fast scan lane for directories outside L0.
     pub l1_l2_fast_scan_enabled: bool,
     /// Allow successful queries to grant or renew automatic fast-scan leases.
@@ -695,6 +699,7 @@ impl Default for TieredWatchConfig {
             rotating_cold_window_ttl_secs: 180,
             rotating_cold_window_max_cost_per_root: 64,
             rotating_cold_window_max_dirs_per_tick: 8,
+            rotating_full_sweep_period_secs: 1_800,
             l1_l2_fast_scan_enabled: true,
             l1_l2_fast_scan_query_leases_enabled: true,
             l1_l2_fast_scan_target_secs: 5,
@@ -757,6 +762,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             rotating_cold_window_ttl_secs: u64,
             rotating_cold_window_max_cost_per_root: usize,
             rotating_cold_window_max_dirs_per_tick: usize,
+            rotating_full_sweep_period_secs: u64,
             l1_l2_fast_scan_enabled: bool,
             l1_l2_fast_scan_query_leases_enabled: bool,
             l1_l2_fast_scan_target_secs: u64,
@@ -815,6 +821,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
                         .rotating_cold_window_max_cost_per_root,
                     rotating_cold_window_max_dirs_per_tick: defaults
                         .rotating_cold_window_max_dirs_per_tick,
+                    rotating_full_sweep_period_secs: defaults.rotating_full_sweep_period_secs,
                     l1_l2_fast_scan_enabled: defaults.l1_l2_fast_scan_enabled,
                     l1_l2_fast_scan_query_leases_enabled: defaults
                         .l1_l2_fast_scan_query_leases_enabled,
@@ -898,6 +905,7 @@ impl<'de> Deserialize<'de> for TieredWatchConfig {
             rotating_cold_window_ttl_secs: raw.rotating_cold_window_ttl_secs,
             rotating_cold_window_max_cost_per_root: raw.rotating_cold_window_max_cost_per_root,
             rotating_cold_window_max_dirs_per_tick: raw.rotating_cold_window_max_dirs_per_tick,
+            rotating_full_sweep_period_secs: raw.rotating_full_sweep_period_secs,
             l1_l2_fast_scan_enabled: raw.l1_l2_fast_scan_enabled,
             l1_l2_fast_scan_query_leases_enabled: raw.l1_l2_fast_scan_query_leases_enabled,
             l1_l2_fast_scan_target_secs: raw.l1_l2_fast_scan_target_secs,

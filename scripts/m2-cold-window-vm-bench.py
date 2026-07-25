@@ -3703,6 +3703,7 @@ def write_config(args: argparse.Namespace, config_home: Path) -> Path:
         f"rotating_cold_window_ttl_secs = {args.rotating_ttl_secs}",
         f"rotating_cold_window_max_cost_per_root = {args.rotating_max_cost_per_root}",
         f"rotating_cold_window_max_dirs_per_tick = {args.rotating_max_dirs_per_tick}",
+        f"rotating_full_sweep_period_secs = {args.rotating_full_sweep_period_secs}",
         f"max_watch_dirs = {args.max_watch_dirs}",
         f"l0_max_cost_per_root = {args.l0_max_cost_per_root}",
         f"l1_scan_interval_secs = {args.l1_scan_interval_secs}",
@@ -5565,6 +5566,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rotating-ttl-secs", type=int, default=180)
     parser.add_argument("--rotating-max-cost-per-root", type=int, default=64)
     parser.add_argument("--rotating-max-dirs-per-tick", type=int, default=8)
+    parser.add_argument(
+        "--rotating-full-sweep-period-secs",
+        type=int,
+        default=1800,
+        help="FastScanLease 完整递归 sweep 周期(秒);0=每轮转周期都 sweep(旧行为)",
+    )
     parser.add_argument("--max-watch-dirs", type=int, default=131072)
     parser.add_argument("--l0-max-cost-per-root", type=int, default=8192)
     parser.add_argument(

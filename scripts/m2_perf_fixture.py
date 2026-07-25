@@ -55,6 +55,9 @@ _FORMAL_MECHANISM_DEFAULTS: dict[str, Any] = {
     "rotating_ttl_secs": 180,
     "rotating_max_cost_per_root": 64,
     "rotating_max_dirs_per_tick": 8,
+    # 正式默认 1800s;fixture 运行时按 --rotating-full-sweep-period-secs 覆盖
+    # （默认 0 = 每周期 sweep，保持单价测量语义）。
+    "rotating_full_sweep_period_secs": 1800,
     "max_watch_dirs": 8,
     "l0_max_cost_per_root": 1,
     "l1_scan_interval_secs": 5,
@@ -87,6 +90,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cycles", type=int, default=5)
     parser.add_argument("--rotating-ttl-secs", type=int, default=45)
     parser.add_argument("--rotating-tick-secs", type=int, default=15)
+    parser.add_argument(
+        "--rotating-full-sweep-period-secs",
+        type=int,
+        default=0,
+        help="0 = 每周期 sweep（单价测量）；设为正式值可验证续租周期的静默性",
+    )
     # L1/L2 扫描节奏必须保持正式值：FastScanLease 目录的覆盖维护重扫跟随该节奏，
     # 压缩它会把维护扫描放大几十倍，破坏 per-cycle 标定（实测确认）。
     parser.add_argument("--l1-scan-interval-secs", type=int, default=5)
@@ -108,6 +117,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--calibrate", dest="calibrate", action="store_true", default=True
     )
     parser.add_argument("--no-calibrate", dest="calibrate", action="store_false")
+    parser.add_argument(
+        "--deep-modify-probe",
+        dest="deep_modify_probe",
+        action="store_true",
+        default=True,
+        help="§18.1 探针：深层已有文件原地改写须在 sweep 周期内可见",
+    )
+    parser.add_argument(
+        "--no-deep-modify-probe", dest="deep_modify_probe", action="store_false"
+    )
     parser.add_argument(
         "--baseline-json",
         default="",
@@ -173,6 +192,52 @@ def _run_burst_probe(
     }
 
 
+def _search_entry(base_url: str, path: Path) -> dict[str, Any] | None:
+    try:
+        results = BENCH.search_results(base_url, path.name, limit=20)
+    except Exception:  # noqa: BLE001 - 传输失败按未见处理
+        return None
+    for item in results:
+        if str(item.get("path", "")) == str(path):
+            return item
+    return None
+
+
+def _run_deep_modify_probe(
+    base_url: str, cold_root: Path, timeout_secs: float
+) -> dict[str, Any]:
+    """§18.1 探针：改写已有深层文件内容（所有目录 mtime 不变），
+    唯一合法检出通道是完整递归 sweep 的逐 entry freshness；
+    以 /search 返回的 index_tier/freshness 翻转（冷层→overlay）判定可见。"""
+    target = cold_root / "d100" / "file_100.txt"
+    baseline = _search_entry(base_url, target)
+    if baseline is None:
+        return {"enabled": True, "visible": False, "error": "baseline entry missing"}
+    target.write_text("deep modify probe payload\n", encoding="utf-8")
+    started = time.monotonic()
+    deadline = started + timeout_secs
+    while time.monotonic() < deadline:
+        entry = _search_entry(base_url, target)
+        if entry is not None and (
+            entry.get("index_tier") != baseline.get("index_tier")
+            or entry.get("freshness") != baseline.get("freshness")
+        ):
+            return {
+                "enabled": True,
+                "visible": True,
+                "latency_secs": round(time.monotonic() - started, 3),
+                "baseline_tier": baseline.get("index_tier"),
+                "updated_tier": entry.get("index_tier"),
+            }
+        time.sleep(0.5)
+    return {
+        "enabled": True,
+        "visible": False,
+        "latency_secs": round(time.monotonic() - started, 3),
+        "baseline_tier": baseline.get("index_tier"),
+    }
+
+
 def _load_reference(args: argparse.Namespace) -> dict[str, float] | None:
     if not args.baseline_json:
         return None
@@ -209,6 +274,7 @@ def run(args: argparse.Namespace) -> int:
             port=args.port,
             rotating_ttl_secs=args.rotating_ttl_secs,
             rotating_tick_secs=args.rotating_tick_secs,
+            rotating_full_sweep_period_secs=args.rotating_full_sweep_period_secs,
             l1_scan_interval_secs=args.l1_scan_interval_secs,
             l2_scan_interval_secs=args.l2_scan_interval_secs,
         )
@@ -261,6 +327,7 @@ def run(args: argparse.Namespace) -> int:
             daemon=True,
         )
         burst: dict[str, Any] = {"enabled": False}
+        deep_modify: dict[str, Any] = {"enabled": False}
         try:
             BENCH.wait_for_http(
                 base_url,
@@ -284,6 +351,19 @@ def run(args: argparse.Namespace) -> int:
                 )
                 burst = _run_burst_probe(base_url, roots["cold-a"], burst_timeout)
                 time.sleep(5.0)
+            if args.deep_modify_probe:
+                if args.rotating_full_sweep_period_secs > args.rotating_ttl_secs * 2:
+                    deep_modify = {
+                        "enabled": False,
+                        "skipped": "sweep period exceeds probe budget",
+                    }
+                else:
+                    deep_modify = _run_deep_modify_probe(
+                        base_url,
+                        roots["cold-a"],
+                        args.rotating_ttl_secs + args.rotating_tick_secs + 15.0,
+                    )
+                    time.sleep(2.0)
         finally:
             stop.set()
             samples.expect_process_exit()
@@ -345,6 +425,7 @@ def run(args: argparse.Namespace) -> int:
         "watch_state": watch_summary,
         "query_guard": {key: int(last_metrics.get(key, 0) or 0) for key in guard_keys},
         "burst": burst,
+        "deep_modify": deep_modify,
         "calibration": (
             analysis.evaluate_calibration(cycles, reference=_load_reference(args))
             if args.calibrate

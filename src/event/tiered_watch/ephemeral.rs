@@ -111,6 +111,36 @@ impl TieredWatchRuntime {
         true
     }
 
+    /// 轮转再选中时延展临时 watcher 到期时间（至少 now+ttl，绝不缩短）。
+    ///
+    /// watcher 连续存活即覆盖连续：coverage `Ready` 路径可继续跳过 seed 重扫；
+    /// 未被再选中的根保持原到期时间自然过期，选择语义不变。
+    pub fn renew_ephemeral_watch_ttl(&self, path: &Path, ttl_secs: u64) -> bool {
+        self.renew_ephemeral_watch_ttl_at(path, ttl_secs, unix_secs())
+    }
+
+    pub(super) fn renew_ephemeral_watch_ttl_at(
+        &self,
+        path: &Path,
+        ttl_secs: u64,
+        now: u64,
+    ) -> bool {
+        if ttl_secs == 0 {
+            return false;
+        }
+        let mut ephemeral = self.ephemeral.write();
+        let Some(lease) = ephemeral.get_mut(path) else {
+            return false;
+        };
+        let requested_expiry = now.saturating_add(ttl_secs);
+        lease.expires_unix_secs = if lease.expires_unix_secs == 0 {
+            requested_expiry
+        } else {
+            lease.expires_unix_secs.max(requested_expiry)
+        };
+        true
+    }
+
     pub(super) fn record_ephemeral_events(&self, paths: &[&PathBuf], now: u64) {
         if paths.is_empty() {
             return;

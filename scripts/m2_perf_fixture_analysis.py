@@ -271,5 +271,17 @@ def render_report(payload: dict[str, Any]) -> str:
         )
     else:
         lines.append("- burst disabled")
+    deep_modify = payload.get("deep_modify", {})
+    lines += ["", "## deep modify (§18.1)", ""]
+    if deep_modify.get("enabled"):
+        lines.append(
+            f"- deep in-place modify visible: {deep_modify.get('visible')} "
+            f"(latency {deep_modify.get('latency_secs')} s, tier "
+            f"{deep_modify.get('baseline_tier')} → {deep_modify.get('updated_tier')})"
+        )
+    elif deep_modify.get("skipped"):
+        lines.append(f"- skipped: {deep_modify['skipped']}")
+    else:
+        lines.append("- deep modify probe disabled")
     lines.append("")
     return "\n".join(lines)

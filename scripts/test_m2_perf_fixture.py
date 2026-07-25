@@ -199,6 +199,13 @@ class ReportRenderTests(unittest.TestCase):
                 "query_guard_hold_count": 10,
             },
             "burst": {"enabled": True, "visible": True, "latency_secs": 1.2},
+            "deep_modify": {
+                "enabled": True,
+                "visible": True,
+                "latency_secs": 40.1,
+                "baseline_tier": "ColdMmap",
+                "updated_tier": "HotMemory",
+            },
         }
 
         rendered = analysis.render_report(payload)
@@ -208,6 +215,8 @@ class ReportRenderTests(unittest.TestCase):
         self.assertIn("first bucket", rendered)
         self.assertIn("p50/p95/p99", rendered)
         self.assertIn("burst", rendered)
+        self.assertIn("deep modify", rendered)
+        self.assertIn("ColdMmap", rendered)
 
 
 class DaemonNamespaceTests(unittest.TestCase):
@@ -217,6 +226,7 @@ class DaemonNamespaceTests(unittest.TestCase):
         self.assertEqual(ns.rotating_budget, 128)
         self.assertEqual(ns.rotating_max_cost_per_root, 64)
         self.assertEqual(ns.rotating_max_dirs_per_tick, 8)
+        self.assertEqual(ns.rotating_full_sweep_period_secs, 1800)
         self.assertEqual(ns.max_watch_dirs, 8)
         self.assertEqual(ns.l0_max_cost_per_root, 1)
         self.assertTrue(ns.fast_scan)
@@ -230,6 +240,7 @@ class DaemonNamespaceTests(unittest.TestCase):
             port=6065,
             rotating_ttl_secs=45,
             rotating_tick_secs=15,
+            rotating_full_sweep_period_secs=0,
         )
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = fixture.BENCH.write_config(ns, Path(tmp))
@@ -237,6 +248,7 @@ class DaemonNamespaceTests(unittest.TestCase):
 
         self.assertIn("rotating_cold_window_enabled = true", content)
         self.assertIn("rotating_cold_window_ttl_secs = 45", content)
+        self.assertIn("rotating_full_sweep_period_secs = 0", content)
         self.assertIn("l1_l2_fast_scan_query_leases_enabled = false", content)
         self.assertIn("max_watch_dirs = 8", content)
 
