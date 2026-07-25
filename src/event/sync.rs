@@ -330,6 +330,11 @@ impl DirtyQueueEntry {
         self.recursive_subtree_repair
     }
 
+    /// 低优先级且启用切片节流的轮转 continuation：可被内联批处理。
+    pub fn is_paced_low_priority(&self) -> bool {
+        self.pace_repair_slices && self.priority == DirtyPriority::Low
+    }
+
     pub fn rotating_cold_window_cycle_id(&self) -> Option<u64> {
         self.rotating_cold_window_cycle_id
     }
@@ -578,7 +583,7 @@ impl DirtyQueue {
         now_ns: u64,
         cursor: DirtyRepairCursor,
     ) {
-        let pace_rotating_scan = source.pace_repair_slices && source.priority == DirtyPriority::Low;
+        let pace_rotating_scan = source.is_paced_low_priority();
         self.enqueue_request_with_delay(
             DirtyQueueRequest {
                 scope,
@@ -683,6 +688,26 @@ impl DirtyQueue {
             }
         }
         out
+    }
+
+    /// 仅当当前全部 ready 项都是低优先级 paced 轮转 continuation 时取出一批。
+    ///
+    /// 存在任何非 paced 或更高优先级的 ready 项时返回空，让主循环按优先级调度；
+    /// 未到期的高优先级项不阻止本批。供 blocking 线程内联续跑使用。
+    pub fn pop_ready_paced_low(&mut self, now_ns: u64, limit: usize) -> Vec<DirtyQueueEntry> {
+        let mut has_ready = false;
+        for entry in self.entries.values() {
+            if entry.not_before_ns <= now_ns {
+                if !entry.is_paced_low_priority() {
+                    return Vec::new();
+                }
+                has_ready = true;
+            }
+        }
+        if !has_ready {
+            return Vec::new();
+        }
+        self.pop_ready(now_ns, limit)
     }
 
     pub fn retry(&mut self, mut entry: DirtyQueueEntry, now_ns: u64) -> bool {
@@ -889,6 +914,96 @@ mod tests {
         assert_eq!(ready.len(), 2);
         assert_eq!(ready[0].priority, DirtyPriority::Critical);
         assert_eq!(ready[0].scope.dir_paths(), &[PathBuf::from("/tmp/high")]);
+    }
+
+    #[test]
+    fn dirty_queue_pop_paced_low_returns_batch_when_only_paced_ready() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        q.enqueue_paced_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/cold-a")]),
+            DirtyReason::RotatingColdWindow { cycle_id: 1 },
+            DirtyPriority::Low,
+            1,
+        );
+        q.enqueue_paced_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/cold-b")]),
+            DirtyReason::RotatingColdWindow { cycle_id: 1 },
+            DirtyPriority::Low,
+            1,
+        );
+
+        let ready = q.pop_ready_paced_low(1, 10);
+        assert_eq!(ready.len(), 2);
+        assert!(ready.iter().all(DirtyQueueEntry::is_paced_low_priority));
+    }
+
+    #[test]
+    fn dirty_queue_pop_paced_low_yields_to_any_higher_priority_ready_entry() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        q.enqueue_paced_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/cold-a")]),
+            DirtyReason::RotatingColdWindow { cycle_id: 1 },
+            DirtyPriority::Low,
+            1,
+        );
+        q.enqueue(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/hot")]),
+            DirtyReason::InotifyEvent,
+            DirtyPriority::Normal,
+            1,
+        );
+
+        // 存在更高优先级 ready 项：paced 批必须让出，由主循环按优先级调度。
+        assert!(q.pop_ready_paced_low(1, 10).is_empty());
+        let ready = q.pop_ready(1, 10);
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].priority, DirtyPriority::Normal);
+    }
+
+    #[test]
+    fn dirty_queue_pop_paced_low_yields_to_non_paced_low_entry() {
+        let mut q = DirtyQueue::new(Duration::ZERO);
+        q.enqueue_paced_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/cold-a")]),
+            DirtyReason::RotatingColdWindow { cycle_id: 1 },
+            DirtyPriority::Low,
+            1,
+        );
+        q.enqueue(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/cold-c")]),
+            DirtyReason::PeriodicColdScan,
+            DirtyPriority::Low,
+            1,
+        );
+
+        assert!(q.pop_ready_paced_low(1, 10).is_empty());
+    }
+
+    #[test]
+    fn dirty_queue_pop_paced_low_ignores_unready_higher_priority_entries() {
+        let mut q = DirtyQueue::new(Duration::from_millis(10));
+        q.enqueue_paced_recursive(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/cold-a")]),
+            DirtyReason::RotatingColdWindow { cycle_id: 1 },
+            DirtyPriority::Low,
+            100_000_000,
+        );
+        // debounce 10ms：110ms 前不 ready。
+        assert!(q.pop_ready_paced_low(105_000_000, 10).is_empty());
+
+        // 200ms 才 ready 的 Normal 项不应阻止已 ready 的 paced 批。
+        q.enqueue(
+            DirtyScope::dirs(0, vec![PathBuf::from("/tmp/hot")]),
+            DirtyReason::InotifyEvent,
+            DirtyPriority::Normal,
+            200_000_000,
+        );
+        let ready = q.pop_ready_paced_low(205_000_000, 10);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            ready[0].reason,
+            DirtyReason::RotatingColdWindow { cycle_id: 1 }
+        );
     }
 
     #[test]

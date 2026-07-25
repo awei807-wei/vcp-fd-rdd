@@ -967,6 +967,14 @@ impl TieredIndex {
         self.dirty_queue.lock().pop_ready(now_ns(), limit)
     }
 
+    /// 仅当全部 ready 项都是低优先级 paced 轮转 continuation 时取出一批。
+    ///
+    /// 供 dirty loop 的 blocking 线程内联续跑使用；任何更高优先级或非 paced
+    /// 的 ready 项存在时返回空，交回主循环按优先级调度。
+    pub fn dirty_queue_ready_paced_low_batch(&self, limit: usize) -> Vec<DirtyQueueEntry> {
+        self.dirty_queue.lock().pop_ready_paced_low(now_ns(), limit)
+    }
+
     /// Returns the precise wake delay for a paced dirty-queue continuation.
     pub fn dirty_queue_next_ready_delay(&self) -> Option<Duration> {
         self.dirty_queue.lock().next_ready_delay(now_ns())

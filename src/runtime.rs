@@ -13,7 +13,7 @@ use crate::event::ignore_filter::IgnoreFilter;
 use crate::event::proc_sampler::{
     sample_proc_write_dirs, ProcSamplerConfig, ProcSamplerCursor, ProcSamplerReport,
 };
-use crate::event::sync::{DirtyReason, DirtyScope};
+use crate::event::sync::{DirtyQueueEntry, DirtyReason, DirtyScope};
 use crate::event::tiered_watch::{
     rotating_cold_window_fast_scan_max_cost, EphemeralWatchConfig, EphemeralWatchDecision,
     FastScanLeaseKind, RotatingColdWindowAction, RotatingColdWindowActionKind,
@@ -39,7 +39,7 @@ use clap::Parser;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 // ---------------------------------------------------------------------------
@@ -58,6 +58,10 @@ const DEFAULT_METRICS_REPORT_INTERVAL_SECS: u64 = 30;
 const DIRTY_QUEUE_BATCH_SIZE: usize = 16;
 /// Idle poll interval for the dirty-queue loop (milliseconds).
 const DIRTY_QUEUE_IDLE_POLL_MS: u64 = 250;
+/// 低优先级 paced 轮转批在 blocking 线程内联续跑的单次预算。
+const DIRTY_QUEUE_PACED_INLINE_BUDGET: Duration = Duration::from_millis(300);
+/// 内联续跑允许等待的最大切片间隔；超过则交回主循环调度。
+const DIRTY_QUEUE_PACED_INLINE_MAX_SLEEP: Duration = Duration::from_millis(50);
 /// Minimum content-index worker interval (seconds).
 const CONTENT_INDEX_INTERVAL_MIN_SECS: u64 = 30;
 /// Maximum content-index worker interval (seconds).
@@ -1464,6 +1468,31 @@ fn strict_required_candidates(
         .collect()
 }
 
+/// 冷扫描条目的 manifest-skip 目录集：L2/L3 覆盖下的冷扫目标可复用 manifest。
+fn cold_scan_manifest_skip_dirs(
+    runtime: Option<&Arc<TieredWatchRuntime>>,
+    entries: &[DirtyQueueEntry],
+) -> HashSet<PathBuf> {
+    let Some(runtime) = runtime else {
+        return HashSet::new();
+    };
+    let mut skip_dirs = HashSet::new();
+    for entry in entries {
+        if !entry.reason.is_cold_scan() {
+            continue;
+        }
+        for dir in entry.scope.dir_paths() {
+            if matches!(
+                runtime.covering_tier(dir.as_path()),
+                Some(WatchTier::L2 | WatchTier::L3)
+            ) {
+                skip_dirs.insert(dir.clone());
+            }
+        }
+    }
+    skip_dirs
+}
+
 fn spawn_dirty_queue_loop(
     index: Arc<TieredIndex>,
     runtime: Option<Arc<TieredWatchRuntime>>,
@@ -1492,43 +1521,55 @@ fn spawn_dirty_queue_loop(
                 .map(|entry| entry.clone_without_repair_cursor())
                 .collect::<Vec<_>>();
             let work = batch;
-            let work_manifest_skip_dirs = runtime
-                .as_ref()
-                .map(|runtime| {
-                    let mut skip_dirs = HashSet::new();
-                    for entry in &work {
-                        if !entry.reason.is_cold_scan() {
-                            continue;
-                        }
-                        for dir in entry.scope.dir_paths() {
-                            if matches!(
-                                runtime.covering_tier(dir.as_path()),
-                                Some(WatchTier::L2 | WatchTier::L3)
-                            ) {
-                                skip_dirs.insert(dir.clone());
-                            }
-                        }
-                    }
-                    skip_dirs
-                })
-                .unwrap_or_default();
+            let work_manifest_skip_dirs = cold_scan_manifest_skip_dirs(runtime.as_ref(), &work);
             let work_index = index.clone();
             let work_ignore_prefixes = ignore_prefixes.clone();
             let work_project_markers = tiered.project_markers.clone();
+            let work_runtime = runtime.clone();
             let processed = tokio::task::spawn_blocking(move || {
-                work.into_iter()
-                    .map(|entry| {
+                let mut processed = Vec::new();
+                let mut work = work;
+                let mut work_skip_dirs = work_manifest_skip_dirs;
+                // 低优先级 paced 轮转批在本 blocking 线程内联续跑：保持切片间隔，
+                // 消除每目录一次 spawn_blocking 往返的跨线程唤醒写。每步续跑前
+                // pop_ready_paced_low 会在存在任何更高优先级/非 paced ready 项时
+                // 返回空，立即交回主循环；worker panic 时内联批不重试，
+                // 由下一个轮转周期自愈（与整周期重扫语义一致）。
+                let inline_deadline = Instant::now() + DIRTY_QUEUE_PACED_INLINE_BUDGET;
+                loop {
+                    let batch_all_paced_low =
+                        work.iter().all(DirtyQueueEntry::is_paced_low_priority);
+                    for entry in work {
                         let post_process_entry = entry.clone_without_repair_cursor();
                         let report = work_index
                             .process_dirty_entry_with_project_markers_and_manifest_skip_dirs(
                                 entry,
                                 &work_ignore_prefixes,
                                 &work_project_markers,
-                                &work_manifest_skip_dirs,
+                                &work_skip_dirs,
                             );
-                        (post_process_entry, report)
-                    })
-                    .collect::<Vec<_>>()
+                        processed.push((post_process_entry, report));
+                    }
+                    if !batch_all_paced_low || Instant::now() >= inline_deadline {
+                        break;
+                    }
+                    let Some(delay) = work_index.dirty_queue_next_ready_delay() else {
+                        break;
+                    };
+                    if delay > DIRTY_QUEUE_PACED_INLINE_MAX_SLEEP {
+                        break;
+                    }
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+                    let next = work_index.dirty_queue_ready_paced_low_batch(DIRTY_QUEUE_BATCH_SIZE);
+                    if next.is_empty() {
+                        break;
+                    }
+                    work_skip_dirs = cold_scan_manifest_skip_dirs(work_runtime.as_ref(), &next);
+                    work = next;
+                }
+                processed
             })
             .await;
 
