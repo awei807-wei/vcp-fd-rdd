@@ -310,6 +310,19 @@ struct WalSyncState {
     last_sync: Instant,
 }
 
+/// 将一条记录按 WAL 帧格式（len|crc|payload，小端）追加到缓冲。
+///
+/// 与逐段 write 的旧布局逐字节一致：len 截断到 u32::MAX 时 payload 同步截断，
+/// crc 仍按完整 payload 计算（历史行为，读侧按 len 校验）。
+fn frame_wal_payload(buffer: &mut Vec<u8>, payload: &[u8]) {
+    let len: u32 = payload.len().try_into().unwrap_or(u32::MAX);
+    let crc = wal_checksum(payload);
+    buffer.reserve(8 + len as usize);
+    buffer.extend_from_slice(&len.to_le_bytes());
+    buffer.extend_from_slice(&crc.to_le_bytes());
+    buffer.extend_from_slice(&payload[..len as usize]);
+}
+
 /// Append-only 事件日志（WAL）。
 ///
 /// - current: events.wal
@@ -350,15 +363,14 @@ impl WalStore {
         if events.is_empty() {
             return Ok(());
         }
-        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        // 批内所有帧在锁外拼成单个缓冲，锁内一次 write 落盘：
+        // 消除每事件 3 次小写（len/crc/payload）的 syscall 放大，字节流不变。
+        let mut framed = Vec::new();
         for ev in events {
-            let payload = encode_event(ev);
-            let len: u32 = payload.len().try_into().unwrap_or(u32::MAX);
-            let crc = wal_checksum(&payload);
-            f.write_all(&len.to_le_bytes())?;
-            f.write_all(&crc.to_le_bytes())?;
-            f.write_all(&payload[..len as usize])?;
+            frame_wal_payload(&mut framed, &encode_event(ev));
         }
+        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        f.write_all(&framed)?;
         f.flush()?;
         let durability = *self.durability.lock().unwrap_or_else(|e| e.into_inner());
         match durability {
@@ -390,15 +402,12 @@ impl WalStore {
         if records.is_empty() {
             return Ok(());
         }
-        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        let mut framed = Vec::new();
         for record in records {
-            let payload = encode_root_state_record(record);
-            let len: u32 = payload.len().try_into().unwrap_or(u32::MAX);
-            let crc = wal_checksum(&payload);
-            f.write_all(&len.to_le_bytes())?;
-            f.write_all(&crc.to_le_bytes())?;
-            f.write_all(&payload[..len as usize])?;
+            frame_wal_payload(&mut framed, &encode_root_state_record(record));
         }
+        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        f.write_all(&framed)?;
         f.flush()?;
         Ok(())
     }
@@ -1116,6 +1125,50 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("fd-rdd-wal-{}-{}", tag, nanos))
+    }
+
+    #[test]
+    fn frame_wal_payload_matches_legacy_three_part_layout() {
+        let payload = b"fd-rdd-frame-payload".to_vec();
+        let mut framed = Vec::new();
+        frame_wal_payload(&mut framed, &payload);
+
+        let len: u32 = payload.len() as u32;
+        let crc = wal_checksum(&payload);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&len.to_le_bytes());
+        expected.extend_from_slice(&crc.to_le_bytes());
+        expected.extend_from_slice(&payload);
+        assert_eq!(framed, expected);
+    }
+
+    #[test]
+    fn append_batch_writes_identical_bytes_and_replays() {
+        let dir = unique_tmp_dir("framing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal = WalStore::open_in_dir(dir.clone()).unwrap();
+        let events: Vec<EventRecord> = (0..3)
+            .map(|i| EventRecord {
+                seq: i,
+                timestamp: std::time::SystemTime::UNIX_EPOCH,
+                event_type: EventType::Create,
+                id: FileIdentifier::Path(dir.join(format!("f{i}.txt"))),
+                path_hint: Some(dir.join(format!("f{i}.txt"))),
+            })
+            .collect();
+        wal.append(&events).unwrap();
+
+        let mut expected = Vec::new();
+        for ev in &events {
+            frame_wal_payload(&mut expected, &encode_event(ev));
+        }
+        let written = std::fs::read(dir.join("events.wal")).unwrap();
+        // 文件头（magic+version，8 字节）之后必须与逐帧布局逐字节一致。
+        assert_eq!(written.len(), expected.len() + 8);
+        assert!(written.ends_with(&expected));
+
+        let replay = wal.replay_since_seal(0).unwrap();
+        assert_eq!(replay.events.len(), 3);
     }
 
     #[test]
