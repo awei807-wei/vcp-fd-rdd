@@ -202,7 +202,8 @@ class ReportRenderTests(unittest.TestCase):
             "deep_modify": {
                 "enabled": True,
                 "visible": True,
-                "latency_secs": 40.1,
+                "flagged_secs": 0.5,
+                "repaired_secs": 40.1,
                 "baseline_tier": "ColdMmap",
                 "updated_tier": "HotMemory",
             },
@@ -216,6 +217,8 @@ class ReportRenderTests(unittest.TestCase):
         self.assertIn("p50/p95/p99", rendered)
         self.assertIn("burst", rendered)
         self.assertIn("deep modify", rendered)
+        self.assertIn("verify channel flagged", rendered)
+        self.assertIn("sweep channel repaired", rendered)
         self.assertIn("ColdMmap", rendered)
 
 

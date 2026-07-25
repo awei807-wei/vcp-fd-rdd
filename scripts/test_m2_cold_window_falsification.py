@@ -968,6 +968,36 @@ class GateTests(unittest.TestCase):
         self.assertTrue(any("最大间隔" in reason for reason in result["reasons"]))
         self.assertTrue(any("计数器发生回退" in reason for reason in result["reasons"]))
 
+    def test_gate_dual_condition_tolerates_high_ratio_with_small_absolute_delta(
+        self,
+    ) -> None:
+        # 202607251527_m2-cost-gate-recovery 任务6 冻结的量纲修订：
+        # 近零基线上的 CPU/读 syscall 比值失真由绝对预算吸收（比值+绝对双门）。
+        legs = self.passing_legs()
+        for leg in legs:
+            if leg["variant"] == "a":
+                leg["resources"]["cpu_core_seconds"] = 12.0
+                leg["resources"]["read_syscalls_delta"] = 5_000
+
+        result = gate.evaluate_suite(legs)
+
+        self.assertEqual(result["decision"], "pass")
+        self.assertGreater(result["median_cpu_ratio"], 1.10)
+        self.assertGreater(result["median_read_syscalls_ratio"], 1.10)
+
+    def test_gate_rejects_when_ratio_and_absolute_both_exceed(self) -> None:
+        legs = self.passing_legs()
+        for leg in legs:
+            if leg["variant"] == "a":
+                leg["resources"]["cpu_core_seconds"] = 16.0
+                leg["resources"]["read_syscalls_delta"] = 20_000
+
+        result = gate.evaluate_suite(legs)
+
+        self.assertEqual(result["decision"], "fail")
+        self.assertTrue(any("CPU" in reason for reason in result["reasons"]))
+        self.assertTrue(any("read syscalls" in reason for reason in result["reasons"]))
+
     def test_gate_reports_paired_resource_and_roi_observations(self) -> None:
         result = gate.evaluate_suite(self.passing_legs())
 
@@ -1009,8 +1039,12 @@ class GateTests(unittest.TestCase):
 
         self.assertEqual(result["median_cpu_ratio"], 1.0)
         self.assertEqual(result["decision"], "fail")
+        # 双门语义:比例(2.0)与绝对增量(10 core-s)同时超限才拒绝,病态块仍被拦截。
         self.assertTrue(
-            any("block 1 配对 CPU" in reason for reason in result["reasons"])
+            any(
+                "block 1 CPU 同时超过比例和绝对增量门槛" in reason
+                for reason in result["reasons"]
+            )
         )
 
     def test_gate_uses_ratio_and_absolute_threshold_for_rss_and_minor_faults(self) -> None:
@@ -2222,6 +2256,8 @@ class ReportTests(unittest.TestCase):
         self.assertIn("incremental write / recovered path", rendered)
         self.assertIn("配对查询工作诊断", rendered)
         self.assertIn("不参与成本硬门", rendered)
+        self.assertIn("C 组参考", rendered)
+        self.assertIn("双门", rendered)
         self.assertIn("10.000/1.020", rendered)
         self.assertIn("9.050/0.405", rendered)
         self.assertIn("4200/160", rendered)

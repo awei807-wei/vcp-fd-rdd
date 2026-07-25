@@ -206,35 +206,49 @@ def _search_entry(base_url: str, path: Path) -> dict[str, Any] | None:
 def _run_deep_modify_probe(
     base_url: str, cold_root: Path, timeout_secs: float
 ) -> dict[str, Any]:
-    """§18.1 探针：改写已有深层文件内容（所有目录 mtime 不变），
-    唯一合法检出通道是完整递归 sweep 的逐 entry freshness；
-    以 /search 返回的 index_tier/freshness 翻转（冷层→overlay）判定可见。"""
+    """§18.1 两相探针：改写已有深层文件内容（所有目录 mtime 不变）。
+
+    相位一（flagged）：查询端冷结果验真在下一次查询就应把 freshness 标为
+    changed——用户可见的陈旧标记即时生效，与 sweep 无关。
+    相位二（repaired）：完整递归 sweep 检出 mtime 变化并 upsert，条目翻到
+    overlay（tier 变化或 freshness 回 fresh）——这是索引修复的 SLA 通道。
+    """
     target = cold_root / "d100" / "file_100.txt"
     baseline = _search_entry(base_url, target)
     if baseline is None:
         return {"enabled": True, "visible": False, "error": "baseline entry missing"}
+    baseline_tier = baseline.get("index_tier")
     target.write_text("deep modify probe payload\n", encoding="utf-8")
     started = time.monotonic()
     deadline = started + timeout_secs
+    flagged_secs: float | None = None
+    last_tier = baseline_tier
     while time.monotonic() < deadline:
         entry = _search_entry(base_url, target)
-        if entry is not None and (
-            entry.get("index_tier") != baseline.get("index_tier")
-            or entry.get("freshness") != baseline.get("freshness")
-        ):
-            return {
-                "enabled": True,
-                "visible": True,
-                "latency_secs": round(time.monotonic() - started, 3),
-                "baseline_tier": baseline.get("index_tier"),
-                "updated_tier": entry.get("index_tier"),
-            }
+        if entry is not None:
+            freshness = str(entry.get("freshness", ""))
+            last_tier = entry.get("index_tier")
+            if flagged_secs is None and (
+                freshness == "changed" or entry.get("validated") is False
+            ):
+                flagged_secs = round(time.monotonic() - started, 3)
+            if last_tier != baseline_tier or freshness == "fresh":
+                return {
+                    "enabled": True,
+                    "visible": True,
+                    "flagged_secs": flagged_secs,
+                    "repaired_secs": round(time.monotonic() - started, 3),
+                    "baseline_tier": baseline_tier,
+                    "updated_tier": last_tier,
+                }
         time.sleep(0.5)
     return {
         "enabled": True,
         "visible": False,
-        "latency_secs": round(time.monotonic() - started, 3),
-        "baseline_tier": baseline.get("index_tier"),
+        "flagged_secs": flagged_secs,
+        "repaired_secs": None,
+        "baseline_tier": baseline_tier,
+        "updated_tier": last_tier,
     }
 
 

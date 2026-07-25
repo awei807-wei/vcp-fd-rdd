@@ -27,6 +27,11 @@ MINOR_FAULT_RATIO_LIMIT = 1.25
 MINOR_FAULT_DELTA_LIMIT = 10_000
 MAJOR_FAULT_DELTA_LIMIT = 8
 QUERY_POLL_RATIO_LIMIT = 1.02
+# 2026-07-25 方案包 202607251527_m2-cost-gate-recovery 任务6 冻结的量纲修订：
+# 近零基线（B 组不做该功能）上的比值门必然失真，CPU 与读 syscall 与 RSS/
+# minor-fault 同构地改为"比值+绝对增量"双门；正式跑之后不得调整。
+CPU_DELTA_LIMIT_CORE_SECONDS = 5.0
+READ_SYSCALL_DELTA_LIMIT = 15_000
 MIN_BENEFIT_BLOCKS = 3
 MIN_SUCCESS_RATE_GAIN = 0.05
 MIN_BENEFIT_BURSTS = 3
@@ -203,6 +208,8 @@ def _pair_row(block: int, a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any
         "write_bytes_per_recovered_path": _per_recovered(write_delta, recovered),
         "rss_p95_delta_bytes": int(ar["rss_bytes_p95"])
         - int(br["rss_bytes_p95"]),
+        "read_syscalls_delta_count": int(ar["read_syscalls_delta"])
+        - int(br["read_syscalls_delta"]),
         "minor_faults_delta_count": int(ar["minor_faults_delta"])
         - int(br["minor_faults_delta"]),
         "major_faults_delta_count": int(ar["major_faults_delta"])
@@ -240,6 +247,8 @@ def _median_ratios(rows: list[dict[str, Any]]) -> dict[str, float]:
         "median_write_syscalls_ratio": "write_syscalls_ratio",
         "median_rss_p95_ratio": "rss_p95_ratio",
         "median_rss_p95_delta_bytes": "rss_p95_delta_bytes",
+        "median_incremental_cpu_core_seconds": "incremental_cpu_core_seconds",
+        "median_read_syscalls_delta_count": "read_syscalls_delta_count",
         "median_minor_faults_ratio": "minor_faults_ratio",
         "median_minor_faults_delta_count": "minor_faults_delta_count",
         "median_major_faults_ratio": "major_faults_ratio",
@@ -260,13 +269,7 @@ def _median_ratios(rows: list[dict[str, Any]]) -> dict[str, float]:
 
 def _validate_cost_limits(medians: dict[str, float], reasons: list[str]) -> None:
     ratio_limits = (
-        ("median_cpu_ratio", CPU_RATIO_LIMIT, "CPU"),
         ("median_read_bytes_ratio", READ_RATIO_LIMIT, "read_bytes"),
-        (
-            "median_read_syscalls_ratio",
-            READ_SYSCALL_RATIO_LIMIT,
-            "read syscalls",
-        ),
         ("median_write_bytes_ratio", WRITE_RATIO_LIMIT, "write_bytes"),
         (
             "median_write_syscalls_ratio",
@@ -284,6 +287,22 @@ def _validate_cost_limits(medians: dict[str, float], reasons: list[str]) -> None
             reasons.append(
                 f"配对 {label} 中位比 {medians[field]:.3f} 超过 {limit:.2f}"
             )
+    if (
+        medians["median_cpu_ratio"] > CPU_RATIO_LIMIT
+        and medians["median_incremental_cpu_core_seconds"] > CPU_DELTA_LIMIT_CORE_SECONDS
+    ):
+        reasons.append(
+            f"配对 CPU 同时超过 {CPU_RATIO_LIMIT:.2f} 倍和 "
+            f"{CPU_DELTA_LIMIT_CORE_SECONDS:.0f} core-s 增量门槛"
+        )
+    if (
+        medians["median_read_syscalls_ratio"] > READ_SYSCALL_RATIO_LIMIT
+        and medians["median_read_syscalls_delta_count"] > READ_SYSCALL_DELTA_LIMIT
+    ):
+        reasons.append(
+            f"配对 read syscalls 同时超过 {READ_SYSCALL_RATIO_LIMIT:.2f} 倍和 "
+            f"{READ_SYSCALL_DELTA_LIMIT} 次增量门槛"
+        )
     if (
         medians["median_rss_p95_ratio"] > RSS_RATIO_LIMIT
         and medians["median_rss_p95_delta_bytes"] > RSS_DELTA_LIMIT_BYTES
@@ -304,9 +323,7 @@ def _validate_cost_limits(medians: dict[str, float], reasons: list[str]) -> None
 def _validate_pair_cost_limits(rows: list[dict[str, Any]], reasons: list[str]) -> None:
     """Reject a single pathological block even when its median is hidden."""
     ratio_limits = (
-        ("cpu_ratio", CPU_RATIO_LIMIT, "CPU"),
         ("read_ratio", READ_RATIO_LIMIT, "read_bytes"),
-        ("read_syscalls_ratio", READ_SYSCALL_RATIO_LIMIT, "read syscalls"),
         ("write_ratio", WRITE_RATIO_LIMIT, "write_bytes"),
         ("write_syscalls_ratio", WRITE_SYSCALL_RATIO_LIMIT, "write syscalls"),
         (
@@ -323,6 +340,18 @@ def _validate_pair_cost_limits(rows: list[dict[str, Any]], reasons: list[str]) -
                 reasons.append(
                     f"block {block} 配对 {label} 比 {value:.3f} 超过 {limit:.2f}"
                 )
+        if (
+            float(row["cpu_ratio"]) > CPU_RATIO_LIMIT
+            and float(row["incremental_cpu_core_seconds"]) > CPU_DELTA_LIMIT_CORE_SECONDS
+        ):
+            reasons.append(f"block {block} CPU 同时超过比例和绝对增量门槛")
+        if (
+            float(row["read_syscalls_ratio"]) > READ_SYSCALL_RATIO_LIMIT
+            and int(row["read_syscalls_delta_count"]) > READ_SYSCALL_DELTA_LIMIT
+        ):
+            reasons.append(
+                f"block {block} read syscalls 同时超过比例和绝对增量门槛"
+            )
         if (
             float(row["rss_p95_ratio"]) > RSS_RATIO_LIMIT
             and int(row["rss_p95_delta_bytes"]) > RSS_DELTA_LIMIT_BYTES

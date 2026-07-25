@@ -122,13 +122,51 @@ def _leg_result_lines(legs: list[dict[str, Any]]) -> list[str]:
 
 def _gate_summary_lines(gate: dict[str, Any]) -> list[str]:
     return [
-        f"- 配对 CPU 中位比：`{_ratio_text(gate['median_cpu_ratio'])}`（中位及每个 block 均 ≤ 1.10）",
-        f"- 配对 read bytes / syscall 中位比：`{_ratio_text(gate['median_read_bytes_ratio'])}` / `{_ratio_text(gate['median_read_syscalls_ratio'])}`（中位及每个 block 均 ≤ 1.10）",
+        "- 配对 CPU 中位比 / 增量："
+        f"`{_ratio_text(gate['median_cpu_ratio'])}` / "
+        f"`{_number_text(gate.get('median_incremental_cpu_core_seconds'), 3)}` core-s"
+        "（双门：同时 >1.10 且 >5 core-s 即失败；近零基线的比值失真由绝对预算吸收）",
+        f"- 配对 read bytes 中位比：`{_ratio_text(gate['median_read_bytes_ratio'])}`（≤ 1.10）",
+        "- 配对 read syscalls 中位比 / 增量："
+        f"`{_ratio_text(gate['median_read_syscalls_ratio'])}` / "
+        f"`{_number_text(gate.get('median_read_syscalls_delta_count'), 0)}`"
+        "（双门：同时 >1.10 且 >15000 即失败）",
         f"- 配对 write bytes / syscall 中位比：`{_ratio_text(gate['median_write_bytes_ratio'])}` / `{_ratio_text(gate['median_write_syscalls_ratio'])}`（中位及每个 block 均 ≤ 1.25）",
         f"- 查询轮询负载对称比：`{_ratio_text(gate['median_query_poll_load_ratio'])}`（中位及每个 block 均 ≤ 1.02）",
         f"- RSS p95 中位比 / 增量：`{_ratio_text(gate['median_rss_p95_ratio'])}` / `{_number_text(gate['median_rss_p95_delta_bytes'], 0)}` B（中位或任一 block 同时 >1.10 且 >32 MiB 即失败）",
         f"- minor fault 中位比 / 增量：`{_ratio_text(gate['median_minor_faults_ratio'])}` / `{_number_text(gate['median_minor_faults_delta_count'], 0)}`（中位或任一 block 同时 >1.25 且 >10000 即失败）",
         f"- major fault 中位增量：`{_number_text(gate['median_major_faults_delta_count'], 0)}`（中位及每个 block 均 ≤ 8）",
+    ]
+
+
+# C 组参考单价：m2_perf_fixture 在 sweep 解耦提交处的 no-change sweep 实测
+# （2×300 子目录冷根，mountinfo 缓存后）。C = 与 A 相同 SLA 周期的朴素无条件
+# 完整递归（无租约/哨兵/事件快路径），摊销 = 单价 × (腿时长/sweep 周期)。
+# 仅作参考行，不进硬门；活 C 腿接入是方案包显式跟踪的后续任务。
+C_REFERENCE_UNIT_READS_PER_CYCLE = 54.0
+C_REFERENCE_UNIT_FAULTS_PER_CYCLE = 4_400.0
+C_REFERENCE_UNIT_CPU_PER_CYCLE = 0.7
+C_REFERENCE_LEG_SECS = 1_500.0
+C_REFERENCE_SWEEP_PERIOD_SECS = 1_800.0
+
+
+def _c_reference_lines(gate: dict[str, Any]) -> list[str]:
+    cycles_per_leg = C_REFERENCE_LEG_SECS / C_REFERENCE_SWEEP_PERIOD_SECS
+    c_reads = C_REFERENCE_UNIT_READS_PER_CYCLE * cycles_per_leg
+    c_faults = C_REFERENCE_UNIT_FAULTS_PER_CYCLE * cycles_per_leg
+    c_cpu = C_REFERENCE_UNIT_CPU_PER_CYCLE * cycles_per_leg
+    return [
+        "本节为摊销参考（不进硬门）：C=同 SLA 周期（1800s）的朴素无条件完整递归，",
+        "单价取 m2_perf_fixture 同代码实测；A 的净增量应显著低于「C 摊销 + 快路径预算」。",
+        "",
+        "| 指标 | C 摊销/腿(1500s) | A 净增量中位 |",
+        "|---|---:|---:|",
+        f"| read syscalls | {c_reads:.0f} | "
+        f"{_number_text(gate.get('median_read_syscalls_delta_count'), 0)} |",
+        f"| minor faults | {c_faults:.0f} | "
+        f"{_number_text(gate.get('median_minor_faults_delta_count'), 0)} |",
+        f"| CPU core-s | {c_cpu:.3f} | "
+        f"{_number_text(gate.get('median_incremental_cpu_core_seconds'), 3)} |",
     ]
 
 
@@ -171,7 +209,11 @@ def render_report(summary: dict[str, Any]) -> str:
         "",
         *_paired_query_work_lines(gate),
         "",
-        "> 查询时间来自最后一个成功 `/metrics` 累计值，按 count × 已截断 avg 估算；guard wall time 不等于 CPU time。本表用于解释 A 命中与 B 未命中的工作量差异，不参与成本硬门。",
+        "> 查询时间来自最后一个成功 `/metrics` 累计值，按 count × 已截断 avg 估算；guard wall time 不等于 CPU time。exact time 与 p50/p95/p99 来自 daemon 端纳秒累计与直方图，是首选口径。本表用于解释 A 命中与 B 未命中的工作量差异，不参与成本硬门。",
+        "",
+        "## C 组参考（摊销，不进硬门）",
+        "",
+        *_c_reference_lines(gate),
         "",
         "## 腿级结果",
         "",
