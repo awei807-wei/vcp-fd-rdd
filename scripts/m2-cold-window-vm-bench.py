@@ -4292,6 +4292,10 @@ def summarize(run_dir: Path, label: str, exit_code: int | None) -> dict[str, Any
         ),
         "query_guard_hold_max_us": metric_int("query_guard_hold_max_us"),
         "query_guard_slow_count": metric_int("query_guard_slow_count"),
+        "query_guard_hold_total_ns": metric_int("query_guard_hold_total_ns"),
+        "query_guard_hold_p50_us": metric_int("query_guard_hold_p50_us"),
+        "query_guard_hold_p95_us": metric_int("query_guard_hold_p95_us"),
+        "query_guard_hold_p99_us": metric_int("query_guard_hold_p99_us"),
     }
 
     def nums(samples: list[dict[str, Any]], key: str) -> list[float]:
@@ -5300,6 +5304,8 @@ def write_report(run_dir: Path, summary: dict[str, Any]) -> None:
 | query total time estimate | {summary["query_work"]["queries_total_us_estimate"] / 1_000_000:.6f} s |
 | query guard hold count / average us | {summary["query_work"]["query_guard_hold_count"]} / {summary["query_work"]["query_guard_hold_avg_us"]} |
 | query guard hold time estimate | {summary["query_work"]["query_guard_hold_total_us_estimate"] / 1_000_000:.6f} s |
+| query guard hold exact time | {summary["query_work"]["query_guard_hold_total_ns"] / 1_000_000_000:.6f} s |
+| query guard hold p50/p95/p99 | {summary["query_work"]["query_guard_hold_p50_us"]} / {summary["query_work"]["query_guard_hold_p95_us"]} / {summary["query_work"]["query_guard_hold_p99_us"]} us |
 | event-storm-window samples | {summary["process_after_event_storm_start"]["sample_count"]} |
 | event-storm-window CPU core seconds | {summary["process_after_event_storm_start"]["cpu_core_seconds"]} |
 | event-storm-window read bytes delta | {summary["process_after_event_storm_start"]["read_bytes_delta"]} |

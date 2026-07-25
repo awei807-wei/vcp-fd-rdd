@@ -1055,14 +1055,14 @@ impl<'a> QueryGenerationGuard<'a> {
 
 impl Drop for QueryGenerationGuard<'_> {
     fn drop(&mut self) {
-        let elapsed_us = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let elapsed_ns = self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         if self
             .index
-            .finish_query_guard_metric(elapsed_us, QUERY_GUARD_SLOW_THRESHOLD_US)
+            .finish_query_guard_metric_ns(elapsed_ns, QUERY_GUARD_SLOW_THRESHOLD_US)
         {
             tracing::warn!(
                 "query generation guard held for {}us (threshold={}us)",
-                elapsed_us,
+                elapsed_ns / 1_000,
                 QUERY_GUARD_SLOW_THRESHOLD_US
             );
         }

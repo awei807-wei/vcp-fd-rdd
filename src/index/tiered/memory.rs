@@ -111,6 +111,10 @@ impl TieredIndex {
             hold_max_us: stats.query_guard_hold_max_us,
             last_hold_us: stats.query_guard_last_hold_us,
             slow_count: stats.query_guard_slow_count,
+            hold_total_ns: stats.query_guard_hold_total_ns,
+            hold_p50_us: stats.query_guard_hold_p50_us,
+            hold_p95_us: stats.query_guard_hold_p95_us,
+            hold_p99_us: stats.query_guard_hold_p99_us,
         }
     }
 

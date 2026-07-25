@@ -383,6 +383,10 @@ def _query_work_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "query_guard_hold_total_us_estimate",
         "query_guard_hold_max_us",
         "query_guard_slow_count",
+        "query_guard_hold_total_ns",
+        "query_guard_hold_p50_us",
+        "query_guard_hold_p95_us",
+        "query_guard_hold_p99_us",
     )
     result = {
         field: int(query_work.get(field, 0) or 0) for field in integer_fields

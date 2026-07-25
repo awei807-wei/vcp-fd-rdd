@@ -714,12 +714,13 @@ impl TieredIndex {
         self.stats.begin_query_guard();
     }
 
-    pub(crate) fn finish_query_guard_metric(
+    pub(crate) fn finish_query_guard_metric_ns(
         &self,
-        elapsed_us: u64,
+        elapsed_ns: u64,
         slow_threshold_us: u64,
     ) -> bool {
-        self.stats.finish_query_guard(elapsed_us, slow_threshold_us)
+        self.stats
+            .finish_query_guard_ns(elapsed_ns, slow_threshold_us)
     }
 
     pub(crate) fn record_exact_query_metric(&self) {

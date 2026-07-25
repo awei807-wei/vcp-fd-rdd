@@ -58,8 +58,8 @@ def _paired_cost_lines(gate: dict[str, Any]) -> list[str]:
 
 def _paired_query_work_lines(gate: dict[str, Any]) -> list[str]:
     lines = [
-        "| block | query count A/B | avg us A/B | estimated query time A/B (s) | estimated ratio | guard avg us A/B | estimated guard time A/B (s) |",
-        "|---:|---:|---:|---:|---:|---:|---:|",
+        "| block | query count A/B | avg us A/B | estimated query time A/B (s) | estimated ratio | guard avg us A/B | estimated guard time A/B (s) | guard exact time A/B (s) | guard p95 us A/B | guard p99 us A/B |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in gate["paired"]:
         lines.append(
@@ -70,7 +70,11 @@ def _paired_query_work_lines(gate: dict[str, Any]) -> list[str]:
             f"{_ratio_text(row['query_time_estimate_ratio'])} | "
             f"{row['a_query_guard_avg_us']}/{row['b_query_guard_avg_us']} | "
             f"{row['a_query_guard_seconds_estimate']:.3f}/"
-            f"{row['b_query_guard_seconds_estimate']:.3f} |"
+            f"{row['b_query_guard_seconds_estimate']:.3f} | "
+            f"{row.get('a_query_guard_seconds_exact', 0.0):.3f}/"
+            f"{row.get('b_query_guard_seconds_exact', 0.0):.3f} | "
+            f"{row.get('a_query_guard_p95_us', 0)}/{row.get('b_query_guard_p95_us', 0)} | "
+            f"{row.get('a_query_guard_p99_us', 0)}/{row.get('b_query_guard_p99_us', 0)} |"
         )
     return lines
 

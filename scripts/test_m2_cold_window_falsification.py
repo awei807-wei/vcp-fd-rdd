@@ -204,6 +204,10 @@ def synthetic_leg(
             "query_guard_hold_total_us_estimate": 9_000_000 if variant == "a" else 408_000,
             "query_guard_hold_max_us": 9000 if variant == "a" else 1000,
             "query_guard_slow_count": 12 if variant == "a" else 0,
+            "query_guard_hold_total_ns": 9_050_000_000 if variant == "a" else 405_000_000,
+            "query_guard_hold_p50_us": 1500 if variant == "a" else 70,
+            "query_guard_hold_p95_us": 4200 if variant == "a" else 160,
+            "query_guard_hold_p99_us": 8800 if variant == "a" else 320,
         },
         "mechanism": {
             "rotating_active_dirs_max": 1 if variant == "a" else 0,
@@ -445,6 +449,10 @@ class LegAnalysisTests(unittest.TestCase):
                             "query_guard_hold_total_us_estimate": 20000,
                             "query_guard_hold_max_us": 500,
                             "query_guard_slow_count": 0,
+                            "query_guard_hold_total_ns": 20_500_000,
+                            "query_guard_hold_p50_us": 150,
+                            "query_guard_hold_p95_us": 380,
+                            "query_guard_hold_p99_us": 480,
                         },
                         "watch_state": {
                             "waterline_soft_degraded_ratio": 0.0,
@@ -517,6 +525,10 @@ class LegAnalysisTests(unittest.TestCase):
             self.assertEqual(result["resources"]["window_source"], "full_run")
             self.assertEqual(result["resources"]["cpu_core_seconds"], 2.5)
             self.assertEqual(result["query_work"]["queries_total_us_estimate"], 25000)
+            self.assertEqual(
+                result["query_work"]["query_guard_hold_total_ns"], 20_500_000
+            )
+            self.assertEqual(result["query_work"]["query_guard_hold_p95_us"], 380)
 
     def test_transport_failure_cannot_count_as_a_correct_negative_result(self) -> None:
         result = falsification._analyze_correctness(
@@ -969,6 +981,12 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result["paired"][0]["a_query_total_seconds_estimate"], 10.0)
         self.assertEqual(result["paired"][0]["b_query_total_seconds_estimate"], 1.02)
         self.assertGreater(result["paired"][0]["query_time_estimate_ratio"], 9.0)
+        self.assertEqual(result["paired"][0]["a_query_guard_seconds_exact"], 9.05)
+        self.assertEqual(result["paired"][0]["b_query_guard_seconds_exact"], 0.405)
+        self.assertEqual(result["paired"][0]["a_query_guard_p95_us"], 4200)
+        self.assertEqual(result["paired"][0]["b_query_guard_p95_us"], 160)
+        self.assertEqual(result["paired"][0]["a_query_guard_p99_us"], 8800)
+        self.assertEqual(result["paired"][0]["b_query_guard_p99_us"], 320)
 
     def test_gate_rejects_write_or_query_load_asymmetry(self) -> None:
         legs = self.passing_legs()
@@ -2205,6 +2223,9 @@ class ReportTests(unittest.TestCase):
         self.assertIn("配对查询工作诊断", rendered)
         self.assertIn("不参与成本硬门", rendered)
         self.assertIn("10.000/1.020", rendered)
+        self.assertIn("9.050/0.405", rendered)
+        self.assertIn("4200/160", rendered)
+        self.assertIn("8800/320", rendered)
         self.assertIn("2000/2000", rendered)
         self.assertIn("主收益端点", rendered)
         self.assertIn("rebuild total:bootstrap:quiesce:unattributed", rendered)

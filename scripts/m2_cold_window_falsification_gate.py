@@ -80,6 +80,18 @@ def _query_work_pair_fields(a: dict[str, Any], b: dict[str, Any]) -> dict[str, A
             int(b.get("query_guard_hold_total_us_estimate", 0) or 0) / 1_000_000,
             6,
         ),
+        "a_query_guard_seconds_exact": round(
+            int(a.get("query_guard_hold_total_ns", 0) or 0) / 1_000_000_000,
+            6,
+        ),
+        "b_query_guard_seconds_exact": round(
+            int(b.get("query_guard_hold_total_ns", 0) or 0) / 1_000_000_000,
+            6,
+        ),
+        "a_query_guard_p95_us": int(a.get("query_guard_hold_p95_us", 0) or 0),
+        "b_query_guard_p95_us": int(b.get("query_guard_hold_p95_us", 0) or 0),
+        "a_query_guard_p99_us": int(a.get("query_guard_hold_p99_us", 0) or 0),
+        "b_query_guard_p99_us": int(b.get("query_guard_hold_p99_us", 0) or 0),
     }
 
 

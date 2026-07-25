@@ -421,6 +421,10 @@ pub struct QueryGuardStats {
     pub hold_max_us: u64,
     pub last_hold_us: u64,
     pub slow_count: u64,
+    pub hold_total_ns: u64,
+    pub hold_p50_us: u64,
+    pub hold_p95_us: u64,
+    pub hold_p99_us: u64,
 }
 
 impl MemoryReport {
@@ -890,6 +894,10 @@ pub struct StatsReport {
     pub query_guard_hold_max_us: u64,
     pub query_guard_last_hold_us: u64,
     pub query_guard_slow_count: u64,
+    pub query_guard_hold_total_ns: u64,
+    pub query_guard_hold_p50_us: u64,
+    pub query_guard_hold_p95_us: u64,
+    pub query_guard_hold_p99_us: u64,
     pub exact_queries_total: u64,
     pub fuzzy_queries_total: u64,
     pub query_no_trigram_hint_count: u64,
@@ -908,6 +916,68 @@ pub struct StatsReport {
     pub refresh_base_count: u64,
 }
 
+/// Query guard 持有时长直方图：1/4 八度对数桶，微秒口径。
+///
+/// 索引 0..=3 直接对应 0..=3us；其余索引为 `octave*4 + sub`（sub 取前导 1 之后两位），
+/// 桶区间为 `[2^octave*(4+sub)/4, 2^octave*(5+sub)/4)`，分辨率约 +25%。
+/// 最后一桶收纳全部溢出样本，分位数落入时回退为精确 max。
+const QUERY_GUARD_HISTOGRAM_BUCKETS: usize = 112;
+
+#[derive(Debug)]
+struct QueryGuardHistogram([std::sync::atomic::AtomicU64; QUERY_GUARD_HISTOGRAM_BUCKETS]);
+
+impl Default for QueryGuardHistogram {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| {
+            std::sync::atomic::AtomicU64::new(0)
+        }))
+    }
+}
+
+fn query_guard_bucket_index(hold_us: u64) -> usize {
+    if hold_us < 4 {
+        return hold_us as usize;
+    }
+    let octave = (63 - hold_us.leading_zeros()) as usize;
+    let sub = ((hold_us >> (octave - 2)) & 0b11) as usize;
+    (octave * 4 + sub).min(QUERY_GUARD_HISTOGRAM_BUCKETS - 1)
+}
+
+fn query_guard_bucket_upper_us(index: usize) -> u64 {
+    if index < 4 {
+        return index as u64;
+    }
+    let octave = index / 4;
+    let sub = (index % 4) as u64;
+    (1u64 << (octave - 2)) * (5 + sub)
+}
+
+fn query_guard_percentile_us(
+    histogram: &[u64; QUERY_GUARD_HISTOGRAM_BUCKETS],
+    total: u64,
+    percent: u64,
+    max_us: u64,
+) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let rank = (total * percent).div_ceil(100).max(1);
+    let mut cumulative = 0u64;
+    for (index, count) in histogram.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        cumulative += count;
+        if cumulative >= rank {
+            if index == QUERY_GUARD_HISTOGRAM_BUCKETS - 1 {
+                return max_us;
+            }
+            return query_guard_bucket_upper_us(index);
+        }
+    }
+    max_us
+}
+
 /// Thread-safe runtime stats collector.
 #[derive(Debug, Default)]
 pub struct StatsCollector {
@@ -916,9 +986,11 @@ pub struct StatsCollector {
     query_guard_active_count: std::sync::atomic::AtomicU64,
     query_guard_hold_count: std::sync::atomic::AtomicU64,
     query_guard_hold_total_us: std::sync::atomic::AtomicU64,
+    query_guard_hold_total_ns: std::sync::atomic::AtomicU64,
     query_guard_hold_max_us: std::sync::atomic::AtomicU64,
     query_guard_last_hold_us: std::sync::atomic::AtomicU64,
     query_guard_slow_count: std::sync::atomic::AtomicU64,
+    query_guard_hold_histogram: QueryGuardHistogram,
     exact_queries_total: std::sync::atomic::AtomicU64,
     fuzzy_queries_total: std::sync::atomic::AtomicU64,
     query_no_trigram_hint_count: std::sync::atomic::AtomicU64,
@@ -955,16 +1027,25 @@ impl StatsCollector {
     }
 
     pub fn finish_query_guard(&self, elapsed_us: u64, slow_threshold_us: u64) -> bool {
+        self.finish_query_guard_ns(elapsed_us.saturating_mul(1_000), slow_threshold_us)
+    }
+
+    pub fn finish_query_guard_ns(&self, elapsed_ns: u64, slow_threshold_us: u64) -> bool {
+        let elapsed_us = elapsed_ns / 1_000;
         self.query_guard_active_count
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.query_guard_hold_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.query_guard_hold_total_us
             .fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+        self.query_guard_hold_total_ns
+            .fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
         self.query_guard_hold_max_us
             .fetch_max(elapsed_us, std::sync::atomic::Ordering::Relaxed);
         self.query_guard_last_hold_us
             .store(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+        self.query_guard_hold_histogram.0[query_guard_bucket_index(elapsed_us)]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let slow = elapsed_us >= slow_threshold_us;
         if slow {
             self.query_guard_slow_count
@@ -1063,6 +1144,19 @@ impl StatsCollector {
         let query_guard_hold_total_us = self
             .query_guard_hold_total_us
             .load(std::sync::atomic::Ordering::Relaxed);
+        let query_guard_hold_max_us = self
+            .query_guard_hold_max_us
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut histogram = [0u64; QUERY_GUARD_HISTOGRAM_BUCKETS];
+        let mut histogram_total = 0u64;
+        for (slot, bucket) in histogram
+            .iter_mut()
+            .zip(self.query_guard_hold_histogram.0.iter())
+        {
+            let count = bucket.load(std::sync::atomic::Ordering::Relaxed);
+            *slot = count;
+            histogram_total += count;
+        }
         StatsReport {
             queries_total: total,
             queries_avg_us: total_us.checked_div(total).unwrap_or(0),
@@ -1073,15 +1167,34 @@ impl StatsCollector {
             query_guard_hold_avg_us: query_guard_hold_total_us
                 .checked_div(query_guard_hold_count)
                 .unwrap_or(0),
-            query_guard_hold_max_us: self
-                .query_guard_hold_max_us
-                .load(std::sync::atomic::Ordering::Relaxed),
+            query_guard_hold_max_us,
             query_guard_last_hold_us: self
                 .query_guard_last_hold_us
                 .load(std::sync::atomic::Ordering::Relaxed),
             query_guard_slow_count: self
                 .query_guard_slow_count
                 .load(std::sync::atomic::Ordering::Relaxed),
+            query_guard_hold_total_ns: self
+                .query_guard_hold_total_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            query_guard_hold_p50_us: query_guard_percentile_us(
+                &histogram,
+                histogram_total,
+                50,
+                query_guard_hold_max_us,
+            ),
+            query_guard_hold_p95_us: query_guard_percentile_us(
+                &histogram,
+                histogram_total,
+                95,
+                query_guard_hold_max_us,
+            ),
+            query_guard_hold_p99_us: query_guard_percentile_us(
+                &histogram,
+                histogram_total,
+                99,
+                query_guard_hold_max_us,
+            ),
             exact_queries_total: self
                 .exact_queries_total
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1199,5 +1312,95 @@ mod tests {
         assert_eq!(report.snapshot_count, 1);
         assert_eq!(report.fast_sync_count, 1);
         assert_eq!(report.refresh_base_count, 1);
+    }
+
+    #[test]
+    fn query_guard_total_ns_accumulates_without_truncation() {
+        let stats = StatsCollector::new();
+        stats.begin_query_guard();
+        stats.finish_query_guard_ns(1_500, 1_000_000);
+        stats.begin_query_guard();
+        stats.finish_query_guard_ns(2_700, 1_000_000);
+
+        let report = stats.report();
+        assert_eq!(report.query_guard_hold_count, 2);
+        // 微秒口径各截断为 1us/2us，纳秒累计必须保留 4200ns 全量。
+        assert_eq!(report.query_guard_hold_total_ns, 4_200);
+        assert_eq!(report.query_guard_hold_avg_us, 1);
+    }
+
+    #[test]
+    fn query_guard_percentiles_track_distribution() {
+        let stats = StatsCollector::new();
+        for _ in 0..90 {
+            stats.begin_query_guard();
+            stats.finish_query_guard_ns(100 * 1_000, 5_000);
+        }
+        for _ in 0..9 {
+            stats.begin_query_guard();
+            stats.finish_query_guard_ns(1_000 * 1_000, 5_000);
+        }
+        stats.begin_query_guard();
+        stats.finish_query_guard_ns(10_000 * 1_000, 5_000);
+
+        let report = stats.report();
+        assert_eq!(report.query_guard_hold_count, 100);
+        // p50 落在 100us 样本的桶，桶上界不超过 1/4 八度分辨率（112us）。
+        assert!(
+            (100..=112).contains(&report.query_guard_hold_p50_us),
+            "p50={}",
+            report.query_guard_hold_p50_us
+        );
+        // 第 95 与第 99 个样本都落在 1000us 样本的桶（桶区间 [896,1024)）。
+        assert!(
+            (1000..=1024).contains(&report.query_guard_hold_p95_us),
+            "p95={}",
+            report.query_guard_hold_p95_us
+        );
+        assert!(
+            (1000..=1024).contains(&report.query_guard_hold_p99_us),
+            "p99={}",
+            report.query_guard_hold_p99_us
+        );
+        assert_eq!(report.query_guard_hold_max_us, 10_000);
+    }
+
+    #[test]
+    fn query_guard_percentiles_reach_tail_bucket() {
+        let stats = StatsCollector::new();
+        for _ in 0..50 {
+            stats.begin_query_guard();
+            stats.finish_query_guard_ns(100 * 1_000, u64::MAX);
+        }
+        for _ in 0..50 {
+            stats.begin_query_guard();
+            stats.finish_query_guard_ns(10_000 * 1_000, u64::MAX);
+        }
+
+        let report = stats.report();
+        assert!(
+            (10_000..=10_240).contains(&report.query_guard_hold_p99_us),
+            "p99={}",
+            report.query_guard_hold_p99_us
+        );
+    }
+
+    #[test]
+    fn query_guard_percentiles_empty_and_overflow_edges() {
+        let stats = StatsCollector::new();
+        let report = stats.report();
+        assert_eq!(report.query_guard_hold_total_ns, 0);
+        assert_eq!(report.query_guard_hold_p50_us, 0);
+        assert_eq!(report.query_guard_hold_p95_us, 0);
+        assert_eq!(report.query_guard_hold_p99_us, 0);
+
+        // 超出直方图范围的超长持有：分位数回退到精确 max。
+        stats.begin_query_guard();
+        stats.finish_query_guard_ns(u64::MAX, u64::MAX);
+        let report = stats.report();
+        assert_eq!(
+            report.query_guard_hold_p99_us,
+            report.query_guard_hold_max_us
+        );
     }
 }

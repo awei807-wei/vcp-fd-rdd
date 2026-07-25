@@ -370,6 +370,10 @@ class SummarySemanticsTests(unittest.TestCase):
                             "query_guard_hold_avg_us": 1800,
                             "query_guard_hold_max_us": 9000,
                             "query_guard_slow_count": 12,
+                            "query_guard_hold_total_ns": 9_100_000_000,
+                            "query_guard_hold_p50_us": 1500,
+                            "query_guard_hold_p95_us": 4200,
+                            "query_guard_hold_p99_us": 8800,
                         },
                     },
                 ],
@@ -422,6 +426,12 @@ class SummarySemanticsTests(unittest.TestCase):
             self.assertEqual(
                 query_work["query_guard_hold_total_us_estimate"], 9_000_000
             )
+            self.assertEqual(
+                query_work["query_guard_hold_total_ns"], 9_100_000_000
+            )
+            self.assertEqual(query_work["query_guard_hold_p50_us"], 1500)
+            self.assertEqual(query_work["query_guard_hold_p95_us"], 4200)
+            self.assertEqual(query_work["query_guard_hold_p99_us"], 8800)
 
             BENCH.write_report(run_dir, summary)
             report = (run_dir / "REPORT.md").read_text(encoding="utf-8")
@@ -437,6 +447,8 @@ class SummarySemanticsTests(unittest.TestCase):
                 "event storm visibility success rate",
                 "query total time estimate",
                 "query guard hold time estimate",
+                "query guard hold exact time",
+                "query guard hold p50/p95/p99",
             ):
                 self.assertIn(metric, report)
 
