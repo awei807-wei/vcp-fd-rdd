@@ -470,28 +470,61 @@ impl TieredIndex {
             for p in db.deleted_paths() {
                 let _ = del.insert(p);
             }
-            let live_events: Vec<EventRecord> = db.live_records().cloned().collect();
+            let overlay_cache_enabled = self.query_overlay_meta_cache_enabled();
+            let cached_overlay_metas = if overlay_cache_enabled {
+                db.overlay_meta_cache()
+            } else {
+                None
+            };
+            let (pending_live_events, overlay_rebuild_epoch) = if cached_overlay_metas.is_none() {
+                (
+                    db.live_records().cloned().collect::<Vec<EventRecord>>(),
+                    db.mutation_epoch(),
+                )
+            } else {
+                (Vec::new(), 0)
+            };
             drop(db);
             let overlay_deleted = Arc::new(del);
             let mut blocked_paths = PathArenaSet::default();
             let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
-            let mut overlay_live_metas: Vec<FileMeta> = Vec::with_capacity(live_events.len());
             let mut verify_budget = QueryVerifyBudget::new(self);
-            for ev in &live_events {
-                if ev.best_path().is_some_and(|path| self.path_is_frozen(path)) {
-                    continue;
+            // overlay 物化（每 live 记录一次 stat + FileMeta 构建）按 delta_buffer
+            // 变更代数缓存：稳态命中时本查询零 stat、零克隆；miss 时锁外重建并按
+            // epoch 回写（并发 mutation 令回写失败，仅本查询自用）。frozen/deleted/
+            // blocked 过滤保持逐查询执行（下方收集环本就重查这三项），meta 的
+            // size/mtime 冻结在物化时刻，下一次事件即失效重建——与 base 层的
+            // 快照语义一致。关闭 overlay_meta_cache_enabled 即回到逐查询物化。
+            let overlay_live_metas: Arc<Vec<FileMeta>> = match cached_overlay_metas {
+                Some(metas) => metas,
+                None => {
+                    let mut metas: Vec<FileMeta> = Vec::with_capacity(pending_live_events.len());
+                    for ev in &pending_live_events {
+                        if ev.best_path().is_some_and(|path| self.path_is_frozen(path)) {
+                            continue;
+                        }
+                        let Some(meta) = self.overlay_meta_for_event(ev) else {
+                            continue;
+                        };
+                        let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+                        if blocked_paths.contains(path_bytes)
+                            || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
+                        {
+                            continue;
+                        }
+                        metas.push(meta);
+                    }
+                    let metas = Arc::new(metas);
+                    if overlay_cache_enabled {
+                        // frozen 集时变，但收集环会再次过滤 frozen/deleted/blocked，
+                        // 缓存里多留的条目不影响结果正确性。
+                        self.delta_buffer
+                            .lock()
+                            .store_overlay_meta_cache(overlay_rebuild_epoch, Arc::clone(&metas));
+                    }
+                    metas
                 }
-                let Some(meta) = self.overlay_meta_for_event(ev) else {
-                    continue;
-                };
-                let path_bytes = meta.path.as_os_str().as_encoded_bytes();
-                if blocked_paths.contains(path_bytes)
-                    || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
-                {
-                    continue;
-                }
-                overlay_live_metas.push(meta);
-            }
+            };
             let mut results: Vec<QueryResultMeta> = Vec::with_capacity(limit.min(128));
             let dupe_metas = if requires_hardlink_dupe || requires_content_dupe {
                 Some(self.collect_live_metas_for_diagnostics())
@@ -522,7 +555,7 @@ impl TieredIndex {
                 // Overlay upserts take precedence over the immutable base. This keeps
                 // delete+recreate and rename windows correct while base is only
                 // materialized at snapshot/rebuild boundaries.
-                for meta in &overlay_live_metas {
+                for meta in overlay_live_metas.iter() {
                     if results.len() >= scan_limit {
                         break;
                     }

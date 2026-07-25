@@ -278,6 +278,9 @@ pub struct QueryConfig {
     pub max_verify_per_query: usize,
     /// Maximum synchronous verification wall time per query.
     pub verify_timeout_ms: u64,
+    /// 按 delta_buffer 变更代数缓存 overlay 物化 meta（关闭即回退逐查询
+    /// stat 全部 live 记录的线性参考路径）。
+    pub overlay_meta_cache_enabled: bool,
 }
 
 impl QueryConfig {
@@ -304,6 +307,7 @@ impl Default for QueryConfig {
         Self {
             max_verify_per_query: DEFAULT_MAX_VERIFY_PER_QUERY,
             verify_timeout_ms: DEFAULT_VERIFY_TIMEOUT_MS,
+            overlay_meta_cache_enabled: true,
         }
     }
 }

@@ -613,6 +613,72 @@ fn path_freshness_keeps_identity_kind_and_delete_boundaries() {
 }
 
 #[test]
+fn overlay_meta_cache_matches_uncached_results_across_mutations() {
+    let root = unique_tmp_dir("overlay-meta-cache-equivalence");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    // xorshift 驱动的确定性伪随机操作序列：create/delete/modify 交错。
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut rng = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    let mut seq = 0u64;
+    let mut alive: Vec<PathBuf> = Vec::new();
+    for step in 0..60 {
+        let roll = rng() % 100;
+        if roll < 55 || alive.is_empty() {
+            let path = root.join(format!("cache_eq_{step}.txt"));
+            std::fs::write(&path, format!("payload {step}")).unwrap();
+            seq += 1;
+            idx.apply_events(&[mk_event(seq, EventType::Create, path.clone())]);
+            alive.push(path);
+        } else if roll < 80 {
+            let victim = alive.remove((rng() as usize) % alive.len());
+            let _ = std::fs::remove_file(&victim);
+            seq += 1;
+            idx.apply_events(&[mk_event(seq, EventType::Delete, victim)]);
+        } else {
+            let target = alive[(rng() as usize) % alive.len()].clone();
+            std::fs::write(&target, format!("modified {step}")).unwrap();
+            seq += 1;
+            idx.apply_events(&[mk_event(seq, EventType::Modify, target)]);
+        }
+
+        // 缓存路径与线性参考路径必须产出相同的结果集合。
+        let mut cached: Vec<PathBuf> = idx
+            .query("cache_eq_")
+            .into_iter()
+            .map(|meta| meta.path)
+            .collect();
+        assert!(
+            idx.delta_buffer.lock().overlay_meta_cache().is_some(),
+            "enabled query must populate the overlay meta cache (step {step})"
+        );
+        idx.apply_query_config(QueryConfig {
+            overlay_meta_cache_enabled: false,
+            ..QueryConfig::default()
+        });
+        let mut uncached: Vec<PathBuf> = idx
+            .query("cache_eq_")
+            .into_iter()
+            .map(|meta| meta.path)
+            .collect();
+        idx.apply_query_config(QueryConfig::default());
+        cached.sort();
+        uncached.sort();
+        assert_eq!(cached, uncached, "cached vs linear diverged at step {step}");
+        assert!(!cached.is_empty() || alive.is_empty());
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn path_freshness_snapshot_honors_ancestor_invalidation() {
     let root = unique_tmp_dir("path-freshness-ancestor-invalidation");
     let nested = root.join("nested");
@@ -4855,6 +4921,7 @@ fn query_verify_budget_caps_wide_stale_candidate_stat_count() {
     idx.apply_query_config(QueryConfig {
         max_verify_per_query: 3,
         verify_timeout_ms: 1_000,
+        ..QueryConfig::default()
     });
 
     for path in &paths {

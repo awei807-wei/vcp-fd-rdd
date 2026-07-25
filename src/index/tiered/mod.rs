@@ -358,6 +358,7 @@ pub struct TieredIndex {
     pub(self) lazy_validation: lazy_validation::LazyValidationRuntime,
     pub(self) query_max_verify_per_query: AtomicU64,
     pub(self) query_verify_timeout_ms: AtomicU64,
+    pub(self) query_overlay_meta_cache_enabled: std::sync::atomic::AtomicBool,
     pub(self) tombstones: TombstoneTracker,
     pub(self) memory_report_cache: Mutex<MemoryReportCache>,
 }
@@ -467,6 +468,13 @@ impl TieredIndex {
             .store(config.max_verify_per_query.max(1) as u64, Ordering::Relaxed);
         self.query_verify_timeout_ms
             .store(config.verify_timeout_ms.max(1), Ordering::Relaxed);
+        self.query_overlay_meta_cache_enabled
+            .store(config.overlay_meta_cache_enabled, Ordering::Relaxed);
+    }
+
+    pub(self) fn query_overlay_meta_cache_enabled(&self) -> bool {
+        self.query_overlay_meta_cache_enabled
+            .load(Ordering::Relaxed)
     }
 
     fn cleanup_runtime_subtree_tombstones_locked(

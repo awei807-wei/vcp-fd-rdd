@@ -1,5 +1,6 @@
-use crate::core::{EventRecord, EventType, FileKind};
+use crate::core::{EventRecord, EventType, FileKind, FileMeta};
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SubtreeInvalidationSnapshot {
@@ -50,6 +51,10 @@ pub struct DeltaBuffer {
     /// A directory rename/recreate crossed the active scan boundary. Replaying
     /// one directory record cannot prove that every descendant was scanned.
     structural_replay_unproven: bool,
+    /// 记录集（entries）的变更代数：任何 insert/delete/clear 递增。
+    mutation_epoch: u64,
+    /// 按 mutation_epoch 失效的 overlay 物化 meta 缓存（查询路径填充）。
+    overlay_meta_cache: Option<Arc<Vec<FileMeta>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +77,8 @@ impl DeltaBuffer {
             structural_upsert_targets: std::collections::HashSet::new(),
             overflowed: false,
             structural_replay_unproven: false,
+            mutation_epoch: 0,
+            overlay_meta_cache: None,
         }
     }
 
@@ -87,7 +94,32 @@ impl DeltaBuffer {
             structural_upsert_targets: std::collections::HashSet::new(),
             overflowed: false,
             structural_replay_unproven: false,
+            mutation_epoch: 0,
+            overlay_meta_cache: None,
         }
+    }
+
+    /// 记录集发生变更：推进代数并失效 overlay 物化缓存。
+    fn note_mutation(&mut self) {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        self.overlay_meta_cache = None;
+    }
+
+    pub fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch
+    }
+
+    pub fn overlay_meta_cache(&self) -> Option<Arc<Vec<FileMeta>>> {
+        self.overlay_meta_cache.as_ref().map(Arc::clone)
+    }
+
+    /// 回写物化缓存；仅在 epoch 未被并发 mutation 推进时接受。
+    pub fn store_overlay_meta_cache(&mut self, epoch: u64, metas: Arc<Vec<FileMeta>>) -> bool {
+        if epoch != self.mutation_epoch {
+            return false;
+        }
+        self.overlay_meta_cache = Some(metas);
+        true
     }
 
     /// 应用一批事件，按路径去重保留最新状态。
@@ -120,6 +152,7 @@ impl DeltaBuffer {
                 }
                 self.note_subtree_invalidation(path_bytes.clone());
                 self.entries.insert(path_bytes, DeltaState::Deleted);
+                self.note_mutation();
                 true
             }
             EventType::Create | EventType::Modify => {
@@ -138,6 +171,7 @@ impl DeltaBuffer {
                     self.structural_upsert_targets.insert(path_bytes.clone());
                 }
                 self.entries.insert(path_bytes, DeltaState::Live(event));
+                self.note_mutation();
                 true
             }
             EventType::Rename {
@@ -168,6 +202,7 @@ impl DeltaBuffer {
                 }
                 self.structural_upsert_targets.insert(path_bytes.clone());
                 self.entries.insert(path_bytes, DeltaState::Live(event));
+                self.note_mutation();
                 true
             }
         }
@@ -362,6 +397,7 @@ impl DeltaBuffer {
     /// 清空（flush 后调用）
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.note_mutation();
         if self.entries.capacity() > 4096 {
             self.entries.shrink_to(1024);
         }
@@ -736,6 +772,32 @@ mod tests {
             "clear should shrink large overlay capacity, got {}",
             db.entries.capacity()
         );
+    }
+
+    #[test]
+    fn overlay_meta_cache_stores_and_invalidates_on_mutation() {
+        let mut db = DeltaBuffer::with_capacity(64);
+        assert!(db.apply_events(&[make_event(1, EventType::Create, "/tmp/cache_a")]));
+        assert!(db.overlay_meta_cache().is_none());
+
+        let epoch = db.mutation_epoch();
+        let metas = std::sync::Arc::new(Vec::new());
+        assert!(db.store_overlay_meta_cache(epoch, std::sync::Arc::clone(&metas)));
+        assert!(db.overlay_meta_cache().is_some());
+
+        // 任何 mutation（insert/delete/clear）都必须失效缓存并推进 epoch。
+        assert!(db.apply_events(&[make_event(2, EventType::Delete, "/tmp/cache_a")]));
+        assert!(db.overlay_meta_cache().is_none());
+        assert_ne!(db.mutation_epoch(), epoch);
+
+        // 陈旧 epoch 的回写必须被拒绝。
+        assert!(!db.store_overlay_meta_cache(epoch, metas));
+        assert!(db.overlay_meta_cache().is_none());
+
+        let fresh_epoch = db.mutation_epoch();
+        assert!(db.store_overlay_meta_cache(fresh_epoch, std::sync::Arc::new(Vec::new())));
+        db.clear();
+        assert!(db.overlay_meta_cache().is_none());
     }
 
     #[test]

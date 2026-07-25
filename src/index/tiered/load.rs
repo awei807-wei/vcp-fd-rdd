@@ -181,6 +181,7 @@ impl TieredIndex {
             lazy_validation: super::lazy_validation::LazyValidationRuntime::default(),
             query_max_verify_per_query: AtomicU64::new(150),
             query_verify_timeout_ms: AtomicU64::new(75),
+            query_overlay_meta_cache_enabled: std::sync::atomic::AtomicBool::new(true),
             tombstones: super::TombstoneTracker::default(),
             memory_report_cache: Mutex::new(super::MemoryReportCache::default()),
         }
