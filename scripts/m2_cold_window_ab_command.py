@@ -53,6 +53,11 @@ class BenchmarkProfile:
     # 宿主机上常驻 fd-rdd 服务占用默认 6060；正式协议腿使用独立端口避让，
     # 端口随 runner args 进入 manifest/comparability fingerprint。
     http_port: int = 6060
+    # daemon 内置 proc_sampler 是全系统 /proc 扫描器：VM 上开销可忽略，
+    # 多进程宿主机上产生 ~4-5k 读/s 且方差随宿主负载波动，会淹没绝对增量
+    # 门（±15k）。它是观测组件而非 M2 机制，falsification 协议腿关闭；
+    # A/B 两腿口径一致，开关随 args 进 fingerprint。
+    proc_sampler: bool = True
 
 
 PROFILES = {
@@ -98,6 +103,7 @@ PROFILES = {
         event_precondition_wait_secs=160,
         event_min_lease_remaining_secs=125,
         http_port=6260,
+        proc_sampler=False,
     ),
 }
 
@@ -172,7 +178,9 @@ def _base_args(
     return args
 
 
-def _tiered_args(query_fast_scan_leases_enabled: bool) -> list[str]:
+def _tiered_args(
+    query_fast_scan_leases_enabled: bool, proc_sampler_enabled: bool
+) -> list[str]:
     return [
         "--rotating-budget", "128",
         "--rotating-tick-secs", "30",
@@ -192,7 +200,7 @@ def _tiered_args(query_fast_scan_leases_enabled: bool) -> list[str]:
             if query_fast_scan_leases_enabled
             else "--no-query-fast-scan-leases"
         ),
-        "--proc-sampler",
+        ("--proc-sampler" if proc_sampler_enabled else "--no-proc-sampler"),
     ]
 
 
@@ -304,7 +312,7 @@ def build_command(
         )
     if planned_git_sha:
         command.extend(("--planned-git-sha", planned_git_sha))
-    command.extend(_tiered_args(query_fast_scan_leases_enabled))
+    command.extend(_tiered_args(query_fast_scan_leases_enabled, selected.proc_sampler))
     command.extend(_canary_args(roots, selected))
     command.extend(_event_storm_args(roots, selected))
     command.extend(
