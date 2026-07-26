@@ -50,6 +50,9 @@ class BenchmarkProfile:
     visibility_poll_interval_secs: float = 1.0
     event_precondition_wait_secs: int = 0
     event_min_lease_remaining_secs: int = 0
+    # 宿主机上常驻 fd-rdd 服务占用默认 6060；正式协议腿使用独立端口避让，
+    # 端口随 runner args 进入 manifest/comparability fingerprint。
+    http_port: int = 6060
 
 
 PROFILES = {
@@ -94,6 +97,7 @@ PROFILES = {
         visibility_poll_interval_secs=1.0,
         event_precondition_wait_secs=160,
         event_min_lease_remaining_secs=125,
+        http_port=6260,
     ),
 }
 
@@ -153,6 +157,8 @@ def _base_args(
             "default",
             "--tiered-profile",
             "balanced",
+            "--port",
+            str(profile.http_port),
             "--duration-secs",
             str(profile.duration_secs),
             "--sample-interval-secs",
