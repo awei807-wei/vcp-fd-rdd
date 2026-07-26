@@ -252,6 +252,29 @@ def _run_deep_modify_probe(
     }
 
 
+def _run_sweep_only_modify_probe(
+    base_url: str, cold_root: Path, wait_secs: float
+) -> dict[str, Any]:
+    """§18.1 纯 sweep 通道：改写一个不被任何查询触碰的深层文件，静默等待
+    一个轮转周期后单次查询——若 sweep 检出并修复，首查即 fresh/overlay；
+    若首查报 changed，说明修复来自本次查询而非 sweep（§18.1 违约信号）。"""
+    target = cold_root / "d150" / "file_150.txt"
+    target.write_text("sweep-only deep modify payload\n", encoding="utf-8")
+    time.sleep(wait_secs)
+    entry = _search_entry(base_url, target)
+    if entry is None:
+        return {"enabled": True, "repaired_by_sweep": False, "error": "entry missing"}
+    freshness = str(entry.get("freshness", ""))
+    return {
+        "enabled": True,
+        "waited_secs": wait_secs,
+        "first_query_freshness": freshness,
+        "first_query_tier": entry.get("index_tier"),
+        "repaired_by_sweep": freshness != "changed"
+        and entry.get("index_tier") == "HotMemory",
+    }
+
+
 def _load_reference(args: argparse.Namespace) -> dict[str, float] | None:
     if not args.baseline_json:
         return None
@@ -342,6 +365,7 @@ def run(args: argparse.Namespace) -> int:
         )
         burst: dict[str, Any] = {"enabled": False}
         deep_modify: dict[str, Any] = {"enabled": False}
+        sweep_only: dict[str, Any] = {"enabled": False}
         try:
             BENCH.wait_for_http(
                 base_url,
@@ -371,11 +395,17 @@ def run(args: argparse.Namespace) -> int:
                         "enabled": False,
                         "skipped": "sweep period exceeds probe budget",
                     }
+                    sweep_only = dict(deep_modify)
                 else:
                     deep_modify = _run_deep_modify_probe(
                         base_url,
                         roots["cold-a"],
                         args.rotating_ttl_secs + args.rotating_tick_secs + 15.0,
+                    )
+                    sweep_only = _run_sweep_only_modify_probe(
+                        base_url,
+                        roots["cold-a"],
+                        args.rotating_ttl_secs + args.rotating_tick_secs + 10.0,
                     )
                     time.sleep(2.0)
         finally:
@@ -440,6 +470,7 @@ def run(args: argparse.Namespace) -> int:
         "query_guard": {key: int(last_metrics.get(key, 0) or 0) for key in guard_keys},
         "burst": burst,
         "deep_modify": deep_modify,
+        "sweep_only_modify": sweep_only,
         "calibration": (
             analysis.evaluate_calibration(cycles, reference=_load_reference(args))
             if args.calibrate
