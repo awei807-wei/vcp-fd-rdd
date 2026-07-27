@@ -50,6 +50,10 @@ pub(super) struct DirState {
 pub(super) struct RotatingColdWindowProgress {
     pub(super) last_scan_seq: u64,
     pub(super) last_scan_cycle_id: u64,
+    /// 最近一次完整递归 sweep 完成的墙钟时间（unix secs，0=从未）。
+    /// sweep 到期用它按 SLA 周期判定，独立于 cycle_id 推进速率
+    /// （cycle 周期由 tick 频率与冷根数量涌现，远快于 rotating ttl）。
+    pub(super) last_full_sweep_unix_secs: u64,
     pub(super) last_event_seq: u64,
     pub(super) last_event_cycle_id: u64,
     pub(super) last_selected_cycle_id: Option<u64>,

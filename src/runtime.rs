@@ -1889,10 +1889,7 @@ fn spawn_rotating_cold_window_loop(
             tiered.l1_l2_fast_scan_lease_ttl_secs.max(1),
             interval,
         );
-        let sweep_every_cycles = rotating_full_sweep_every_cycles(
-            tiered.rotating_full_sweep_period_secs,
-            tiered.rotating_cold_window_ttl_secs,
-        );
+        let sweep_period_secs = tiered.rotating_full_sweep_period_secs;
         let ephemeral_config = EphemeralWatchConfig {
             budget: tiered.ephemeral_watch_budget,
             ttl_secs: tiered.rotating_cold_window_ttl_secs.max(1),
@@ -1954,21 +1951,20 @@ fn spawn_rotating_cold_window_loop(
                             action.score.max(1),
                         );
                         if ready {
-                            // 完整递归 sweep 只按 SLA 周期到期时入队；周期之间由
-                            // sentinel/事件维持可见性。sweep_due 基于绑定活跃
-                            // lease cycle 的真实完成记录，fail-closed 判 due。
+                            // 完整递归 sweep 只按 SLA 墙钟周期到期时入队；周期之间由
+                            // sentinel/事件维持可见性。sweep_due 基于活跃 lease 下
+                            // 真实完成的墙钟戳，fail-closed 判 due。
                             if runtime.rotating_cold_window_sweep_due(
                                 action.path.as_path(),
-                                tick.cycle_id,
-                                sweep_every_cycles,
+                                sweep_period_secs,
                             ) {
                                 initial_scan_dirs.push(action.path);
                             } else {
                                 tracing::debug!(
-                                    "rotating full sweep deferred for {:?} at cycle {} (every {} cycles)",
+                                    "rotating full sweep deferred for {:?} at cycle {} (period {}s)",
                                     action.path,
                                     tick.cycle_id,
-                                    sweep_every_cycles
+                                    sweep_period_secs
                                 );
                             }
                         } else {
@@ -2005,15 +2001,6 @@ fn spawn_rotating_cold_window_loop(
 
 fn enqueue_rotating_recursive_scan(index: &TieredIndex, dirs: Vec<PathBuf>, cycle_id: u64) {
     index.enqueue_paced_recursive_dirty_dirs(dirs, DirtyReason::RotatingColdWindow { cycle_id });
-}
-
-/// 把完整递归 sweep 周期换算成轮转周期距离（每 K 个周期 sweep 一次）。
-/// period=0 保持旧的每周期 sweep 行为。
-fn rotating_full_sweep_every_cycles(period_secs: u64, rotating_ttl_secs: u64) -> u64 {
-    if period_secs == 0 {
-        return 1;
-    }
-    period_secs.div_ceil(rotating_ttl_secs.max(1)).max(1)
 }
 
 fn rotating_fast_scan_lease_ttl_secs(
@@ -2817,19 +2804,6 @@ mod tests {
             rotating_fast_scan_lease_ttl_secs(1, 1, Duration::from_millis(1)),
             3
         );
-    }
-
-    #[test]
-    fn rotating_full_sweep_every_cycles_maps_period_to_cycle_distance() {
-        // 正式口径：1800s sweep / 180s 轮转 = 每 10 个周期一次。
-        assert_eq!(rotating_full_sweep_every_cycles(1_800, 180), 10);
-        // fixture 口径：1800/45 = 40。
-        assert_eq!(rotating_full_sweep_every_cycles(1_800, 45), 40);
-        // 0 = 保持旧的每周期 sweep 行为。
-        assert_eq!(rotating_full_sweep_every_cycles(0, 180), 1);
-        // 周期短于轮转间隔时向上取整到每周期。
-        assert_eq!(rotating_full_sweep_every_cycles(90, 180), 1);
-        assert_eq!(rotating_full_sweep_every_cycles(1_800, 0), 1_800);
     }
 
     fn temp_root(tag: &str) -> PathBuf {

@@ -29,6 +29,43 @@ pub fn maybe_trim_rss() {
 ))]
 pub fn maybe_trim_rss() {}
 
+// ── 周期性 trim 的节流 ──
+
+/// 周期性调用点（事件流 idle、快照循环、fast-sync 收尾）的最小 trim 间隔。
+const PERIODIC_TRIM_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+/// RSS 低于该值时跳过周期性 trim：trim 把空闲页归还 OS，随后的复用全部重新
+/// 缺页——高频调用会制造持续的 minor-fault 跑步机（正式 A/B 腿实测每分钟
+/// 1.9–3.6k 次缺页的节律即来源于此）。工作集级 RSS 下不值得付这个税；
+/// 高水位嫌疑与 rebuild 后的即时 trim 不走本节流。
+const PERIODIC_TRIM_MIN_RSS_BYTES: u64 = 128 * 1024 * 1024;
+
+/// 纯判定：距上次 trim 是否已超过最小间隔、且 RSS 达到下限。
+pub fn should_periodic_trim(
+    elapsed_since_last: Option<std::time::Duration>,
+    rss_bytes: u64,
+) -> bool {
+    if rss_bytes < PERIODIC_TRIM_MIN_RSS_BYTES {
+        return false;
+    }
+    elapsed_since_last.is_none_or(|elapsed| elapsed >= PERIODIC_TRIM_MIN_INTERVAL)
+}
+
+/// 周期性调用点使用的节流 trim；满足条件时才真正回吐。
+pub fn maybe_trim_rss_throttled() {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static LAST_TRIM: Mutex<Option<Instant>> = Mutex::new(None);
+
+    let rss_bytes = crate::stats::MemoryReport::read_process_rss();
+    let mut last = LAST_TRIM.lock().unwrap_or_else(|e| e.into_inner());
+    if !should_periodic_trim(last.map(|at| at.elapsed()), rss_bytes) {
+        return;
+    }
+    *last = Some(Instant::now());
+    drop(last);
+    maybe_trim_rss();
+}
+
 // ── 路径工具 ──
 
 /// 从原始字节构造 PathBuf（Unix 上保持无损、非 Unix 上 lossy UTF-8）。
@@ -206,6 +243,23 @@ pub fn read_u32(bytes: &[u8], off: &mut usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn periodic_trim_requires_interval_and_rss_floor() {
+        use std::time::Duration;
+        let big = 256 * 1024 * 1024;
+        let small = 32 * 1024 * 1024;
+        // 工作集级 RSS：无论间隔多久都不 trim（避免缺页跑步机）。
+        assert!(!should_periodic_trim(None, small));
+        assert!(!should_periodic_trim(
+            Some(Duration::from_secs(3_600)),
+            small
+        ));
+        // 高 RSS：首次可 trim；间隔不足不 trim；间隔到即 trim。
+        assert!(should_periodic_trim(None, big));
+        assert!(!should_periodic_trim(Some(Duration::from_secs(60)), big));
+        assert!(should_periodic_trim(Some(Duration::from_secs(300)), big));
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

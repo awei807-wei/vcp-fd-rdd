@@ -13,9 +13,7 @@ use crate::event::watcher::{check_inotify_limit, watch_roots_enhanced, EventWatc
 use crate::fs_policy::{FsPolicy, SharedMountPolicyCounters};
 use crate::index::TieredIndex;
 use crate::stats::EventPipelineStats;
-use crate::util::{
-    estimate_notify_recursive_watch_count, maybe_trim_rss, path_has_excluded_component,
-};
+use crate::util::{estimate_notify_recursive_watch_count, path_has_excluded_component};
 
 fn shrink_if_large_vec<T>(v: &mut Vec<T>, keep_cap: usize) -> bool {
     if v.capacity() > keep_cap.saturating_mul(2) {
@@ -1590,7 +1588,7 @@ fn idle_maintenance(
             records_capacity.store(merge_scratch.records.capacity() as u64, Ordering::Relaxed);
         }
         if current_total != *last_idle_trim_total_events {
-            maybe_trim_rss();
+            crate::util::maybe_trim_rss_throttled();
             *last_idle_trim_total_events = current_total;
         }
         *last_idle_trim = tokio::time::Instant::now();

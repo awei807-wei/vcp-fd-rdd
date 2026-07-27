@@ -269,7 +269,7 @@ impl RotatingColdWindowActionKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct RotatingColdWindowConfig {
     pub enabled: bool,
     pub budget: usize,

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::storage::traits::StorageBackend;
-use crate::util::maybe_trim_rss;
 
 use super::TieredIndex;
 
@@ -30,7 +29,7 @@ impl TieredIndex {
         if !wrote_snapshot {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        maybe_trim_rss();
+        crate::util::maybe_trim_rss_throttled();
         Ok(())
     }
 

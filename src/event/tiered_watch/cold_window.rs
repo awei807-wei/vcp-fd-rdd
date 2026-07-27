@@ -980,54 +980,77 @@ impl TieredWatchRuntime {
     }
 
     pub fn record_rotating_cold_window_scan_completion(&self, path: &Path, cycle_id: u64) -> bool {
+        self.record_rotating_cold_window_scan_completion_at(path, cycle_id, unix_secs())
+    }
+
+    pub(super) fn record_rotating_cold_window_scan_completion_at(
+        &self,
+        path: &Path,
+        cycle_id: u64,
+        now_unix_secs: u64,
+    ) -> bool {
         let Some(state) = self.state(path) else {
             return false;
         };
-        let now_unix_secs = unix_secs();
         let now = Instant::now();
         let mut progress = state.rotating_cold_window_progress.write();
-        {
+        let cycle_matches = {
             let leases = self.rotating_cold_window_leases.read();
             let Some(lease) = leases.get(path) else {
+                // fail-closed：无活跃 lease 时不记录任何完成（sweep 保持 due）。
                 return false;
             };
-            if lease.cycle_id != cycle_id || !lease.is_active(now_unix_secs, now) {
+            if !lease.is_active(now_unix_secs, now) {
                 return false;
             }
+            lease.cycle_id == cycle_id
+        };
+        // sweep 到期：任何在活跃 lease 下真实完成的完整递归 sweep 都刷新墙钟戳，
+        // 与 cycle 是否匹配无关（paced sweep 可能跨 lease 续期完成）。
+        progress.last_full_sweep_unix_secs = now_unix_secs;
+        // 因果证据：last_scan_seq/cycle_id 仍严格绑定同 cycle 的活跃 lease，
+        // 不被跨 cycle 完成或伪造 completion 推进。
+        if cycle_matches {
+            let sequence = self
+                .rotating_cold_window_causal_seq
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            progress.last_scan_seq = sequence;
+            progress.last_scan_cycle_id = cycle_id;
         }
-        let sequence = self
-            .rotating_cold_window_causal_seq
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        progress.last_scan_seq = sequence;
-        progress.last_scan_cycle_id = cycle_id;
         true
     }
 
-    /// 完整递归 sweep 是否到期：按最近一次已完成 sweep 的周期距离判定。
+    /// 完整递归 sweep 是否到期：按 SLA 墙钟周期判定。
     ///
-    /// 从未完成过（或该目录无状态）时 fail-closed 判 due；同周期内不重复 due。
-    /// 完成记录本身绑定当前活跃 lease 的 cycle_id（见上），因此这里读到的
-    /// 距离总是真实扫描进展的距离，不可能被伪造的 completion 推进。
-    pub fn rotating_cold_window_sweep_due(
+    /// 从未完成过（或该目录无状态）时 fail-closed 判 due。period_secs=0 保持
+    /// 旧的每周期 sweep 行为。用墙钟而非 cycle 距离，因为 cycle 周期由 tick
+    /// 频率与冷根数量涌现（实测 ~30–60s），远快于 rotating ttl，cycle 距离
+    /// 无法稳定映射到 SLA 秒数。
+    pub fn rotating_cold_window_sweep_due(&self, path: &Path, period_secs: u64) -> bool {
+        self.rotating_cold_window_sweep_due_at(path, period_secs, unix_secs())
+    }
+
+    pub(super) fn rotating_cold_window_sweep_due_at(
         &self,
         path: &Path,
-        current_cycle_id: u64,
-        sweep_every_cycles: u64,
+        period_secs: u64,
+        now_unix_secs: u64,
     ) -> bool {
+        if period_secs == 0 {
+            return true;
+        }
         let Some(state) = self.state(path) else {
             return true;
         };
-        let progress = state.rotating_cold_window_progress.read();
-        // last_scan_seq 从 1 起：0 即从未有过绑定活跃 lease 的完成记录。
-        // cycle_id 本身 0 起始，不能用作 never 标记。
-        if progress.last_scan_seq == 0 {
+        let last = state
+            .rotating_cold_window_progress
+            .read()
+            .last_full_sweep_unix_secs;
+        if last == 0 {
             return true;
         }
-        if current_cycle_id <= progress.last_scan_cycle_id {
-            return false;
-        }
-        current_cycle_id - progress.last_scan_cycle_id >= sweep_every_cycles.max(1)
+        now_unix_secs.saturating_sub(last) >= period_secs
     }
 
     pub(super) fn record_rotating_cold_window_event_progress(

@@ -1963,7 +1963,7 @@ fn rotating_reselection_renews_ephemeral_watch_ttl_across_cycle_boundary() {
 }
 
 #[test]
-fn rotating_full_sweep_due_follows_completed_cycle_distance() {
+fn rotating_full_sweep_due_follows_wall_clock_period() {
     let cold = PathBuf::from("/tmp/cold-sweep-due");
     let rt = TieredWatchRuntime::new(Vec::new(), vec![(cold.clone(), 4)], 16, 5_000, 20);
     let state = rt.state(&cold).expect("cold dir should exist");
@@ -1975,24 +1975,75 @@ fn rotating_full_sweep_due_follows_completed_cycle_distance() {
     let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
         enabled: true,
         budget: 1,
-        ttl_secs: 60,
+        ttl_secs: 3_600,
         max_cost_per_root: 64,
         max_dirs_per_tick: 1,
     });
     assert_eq!(tick.actions.len(), 1);
+    let now = unix_secs();
 
-    // 从未完成过 sweep：fail-closed 判 due；未知目录同理。
-    assert!(rt.rotating_cold_window_sweep_due(cold.as_path(), tick.cycle_id, 10));
-    assert!(rt.rotating_cold_window_sweep_due(Path::new("/tmp/never-seen-root"), 5, 10));
+    // 从未完成过 sweep：fail-closed 判 due；未知目录同理；period=0 恒 due（旧行为）。
+    assert!(rt.rotating_cold_window_sweep_due_at(cold.as_path(), 1_800, now));
+    assert!(rt.rotating_cold_window_sweep_due_at(Path::new("/tmp/never-seen-root"), 1_800, now));
+    assert!(rt.rotating_cold_window_sweep_due_at(cold.as_path(), 0, now));
 
-    assert!(rt.record_rotating_cold_window_scan_completion(cold.as_path(), tick.cycle_id));
-    // 同周期不重复 due（即使 K=1）。
-    assert!(!rt.rotating_cold_window_sweep_due(cold.as_path(), tick.cycle_id, 1));
-    // K=1：下一周期即 due（旧的每周期行为）。
-    assert!(rt.rotating_cold_window_sweep_due(cold.as_path(), tick.cycle_id + 1, 1));
-    // K=10：距离不足不 due，达到即 due。
-    assert!(!rt.rotating_cold_window_sweep_due(cold.as_path(), tick.cycle_id + 9, 10));
-    assert!(rt.rotating_cold_window_sweep_due(cold.as_path(), tick.cycle_id + 10, 10));
+    assert!(rt.record_rotating_cold_window_scan_completion_at(cold.as_path(), tick.cycle_id, now));
+    // SLA 周期内不 due；到期即 due；period=0 仍恒 due。
+    assert!(!rt.rotating_cold_window_sweep_due_at(cold.as_path(), 1_800, now + 1_799));
+    assert!(rt.rotating_cold_window_sweep_due_at(cold.as_path(), 1_800, now + 1_800));
+    assert!(rt.rotating_cold_window_sweep_due_at(cold.as_path(), 0, now + 1));
+}
+
+#[test]
+fn rotating_full_sweep_completion_survives_lease_cycle_advance() {
+    // 回归：paced 递归 sweep 跨多个 rotation cycle，完成时 lease.cycle_id 已被
+    // 后续续租推进。墙钟 sweep 戳必须仍被记录（否则 sweep_due 永远判 due，
+    // 每次重选都全量复扫——正式跑实测 6 次冗余复扫、~8.2k 缺页即此病）；
+    // 因果字段（last_scan_seq/cycle_id）仍只在 cycle 匹配时推进。
+    let cold = PathBuf::from("/tmp/cold-sweep-cycle-advance");
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(cold.clone(), 4)], 16, 5_000, 20);
+    let state = rt.state(&cold).expect("cold dir should exist");
+    state.tier.store(WatchTier::L3.as_u8(), Ordering::Release);
+    state
+        .last_scan_unix_secs
+        .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
+
+    let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
+        enabled: true,
+        budget: 1,
+        ttl_secs: 3_600,
+        max_cost_per_root: 64,
+        max_dirs_per_tick: 1,
+    });
+    assert_eq!(tick.actions.len(), 1);
+    let enqueue_cycle = tick.cycle_id;
+
+    // 模拟轮转继续：lease 被续租为更高 cycle（paced sweep 仍在进行）。
+    if let Some(lease) = rt.rotating_cold_window_leases.write().get_mut(&cold) {
+        lease.cycle_id = enqueue_cycle + 3;
+    }
+    let now = unix_secs();
+
+    // 入队时（enqueue_cycle）发起的 sweep 现在完成：墙钟戳必须被接受。
+    assert!(
+        rt.record_rotating_cold_window_scan_completion_at(cold.as_path(), enqueue_cycle, now),
+        "delayed sweep completion must be accepted after the lease cycle advanced"
+    );
+    assert!(!rt.rotating_cold_window_sweep_due_at(cold.as_path(), 1_800, now + 60));
+    assert!(rt.rotating_cold_window_sweep_due_at(cold.as_path(), 1_800, now + 1_800));
+
+    // 但因果字段不被跨 cycle 完成推进：证据仍严格绑定同 cycle。
+    let dump = rt.debug_dump(Some("/tmp/cold-sweep-cycle-advance"));
+    let dir = dump.dirs.first().expect("cold dir should be present");
+    assert_eq!(dir.rotating_cold_window_last_scan_seq, 0);
+
+    // fail-closed 不变：无活跃 lease 时拒绝（sweep 保持 due）。
+    let orphan = PathBuf::from("/tmp/cold-sweep-no-lease");
+    assert!(!rt.record_rotating_cold_window_scan_completion_at(
+        orphan.as_path(),
+        enqueue_cycle,
+        now
+    ));
 }
 
 #[test]
@@ -2275,7 +2326,7 @@ fn rotating_cold_window_reports_adjacent_cycle_reselection_and_action_switch() {
         max_cost_per_root: 64,
         max_dirs_per_tick: 1,
     };
-    let first_tick = rt.rotating_cold_window_tick(cfg.clone());
+    let first_tick = rt.rotating_cold_window_tick(cfg);
     assert_eq!(first_tick.actions.len(), 1);
     assert_eq!(first_tick.telemetry.ephemeral.selected_dirs, 1);
     assert_eq!(first_tick.telemetry.ephemeral.estimated_cost, 4);
@@ -2488,9 +2539,9 @@ fn rotating_cold_window_budget_and_ttl_gate_selection() {
         max_cost_per_root: 64,
         max_dirs_per_tick: 8,
     };
-    let first_tick = rt.rotating_cold_window_tick(cfg.clone());
+    let first_tick = rt.rotating_cold_window_tick(cfg);
     assert_eq!(first_tick.actions.len(), 1);
-    let blocked_tick = rt.rotating_cold_window_tick(cfg.clone());
+    let blocked_tick = rt.rotating_cold_window_tick(cfg);
     assert!(blocked_tick.budget_blocked);
 
     if let Some(lease) = rt.rotating_cold_window_leases.write().values_mut().next() {
@@ -2536,10 +2587,14 @@ fn rotating_cold_window_progress_is_scoped_to_an_active_lease_cycle() {
     let ordinary = rt.debug_dump(Some("/tmp/cold-causal-progress"));
     let ordinary_dir = ordinary.dirs.first().expect("cold dir should be present");
     assert_eq!(ordinary_dir.rotating_cold_window_last_scan_seq, 0);
-    assert!(!rt.record_rotating_cold_window_scan_completion(
+    // cycle 不匹配的完成：墙钟 sweep 戳被接受（返回 true），但因果 seq 不推进。
+    assert!(rt.record_rotating_cold_window_scan_completion(
         cold.as_path(),
         tick.cycle_id.saturating_add(1)
     ));
+    let mismatched = rt.debug_dump(Some("/tmp/cold-causal-progress"));
+    let mismatched_dir = mismatched.dirs.first().expect("cold dir should be present");
+    assert_eq!(mismatched_dir.rotating_cold_window_last_scan_seq, 0);
     assert!(rt.record_rotating_cold_window_scan_completion(cold.as_path(), tick.cycle_id));
     rt.record_event_paths([&child]);
     let active = rt.debug_dump(Some("/tmp/cold-causal-progress"));

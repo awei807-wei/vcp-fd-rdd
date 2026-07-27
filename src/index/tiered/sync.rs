@@ -25,6 +25,46 @@ use super::{
 };
 
 const REPAIR_SLICE_MAX_ENTRIES: usize = 512;
+
+/// 修复切片的线程局部 scratch：批内跨目录复用两个按 entry 规模分配的大缓冲，
+/// 消除每目录全新分配簇带来的次缺页与分配 CPU（任务5b）。
+///
+/// take/return 模式：主流程单一归还点；任何提前 return 只会让本次取出的
+/// 缓冲随栈丢弃（下次取到空 Vec，仅损失一次复用，不影响正确性）。
+struct RepairSliceScratch {
+    upsert_events: Vec<EventRecord>,
+    upsert_metas: Vec<FileMeta>,
+}
+
+thread_local! {
+    static REPAIR_SLICE_SCRATCH: std::cell::RefCell<RepairSliceScratch> =
+        const {
+            std::cell::RefCell::new(RepairSliceScratch {
+                upsert_events: Vec::new(),
+                upsert_metas: Vec::new(),
+            })
+        };
+}
+
+fn take_repair_slice_scratch() -> (Vec<EventRecord>, Vec<FileMeta>) {
+    REPAIR_SLICE_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        (
+            std::mem::take(&mut scratch.upsert_events),
+            std::mem::take(&mut scratch.upsert_metas),
+        )
+    })
+}
+
+fn return_repair_slice_scratch(mut events: Vec<EventRecord>, mut metas: Vec<FileMeta>) {
+    events.clear();
+    metas.clear();
+    REPAIR_SLICE_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.upsert_events = events;
+        scratch.upsert_metas = metas;
+    });
+}
 const REPAIR_SLICE_MAX_MS: u64 = 20;
 
 /// readdir 批量删除对齐（v2）。
@@ -856,7 +896,7 @@ impl TieredIndex {
                 report.delete_events
             );
             tracing::warn!("Fast-sync complete, triggering manual RSS trim...");
-            maybe_trim_rss();
+            crate::util::maybe_trim_rss_throttled();
         });
     }
 
@@ -1980,8 +2020,9 @@ impl TieredIndex {
             }
         };
 
-        let mut upsert_events: Vec<EventRecord> = Vec::with_capacity(slice.entries.len());
-        let mut upsert_metas: Vec<FileMeta> = Vec::with_capacity(slice.entries.len());
+        let (mut upsert_events, mut upsert_metas) = take_repair_slice_scratch();
+        upsert_events.reserve(slice.entries.len());
+        upsert_metas.reserve(slice.entries.len());
         let mut project_roots = Vec::new();
         let mut child_dirs = Vec::new();
         let mut scanned = 0usize;
@@ -2088,6 +2129,7 @@ impl TieredIndex {
             }
             alignment_started_seq = Some(self.event_seq.load(Ordering::Relaxed));
         }
+        return_repair_slice_scratch(upsert_events, upsert_metas);
 
         let completed = slice.completed;
         if completed && !dropped_stale_batch && !metadata_failed {
