@@ -972,12 +972,16 @@ class GateTests(unittest.TestCase):
         self,
     ) -> None:
         # 202607251527_m2-cost-gate-recovery 任务6 冻结的量纲修订：
-        # 近零基线上的 CPU/读 syscall 比值失真由绝对预算吸收（比值+绝对双门）。
+        # 近零基线上的 CPU/读 syscall/读字节比值失真由绝对预算吸收（比值+绝对双门）。
         legs = self.passing_legs()
         for leg in legs:
             if leg["variant"] == "a":
                 leg["resources"]["cpu_core_seconds"] = 12.0
                 leg["resources"]["read_syscalls_delta"] = 5_000
+                # 读字节:A 比 B 多 ~57KB(页缓存噪声量级),比值 1.5+ 但远低于 1MiB。
+                leg["resources"]["read_bytes_delta"] = leg["resources"][
+                    "read_bytes_delta"
+                ] + 57_344
 
         result = gate.evaluate_suite(legs)
 

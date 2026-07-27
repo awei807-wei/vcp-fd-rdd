@@ -126,7 +126,9 @@ def _gate_summary_lines(gate: dict[str, Any]) -> list[str]:
         f"`{_ratio_text(gate['median_cpu_ratio'])}` / "
         f"`{_number_text(gate.get('median_incremental_cpu_core_seconds'), 3)}` core-s"
         "（双门：同时 >1.10 且 >5 core-s 即失败；近零基线的比值失真由绝对预算吸收）",
-        f"- 配对 read bytes 中位比：`{_ratio_text(gate['median_read_bytes_ratio'])}`（≤ 1.10）",
+        f"- 配对 read bytes 中位比 / 增量：`{_ratio_text(gate['median_read_bytes_ratio'])}` / "
+        f"`{_number_text(gate.get('median_incremental_read_bytes'), 0)}` B"
+        "（双门：同时 >1.10 且 >1 MiB 即失败；页缓存噪声由绝对预算吸收）",
         "- 配对 read syscalls 中位比 / 增量："
         f"`{_ratio_text(gate['median_read_syscalls_ratio'])}` / "
         f"`{_number_text(gate.get('median_read_syscalls_delta_count'), 0)}`"

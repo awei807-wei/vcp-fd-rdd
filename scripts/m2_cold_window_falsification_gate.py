@@ -32,6 +32,10 @@ QUERY_POLL_RATIO_LIMIT = 1.02
 # minor-fault 同构地改为"比值+绝对增量"双门；正式跑之后不得调整。
 CPU_DELTA_LIMIT_CORE_SECONDS = 5.0
 READ_SYSCALL_DELTA_LIMIT = 15_000
+# 物理读字节在近零基线上（两侧多为页缓存命中，绝对量 ~100KB 级）同样受比值失真：
+# 观测到 ~57KB 页缓存噪声即可触发 1.5×。绝对阈值取 1 MiB（噪声的 ~60 倍），
+# 真实内容读取回归仍会同时触发双门。
+READ_BYTES_DELTA_LIMIT = 1024 * 1024
 MIN_BENEFIT_BLOCKS = 3
 MIN_SUCCESS_RATE_GAIN = 0.05
 MIN_BENEFIT_BURSTS = 3
@@ -249,6 +253,7 @@ def _median_ratios(rows: list[dict[str, Any]]) -> dict[str, float]:
         "median_rss_p95_delta_bytes": "rss_p95_delta_bytes",
         "median_incremental_cpu_core_seconds": "incremental_cpu_core_seconds",
         "median_read_syscalls_delta_count": "read_syscalls_delta_count",
+        "median_incremental_read_bytes": "incremental_read_bytes",
         "median_minor_faults_ratio": "minor_faults_ratio",
         "median_minor_faults_delta_count": "minor_faults_delta_count",
         "median_major_faults_ratio": "major_faults_ratio",
@@ -269,7 +274,6 @@ def _median_ratios(rows: list[dict[str, Any]]) -> dict[str, float]:
 
 def _validate_cost_limits(medians: dict[str, float], reasons: list[str]) -> None:
     ratio_limits = (
-        ("median_read_bytes_ratio", READ_RATIO_LIMIT, "read_bytes"),
         ("median_write_bytes_ratio", WRITE_RATIO_LIMIT, "write_bytes"),
         (
             "median_write_syscalls_ratio",
@@ -287,6 +291,13 @@ def _validate_cost_limits(medians: dict[str, float], reasons: list[str]) -> None
             reasons.append(
                 f"配对 {label} 中位比 {medians[field]:.3f} 超过 {limit:.2f}"
             )
+    if (
+        medians["median_read_bytes_ratio"] > READ_RATIO_LIMIT
+        and medians["median_incremental_read_bytes"] > READ_BYTES_DELTA_LIMIT
+    ):
+        reasons.append(
+            f"配对 read_bytes 同时超过 {READ_RATIO_LIMIT:.2f} 倍和 1 MiB 增量门槛"
+        )
     if (
         medians["median_cpu_ratio"] > CPU_RATIO_LIMIT
         and medians["median_incremental_cpu_core_seconds"] > CPU_DELTA_LIMIT_CORE_SECONDS
@@ -323,7 +334,6 @@ def _validate_cost_limits(medians: dict[str, float], reasons: list[str]) -> None
 def _validate_pair_cost_limits(rows: list[dict[str, Any]], reasons: list[str]) -> None:
     """Reject a single pathological block even when its median is hidden."""
     ratio_limits = (
-        ("read_ratio", READ_RATIO_LIMIT, "read_bytes"),
         ("write_ratio", WRITE_RATIO_LIMIT, "write_bytes"),
         ("write_syscalls_ratio", WRITE_SYSCALL_RATIO_LIMIT, "write syscalls"),
         (
@@ -340,6 +350,13 @@ def _validate_pair_cost_limits(rows: list[dict[str, Any]], reasons: list[str]) -
                 reasons.append(
                     f"block {block} 配对 {label} 比 {value:.3f} 超过 {limit:.2f}"
                 )
+        if (
+            float(row["read_ratio"]) > READ_RATIO_LIMIT
+            and int(row["incremental_read_bytes"]) > READ_BYTES_DELTA_LIMIT
+        ):
+            reasons.append(
+                f"block {block} read_bytes 同时超过比例和绝对增量门槛"
+            )
         if (
             float(row["cpu_ratio"]) > CPU_RATIO_LIMIT
             and float(row["incremental_cpu_core_seconds"]) > CPU_DELTA_LIMIT_CORE_SECONDS
