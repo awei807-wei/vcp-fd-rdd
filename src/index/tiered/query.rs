@@ -1255,7 +1255,7 @@ fn content_duplicate_paths(
     let mut outcome = ContentDupeOutcome::default();
     let mut by_size: HashMap<u64, Vec<ContentDupeCandidate>> = HashMap::new();
     let config = index.content.config.lock().clone();
-    let fs_policy = FsPolicy::current_with_config(index.fs_policy_config());
+    let fs_policy = FsPolicy::current_with_shared_config(index.shared_fs_policy_config());
 
     for meta in metas {
         let Some(candidate) =

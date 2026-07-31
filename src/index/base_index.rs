@@ -767,6 +767,30 @@ impl BaseIndexData {
         result
     }
 
+    /// Return indexed files directly below one directory without constructing
+    /// the multi-directory union scratch used by bulk alignment.
+    pub fn append_delete_alignment_for_dir(&self, dir: &Path, result: &mut Vec<PathBuf>) {
+        if let Some(dir_idx) = self.path_table.lookup(dir.as_os_str().as_encoded_bytes()) {
+            if let Some(doc_ids) = self.parent_index.files_in_dir(dir_idx) {
+                result.reserve(doc_ids.len());
+                for &doc_id in doc_ids {
+                    let Some(entry) = self.entries_by_key.get(doc_id as usize) else {
+                        continue;
+                    };
+                    let Some(path_bytes) = self.path_table.resolve(entry.path_index()) else {
+                        continue;
+                    };
+                    result.push(pathbuf_from_encoded_vec(path_bytes));
+                }
+            }
+        }
+        self.cold_segments.for_each_live_meta(|meta| {
+            if meta.path.parent() == Some(dir) {
+                result.push(meta.path);
+            }
+        });
+    }
+
     pub fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
         let mut keys = self.resident_parent_candidates(parent_path);
         keys.extend(self.cold_segments.parent_candidates(parent_path));

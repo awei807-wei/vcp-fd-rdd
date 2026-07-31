@@ -63,6 +63,7 @@ struct DirectoryManifestChild {
 #[derive(Debug, Default)]
 pub(crate) struct DirectoryManifestBuilder {
     children: Vec<DirectoryManifestChild>,
+    active_len: usize,
 }
 
 impl DirectoryManifestBuilder {
@@ -70,15 +71,23 @@ impl DirectoryManifestBuilder {
         let Some(name) = path.file_name() else {
             return;
         };
-        self.children.push(DirectoryManifestChild {
-            name: name.as_encoded_bytes().to_vec(),
-            kind,
-            mtime_ns,
-        });
+        if let Some(child) = self.children.get_mut(self.active_len) {
+            child.name.clear();
+            child.name.extend_from_slice(name.as_encoded_bytes());
+            child.kind = kind;
+            child.mtime_ns = mtime_ns;
+        } else {
+            self.children.push(DirectoryManifestChild {
+                name: name.as_encoded_bytes().to_vec(),
+                kind,
+                mtime_ns,
+            });
+        }
+        self.active_len = self.active_len.saturating_add(1);
     }
 
-    pub fn finish(mut self) -> DirectoryManifestSummary {
-        if self.children.is_empty() {
+    pub fn finish(&mut self) -> DirectoryManifestSummary {
+        if self.active_len == 0 {
             return DirectoryManifestSummary {
                 min_mtime_ns: -1,
                 max_mtime_ns: -1,
@@ -86,15 +95,15 @@ impl DirectoryManifestBuilder {
             };
         }
 
-        self.children
-            .sort_by(|a, b| a.name.cmp(&b.name).then(a.mtime_ns.cmp(&b.mtime_ns)));
+        let active_children = &mut self.children[..self.active_len];
+        active_children.sort_by(|a, b| a.name.cmp(&b.name).then(a.mtime_ns.cmp(&b.mtime_ns)));
 
         let mut names = Xxh3::new();
         let mut mtimes = Xxh3::new();
         let mut min_mtime_ns = i64::MAX;
         let mut max_mtime_ns = i64::MIN;
 
-        for child in &self.children {
+        for child in active_children.iter() {
             names.update(&(child.name.len() as u64).to_le_bytes());
             names.update(&child.name);
             names.update(&[kind_tag(child.kind)]);
@@ -108,13 +117,20 @@ impl DirectoryManifestBuilder {
             max_mtime_ns = max_mtime_ns.max(child.mtime_ns);
         }
 
-        DirectoryManifestSummary {
-            child_count: self.children.len() as u64,
+        let summary = DirectoryManifestSummary {
+            child_count: self.active_len as u64,
             names_hash: names.digest(),
             child_mtime_hash: mtimes.digest(),
             min_mtime_ns,
             max_mtime_ns,
-        }
+        };
+        self.active_len = 0;
+        summary
+    }
+
+    /// 丢弃当前尚未完成的目录内容，同时保留子项缓冲供下一目录复用。
+    pub fn reset(&mut self) {
+        self.active_len = 0;
     }
 }
 
@@ -136,7 +152,7 @@ pub struct DirectoryManifestReport {
     pub mtime_precheck_untrusted_clock: u64,
     /// Phase 3：unbounded summary 二次确认命中（目录 mtime 变了但内容没变，跳过扫描）。
     pub unbounded_summary_hits: u64,
-    /// Phase 3：unbounded summary 二次确认未命中（内容确实变了或无存储记录，继续扫描）。
+    /// Phase 3：unbounded summary 二次确认未命中（已有记录但内容确实变了，继续扫描）。
     pub unbounded_summary_misses: u64,
 }
 
@@ -239,6 +255,14 @@ impl DirectoryManifestStore {
             .unwrap_or(false)
     }
 
+    pub(crate) fn record_changed_scan(&self) {
+        self.changed_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_untrusted_clock_bypass(&self) {
+        self.untrusted_clock_bypass.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn report(&self) -> DirectoryManifestReport {
         DirectoryManifestReport {
             dirs: self.manifests.lock().len(),
@@ -296,6 +320,51 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn manifest_builder_reuses_slots_without_cross_directory_leakage() {
+        let mut builder = DirectoryManifestBuilder::default();
+        builder.push_child(Path::new("/tmp/b.txt"), FileKind::File, 20);
+        builder.push_child(Path::new("/tmp/a"), FileKind::Directory, 10);
+        let first = builder.finish();
+        assert_eq!(first.child_count, 2);
+        let slots = builder.children.len();
+        let name_capacities = builder
+            .children
+            .iter()
+            .map(|child| child.name.capacity())
+            .collect::<Vec<_>>();
+
+        builder.push_child(Path::new("/tmp/c.txt"), FileKind::File, 30);
+        let reused = builder.finish();
+        let mut fresh = DirectoryManifestBuilder::default();
+        fresh.push_child(Path::new("/tmp/c.txt"), FileKind::File, 30);
+        assert_eq!(reused, fresh.finish());
+        assert_eq!(builder.children.len(), slots);
+        assert!(builder
+            .children
+            .iter()
+            .zip(name_capacities)
+            .all(|(child, capacity)| child.name.capacity() >= capacity));
+
+        assert_eq!(
+            builder.finish(),
+            DirectoryManifestSummary {
+                min_mtime_ns: -1,
+                max_mtime_ns: -1,
+                ..DirectoryManifestSummary::default()
+            },
+            "an empty directory must not inherit the previous active slots"
+        );
+
+        builder.push_child(Path::new("/tmp/stale.txt"), FileKind::File, 40);
+        builder.reset();
+        builder.push_child(Path::new("/tmp/fresh.txt"), FileKind::File, 50);
+        let after_reset = builder.finish();
+        let mut fresh = DirectoryManifestBuilder::default();
+        fresh.push_child(Path::new("/tmp/fresh.txt"), FileKind::File, 50);
+        assert_eq!(after_reset, fresh.finish());
     }
 
     #[test]

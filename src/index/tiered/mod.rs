@@ -342,6 +342,7 @@ pub struct TieredIndex {
     pub follow_symlinks: bool,
     pub exclude_dirs: Vec<String>,
     pub fs_policy_config: FsPolicyConfig,
+    pub(self) fs_policy_config_shared: Mutex<Arc<FsPolicyConfig>>,
     pub(self) fast_sync_semaphore: Arc<tokio::sync::Semaphore>,
     pub(self) dirty_queue: Mutex<DirtyQueue>,
     pub(self) dirty_notify: Notify,
@@ -762,6 +763,14 @@ impl TieredIndex {
 
     pub fn fs_policy_config(&self) -> FsPolicyConfig {
         self.fs_policy_config.clone()
+    }
+
+    pub(crate) fn shared_fs_policy_config(&self) -> Arc<FsPolicyConfig> {
+        let mut shared = self.fs_policy_config_shared.lock();
+        if shared.as_ref() != &self.fs_policy_config {
+            *shared = Arc::new(self.fs_policy_config.clone());
+        }
+        Arc::clone(&shared)
     }
 
     pub fn directory_manifest_report(&self) -> DirectoryManifestReport {
