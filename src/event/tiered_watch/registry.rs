@@ -124,6 +124,13 @@ impl TieredWatchRuntime {
             );
         let mut state = self.fast_scan_state.write();
         for entry in registry.entries.into_iter().take(max_entries) {
+            // Rotating leases are process-local scheduling claims. Restoring one
+            // without its active cycle would first emit a shallow bootstrap and
+            // then a second full sweep, so let the cold-window loop recreate it.
+            if entry.lease_kind == FastScanLeaseKind::RotatingColdWindow {
+                report.rejected_entries = report.rejected_entries.saturating_add(1);
+                continue;
+            }
             if entry.lease_kind == FastScanLeaseKind::Query
                 && !config.l1_l2_fast_scan_query_leases_enabled
             {
@@ -173,6 +180,7 @@ impl TieredWatchRuntime {
                     source_score: entry.source_score,
                     renew_count: entry.renew_count,
                     sentinel_state,
+                    bootstrap_recursive_cycle_id: None,
                 },
             );
             let signature = if active {

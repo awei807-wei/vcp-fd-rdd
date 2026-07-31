@@ -208,8 +208,16 @@ impl Default for FastScanTickConfig {
 pub struct FastScanTickResult {
     pub checked_dirs: usize,
     pub initial_dirs: Vec<PathBuf>,
+    pub rotating_initial_dirs: Vec<(PathBuf, u64)>,
     pub changed_dirs: Vec<PathBuf>,
     pub budget_degraded: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RotatingFastScanReadiness {
+    Unavailable,
+    Active,
+    BootstrapPending,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

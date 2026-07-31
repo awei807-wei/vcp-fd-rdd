@@ -17,7 +17,7 @@ use crate::event::sync::{DirtyQueueEntry, DirtyReason, DirtyScope};
 use crate::event::tiered_watch::{
     rotating_cold_window_fast_scan_max_cost, EphemeralWatchConfig, EphemeralWatchDecision,
     FastScanLeaseKind, RotatingColdWindowAction, RotatingColdWindowActionKind,
-    TieredWatchDebugDump, TieredWatchDebugSummary, WatchTier,
+    RotatingFastScanReadiness, TieredWatchDebugDump, TieredWatchDebugSummary, WatchTier,
 };
 use crate::event::watcher::check_inotify_limit;
 use crate::event::{EventPipeline, TieredWatchRuntime, WatchCommand};
@@ -1865,6 +1865,9 @@ fn spawn_tiered_fast_scan_loop(
             if !result.initial_dirs.is_empty() {
                 index.enqueue_dirty_dirs(result.initial_dirs, DirtyReason::FastScanBootstrapDir);
             }
+            for (path, cycle_id) in result.rotating_initial_dirs {
+                enqueue_rotating_recursive_scan(&index, vec![path], cycle_id);
+            }
             if !result.changed_dirs.is_empty() {
                 index.enqueue_dirty_dirs(result.changed_dirs, DirtyReason::FastScanChangedDir);
             }
@@ -1944,29 +1947,46 @@ fn spawn_rotating_cold_window_loop(
                             action.path.as_path(),
                             tiered.rotating_cold_window_ttl_secs.max(1),
                         );
-                        let ready = runtime.ensure_fast_scan_lease(
+                        let sweep_due = runtime.rotating_cold_window_sweep_due(
+                            action.path.as_path(),
+                            sweep_period_secs,
+                        );
+                        if sweep_due {
+                            match runtime.ensure_rotating_fast_scan_lease(
+                                action.path.clone(),
+                                Some(fast_scan_lease_ttl_secs),
+                                action.score.max(1),
+                                tick.cycle_id,
+                            ) {
+                                RotatingFastScanReadiness::Active => {
+                                    initial_scan_dirs.push(action.path);
+                                }
+                                RotatingFastScanReadiness::BootstrapPending => {}
+                                RotatingFastScanReadiness::Unavailable => {
+                                    tracing::debug!(
+                                        "rotating cold window fast-scan lease unavailable, falling back to scan-only for {:?}",
+                                        action.path
+                                    );
+                                    if runtime.downgrade_rotating_cold_window_lease_to_scan_only(
+                                        action.path.as_path(),
+                                        tick.cycle_id,
+                                    ) {
+                                        initial_scan_dirs.push(action.path);
+                                    }
+                                }
+                            }
+                        } else if runtime.ensure_fast_scan_lease(
                             action.path.clone(),
                             FastScanLeaseKind::RotatingColdWindow,
                             Some(fast_scan_lease_ttl_secs),
                             action.score.max(1),
-                        );
-                        if ready {
-                            // 完整递归 sweep 只按 SLA 墙钟周期到期时入队；周期之间由
-                            // sentinel/事件维持可见性。sweep_due 基于活跃 lease 下
-                            // 真实完成的墙钟戳，fail-closed 判 due。
-                            if runtime.rotating_cold_window_sweep_due(
-                                action.path.as_path(),
-                                sweep_period_secs,
-                            ) {
-                                initial_scan_dirs.push(action.path);
-                            } else {
-                                tracing::debug!(
-                                    "rotating full sweep deferred for {:?} at cycle {} (period {}s)",
-                                    action.path,
-                                    tick.cycle_id,
-                                    sweep_period_secs
-                                );
-                            }
+                        ) {
+                            tracing::debug!(
+                                "rotating full sweep deferred for {:?} at cycle {} (period {}s)",
+                                action.path,
+                                tick.cycle_id,
+                                sweep_period_secs
+                            );
                         } else {
                             tracing::debug!(
                                 "rotating cold window fast-scan lease unavailable, falling back to scan-only for {:?}",
@@ -2312,15 +2332,19 @@ async fn activate_rotating_ephemeral_action(
                     action.path.as_path(),
                     cycle_id,
                 );
-            if reclassified
-                && runtime.ensure_fast_scan_lease(
+            if reclassified {
+                return match runtime.ensure_rotating_fast_scan_lease(
                     action.path.clone(),
-                    FastScanLeaseKind::RotatingColdWindow,
                     Some(ttl_secs),
                     action.score.max(1),
-                )
-            {
-                return true;
+                    cycle_id,
+                ) {
+                    RotatingFastScanReadiness::Active => true,
+                    RotatingFastScanReadiness::BootstrapPending => false,
+                    RotatingFastScanReadiness::Unavailable => {
+                        downgrade_rotating_action_to_scan_only(runtime, action, cycle_id)
+                    }
+                };
             }
             downgrade_rotating_action_to_scan_only(runtime, action, cycle_id)
         }
@@ -2632,14 +2656,8 @@ mod tests {
             ..EphemeralWatchConfig::default()
         };
         let (watch_command_tx, mut watch_command_rx) = tokio::sync::mpsc::channel(1);
-        assert!(runtime.grant_fast_scan_lease(
-            root.clone(),
-            FastScanLeaseKind::RotatingColdWindow,
-            Some(5),
-            1,
-        ));
         assert!(
-            activate_rotating_ephemeral_action(
+            !activate_rotating_ephemeral_action(
                 &runtime,
                 &watch_command_tx,
                 &tick.actions[0],
@@ -2654,12 +2672,32 @@ mod tests {
 
         let report = runtime.report();
         assert_eq!(report.fast_scan_hotset_lease_count, 1);
-        assert_eq!(report.fast_scan_lease_renewals, 1);
+        assert_eq!(report.fast_scan_lease_renewals, 0);
         assert_eq!(report.rotating_cold_window_fast_scan_lease_dirs, 1);
         assert_eq!(report.rotating_cold_window_scan_only_dirs, 0);
         let debug = runtime.debug_dump(root.to_str());
         assert_eq!(debug.dirs[0].rotating_cold_window_action, "fast_scan_lease");
         assert!(runtime.take_due_rotating_cold_window_scans().is_empty());
+
+        let mount_table = MountTable::current().unwrap_or_default();
+        assert_eq!(
+            runtime.bootstrap_fast_scan_dirs(vec![root.clone()], &mount_table, 1),
+            1
+        );
+        let bootstrap = runtime.fast_scan_tick(
+            &mount_table,
+            crate::event::tiered_watch::FastScanTickConfig {
+                target_secs: 0,
+                local_stat_budget_per_tick: 8,
+                initial_backfill_budget_per_tick: 1,
+                ..crate::event::tiered_watch::FastScanTickConfig::default()
+            },
+        );
+        assert!(bootstrap.initial_dirs.is_empty());
+        assert_eq!(
+            bootstrap.rotating_initial_dirs,
+            vec![(root.clone(), tick.cycle_id)]
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

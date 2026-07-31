@@ -109,6 +109,92 @@ fn fast_scan_sentinel_detects_local_directory_entry_change() {
 }
 
 #[test]
+fn rotating_fast_scan_bootstrap_preserves_cycle_and_uses_single_initial_budget() {
+    let root = temp_root("rotating-fast-scan-bootstrap");
+    let rotating = root.join("rotating");
+    let query = root.join("query");
+    std::fs::create_dir_all(&rotating).unwrap();
+    std::fs::create_dir_all(&query).unwrap();
+    let table = mount_table_for(root.as_path(), "ext4");
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(root.clone(), 1)], 16, 5_000, 20);
+
+    assert_eq!(
+        rt.ensure_rotating_fast_scan_lease(rotating.clone(), Some(60), 1, 41),
+        RotatingFastScanReadiness::BootstrapPending
+    );
+    assert!(rt.grant_fast_scan_lease(query.clone(), FastScanLeaseKind::Query, None, 1));
+    assert_eq!(
+        rt.bootstrap_fast_scan_dirs(vec![rotating.clone(), query.clone()], &table, 2),
+        2
+    );
+
+    let cfg = FastScanTickConfig {
+        target_secs: 0,
+        local_stat_budget_per_tick: 8,
+        initial_backfill_budget_per_tick: 1,
+        ..FastScanTickConfig::default()
+    };
+    let first = rt.fast_scan_tick(&table, cfg);
+    assert!(first.initial_dirs.is_empty());
+    assert_eq!(first.rotating_initial_dirs, vec![(rotating.clone(), 41)]);
+
+    let second = rt.fast_scan_tick(&table, cfg);
+    assert_eq!(second.initial_dirs, vec![query.clone()]);
+    assert!(second.rotating_initial_dirs.is_empty());
+
+    let third = rt.fast_scan_tick(&table, cfg);
+    assert!(third.initial_dirs.is_empty());
+    assert!(third.rotating_initial_dirs.is_empty());
+    assert_eq!(
+        rt.ensure_rotating_fast_scan_lease(rotating.clone(), Some(60), 1, 42),
+        RotatingFastScanReadiness::Active
+    );
+    let active = rt.fast_scan_tick(&table, cfg);
+    assert!(active.initial_dirs.is_empty());
+    assert!(active.rotating_initial_dirs.is_empty());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pending_rotating_fast_scan_bootstrap_is_not_hotset_eviction_victim() {
+    let root = temp_root("rotating-fast-scan-pending-eviction");
+    let rotating = root.join("rotating");
+    let query = root.join("query");
+    std::fs::create_dir_all(&rotating).unwrap();
+    std::fs::create_dir_all(&query).unwrap();
+    let table = mount_table_for(root.as_path(), "ext4");
+    let rt = TieredWatchRuntime::new(Vec::new(), vec![(root.clone(), 1)], 16, 5_000, 20);
+    let config = TieredWatchConfig {
+        l1_l2_fast_scan_hotset_max_leases: 1,
+        ..TieredWatchConfig::default()
+    };
+    rt.apply_fast_scan_config(&config);
+
+    assert_eq!(
+        rt.ensure_rotating_fast_scan_lease(rotating.clone(), Some(60), 1, 77),
+        RotatingFastScanReadiness::BootstrapPending
+    );
+    assert!(!rt.grant_fast_scan_lease(query, FastScanLeaseKind::Query, None, 100));
+    assert_eq!(
+        rt.bootstrap_fast_scan_dirs(vec![rotating.clone()], &table, 1),
+        1
+    );
+    let tick = rt.fast_scan_tick(
+        &table,
+        FastScanTickConfig {
+            target_secs: 0,
+            local_stat_budget_per_tick: 8,
+            initial_backfill_budget_per_tick: 1,
+            ..FastScanTickConfig::default()
+        },
+    );
+    assert_eq!(tick.rotating_initial_dirs, vec![(rotating, 77)]);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn fast_scan_bootstrap_is_driven_by_uncovered_hotset_leases() {
     let root = temp_root("fast-scan-bootstrap-limit");
     let hot = root.join("hot");
@@ -388,6 +474,53 @@ fn fast_scan_registry_restore_trust_gate_controls_backfill() {
     let query_disabled_report = query_disabled.report();
     assert_eq!(query_disabled_report.fast_scan_hotset_lease_count, 0);
     assert_eq!(query_disabled_report.fast_scan_hotset_sentinel_count, 0);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn fast_scan_registry_does_not_restore_process_local_rotating_leases() {
+    let root = temp_root("fast-scan-registry-rotating");
+    let cold = root.join("cold");
+    let snapshot = root.join("snapshot.v7");
+    std::fs::create_dir_all(&cold).unwrap();
+    let table = mount_table_for(root.as_path(), "ext4");
+    let cfg = TieredWatchConfig::default();
+
+    let source = TieredWatchRuntime::new(Vec::new(), vec![(cold.clone(), 1)], 16, 5_000, 20);
+    source.apply_fast_scan_config(&cfg);
+    assert!(source.grant_fast_scan_lease(
+        cold.clone(),
+        FastScanLeaseKind::RotatingColdWindow,
+        None,
+        1,
+    ));
+    assert_eq!(
+        source.bootstrap_fast_scan_dirs(vec![cold.clone()], &table, 1),
+        1
+    );
+    let _ = source.fast_scan_tick(
+        &table,
+        FastScanTickConfig {
+            target_secs: 0,
+            local_stat_budget_per_tick: 8,
+            initial_backfill_budget_per_tick: 1,
+            ..FastScanTickConfig::default()
+        },
+    );
+    assert_eq!(
+        source
+            .persist_fast_scan_registry(&snapshot, &cfg, "stable", 42, true)
+            .unwrap(),
+        1
+    );
+
+    let restored = TieredWatchRuntime::new(Vec::new(), vec![(cold.clone(), 1)], 16, 5_000, 20);
+    restored.apply_fast_scan_config(&cfg);
+    let report = restored.restore_fast_scan_registry(&snapshot, &cfg, true, "stable", 42, &table);
+    assert_eq!(report.rejected_entries, 1);
+    assert_eq!(report.restored_active, 0);
+    assert_eq!(restored.report().fast_scan_hotset_lease_count, 0);
 
     let _ = std::fs::remove_dir_all(root);
 }

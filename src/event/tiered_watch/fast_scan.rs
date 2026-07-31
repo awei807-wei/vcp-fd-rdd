@@ -69,6 +69,7 @@ pub(super) struct FastScanLease {
     pub(super) source_score: u64,
     pub(super) renew_count: u64,
     pub(super) sentinel_state: FastScanSentinelState,
+    pub(super) bootstrap_recursive_cycle_id: Option<u64>,
 }
 
 impl FastScanLease {
@@ -311,8 +312,20 @@ impl TieredWatchRuntime {
         ttl_secs: Option<u64>,
         source_score: u64,
     ) -> bool {
+        self.upsert_fast_scan_lease(path, kind, ttl_secs, source_score, None)
+            .inserted
+    }
+
+    fn upsert_fast_scan_lease(
+        &self,
+        path: PathBuf,
+        kind: FastScanLeaseKind,
+        ttl_secs: Option<u64>,
+        source_score: u64,
+        bootstrap_recursive_cycle_id: Option<u64>,
+    ) -> FastScanLeaseUpdate {
         if !self.fast_scan_enabled.load(Ordering::Relaxed) {
-            return false;
+            return FastScanLeaseUpdate::default();
         }
 
         let now = unix_secs();
@@ -327,30 +340,15 @@ impl TieredWatchRuntime {
         self.prune_expired_fast_scan_leases_locked(&mut state, now);
 
         if state.leases.contains_key(path.as_path()) {
-            let lease_kind = {
-                let lease = state
-                    .leases
-                    .get_mut(path.as_path())
-                    .expect("checked lease existence");
-                lease.last_used_unix_secs = now;
-                lease.expires_unix_secs = lease.expires_unix_secs.max(expires);
-                lease.priority = lease.priority.max(kind.priority());
-                lease.source_score = lease.source_score.saturating_add(source_score.max(1));
-                lease.renew_count = lease.renew_count.saturating_add(1);
-                if kind.priority() >= lease.lease_kind.priority() {
-                    lease.lease_kind = kind;
-                }
-                lease.lease_kind
-            };
-            if let Some(sentinel) = state.sentinels.get_mut(path.as_path()) {
-                sentinel.lease_kind = lease_kind;
-            } else {
-                self.fast_scan_bootstrap_next_unix_ms
-                    .store(0, Ordering::Relaxed);
-            }
-            self.fast_scan_lease_renewals
-                .fetch_add(1, Ordering::Relaxed);
-            return false;
+            return self.renew_fast_scan_lease_locked(
+                &mut state,
+                path.as_path(),
+                kind,
+                now,
+                expires,
+                source_score,
+                bootstrap_recursive_cycle_id,
+            );
         }
 
         let max_leases = self
@@ -362,11 +360,76 @@ impl TieredWatchRuntime {
                 .store(true, Ordering::Relaxed);
             state.last_degraded_reason =
                 format!("lease hotset budget full: max_leases={max_leases}");
-            return false;
+            return FastScanLeaseUpdate::default();
         }
 
+        self.insert_fast_scan_lease_locked(
+            &mut state,
+            path,
+            kind,
+            now,
+            expires,
+            source_score,
+            bootstrap_recursive_cycle_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn renew_fast_scan_lease_locked(
+        &self,
+        state: &mut FastScanState,
+        path: &Path,
+        kind: FastScanLeaseKind,
+        now: u64,
+        expires: u64,
+        source_score: u64,
+        bootstrap_recursive_cycle_id: Option<u64>,
+    ) -> FastScanLeaseUpdate {
+        let sentinel_active = state
+            .sentinels
+            .get(path)
+            .is_some_and(|sentinel| sentinel.sentinel_state == FastScanSentinelState::Active);
+        let lease = state.leases.get_mut(path).expect("checked lease existence");
+        lease.last_used_unix_secs = now;
+        lease.expires_unix_secs = lease.expires_unix_secs.max(expires);
+        lease.priority = lease.priority.max(kind.priority());
+        lease.source_score = lease.source_score.saturating_add(source_score.max(1));
+        lease.renew_count = lease.renew_count.saturating_add(1);
+        if kind.priority() >= lease.lease_kind.priority() {
+            lease.lease_kind = kind;
+        }
+        if let Some(cycle_id) = bootstrap_recursive_cycle_id {
+            lease.bootstrap_recursive_cycle_id = (!sentinel_active).then_some(cycle_id);
+        }
+        let lease_kind = lease.lease_kind;
+        if let Some(sentinel) = state.sentinels.get_mut(path) {
+            sentinel.lease_kind = lease_kind;
+        } else {
+            self.fast_scan_bootstrap_next_unix_ms
+                .store(0, Ordering::Relaxed);
+        }
+        self.fast_scan_lease_renewals
+            .fetch_add(1, Ordering::Relaxed);
+        FastScanLeaseUpdate {
+            inserted: false,
+            available: true,
+            sentinel_active,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_fast_scan_lease_locked(
+        &self,
+        state: &mut FastScanState,
+        path: PathBuf,
+        kind: FastScanLeaseKind,
+        now: u64,
+        expires: u64,
+        source_score: u64,
+        bootstrap_recursive_cycle_id: Option<u64>,
+    ) -> FastScanLeaseUpdate {
         state.leases.insert(
-            path.clone(),
+            path,
             FastScanLease {
                 lease_kind: kind,
                 created_unix_secs: now,
@@ -378,11 +441,16 @@ impl TieredWatchRuntime {
                 source_score: source_score.max(1),
                 renew_count: 0,
                 sentinel_state: FastScanSentinelState::BackfillPending,
+                bootstrap_recursive_cycle_id,
             },
         );
         self.fast_scan_bootstrap_next_unix_ms
             .store(0, Ordering::Relaxed);
-        true
+        FastScanLeaseUpdate {
+            inserted: true,
+            available: true,
+            sentinel_active: false,
+        }
     }
 
     /// Grant or renew a fast-scan lease and report whether coverage is active afterward.
@@ -393,19 +461,31 @@ impl TieredWatchRuntime {
         ttl_secs: Option<u64>,
         source_score: u64,
     ) -> bool {
-        if !self.fast_scan_enabled.load(Ordering::Relaxed) {
-            return false;
+        self.upsert_fast_scan_lease(path, kind, ttl_secs, source_score, None)
+            .available
+    }
+
+    pub(crate) fn ensure_rotating_fast_scan_lease(
+        &self,
+        path: PathBuf,
+        ttl_secs: Option<u64>,
+        source_score: u64,
+        cycle_id: u64,
+    ) -> RotatingFastScanReadiness {
+        let update = self.upsert_fast_scan_lease(
+            path,
+            FastScanLeaseKind::RotatingColdWindow,
+            ttl_secs,
+            source_score,
+            Some(cycle_id),
+        );
+        if !update.available {
+            RotatingFastScanReadiness::Unavailable
+        } else if update.sentinel_active {
+            RotatingFastScanReadiness::Active
+        } else {
+            RotatingFastScanReadiness::BootstrapPending
         }
-        if self.grant_fast_scan_lease(path.clone(), kind, ttl_secs, source_score) {
-            return true;
-        }
-        let path = normalize_fast_scan_dir(path);
-        let now = unix_secs();
-        self.fast_scan_state
-            .read()
-            .leases
-            .get(path.as_path())
-            .is_some_and(|lease| !lease.expired(now))
     }
 
     pub(super) fn default_fast_scan_lease_ttl(&self, kind: FastScanLeaseKind) -> u64 {
@@ -464,7 +544,9 @@ impl TieredWatchRuntime {
         let Some(victim) = state
             .leases
             .iter()
-            .filter(|(_, lease)| !lease.lease_kind.is_explicit())
+            .filter(|(_, lease)| {
+                !lease.lease_kind.is_explicit() && lease.bootstrap_recursive_cycle_id.is_none()
+            })
             .min_by_key(|(path, lease)| {
                 (
                     lease.priority,
@@ -756,7 +838,9 @@ impl TieredWatchRuntime {
 
         let initial_budget = config.initial_backfill_budget_per_tick.max(1);
         let mut initial_dirs = Vec::new();
-        while initial_dirs.len() < initial_budget {
+        let mut rotating_initial_dirs = Vec::new();
+        let mut initial_processed = 0usize;
+        while initial_processed < initial_budget {
             let Some(path) = state.initial_backfill_queue.pop_front() else {
                 break;
             };
@@ -767,13 +851,24 @@ impl TieredWatchRuntime {
             {
                 continue;
             }
-            if let Some(sentinel) = state.sentinels.get_mut(path.as_path()) {
-                sentinel.sentinel_state = FastScanSentinelState::Active;
-            }
-            if let Some(lease) = state.leases.get_mut(path.as_path()) {
+            let Some(sentinel) = state.sentinels.get_mut(path.as_path()) else {
+                self.fast_scan_bootstrap_next_unix_ms
+                    .store(0, Ordering::Relaxed);
+                continue;
+            };
+            sentinel.sentinel_state = FastScanSentinelState::Active;
+            let bootstrap_cycle_id = if let Some(lease) = state.leases.get_mut(path.as_path()) {
                 lease.sentinel_state = FastScanSentinelState::Active;
+                lease.bootstrap_recursive_cycle_id.take()
+            } else {
+                None
+            };
+            if let Some(cycle_id) = bootstrap_cycle_id {
+                rotating_initial_dirs.push((path, cycle_id));
+            } else {
+                initial_dirs.push(path);
             }
-            initial_dirs.push(path);
+            initial_processed = initial_processed.saturating_add(1);
         }
 
         let changed_budget = config
@@ -794,7 +889,10 @@ impl TieredWatchRuntime {
         self.fast_scan_checked_dirs
             .fetch_add(checked_dirs as u64, Ordering::Relaxed);
         self.fast_scan_changed_dirs.fetch_add(
-            initial_dirs.len().saturating_add(changed_dirs.len()) as u64,
+            initial_dirs
+                .len()
+                .saturating_add(rotating_initial_dirs.len())
+                .saturating_add(changed_dirs.len()) as u64,
             Ordering::Relaxed,
         );
         self.fast_scan_real_changed_dirs
@@ -813,6 +911,7 @@ impl TieredWatchRuntime {
         FastScanTickResult {
             checked_dirs,
             initial_dirs,
+            rotating_initial_dirs,
             changed_dirs,
             budget_degraded: self.fast_scan_budget_degraded.load(Ordering::Relaxed),
         }
@@ -832,6 +931,13 @@ impl TieredWatchRuntime {
         self.fast_scan_parent_fence_retries
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FastScanLeaseUpdate {
+    inserted: bool,
+    available: bool,
+    sentinel_active: bool,
 }
 
 pub(super) fn network_fast_scan_mode_to_u8(mode: NetworkFastScanMode) -> u8 {
