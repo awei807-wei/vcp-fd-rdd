@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SubtreeInvalidationSnapshot {
-    prefixes: Arc<BTreeSet<Vec<u8>>>,
+    prefixes: BTreeSet<Vec<u8>>,
     epoch: u64,
 }
 
@@ -177,7 +177,6 @@ pub struct DeltaBuffer {
     /// cannot resurrect cold children.
     subtree_invalidations: std::collections::HashSet<Vec<u8>>,
     subtree_invalidation_epoch: u64,
-    subtree_invalidation_snapshot_cache: Option<Arc<BTreeSet<Vec<u8>>>>,
     /// Recursively scanned subtree roots whose descendants were stable at the
     /// scan boundary. Direct v7 persistence may use these proofs to distinguish
     /// a complete subtree move/recreate from a lone directory event.
@@ -215,7 +214,6 @@ impl DeltaBuffer {
             base_max_capacity: cap,
             subtree_invalidations: std::collections::HashSet::new(),
             subtree_invalidation_epoch: 0,
-            subtree_invalidation_snapshot_cache: None,
             complete_subtree_scans: std::collections::HashSet::new(),
             structural_upsert_targets: std::collections::HashSet::new(),
             overflowed: false,
@@ -233,7 +231,6 @@ impl DeltaBuffer {
             base_max_capacity: max_capacity,
             subtree_invalidations: std::collections::HashSet::new(),
             subtree_invalidation_epoch: 0,
-            subtree_invalidation_snapshot_cache: None,
             complete_subtree_scans: std::collections::HashSet::new(),
             structural_upsert_targets: std::collections::HashSet::new(),
             overflowed: false,
@@ -403,18 +400,9 @@ impl DeltaBuffer {
         self.subtree_invalidations.iter().cloned().collect()
     }
 
-    pub(crate) fn invalidation_snapshot(&mut self) -> SubtreeInvalidationSnapshot {
-        if self.subtree_invalidation_snapshot_cache.is_none() {
-            self.subtree_invalidation_snapshot_cache =
-                Some(Arc::new(self.snapshot_subtree_invalidations()));
-        }
-        let prefixes = Arc::clone(
-            self.subtree_invalidation_snapshot_cache
-                .as_ref()
-                .expect("invalidation snapshot cache was initialized"),
-        );
+    pub(crate) fn invalidation_snapshot(&self) -> SubtreeInvalidationSnapshot {
         SubtreeInvalidationSnapshot {
-            prefixes,
+            prefixes: self.snapshot_subtree_invalidations(),
             epoch: self.subtree_invalidation_epoch,
         }
     }
@@ -647,19 +635,6 @@ impl DeltaBuffer {
                 .map(|path| path.capacity() + size_of::<Vec<u8>>() + 16)
                 .sum::<usize>()
             + self
-                .subtree_invalidation_snapshot_cache
-                .as_ref()
-                .map(|prefixes| {
-                    size_of::<BTreeSet<Vec<u8>>>()
-                        + prefixes
-                            .iter()
-                            .map(|path| {
-                                path.capacity() + size_of::<Vec<u8>>() + 3 * size_of::<usize>()
-                            })
-                            .sum::<usize>()
-                })
-                .unwrap_or(0)
-            + self
                 .complete_subtree_scans
                 .iter()
                 .map(|path| path.capacity() + size_of::<Vec<u8>>() + 16)
@@ -679,7 +654,6 @@ impl DeltaBuffer {
     fn note_subtree_invalidation(&mut self, path: Vec<u8>) {
         if self.subtree_invalidations.insert(path) {
             self.subtree_invalidation_epoch = self.subtree_invalidation_epoch.wrapping_add(1);
-            self.subtree_invalidation_snapshot_cache = None;
         }
     }
 
@@ -687,7 +661,6 @@ impl DeltaBuffer {
         if !self.subtree_invalidations.is_empty() {
             self.subtree_invalidations.clear();
             self.subtree_invalidation_epoch = self.subtree_invalidation_epoch.wrapping_add(1);
-            self.subtree_invalidation_snapshot_cache = None;
         }
     }
 }
@@ -885,32 +858,6 @@ mod tests {
         assert!(db
             .invalidation_covering_path(std::path::Path::new("/tmp/other-tree/child.txt"))
             .is_none());
-    }
-
-    #[test]
-    fn invalidation_snapshot_reuses_prefix_storage_until_prefixes_change() {
-        let mut db = DeltaBuffer::with_capacity(1024);
-        assert!(db.apply_events(&[make_event(1, EventType::Delete, "/tmp/old-tree")]));
-
-        let first = db.invalidation_snapshot();
-        let second = db.invalidation_snapshot();
-        assert!(Arc::ptr_eq(&first.prefixes, &second.prefixes));
-        assert!(second.covers(std::path::Path::new("/tmp/old-tree/child.txt")));
-
-        assert!(db.apply_events(&[make_event(2, EventType::Create, "/tmp/live-file")]));
-        let live_only_mutation = db.invalidation_snapshot();
-        assert!(Arc::ptr_eq(&first.prefixes, &live_only_mutation.prefixes));
-
-        assert!(db.apply_events(&[make_event(3, EventType::Delete, "/tmp/new-tree")]));
-        let changed = db.invalidation_snapshot();
-        assert!(!Arc::ptr_eq(&first.prefixes, &changed.prefixes));
-        assert_ne!(first.epoch(), changed.epoch());
-        assert!(changed.covers(std::path::Path::new("/tmp/new-tree/child.txt")));
-
-        db.clear_subtree_invalidations();
-        let cleared = db.invalidation_snapshot();
-        assert!(cleared.prefixes.is_empty());
-        assert_ne!(changed.epoch(), cleared.epoch());
     }
 
     #[test]
