@@ -137,7 +137,7 @@ fn unescape_mount_path(input: &str) -> PathBuf {
     crate::util::pathbuf_from_encoded_vec(out)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FsPolicyConfig {
     #[serde(default)]
     pub allow_remote: bool,
@@ -417,14 +417,14 @@ impl MountProbeCache {
 #[derive(Clone, Debug)]
 pub struct FsPolicy {
     table: Arc<MountTable>,
-    config: Arc<FsPolicyConfig>,
+    config: FsPolicyConfig,
 }
 
 impl FsPolicy {
     pub fn new(table: MountTable, config: FsPolicyConfig) -> Self {
         Self {
             table: Arc::new(table),
-            config: Arc::new(config),
+            config,
         }
     }
 
@@ -433,10 +433,6 @@ impl FsPolicy {
     }
 
     pub fn current_with_config(config: FsPolicyConfig) -> Option<Self> {
-        Self::current_with_shared_config(Arc::new(config))
-    }
-
-    pub fn current_with_shared_config(config: Arc<FsPolicyConfig>) -> Option<Self> {
         MountTable::current_cached().map(|table| Self { table, config })
     }
 

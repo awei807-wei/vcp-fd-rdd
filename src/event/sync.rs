@@ -164,12 +164,12 @@ impl DirtyRepairProgress {
         scanned: usize,
         changed: usize,
         elapsed_ms: u64,
-        project_roots: Vec<PathBuf>,
+        project_roots: &[PathBuf],
     ) {
         self.scanned = self.scanned.saturating_add(scanned);
         self.changed = self.changed.saturating_add(changed);
         self.elapsed_ms = self.elapsed_ms.saturating_add(elapsed_ms);
-        self.project_roots.extend(project_roots);
+        self.project_roots.extend(project_roots.iter().cloned());
     }
 
     pub(crate) fn into_parts(self) -> (usize, usize, u64, Vec<PathBuf>) {

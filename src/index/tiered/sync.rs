@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -33,147 +34,36 @@ const REPAIR_SLICE_MAX_ENTRIES: usize = 512;
 struct RepairSliceScratch {
     upsert_events: Vec<EventRecord>,
     upsert_metas: Vec<FileMeta>,
-    manifest: DirectoryManifestBuilder,
-    dir_children: DirChildBuffer,
 }
 
 thread_local! {
     static REPAIR_SLICE_SCRATCH: std::cell::RefCell<RepairSliceScratch> =
-        std::cell::RefCell::new(RepairSliceScratch {
-            upsert_events: Vec::new(),
-            upsert_metas: Vec::new(),
-            manifest: DirectoryManifestBuilder::default(),
-            dir_children: DirChildBuffer::default(),
-        });
+        const {
+            std::cell::RefCell::new(RepairSliceScratch {
+                upsert_events: Vec::new(),
+                upsert_metas: Vec::new(),
+            })
+        };
 }
 
-fn take_repair_slice_scratch() -> (
-    Vec<EventRecord>,
-    Vec<FileMeta>,
-    DirectoryManifestBuilder,
-    DirChildBuffer,
-) {
+fn take_repair_slice_scratch() -> (Vec<EventRecord>, Vec<FileMeta>) {
     REPAIR_SLICE_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
         (
             std::mem::take(&mut scratch.upsert_events),
             std::mem::take(&mut scratch.upsert_metas),
-            std::mem::take(&mut scratch.manifest),
-            std::mem::take(&mut scratch.dir_children),
         )
     })
 }
 
-fn return_repair_slice_scratch(
-    mut events: Vec<EventRecord>,
-    mut metas: Vec<FileMeta>,
-    mut manifest: DirectoryManifestBuilder,
-    mut dir_children: DirChildBuffer,
-) {
+fn return_repair_slice_scratch(mut events: Vec<EventRecord>, mut metas: Vec<FileMeta>) {
     events.clear();
     metas.clear();
-    manifest.reset();
-    dir_children.reset();
     REPAIR_SLICE_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
         scratch.upsert_events = events;
         scratch.upsert_metas = metas;
-        scratch.manifest = manifest;
-        scratch.dir_children = dir_children;
     });
-}
-
-#[derive(Default)]
-struct AlignmentScratch {
-    current_names: DirectoryNameBuffer,
-    indexed_children: Vec<PathBuf>,
-    missing_children: Vec<PathBuf>,
-    delete_events: Vec<EventRecord>,
-}
-
-thread_local! {
-    static ALIGNMENT_SCRATCH: std::cell::RefCell<AlignmentScratch> =
-        std::cell::RefCell::new(AlignmentScratch::default());
-}
-
-fn take_alignment_scratch() -> AlignmentScratch {
-    ALIGNMENT_SCRATCH.with(|scratch| std::mem::take(&mut *scratch.borrow_mut()))
-}
-
-fn return_alignment_scratch(mut scratch: AlignmentScratch) {
-    const MAX_RETAINED_NAMES: usize = 65_536;
-    const MAX_RETAINED_EVENTS: usize = 16_384;
-
-    if scratch.current_names.slot_count() > MAX_RETAINED_NAMES {
-        scratch.current_names = DirectoryNameBuffer::default();
-    } else {
-        scratch.current_names.reset();
-    }
-    if scratch.missing_children.capacity() > MAX_RETAINED_EVENTS {
-        scratch.missing_children = Vec::new();
-    } else {
-        scratch.missing_children.clear();
-    }
-    if scratch.indexed_children.capacity() > MAX_RETAINED_EVENTS {
-        scratch.indexed_children = Vec::new();
-    } else {
-        scratch.indexed_children.clear();
-    }
-    if scratch.delete_events.capacity() > MAX_RETAINED_EVENTS {
-        scratch.delete_events = Vec::new();
-    } else {
-        scratch.delete_events.clear();
-    }
-    ALIGNMENT_SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
-}
-
-#[cfg(test)]
-struct RepairSlicePreApplyTestHook {
-    dir: PathBuf,
-    entered: Arc<std::sync::Barrier>,
-    release: Arc<std::sync::Barrier>,
-}
-
-#[cfg(test)]
-fn repair_slice_pre_apply_test_hook(
-) -> &'static std::sync::Mutex<Option<RepairSlicePreApplyTestHook>> {
-    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<RepairSlicePreApplyTestHook>>> =
-        std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-pub(super) fn install_repair_slice_pre_apply_test_hook(
-    dir: PathBuf,
-) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
-    let entered = Arc::new(std::sync::Barrier::new(2));
-    let release = Arc::new(std::sync::Barrier::new(2));
-    *repair_slice_pre_apply_test_hook()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(RepairSlicePreApplyTestHook {
-        dir,
-        entered: Arc::clone(&entered),
-        release: Arc::clone(&release),
-    });
-    (entered, release)
-}
-
-#[cfg(test)]
-fn run_repair_slice_pre_apply_test_hook(dir: &Path) {
-    let hook = {
-        let mut slot = repair_slice_pre_apply_test_hook()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if slot.as_ref().is_some_and(|hook| hook.dir == dir) {
-            slot.take()
-        } else {
-            None
-        }
-    };
-    if let Some(hook) = hook {
-        hook.entered.wait();
-        hook.release.wait();
-    }
 }
 const REPAIR_SLICE_MAX_MS: u64 = 20;
 
@@ -293,7 +183,7 @@ struct RepairContinuationState {
 
 fn repair_continuation_cursor(
     entry: &mut DirtyQueueEntry,
-    sliced: &mut SlicedScanOutcome,
+    sliced: &SlicedScanOutcome,
     recursive_subtree_repair: bool,
 ) -> RepairContinuationState {
     if sliced.dropped_stale_batch || sliced.failed {
@@ -330,9 +220,9 @@ fn repair_continuation_cursor(
         sliced.outcome.scanned,
         sliced.outcome.changed,
         sliced.outcome.elapsed_ms,
-        std::mem::take(&mut sliced.outcome.project_roots),
+        sliced.outcome.project_roots.as_slice(),
     );
-    pending_dirs.extend(std::mem::take(&mut sliced.child_dirs));
+    pending_dirs.extend(sliced.child_dirs.iter().cloned());
     if sliced.completed {
         let Some(dir_start_stamp) = sliced.dir_start_stamp else {
             return RepairContinuationState {
@@ -428,88 +318,6 @@ struct ImmediateScanReconcileOutcome {
 #[derive(Clone, Debug)]
 struct DirChildEntry {
     path: PathBuf,
-}
-
-#[derive(Debug, Default)]
-struct DirectoryNameBuffer {
-    names: Vec<Vec<u8>>,
-    active_len: usize,
-}
-
-impl DirectoryNameBuffer {
-    fn reset(&mut self) {
-        self.active_len = 0;
-    }
-
-    fn push(&mut self, name: &[u8]) {
-        if let Some(slot) = self.names.get_mut(self.active_len) {
-            slot.clear();
-            slot.extend_from_slice(name);
-        } else {
-            self.names.push(name.to_vec());
-        }
-        self.active_len = self.active_len.saturating_add(1);
-    }
-
-    fn finish(&mut self) {
-        self.names[..self.active_len].sort_unstable();
-    }
-
-    fn contains(&self, name: &std::ffi::OsStr) -> bool {
-        self.names[..self.active_len]
-            .binary_search_by(|candidate| candidate.as_slice().cmp(name.as_encoded_bytes()))
-            .is_ok()
-    }
-
-    fn slot_count(&self) -> usize {
-        self.names.len()
-    }
-}
-
-#[derive(Debug, Default)]
-struct DirChildBuffer {
-    entries: Vec<DirChildEntry>,
-    active_len: usize,
-}
-
-impl DirChildBuffer {
-    fn reset(&mut self) {
-        self.active_len = 0;
-    }
-
-    fn len(&self) -> usize {
-        self.active_len
-    }
-
-    fn active(&self) -> &[DirChildEntry] {
-        &self.entries[..self.active_len]
-    }
-
-    fn push_joined(&mut self, dir: &Path, name: &std::ffi::OsStr) {
-        if let Some(entry) = self.entries.get_mut(self.active_len) {
-            entry.path.clear();
-            entry.path.push(dir);
-            entry.path.push(name);
-        } else {
-            self.entries.push(DirChildEntry {
-                path: dir.join(name),
-            });
-        }
-        self.active_len = self.active_len.saturating_add(1);
-    }
-
-    #[cfg(not(unix))]
-    fn push_path(&mut self, path: &Path) {
-        if let Some(entry) = self.entries.get_mut(self.active_len) {
-            entry.path.clear();
-            entry.path.push(path);
-        } else {
-            self.entries.push(DirChildEntry {
-                path: path.to_path_buf(),
-            });
-        }
-        self.active_len = self.active_len.saturating_add(1);
-    }
 }
 
 fn visit_dirs_since(
@@ -622,6 +430,7 @@ fn collect_dirs_changed_since(
 }
 
 struct ReadDirSlice {
+    entries: Vec<DirChildEntry>,
     completed: bool,
     next_offset: Option<i64>,
 }
@@ -638,10 +447,9 @@ fn read_dir_slice(
     start_offset: i64,
     max_entries: usize,
     max_elapsed: Duration,
-    entries: &mut DirChildBuffer,
 ) -> std::io::Result<ReadDirSlice> {
     use std::ffi::{CStr, CString};
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     struct DirHandle(*mut libc::DIR);
 
@@ -654,7 +462,7 @@ fn read_dir_slice(
     }
 
     let start = Instant::now();
-    entries.reset();
+    let mut entries = Vec::new();
     let mut completed = true;
     let c_path = CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has NUL byte"))?;
@@ -684,11 +492,15 @@ fn read_dir_slice(
             next_offset = unsafe { libc::telldir(handle.0) as i64 };
             continue;
         }
-        entries.push_joined(dir, std::ffi::OsStr::from_bytes(name));
+        let name = OsString::from_vec(name.to_vec());
+        entries.push(DirChildEntry {
+            path: dir.join(&name),
+        });
         next_offset = unsafe { libc::telldir(handle.0) as i64 };
     }
 
     Ok(ReadDirSlice {
+        entries,
         completed,
         next_offset: (!completed).then_some(next_offset),
     })
@@ -700,10 +512,9 @@ fn read_dir_slice(
     start_offset: i64,
     max_entries: usize,
     max_elapsed: Duration,
-    entries: &mut DirChildBuffer,
 ) -> std::io::Result<ReadDirSlice> {
     let start = Instant::now();
-    entries.reset();
+    let mut entries = Vec::new();
     let mut skipped = 0i64;
     let mut completed = true;
 
@@ -721,70 +532,15 @@ fn read_dir_slice(
             break;
         }
         let child = child?;
-        entries.push_path(child.path().as_path());
+        entries.push(DirChildEntry { path: child.path() });
     }
 
     let consumed = start_offset.saturating_add(entries.len() as i64);
     Ok(ReadDirSlice {
+        entries,
         completed,
         next_offset: (!completed).then_some(consumed),
     })
-}
-
-#[cfg(target_os = "linux")]
-fn read_dir_names(dir: &Path, names: &mut DirectoryNameBuffer) -> std::io::Result<()> {
-    use std::ffi::{CStr, CString};
-    use std::os::unix::ffi::OsStrExt;
-
-    struct DirHandle(*mut libc::DIR);
-
-    impl Drop for DirHandle {
-        fn drop(&mut self) {
-            unsafe {
-                libc::closedir(self.0);
-            }
-        }
-    }
-
-    names.reset();
-    let c_path = CString::new(dir.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has NUL byte"))?;
-    let raw = unsafe { libc::opendir(c_path.as_ptr()) };
-    if raw.is_null() {
-        return Err(std::io::Error::last_os_error());
-    }
-    let handle = DirHandle(raw);
-
-    loop {
-        unsafe {
-            *libc::__errno_location() = 0;
-        }
-        let entry = unsafe { libc::readdir(handle.0) };
-        if entry.is_null() {
-            let errno = unsafe { *libc::__errno_location() };
-            return if errno == 0 {
-                names.finish();
-                Ok(())
-            } else {
-                Err(std::io::Error::from_raw_os_error(errno))
-            };
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." {
-            names.push(name);
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_dir_names(dir: &Path, names: &mut DirectoryNameBuffer) -> std::io::Result<()> {
-    names.reset();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        names.push(entry.file_name().as_encoded_bytes());
-    }
-    names.finish();
-    Ok(())
 }
 
 fn should_skip_dirty_dir(
@@ -1390,7 +1146,7 @@ impl TieredIndex {
                                 scan_failed,
                                 completed_recursive_outcome,
                             ) = if entry.reason.is_cold_scan() || recursive_subtree_repair {
-                                let mut sliced = self.scan_dir_repair_slice_with_project_markers(
+                                let sliced = self.scan_dir_repair_slice_with_project_markers(
                                     dir,
                                     entry.repair_cursor.as_ref(),
                                     ignore_prefixes,
@@ -1401,7 +1157,7 @@ impl TieredIndex {
                                 );
                                 let continuation_state = repair_continuation_cursor(
                                     &mut entry,
-                                    &mut sliced,
+                                    &sliced,
                                     recursive_subtree_repair,
                                 );
                                 let continuation = continuation_state.cursor;
@@ -1671,9 +1427,8 @@ impl TieredIndex {
                 .git_ignore(self.ignore_enabled)
                 .git_global(self.ignore_enabled)
                 .git_exclude(self.ignore_enabled);
-            let fs_policy = crate::fs_policy::FsPolicy::current_with_shared_config(
-                self.shared_fs_policy_config(),
-            );
+            let fs_policy =
+                crate::fs_policy::FsPolicy::current_with_config(self.fs_policy_config());
             let root = dir.clone();
             let exclude_dirs = self.exclude_dirs.clone();
             let mount_policy_counters = self.mount_policy_counters();
@@ -1881,9 +1636,8 @@ impl TieredIndex {
                 .git_ignore(self.ignore_enabled)
                 .git_global(self.ignore_enabled)
                 .git_exclude(self.ignore_enabled);
-            let fs_policy = crate::fs_policy::FsPolicy::current_with_shared_config(
-                self.shared_fs_policy_config(),
-            );
+            let fs_policy =
+                crate::fs_policy::FsPolicy::current_with_config(self.fs_policy_config());
             let root = (*dir).clone();
             let exclude_dirs = self.exclude_dirs.clone();
             let mount_policy_counters = self.mount_policy_counters();
@@ -2061,11 +1815,9 @@ impl TieredIndex {
                     .and_then(|meta| directory_read_fingerprint(dir, &meta))
             });
 
-        // summary 去重状态：首次扫描没有已存 manifest，任何 summary 都不可能
-        // 命中；可靠 unbounded summary 已证明 mismatch 后，bounded summary 也只会
-        // 重复遍历，直接进入实际 repair。stat 错误时仍保留 bounded 兜底。
-        let mut try_unbounded_summary = false;
-        let mut try_bounded_summary = allow_manifest_skip && cursor.is_none();
+        // Phase 3：标记 mtime 预检是否判定为"变了或首次扫描"（Some(false) 或 None）。
+        // 供段 1.5（unbounded summary 二次确认）使用。
+        let mut mtime_precheck_changed = false;
 
         // ===== 段 1：目录 mtime 预检（Phase 1 新增）=====
         // 对所有 PeriodicColdScan 目录生效，独立于 allow_manifest_skip，
@@ -2085,7 +1837,7 @@ impl TieredIndex {
                                     self.directory_manifests
                                         .mtime_precheck_no_record
                                         .fetch_add(1, Ordering::Relaxed);
-                                    try_bounded_summary = false;
+                                    mtime_precheck_changed = true;
                                 }
                                 Some(true) => {
                                     // 目录 mtime 未变，跳过整个扫描
@@ -2112,7 +1864,7 @@ impl TieredIndex {
                                     self.directory_manifests
                                         .mtime_precheck_misses
                                         .fetch_add(1, Ordering::Relaxed);
-                                    try_unbounded_summary = true;
+                                    mtime_precheck_changed = true;
                                 }
                             }
                         }
@@ -2133,21 +1885,16 @@ impl TieredIndex {
                 self.directory_manifests
                     .mtime_precheck_untrusted_clock
                     .fetch_add(1, Ordering::Relaxed);
-                if allow_manifest_skip {
-                    self.directory_manifests.record_untrusted_clock_bypass();
-                }
-                try_bounded_summary = false;
             }
         }
 
         // ===== 段 1.5：unbounded summary 二次确认（Phase 3 新增）=====
-        // 仅在 mtime 预检确认“已有 manifest 且目录 mtime 已变”时执行；首次
-        // 扫描无可命中的记录，直接进入 repair，避免两次无效 summary 遍历。
+        // 仅在 mtime 预检判定"变了或首次扫描"（Some(false)/None）且 allow_manifest_skip 时执行。
         // 计算不受 512 条限制的 summary（WalkBuilder 过滤），与已存储的 manifest 比对。
         // 匹配则跳过（可能是 touch/atime 导致 mtime 变了但内容没变），不匹配才继续。
         // 对大目录（>512 条）尤其重要：段 2 的 bounded summary 对大目录永远 complete=false，
         // 而此处用 unbounded summary 可以覆盖大目录的 manifest 跳过。
-        if try_unbounded_summary {
+        if allow_manifest_skip && cursor.is_none() && mtime_precheck_changed {
             if let Some(current_summary) =
                 self.directory_manifest_summary_with_limit(dir, project_markers, None)
             {
@@ -2176,13 +1923,11 @@ impl TieredIndex {
                 self.directory_manifests
                     .unbounded_summary_misses
                     .fetch_add(1, Ordering::Relaxed);
-                self.directory_manifests.record_changed_scan();
-                try_bounded_summary = false;
             }
         }
 
         // ===== 段 2：现有 manifest skip（仅 L2/L3 PeriodicColdScan 生效）=====
-        if try_bounded_summary {
+        if allow_manifest_skip && cursor.is_none() {
             if let Some((summary, complete)) = self.directory_manifest_summary_bounded(
                 dir,
                 project_markers,
@@ -2248,14 +1993,11 @@ impl TieredIndex {
             .filter(|cursor| cursor.dir == *dir)
             .map(|cursor| cursor.offset.max(0))
             .unwrap_or(0);
-        let (mut upsert_events, mut upsert_metas, mut scanned_manifest, mut dir_children) =
-            take_repair_slice_scratch();
         let slice = match read_dir_slice(
             dir,
             start_offset,
             REPAIR_SLICE_MAX_ENTRIES,
             Duration::from_millis(REPAIR_SLICE_MAX_MS),
-            &mut dir_children,
         ) {
             Ok(slice) => slice,
             Err(err) => {
@@ -2263,12 +2005,6 @@ impl TieredIndex {
                     "repair slice skipped unreadable dir {}: {}",
                     dir.display(),
                     err
-                );
-                return_repair_slice_scratch(
-                    upsert_events,
-                    upsert_metas,
-                    scanned_manifest,
-                    dir_children,
                 );
                 return SlicedScanOutcome {
                     outcome: ScanOutcome::default(),
@@ -2284,23 +2020,24 @@ impl TieredIndex {
             }
         };
 
-        upsert_events.reserve(dir_children.len());
-        upsert_metas.reserve(dir_children.len());
+        let (mut upsert_events, mut upsert_metas) = take_repair_slice_scratch();
+        upsert_events.reserve(slice.entries.len());
+        upsert_metas.reserve(slice.entries.len());
         let mut project_roots = Vec::new();
         let mut child_dirs = Vec::new();
         let mut scanned = 0usize;
         let mut changed = 0usize;
         let mut metadata_failed = false;
         let mut seq = 0u64;
-        let collect_scanned_manifest = start_offset == 0 && slice.completed;
+        let mut scanned_manifest = DirectoryManifestBuilder::default();
         let hidden_markers_enabled = project_markers.iter().any(|marker| marker.starts_with('.'));
         // 每切片构建一次 FsPolicy 并复用计数器 Arc，避免每 entry 重复
         // 克隆配置 Vec/PathBuf 与 Arc。挂载表在单个最多 512 条目的切片
         // 处理期间保持快照一致。
-        let slice_fs_policy = FsPolicy::current_with_shared_config(self.shared_fs_policy_config());
+        let slice_fs_policy = FsPolicy::current_with_config(self.fs_policy_config());
         let slice_mount_policy_counters = self.mount_policy_counters();
 
-        for child in dir_children.active() {
+        for child in &slice.entries {
             let path = super::normalize_path(child.path.as_path());
             if should_skip_dirty_dir(path.as_path(), ignore_prefixes, &self.exclude_dirs) {
                 continue;
@@ -2332,7 +2069,7 @@ impl TieredIndex {
             ) {
                 continue;
             }
-            if force_scan && meta.is_dir() {
+            if meta.is_dir() {
                 child_dirs.push(path.clone());
             }
             if let Some(project_root) = project_root_for_marker(path.as_path(), project_markers) {
@@ -2345,9 +2082,7 @@ impl TieredIndex {
             let mtime = meta.modified().ok();
             let mtime_ns = mtime_to_ns(mtime);
             let kind = FileKind::from_metadata(&meta);
-            if collect_scanned_manifest {
-                scanned_manifest.push_child(path.as_path(), kind, mtime_ns);
-            }
+            scanned_manifest.push_child(path.as_path(), kind, mtime_ns);
             scanned = scanned.saturating_add(1);
             let freshness = invalidations.as_ref().map_or_else(
                 || self.path_freshness(&path, file_key, mtime_ns, kind),
@@ -2378,9 +2113,6 @@ impl TieredIndex {
             });
         }
 
-        #[cfg(test)]
-        run_repair_slice_pre_apply_test_hook(dir);
-
         let mut dropped_stale_batch = false;
         let mut alignment_started_seq = None;
         if metadata_failed {
@@ -2404,6 +2136,8 @@ impl TieredIndex {
             }
             alignment_started_seq = Some(self.event_seq.load(Ordering::Relaxed));
         }
+        return_repair_slice_scratch(upsert_events, upsert_metas);
+
         let completed = slice.completed;
         if completed && !dropped_stale_batch && !metadata_failed {
             let (deleted, dropped_stale) = self.align_missing_indexed_direct_children(
@@ -2414,7 +2148,7 @@ impl TieredIndex {
             dropped_stale_batch |= dropped_stale;
         }
         if completed && !dropped_stale_batch && !metadata_failed {
-            let summary = if collect_scanned_manifest {
+            let summary = if start_offset == 0 {
                 Some(scanned_manifest.finish())
             } else {
                 self.directory_manifest_summary_bounded(
@@ -2440,8 +2174,6 @@ impl TieredIndex {
                 }
             }
         }
-
-        return_repair_slice_scratch(upsert_events, upsert_metas, scanned_manifest, dir_children);
 
         project_roots.sort();
         project_roots.dedup();
@@ -2487,32 +2219,11 @@ impl TieredIndex {
     pub(super) fn align_missing_indexed_direct_children(
         &self,
         dir: &Path,
-        scan_started_seq: u64,
+        _scan_started_seq: u64,
     ) -> (usize, bool) {
         if self.path_is_frozen(dir) {
             return (0, true);
         }
-
-        let mut scratch = take_alignment_scratch();
-        let result = self.align_missing_indexed_direct_children_with_scratch(
-            dir,
-            scan_started_seq,
-            &mut scratch,
-        );
-        return_alignment_scratch(scratch);
-        result
-    }
-
-    fn align_missing_indexed_direct_children_with_scratch(
-        &self,
-        dir: &Path,
-        _scan_started_seq: u64,
-        scratch: &mut AlignmentScratch,
-    ) -> (usize, bool) {
-        scratch.current_names.reset();
-        scratch.indexed_children.clear();
-        scratch.missing_children.clear();
-        scratch.delete_events.clear();
 
         self.io_governor.before_io();
         let before_meta = match std::fs::symlink_metadata(dir) {
@@ -2524,66 +2235,82 @@ impl TieredIndex {
         };
 
         self.io_governor.before_io();
-        if let Err(err) = read_dir_names(dir, &mut scratch.current_names) {
-            tracing::debug!(
-                "negative alignment abandoned incomplete readdir for {}: {}",
-                dir.display(),
-                err
-            );
-            return (0, true);
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::debug!(
+                    "negative alignment skipped unreadable dir {}: {}",
+                    dir.display(),
+                    err
+                );
+                return (0, true);
+            }
+        };
+        let mut current_names = HashSet::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::debug!(
+                        "negative alignment abandoned incomplete readdir for {}: {}",
+                        dir.display(),
+                        err
+                    );
+                    return (0, true);
+                }
+            };
+            current_names.insert(entry.file_name());
         }
 
-        self.base
+        let dirty_dirs = HashSet::from([dir.to_path_buf()]);
+        let mut indexed_children = self
+            .base
             .load_full()
-            .append_delete_alignment_for_dir(dir, &mut scratch.indexed_children);
-        self.l2
-            .load_full()
-            .append_delete_alignment_for_dir(dir, &mut scratch.indexed_children);
-        for path in scratch.indexed_children.drain(..) {
-            push_missing_direct_child(
-                dir,
-                path,
-                &scratch.current_names,
-                &mut scratch.missing_children,
-            );
-        }
+            .delete_alignment_with_parent_index(&dirty_dirs)
+            .into_iter()
+            .filter_map(|(_, path)| first_direct_child(dir, path.as_path()))
+            .collect::<Vec<_>>();
+        indexed_children.extend(
+            self.l2
+                .load_full()
+                .delete_alignment_with_parent_index(&dirty_dirs)
+                .into_iter()
+                .filter_map(|(_, path)| first_direct_child(dir, path.as_path())),
+        );
         {
             let db = self.delta_buffer.lock();
-            scratch.indexed_children.extend(
+            indexed_children.extend(
                 db.live_records()
                     .filter_map(EventRecord::best_path)
                     .filter_map(|path| first_direct_child(dir, path)),
             );
         }
-        for child in scratch.indexed_children.drain(..) {
-            push_missing_direct_child(
-                dir,
-                child,
-                &scratch.current_names,
-                &mut scratch.missing_children,
-            );
-        }
-        scratch.missing_children.sort();
-        scratch.missing_children.dedup();
-        if scratch.missing_children.is_empty() {
+        let mut missing_children = indexed_children
+            .into_iter()
+            .filter(|child| {
+                child
+                    .file_name()
+                    .is_some_and(|name| !current_names.contains(name))
+            })
+            .map(|path| super::normalize_path(path.as_path()))
+            .collect::<Vec<_>>();
+        missing_children.sort();
+        missing_children.dedup();
+        if missing_children.is_empty() {
             return (0, false);
         }
 
-        scratch
-            .delete_events
-            .extend(
-                scratch
-                    .missing_children
-                    .drain(..)
-                    .enumerate()
-                    .map(|(index, path)| EventRecord {
-                        seq: index as u64 + 1,
-                        timestamp: std::time::SystemTime::now(),
-                        event_type: EventType::Delete,
-                        id: FileIdentifier::Path(path),
-                        path_hint: None,
-                    }),
-            );
+        let delete_events = missing_children
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| EventRecord {
+                seq: index as u64 + 1,
+                timestamp: std::time::SystemTime::now(),
+                event_type: EventType::Delete,
+                id: FileIdentifier::Path(path),
+                path_hint: None,
+            })
+            .collect::<Vec<_>>();
 
         self.io_governor.before_io();
         let _snapshot_boundary = self.snapshot_event_gate.lock();
@@ -2599,12 +2326,11 @@ impl TieredIndex {
             return (0, true);
         }
         let mut freeze_gate = self.recovery_quarantine.freeze_gate.lock();
-        if scratch
-            .delete_events
+        if delete_events
             .iter()
             .any(|event| freeze_gate.should_block_event(event))
         {
-            for event in &scratch.delete_events {
+            for event in &delete_events {
                 if freeze_gate.should_block_event(event) {
                     freeze_gate.note_blocked();
                 }
@@ -2613,11 +2339,10 @@ impl TieredIndex {
         }
         drop(freeze_gate);
 
-        let Some(batch) = self.begin_apply_batch(scratch.delete_events.as_slice(), true, None)
-        else {
+        let Some(batch) = self.begin_apply_batch(delete_events.as_slice(), true, None) else {
             return (0, false);
         };
-        batch.l2.apply_events(scratch.delete_events.as_slice());
+        batch.l2.apply_events(delete_events.as_slice());
         self.event_seq
             .fetch_add(batch.event_count as u64, Ordering::Relaxed);
         self.stats.record_events_applied(batch.event_count as u64);
@@ -2731,8 +2456,7 @@ impl TieredIndex {
                     .git_ignore(self.ignore_enabled)
                     .git_global(self.ignore_enabled)
                     .git_exclude(self.ignore_enabled);
-                let fs_policy =
-                    FsPolicy::current_with_shared_config(self.shared_fs_policy_config());
+                let fs_policy = FsPolicy::current_with_config(self.fs_policy_config());
                 let root = dir.to_path_buf();
                 let exclude_dirs = self.exclude_dirs.clone();
                 let mount_policy_counters = self.mount_policy_counters();
@@ -2820,8 +2544,7 @@ impl TieredIndex {
         max_entries: usize,
     ) -> Option<(DirectoryManifestSummary, bool)> {
         let hidden_markers_enabled = project_markers.iter().any(|marker| marker.starts_with('.'));
-        let bounded_fs_policy =
-            FsPolicy::current_with_shared_config(self.shared_fs_policy_config());
+        let bounded_fs_policy = FsPolicy::current_with_config(self.fs_policy_config());
         let bounded_mount_policy_counters = self.mount_policy_counters();
         let mut manifest = DirectoryManifestBuilder::default();
         let mut seen = 0usize;
@@ -3097,23 +2820,6 @@ fn first_direct_child(root: &Path, path: &Path) -> Option<PathBuf> {
     Some(root.join(name))
 }
 
-fn push_missing_direct_child(
-    dir: &Path,
-    path: PathBuf,
-    current_names: &DirectoryNameBuffer,
-    missing_children: &mut Vec<PathBuf>,
-) {
-    if path.parent() != Some(dir) {
-        return;
-    }
-    let Some(name) = path.file_name() else {
-        return;
-    };
-    if !current_names.contains(name) {
-        missing_children.push(super::normalize_path(path.as_path()));
-    }
-}
-
 #[cfg(unix)]
 fn directory_read_fingerprint(
     path: &Path,
@@ -3131,45 +2837,6 @@ fn directory_read_fingerprint(
             .saturating_add(i128::from(meta.ctime_nsec())),
         nlink: meta.nlink(),
     })
-}
-
-#[cfg(all(test, unix))]
-mod reusable_directory_buffer_tests {
-    use super::*;
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-    #[test]
-    fn linux_name_buffer_preserves_non_utf8_and_resets_active_slots() {
-        let root = std::env::temp_dir().join(format!(
-            "fd-rdd-name-buffer-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let large = root.join("large");
-        let small = root.join("small");
-        std::fs::create_dir_all(&large).unwrap();
-        std::fs::create_dir_all(&small).unwrap();
-        let raw_name = std::ffi::OsString::from_vec(b"keep-\xff.txt".to_vec());
-        std::fs::write(large.join(&raw_name), b"x").unwrap();
-        for index in 0..64 {
-            std::fs::write(large.join(format!("entry-{index:02}.txt")), b"x").unwrap();
-        }
-        std::fs::write(small.join("only.txt"), b"x").unwrap();
-
-        let mut names = DirectoryNameBuffer::default();
-        read_dir_names(&large, &mut names).unwrap();
-        assert!(names.contains(std::ffi::OsStr::from_bytes(b"keep-\xff.txt")));
-        assert!(names.slot_count() >= 65);
-
-        read_dir_names(&small, &mut names).unwrap();
-        assert!(names.contains(std::ffi::OsStr::new("only.txt")));
-        assert!(!names.contains(std::ffi::OsStr::from_bytes(b"keep-\xff.txt")));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
 }
 
 #[cfg(not(unix))]

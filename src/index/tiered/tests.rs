@@ -373,13 +373,12 @@ fn unbounded_summary_metrics() {
     let idx = TieredIndex::empty(vec![root.clone()]);
     let skip_dirs = std::collections::HashSet::from([root.clone()]);
 
-    // 1. 首次 PeriodicColdScan：无 manifest 记录，summary 不可能命中，直接 repair。
+    // 1. 首次 PeriodicColdScan：无 manifest 记录 → 段 1 None → 段 1.5 miss（无 stored）
     let reports = mtime_precheck_run_cold_scan_to_completion(&idx, &root, &skip_dirs);
     assert!(!reports[0].outcomes[0].manifest_skipped);
     let m1 = idx.directory_manifest_report();
     assert_eq!(m1.unbounded_summary_hits, 0);
-    assert_eq!(m1.unbounded_summary_misses, 0);
-    assert_eq!(m1.mtime_precheck_no_record, 1);
+    assert_eq!(m1.unbounded_summary_misses, 1);
 
     // 2. immediate scan 存储 WalkBuilder summary（覆盖首次扫描存储的 bounded summary）
     idx.scan_dirs_immediate_outcome(std::slice::from_ref(&root));
@@ -390,7 +389,7 @@ fn unbounded_summary_metrics() {
     assert!(reports[0].outcomes[0].manifest_skipped);
     let m2 = idx.directory_manifest_report();
     assert_eq!(m2.unbounded_summary_hits, 1);
-    assert_eq!(m2.unbounded_summary_misses, 0);
+    assert_eq!(m2.unbounded_summary_misses, 1);
 
     // 4. 改变内容 → 段 1 Some(false) → 段 1.5 miss
     std::fs::write(root.join("extra.txt"), b"extra").unwrap();
@@ -398,7 +397,7 @@ fn unbounded_summary_metrics() {
     assert!(!reports[0].outcomes[0].manifest_skipped);
     let m3 = idx.directory_manifest_report();
     assert_eq!(m3.unbounded_summary_hits, 1);
-    assert_eq!(m3.unbounded_summary_misses, 1);
+    assert_eq!(m3.unbounded_summary_misses, 2);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -969,17 +968,17 @@ fn mtime_record_skipped_on_stale_scan() {
         "dir mtime should change after adding file"
     );
 
-    // 第二次扫描：在元数据采集完成、应用开始前确定性暂停，随后修改目标
-    // 文件并推进 event_seq，触发逐路径复验失败。
+    // 第二次扫描：扫描过程中修改目标文件并推进 event_seq，触发逐路径复验失败。
     idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::PeriodicColdScan);
-    let (entered, release) = super::sync::install_repair_slice_pre_apply_test_hook(root.clone());
     let report = std::thread::scope(|s| {
         let handle = s.spawn(|| mtime_precheck_pop_and_process(&idx, &skip_dirs).unwrap());
-        entered.wait();
-        std::fs::write(root.join("file_0000.txt"), b"changed-content").unwrap();
+        // 等扫描开始后改写整个目录，确保至少一个已采集元数据的路径发生冲突。
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        for i in 0..400 {
+            std::fs::write(root.join(format!("file_{:04}.txt", i)), b"changed-content").unwrap();
+        }
         idx.event_seq
             .fetch_add(1_000_000, std::sync::atomic::Ordering::Relaxed);
-        release.wait();
         handle.join().unwrap()
     });
 
@@ -2305,40 +2304,6 @@ fn periodic_negative_alignment_covers_l2_direct_children() {
     let scan_started_seq = idx.event_seq.load(Ordering::Relaxed);
     let (deleted, dropped_stale) =
         idx.align_missing_indexed_direct_children(&root, scan_started_seq);
-    assert_eq!(deleted, 1);
-    assert!(!dropped_stale);
-    assert!(idx
-        .delta_buffer
-        .lock()
-        .is_deleted(stale_path.as_os_str().as_encoded_bytes()));
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn periodic_negative_alignment_reuses_name_slots_without_cross_dir_leakage() {
-    let root = unique_tmp_dir("periodic-negative-name-reuse");
-    let large = root.join("large");
-    let small = root.join("small");
-    std::fs::create_dir_all(&large).unwrap();
-    std::fs::create_dir_all(&small).unwrap();
-    for index in 0..128 {
-        std::fs::write(large.join(format!("entry-{index:03}.txt")), b"x").unwrap();
-    }
-    std::fs::write(large.join("shared.txt"), b"x").unwrap();
-    let stale_path = small.join("shared.txt");
-    std::fs::write(&stale_path, b"stale").unwrap();
-
-    let idx = TieredIndex::empty(vec![root.clone()]);
-    idx.apply_events(&[mk_event(1, EventType::Create, stale_path.clone())]);
-    let seq = idx.event_seq.load(Ordering::Relaxed);
-    assert_eq!(
-        idx.align_missing_indexed_direct_children(&large, seq),
-        (0, false)
-    );
-
-    std::fs::remove_file(&stale_path).unwrap();
-    let (deleted, dropped_stale) = idx.align_missing_indexed_direct_children(&small, seq);
     assert_eq!(deleted, 1);
     assert!(!dropped_stale);
     assert!(idx

@@ -331,7 +331,7 @@ impl EventPipeline {
         let raw_events_capacity = self.raw_events_capacity.clone();
         let merged_map_capacity = self.merged_map_capacity.clone();
         let records_capacity = self.records_capacity.clone();
-        let fs_policy = FsPolicy::current_with_shared_config(index.shared_fs_policy_config());
+        let fs_policy = FsPolicy::current_with_config(index.fs_policy_config());
         let mount_policy_counters = index.mount_policy_counters();
         let configured_roots = index.roots.clone();
         let pending_moves: Arc<tokio::sync::Mutex<PendingMoveMap>> =

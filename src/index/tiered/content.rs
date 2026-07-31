@@ -119,7 +119,7 @@ impl TieredIndex {
         let config = self.content.config.lock().clone();
         let mut docs: HashMap<PathBuf, String> = HashMap::new();
         let mut report = ContentIndexReport::default();
-        let fs_policy = FsPolicy::current_with_shared_config(self.shared_fs_policy_config());
+        let fs_policy = FsPolicy::current_with_config(self.fs_policy_config());
 
         for meta in self.collect_live_metas_for_diagnostics() {
             let Some((path, text, bytes)) = self.read_content_index_doc(&meta, &config, &fs_policy)

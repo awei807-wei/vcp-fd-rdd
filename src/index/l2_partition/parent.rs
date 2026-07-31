@@ -106,31 +106,6 @@ impl PersistentIndex {
         }
     }
 
-    /// Return indexed files directly below one directory without allocating
-    /// the temporary directory-index union used by bulk alignment.
-    pub fn append_delete_alignment_for_dir(&self, dir: &Path, result: &mut Vec<PathBuf>) {
-        let parent_idx = self.parent_index.read();
-        let path_table = self.parent_path_table.read();
-        let (Some(index), Some(parent_lookup)) = (&*parent_idx, &*path_table) else {
-            return;
-        };
-        let Some(dir_idx) = parent_lookup.lookup(dir.as_os_str().as_encoded_bytes()) else {
-            return;
-        };
-        let Some(doc_ids) = index.files_in_dir(dir_idx) else {
-            return;
-        };
-
-        let paths = self.paths.read();
-        result.reserve(doc_ids.len());
-        for &doc_id in doc_ids {
-            let Some(path_bytes) = paths.get_bytes(doc_id) else {
-                continue;
-            };
-            result.push(pathbuf_from_encoded_vec(path_bytes.to_vec()));
-        }
-    }
-
     /// 使用 ParentIndex 查询某目录下的文件候选（Query 加速）
     pub fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
         let parent_idx = self.parent_index.read();
