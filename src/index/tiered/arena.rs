@@ -73,6 +73,10 @@ impl PathArenaSet {
             .any(|b| b == bytes)
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.paths_len
+    }
+
     /// 返回 true 表示本次为"新路径"插入（用于统计）
     pub(crate) fn insert(&mut self, bytes: &[u8]) -> bool {
         let h = hash_bytes64(bytes);
@@ -116,6 +120,22 @@ impl PathArenaSet {
         self.arena.clear();
         self.paths_len = 0;
         self.active_bytes = 0;
+    }
+
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        use std::mem::size_of;
+
+        size_of::<Self>()
+            + self.arena.capacity()
+            + self.map.capacity() * (size_of::<(u64, OneOrManySpan)>() + 1)
+            + self
+                .map
+                .values()
+                .map(|spans| match spans {
+                    OneOrManySpan::One(_) => 0,
+                    OneOrManySpan::Many(items) => items.capacity() * size_of::<Span>(),
+                })
+                .sum::<usize>()
     }
 }
 

@@ -483,43 +483,50 @@ impl TieredIndex {
             let overlay_freeze_guard = self.recovery_quarantine.freeze_gate.lock();
             let db = self.delta_buffer.lock();
             let base = self.base.load_full();
-            let mut del = PathArenaSet::default();
-            for p in db.deleted_paths() {
-                let _ = del.insert(p);
-            }
             let overlay_cache_enabled = self.query_overlay_meta_cache_enabled();
             let cached_overlay = if overlay_cache_enabled {
                 db.overlay_meta_cache()
             } else {
                 None
             };
-            let (pending_live_events, overlay_rebuild_epoch) = if cached_overlay.is_none() {
-                (
-                    db.live_records().cloned().collect::<Vec<EventRecord>>(),
-                    db.mutation_epoch(),
-                )
-            } else {
-                (Vec::new(), 0)
-            };
+            let (pending_live_events, pending_deleted_paths, overlay_rebuild_epoch) =
+                if cached_overlay.is_none() {
+                    (
+                        db.live_records().cloned().collect::<Vec<EventRecord>>(),
+                        db.deleted_paths().map(<[u8]>::to_vec).collect::<Vec<_>>(),
+                        db.mutation_epoch(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), 0)
+                };
             drop(db);
             let overlay_freeze_gate = overlay_freeze_guard.clone();
             drop(overlay_freeze_guard);
-            let overlay_deleted = Arc::new(del);
             let mut blocked_paths = PathArenaSet::default();
-            let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
             let mut verify_budget = QueryVerifyBudget::new(self);
-            // overlay 物化（每 live 记录一次 stat + FileMeta 构建）按 delta_buffer
-            // 变更代数缓存：稳态命中时本查询零 stat、零克隆；miss 时锁外重建并按
-            // epoch 回写（并发 mutation 令回写失败，仅本查询自用）。frozen/deleted/
+            // overlay 物化（每 live 记录一次 stat + FileMeta 构建）和 tombstone arena
+            // 按 delta_buffer 变更代数缓存：稳态命中时本查询零 stat、零路径重建；
+            // miss 时锁外重建并按 epoch 回写（并发 mutation 令回写失败，仅本查询自用）。frozen/deleted/
             // blocked 过滤保持逐查询执行（下方收集环本就重查这三项），meta 的
             // size/mtime 冻结在物化时刻，下一次事件即失效重建——与 base 层的
             // 快照语义一致。关闭 overlay_meta_cache_enabled 即回到逐查询物化。
-            let (overlay_live_metas, overlay_candidate_cache): (
+            let (overlay_live_metas, overlay_candidate_cache, overlay_deleted): (
                 Arc<Vec<FileMeta>>,
                 Option<Arc<OverlayMetaCache>>,
+                Arc<PathArenaSet>,
             ) = match cached_overlay {
-                Some(cache) => (cache.metas_arc(), Some(cache)),
+                Some(cache) => (
+                    cache.metas_arc(),
+                    Some(Arc::clone(&cache)),
+                    cache.deleted_paths_arc(),
+                ),
                 None => {
+                    let mut deleted_paths = PathArenaSet::default();
+                    for path in pending_deleted_paths {
+                        let _ = deleted_paths.insert(path.as_slice());
+                    }
+                    let deleted_paths = Arc::new(deleted_paths);
+                    let deleted_sources = [Arc::clone(&deleted_paths)];
                     let mut metas: Vec<FileMeta> = Vec::with_capacity(pending_live_events.len());
                     for ev in &pending_live_events {
                         if ev
@@ -541,20 +548,24 @@ impl TieredIndex {
                     }
                     let metas = Arc::new(metas);
                     if overlay_cache_enabled {
-                        let cache = Arc::new(OverlayMetaCache::new(Arc::clone(&metas)));
+                        let cache = Arc::new(OverlayMetaCache::new(
+                            Arc::clone(&metas),
+                            Arc::clone(&deleted_paths),
+                        ));
                         // gate 与 overlay epoch 已按固定锁序原子捕获；冻结条目可安全
                         // 省略，解冻前会先失效该代缓存，且不会触碰断联挂载。
                         self.delta_buffer
                             .lock()
                             .store_overlay_meta_cache(overlay_rebuild_epoch, Arc::clone(&cache));
-                        (metas, Some(cache))
+                        (metas, Some(cache), deleted_paths)
                     } else {
                         // 显式关闭缓存时保持真正的线性参考路径：不构建 posting，
                         // 每次查询按历史逻辑物化并全扫当前 metas。
-                        (metas, None)
+                        (metas, None, deleted_paths)
                     }
                 }
             };
+            let deleted_sources = [overlay_deleted];
             let mut results: Vec<QueryResultMeta> = Vec::with_capacity(limit.min(128));
             let dupe_metas = if requires_hardlink_dupe || requires_content_dupe {
                 Some(self.collect_live_metas_for_diagnostics())

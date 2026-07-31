@@ -655,10 +655,19 @@ fn overlay_meta_cache_matches_uncached_results_across_mutations() {
             .into_iter()
             .map(|meta| meta.path)
             .collect();
-        assert!(
-            idx.delta_buffer.lock().overlay_meta_cache().is_some(),
-            "enabled query must populate the overlay meta cache (step {step})"
-        );
+        {
+            let db = idx.delta_buffer.lock();
+            let cache = db
+                .overlay_meta_cache()
+                .expect("enabled query must populate the overlay meta cache");
+            let deleted_paths = cache.deleted_paths_arc();
+            for deleted in db.deleted_paths() {
+                assert!(
+                    deleted_paths.contains(deleted),
+                    "cached tombstone snapshot missed a current delete at step {step}"
+                );
+            }
+        }
         idx.apply_query_config(QueryConfig {
             overlay_meta_cache_enabled: false,
             ..QueryConfig::default()
@@ -674,6 +683,56 @@ fn overlay_meta_cache_matches_uncached_results_across_mutations() {
         assert_eq!(cached, uncached, "cached vs linear diverged at step {step}");
         assert!(!cached.is_empty() || alive.is_empty());
     }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn overlay_meta_cache_reuses_tombstone_snapshot_across_queries() {
+    let root = unique_tmp_dir("overlay-tombstone-cache-reuse");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let deletes = (0..128)
+        .map(|index| {
+            mk_event(
+                index + 1,
+                EventType::Delete,
+                root.join(format!("deleted-{index}.txt")),
+            )
+        })
+        .collect::<Vec<_>>();
+    idx.apply_events(&deletes);
+
+    assert!(idx.query("never-matches").is_empty());
+    let first = idx
+        .delta_buffer
+        .lock()
+        .overlay_meta_cache()
+        .unwrap()
+        .deleted_paths_arc();
+    assert!(idx.query("still-never-matches").is_empty());
+    let second = idx
+        .delta_buffer
+        .lock()
+        .overlay_meta_cache()
+        .unwrap()
+        .deleted_paths_arc();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "steady queries must reuse the same tombstone arena"
+    );
+
+    let new_deleted = root.join("deleted-after-cache.txt");
+    idx.apply_events(&[mk_event(1000, EventType::Delete, new_deleted.clone())]);
+    assert!(idx.query("never-matches-after-mutation").is_empty());
+    let refreshed = idx
+        .delta_buffer
+        .lock()
+        .overlay_meta_cache()
+        .unwrap()
+        .deleted_paths_arc();
+    assert!(!Arc::ptr_eq(&first, &refreshed));
+    assert!(refreshed.contains(new_deleted.as_os_str().as_encoded_bytes()));
 
     let _ = std::fs::remove_dir_all(&root);
 }

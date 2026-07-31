@@ -1,5 +1,6 @@
 use crate::core::{EventRecord, EventType, FileKind, FileMeta};
 use crate::index::case_policy::unicode_case_fold_lookup;
+use crate::index::tiered::arena::PathArenaSet;
 use roaring::RoaringBitmap;
 use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -23,7 +24,7 @@ impl SubtreeInvalidationSnapshot {
     }
 }
 
-/// 查询 overlay 的稳态物化缓存：元数据数组与同代 trigram posting 原子发布。
+/// 查询 overlay 的稳态物化缓存：元数据、删除集合与同代 trigram posting 原子发布。
 const OVERLAY_TRIGRAM_MAX_METAS: usize = 16 * 1024;
 const OVERLAY_TRIGRAM_MAX_PATH_BYTES: usize = 8 * 1024 * 1024;
 const OVERLAY_TRIGRAM_MAX_DISTINCT: usize = 64 * 1024;
@@ -32,17 +33,19 @@ const OVERLAY_TRIGRAM_MAX_POSTINGS: usize = 1_000_000;
 #[derive(Debug)]
 pub struct OverlayMetaCache {
     metas: Arc<Vec<FileMeta>>,
+    deleted_paths: Arc<PathArenaSet>,
     trigram_index: Option<HashMap<[u8; 3], RoaringBitmap>>,
 }
 
 impl OverlayMetaCache {
-    pub fn new(metas: Arc<Vec<FileMeta>>) -> Self {
+    pub(crate) fn new(metas: Arc<Vec<FileMeta>>, deleted_paths: Arc<PathArenaSet>) -> Self {
         let path_bytes = metas.iter().fold(0usize, |total, meta| {
             total.saturating_add(meta.path.as_os_str().as_encoded_bytes().len())
         });
         if metas.len() > OVERLAY_TRIGRAM_MAX_METAS || path_bytes > OVERLAY_TRIGRAM_MAX_PATH_BYTES {
             return Self {
                 metas,
+                deleted_paths,
                 trigram_index: None,
             };
         }
@@ -53,8 +56,14 @@ impl OverlayMetaCache {
         );
         Self {
             metas,
+            deleted_paths,
             trigram_index,
         }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(metas: Arc<Vec<FileMeta>>) -> Self {
+        Self::new(metas, Arc::new(PathArenaSet::default()))
     }
 
     fn build_trigram_index(
@@ -97,6 +106,10 @@ impl OverlayMetaCache {
         Arc::clone(&self.metas)
     }
 
+    pub(crate) fn deleted_paths_arc(&self) -> Arc<PathArenaSet> {
+        Arc::clone(&self.deleted_paths)
+    }
+
     pub fn estimated_bytes(&self) -> usize {
         use std::mem::size_of;
         let meta_bytes = self.metas.capacity() * size_of::<FileMeta>()
@@ -121,7 +134,7 @@ impl OverlayMetaCache {
                         .sum::<usize>()
             })
             .unwrap_or(0);
-        size_of::<Self>() + meta_bytes + trigram_bytes
+        size_of::<Self>() + meta_bytes + self.deleted_paths.estimated_bytes() + trigram_bytes
     }
 
     /// 返回 literal hint 的安全候选交集；短于 3 字节时无法收窄。
@@ -181,7 +194,7 @@ pub struct DeltaBuffer {
     structural_replay_unproven: bool,
     /// 记录集（entries）的变更代数：任何 insert/delete/clear 递增。
     mutation_epoch: u64,
-    /// 按 mutation_epoch 失效的 overlay 物化 meta 缓存（查询路径填充）。
+    /// 按 mutation_epoch 失效的 overlay 查询缓存（查询路径填充）。
     overlay_meta_cache: Option<Arc<OverlayMetaCache>>,
 }
 
@@ -250,6 +263,17 @@ impl DeltaBuffer {
     /// 回写物化缓存；仅在 epoch 未被并发 mutation 推进时接受。
     pub fn store_overlay_meta_cache(&mut self, epoch: u64, cache: Arc<OverlayMetaCache>) -> bool {
         if epoch != self.mutation_epoch {
+            return false;
+        }
+        let deleted_paths = cache.deleted_paths_arc();
+        let mut current_deleted_count = 0usize;
+        for path in self.deleted_paths() {
+            current_deleted_count += 1;
+            if !deleted_paths.contains(path) {
+                return false;
+            }
+        }
+        if deleted_paths.len() != current_deleted_count {
             return false;
         }
         self.overlay_meta_cache = Some(cache);
@@ -692,7 +716,7 @@ mod tests {
 
     #[test]
     fn overlay_meta_cache_trigram_candidates_narrow_without_false_negatives() {
-        let cache = OverlayMetaCache::new(Arc::new(vec![
+        let cache = OverlayMetaCache::new_for_test(Arc::new(vec![
             make_meta(1, "/tmp/AlphaTarget.txt"),
             make_meta(2, "/tmp/beta.txt"),
             make_meta(3, "/tmp/alpha-other.txt"),
@@ -709,7 +733,7 @@ mod tests {
         let metas = (0..=OVERLAY_TRIGRAM_MAX_METAS)
             .map(|index| make_meta(index as u64 + 1, &format!("/tmp/target-{index}.txt")))
             .collect::<Vec<_>>();
-        let cache = OverlayMetaCache::new(Arc::new(metas));
+        let cache = OverlayMetaCache::new_for_test(Arc::new(metas));
 
         assert!(
             cache.trigram_candidates(b"target").is_none(),
@@ -726,6 +750,35 @@ mod tests {
 
         assert!(OverlayMetaCache::build_trigram_index(&metas, 64, 1).is_none());
         assert!(OverlayMetaCache::build_trigram_index(&metas, 1, 64).is_none());
+    }
+
+    #[test]
+    fn overlay_meta_cache_reuses_deleted_paths_until_mutation() {
+        let mut deleted_paths = PathArenaSet::default();
+        assert!(deleted_paths.insert(b"/tmp/deleted-a"));
+        assert!(deleted_paths.insert(b"/tmp/deleted-b"));
+        let deleted_paths = Arc::new(deleted_paths);
+        let cache = Arc::new(OverlayMetaCache::new(
+            Arc::new(vec![make_meta(1, "/tmp/live")]),
+            Arc::clone(&deleted_paths),
+        ));
+        assert!(cache.deleted_paths_arc().contains(b"/tmp/deleted-a"));
+        assert!(Arc::ptr_eq(&cache.deleted_paths_arc(), &deleted_paths));
+
+        let mut db = DeltaBuffer::with_capacity(1024);
+        assert!(db.apply_events(&[
+            make_event(1, EventType::Delete, "/tmp/deleted-a"),
+            make_event(2, EventType::Delete, "/tmp/deleted-b"),
+        ]));
+        let epoch = db.mutation_epoch();
+        assert!(db.store_overlay_meta_cache(epoch, Arc::clone(&cache)));
+        assert!(Arc::ptr_eq(
+            &db.overlay_meta_cache().unwrap().deleted_paths_arc(),
+            &deleted_paths
+        ));
+
+        assert!(db.apply_events(&[make_event(3, EventType::Create, "/tmp/new-live")]));
+        assert!(db.overlay_meta_cache().is_none());
     }
 
     #[test]
@@ -975,7 +1028,7 @@ mod tests {
 
         let epoch = db.mutation_epoch();
         let bytes_without_cache = db.estimated_bytes();
-        let cache = Arc::new(OverlayMetaCache::new(Arc::new(vec![make_meta(
+        let cache = Arc::new(OverlayMetaCache::new_for_test(Arc::new(vec![make_meta(
             1,
             "/tmp/cache_a",
         )])));
@@ -996,9 +1049,23 @@ mod tests {
         assert!(db.overlay_meta_cache().is_none());
 
         let fresh_epoch = db.mutation_epoch();
+        assert!(
+            !db.store_overlay_meta_cache(
+                fresh_epoch,
+                Arc::new(OverlayMetaCache::new_for_test(Arc::new(Vec::new())))
+            ),
+            "same-epoch caches must still contain the complete tombstone snapshot"
+        );
+        let mut deleted_paths = PathArenaSet::default();
+        for path in db.deleted_paths() {
+            assert!(deleted_paths.insert(path));
+        }
         assert!(db.store_overlay_meta_cache(
             fresh_epoch,
-            Arc::new(OverlayMetaCache::new(Arc::new(Vec::new())))
+            Arc::new(OverlayMetaCache::new(
+                Arc::new(Vec::new()),
+                Arc::new(deleted_paths),
+            ))
         ));
         db.clear();
         assert!(db.overlay_meta_cache().is_none());
