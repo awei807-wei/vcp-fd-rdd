@@ -589,7 +589,12 @@ impl TieredIndex {
     }
 
     pub fn install_freeze_gate(&self, gate: FreezeGate) {
-        *self.recovery_quarantine.freeze_gate.lock() = gate;
+        // 与查询保持 freeze_gate -> delta_buffer 的固定锁序；新 gate 仅在
+        // overlay cache 失效后才对后续查询可见，避免解冻窗口读取缺项缓存。
+        let mut freeze_gate = self.recovery_quarantine.freeze_gate.lock();
+        *freeze_gate = gate;
+        self.delta_buffer.lock().invalidate_overlay_meta_cache();
+        drop(freeze_gate);
     }
 
     pub fn restore_quarantine_from_wal(&self, records: &[RootStateRecord]) {

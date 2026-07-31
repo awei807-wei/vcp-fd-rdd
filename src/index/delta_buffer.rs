@@ -1,5 +1,7 @@
 use crate::core::{EventRecord, EventType, FileKind, FileMeta};
-use std::collections::{BTreeSet, HashMap};
+use crate::index::case_policy::unicode_case_fold_lookup;
+use roaring::RoaringBitmap;
+use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
@@ -18,6 +20,132 @@ impl SubtreeInvalidationSnapshot {
 
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
+    }
+}
+
+/// 查询 overlay 的稳态物化缓存：元数据数组与同代 trigram posting 原子发布。
+const OVERLAY_TRIGRAM_MAX_METAS: usize = 16 * 1024;
+const OVERLAY_TRIGRAM_MAX_PATH_BYTES: usize = 8 * 1024 * 1024;
+const OVERLAY_TRIGRAM_MAX_DISTINCT: usize = 64 * 1024;
+const OVERLAY_TRIGRAM_MAX_POSTINGS: usize = 1_000_000;
+
+#[derive(Debug)]
+pub struct OverlayMetaCache {
+    metas: Arc<Vec<FileMeta>>,
+    trigram_index: Option<HashMap<[u8; 3], RoaringBitmap>>,
+}
+
+impl OverlayMetaCache {
+    pub fn new(metas: Arc<Vec<FileMeta>>) -> Self {
+        let path_bytes = metas.iter().fold(0usize, |total, meta| {
+            total.saturating_add(meta.path.as_os_str().as_encoded_bytes().len())
+        });
+        if metas.len() > OVERLAY_TRIGRAM_MAX_METAS || path_bytes > OVERLAY_TRIGRAM_MAX_PATH_BYTES {
+            return Self {
+                metas,
+                trigram_index: None,
+            };
+        }
+        let trigram_index = Self::build_trigram_index(
+            metas.as_slice(),
+            OVERLAY_TRIGRAM_MAX_DISTINCT,
+            OVERLAY_TRIGRAM_MAX_POSTINGS,
+        );
+        Self {
+            metas,
+            trigram_index,
+        }
+    }
+
+    fn build_trigram_index(
+        metas: &[FileMeta],
+        max_distinct: usize,
+        max_postings: usize,
+    ) -> Option<HashMap<[u8; 3], RoaringBitmap>> {
+        let mut trigram_index: HashMap<[u8; 3], RoaringBitmap> = HashMap::new();
+        let mut posting_count = 0usize;
+        for (doc_id, meta) in metas.iter().enumerate() {
+            let folded = unicode_case_fold_lookup(&meta.path.to_string_lossy());
+            for tri in folded.as_bytes().windows(3) {
+                let key = [tri[0], tri[1], tri[2]];
+                let distinct_count = trigram_index.len();
+                let inserted = match trigram_index.entry(key) {
+                    Entry::Occupied(mut entry) => entry.get_mut().insert(doc_id as u32),
+                    Entry::Vacant(entry) => {
+                        if distinct_count >= max_distinct {
+                            return None;
+                        }
+                        entry.insert(RoaringBitmap::new()).insert(doc_id as u32)
+                    }
+                };
+                if inserted {
+                    posting_count = posting_count.saturating_add(1);
+                    if posting_count > max_postings {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(trigram_index)
+    }
+
+    pub fn metas(&self) -> &[FileMeta] {
+        self.metas.as_slice()
+    }
+
+    pub fn metas_arc(&self) -> Arc<Vec<FileMeta>> {
+        Arc::clone(&self.metas)
+    }
+
+    pub fn estimated_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let meta_bytes = self.metas.capacity() * size_of::<FileMeta>()
+            + self
+                .metas
+                .iter()
+                .map(|meta| meta.path.as_os_str().as_encoded_bytes().len())
+                .sum::<usize>();
+        let trigram_bytes = self
+            .trigram_index
+            .as_ref()
+            .map(|index| {
+                index.capacity() * (size_of::<([u8; 3], RoaringBitmap)>() + 1)
+                    + index
+                        .values()
+                        .map(|posting| {
+                            size_of::<RoaringBitmap>()
+                                + posting
+                                    .serialized_size()
+                                    .max(posting.len() as usize * size_of::<u32>())
+                        })
+                        .sum::<usize>()
+            })
+            .unwrap_or(0);
+        size_of::<Self>() + meta_bytes + trigram_bytes
+    }
+
+    /// 返回 literal hint 的安全候选交集；短于 3 字节时无法收窄。
+    pub fn trigram_candidates(&self, hint: &[u8]) -> Option<RoaringBitmap> {
+        let index = self.trigram_index.as_ref()?;
+        let folded = unicode_case_fold_lookup(&String::from_utf8_lossy(hint));
+        let mut trigrams = folded.as_bytes().windows(3);
+        let first = trigrams.next()?;
+        let first_key = [first[0], first[1], first[2]];
+        let Some(first_posting) = index.get(&first_key) else {
+            return Some(RoaringBitmap::new());
+        };
+        let mut candidates = first_posting.clone();
+        for tri in trigrams {
+            let key = [tri[0], tri[1], tri[2]];
+            let Some(posting) = index.get(&key) else {
+                return Some(RoaringBitmap::new());
+            };
+            candidates &= posting;
+            if candidates.is_empty() {
+                break;
+            }
+        }
+        Some(candidates)
     }
 }
 
@@ -54,7 +182,7 @@ pub struct DeltaBuffer {
     /// 记录集（entries）的变更代数：任何 insert/delete/clear 递增。
     mutation_epoch: u64,
     /// 按 mutation_epoch 失效的 overlay 物化 meta 缓存（查询路径填充）。
-    overlay_meta_cache: Option<Arc<Vec<FileMeta>>>,
+    overlay_meta_cache: Option<Arc<OverlayMetaCache>>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,20 +233,26 @@ impl DeltaBuffer {
         self.overlay_meta_cache = None;
     }
 
+    /// 使依赖外部可见性状态（例如 freeze gate）的查询缓存失效。
+    /// 推进 epoch 可阻止并发中的旧构建结果重新发布。
+    pub fn invalidate_overlay_meta_cache(&mut self) {
+        self.note_mutation();
+    }
+
     pub fn mutation_epoch(&self) -> u64 {
         self.mutation_epoch
     }
 
-    pub fn overlay_meta_cache(&self) -> Option<Arc<Vec<FileMeta>>> {
+    pub fn overlay_meta_cache(&self) -> Option<Arc<OverlayMetaCache>> {
         self.overlay_meta_cache.as_ref().map(Arc::clone)
     }
 
     /// 回写物化缓存；仅在 epoch 未被并发 mutation 推进时接受。
-    pub fn store_overlay_meta_cache(&mut self, epoch: u64, metas: Arc<Vec<FileMeta>>) -> bool {
+    pub fn store_overlay_meta_cache(&mut self, epoch: u64, cache: Arc<OverlayMetaCache>) -> bool {
         if epoch != self.mutation_epoch {
             return false;
         }
-        self.overlay_meta_cache = Some(metas);
+        self.overlay_meta_cache = Some(cache);
         true
     }
 
@@ -486,6 +620,11 @@ impl DeltaBuffer {
                 .iter()
                 .map(|path| path.capacity() + size_of::<Vec<u8>>() + 16)
                 .sum::<usize>()
+            + self
+                .overlay_meta_cache
+                .as_ref()
+                .map(|cache| cache.estimated_bytes())
+                .unwrap_or(0)
     }
 
     fn note_subtree_invalidation(&mut self, path: Vec<u8>) {
@@ -533,6 +672,60 @@ mod tests {
             id: FileIdentifier::Path(PathBuf::from(path)),
             path_hint: None,
         }
+    }
+
+    fn make_meta(ino: u64, path: &str) -> FileMeta {
+        FileMeta {
+            file_key: crate::core::FileKey {
+                dev: 1,
+                ino,
+                generation: 0,
+            },
+            path: PathBuf::from(path),
+            size: 0,
+            mtime: None,
+            ctime: None,
+            atime: None,
+            kind: FileKind::File,
+        }
+    }
+
+    #[test]
+    fn overlay_meta_cache_trigram_candidates_narrow_without_false_negatives() {
+        let cache = OverlayMetaCache::new(Arc::new(vec![
+            make_meta(1, "/tmp/AlphaTarget.txt"),
+            make_meta(2, "/tmp/beta.txt"),
+            make_meta(3, "/tmp/alpha-other.txt"),
+        ]));
+
+        let alpha = cache.trigram_candidates(b"ALPHA").unwrap();
+        assert_eq!(alpha.iter().collect::<Vec<_>>(), vec![0, 2]);
+        assert!(cache.trigram_candidates(b"missing").unwrap().is_empty());
+        assert!(cache.trigram_candidates(b"ab").is_none());
+    }
+
+    #[test]
+    fn overlay_meta_cache_disables_trigrams_over_meta_budget() {
+        let metas = (0..=OVERLAY_TRIGRAM_MAX_METAS)
+            .map(|index| make_meta(index as u64 + 1, &format!("/tmp/target-{index}.txt")))
+            .collect::<Vec<_>>();
+        let cache = OverlayMetaCache::new(Arc::new(metas));
+
+        assert!(
+            cache.trigram_candidates(b"target").is_none(),
+            "oversized overlays must fall back to the bounded-memory linear path"
+        );
+    }
+
+    #[test]
+    fn overlay_meta_cache_disables_trigrams_over_posting_budget() {
+        let metas = vec![
+            make_meta(1, "/tmp/alpha-target.txt"),
+            make_meta(2, "/tmp/beta-target.txt"),
+        ];
+
+        assert!(OverlayMetaCache::build_trigram_index(&metas, 64, 1).is_none());
+        assert!(OverlayMetaCache::build_trigram_index(&metas, 1, 64).is_none());
     }
 
     #[test]
@@ -781,9 +974,17 @@ mod tests {
         assert!(db.overlay_meta_cache().is_none());
 
         let epoch = db.mutation_epoch();
-        let metas = std::sync::Arc::new(Vec::new());
-        assert!(db.store_overlay_meta_cache(epoch, std::sync::Arc::clone(&metas)));
+        let bytes_without_cache = db.estimated_bytes();
+        let cache = Arc::new(OverlayMetaCache::new(Arc::new(vec![make_meta(
+            1,
+            "/tmp/cache_a",
+        )])));
+        assert!(db.store_overlay_meta_cache(epoch, Arc::clone(&cache)));
         assert!(db.overlay_meta_cache().is_some());
+        assert!(
+            db.estimated_bytes() > bytes_without_cache,
+            "memory accounting must include the materialized metas and postings"
+        );
 
         // 任何 mutation（insert/delete/clear）都必须失效缓存并推进 epoch。
         assert!(db.apply_events(&[make_event(2, EventType::Delete, "/tmp/cache_a")]));
@@ -791,11 +992,14 @@ mod tests {
         assert_ne!(db.mutation_epoch(), epoch);
 
         // 陈旧 epoch 的回写必须被拒绝。
-        assert!(!db.store_overlay_meta_cache(epoch, metas));
+        assert!(!db.store_overlay_meta_cache(epoch, cache));
         assert!(db.overlay_meta_cache().is_none());
 
         let fresh_epoch = db.mutation_epoch();
-        assert!(db.store_overlay_meta_cache(fresh_epoch, std::sync::Arc::new(Vec::new())));
+        assert!(db.store_overlay_meta_cache(
+            fresh_epoch,
+            Arc::new(OverlayMetaCache::new(Arc::new(Vec::new())))
+        ));
         db.clear();
         assert!(db.overlay_meta_cache().is_none());
     }

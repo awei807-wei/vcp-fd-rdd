@@ -679,6 +679,66 @@ fn overlay_meta_cache_matches_uncached_results_across_mutations() {
 }
 
 #[test]
+fn overlay_trigram_candidates_preserve_linear_order_and_limit() {
+    let root = unique_tmp_dir("overlay-trigram-query-shapes");
+    std::fs::create_dir_all(&root).unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    let paths = [
+        root.join("AlphaTarget.txt"),
+        root.join("alpha-other.txt"),
+        root.join("beta.txt"),
+    ];
+    for (index, path) in paths.iter().enumerate() {
+        std::fs::write(path, format!("payload {index}")).unwrap();
+        idx.apply_events(&[mk_event(index as u64 + 1, EventType::Create, path.clone())]);
+    }
+
+    for (query, limit) in [
+        ("alpha", 1),
+        ("ALPHA", 1),
+        ("alpha", 10),
+        ("ab", 10),
+        ("missing", 10),
+    ] {
+        idx.apply_query_config(QueryConfig::default());
+        let cached = idx
+            .query_limit(query, limit)
+            .into_iter()
+            .map(|meta| meta.path)
+            .collect::<Vec<_>>();
+        idx.apply_query_config(QueryConfig {
+            overlay_meta_cache_enabled: false,
+            ..QueryConfig::default()
+        });
+        let linear = idx
+            .query_limit(query, limit)
+            .into_iter()
+            .map(|meta| meta.path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cached, linear,
+            "candidate narrowing changed order or limit semantics for {query:?}"
+        );
+    }
+
+    let fresh = TieredIndex::empty(vec![root.clone()]);
+    let fresh_path = root.join("cache_disabled.txt");
+    std::fs::write(&fresh_path, b"data").unwrap();
+    fresh.apply_events(&[mk_event(10, EventType::Create, fresh_path)]);
+    fresh.apply_query_config(QueryConfig {
+        overlay_meta_cache_enabled: false,
+        ..QueryConfig::default()
+    });
+    assert!(!fresh.query("cache_disabled").is_empty());
+    assert!(
+        fresh.delta_buffer.lock().overlay_meta_cache().is_none(),
+        "the disabled reference path must not construct or publish a cache"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn path_freshness_snapshot_honors_ancestor_invalidation() {
     let root = unique_tmp_dir("path-freshness-ancestor-invalidation");
     let nested = root.join("nested");
@@ -1352,6 +1412,38 @@ fn frozen_root_query_results_are_hidden_by_default() {
 
     idx.install_freeze_gate(FreezeGate::from_roots(vec![root]));
     assert!(idx.query("visible_before_freeze").is_empty());
+}
+
+#[test]
+fn overlay_meta_cache_is_invalidated_when_freeze_gate_changes() {
+    let root = unique_tmp_dir("freeze-overlay-cache");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("visible_after_unfreeze.txt");
+    std::fs::write(&path, b"data").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+    idx.apply_events(&[mk_event(1, EventType::Create, path.clone())]);
+
+    idx.install_freeze_gate(FreezeGate::from_roots(vec![root.clone()]));
+    assert!(idx.query("visible_after_unfreeze").is_empty());
+    assert!(
+        idx.delta_buffer.lock().overlay_meta_cache().is_some(),
+        "the frozen query should populate a cache while filtering at collection time"
+    );
+
+    idx.install_freeze_gate(FreezeGate::default());
+    assert!(
+        idx.delta_buffer.lock().overlay_meta_cache().is_none(),
+        "unfreezing must invalidate the cache built while the path was hidden"
+    );
+    assert_eq!(
+        idx.query("visible_after_unfreeze")
+            .into_iter()
+            .map(|meta| meta.path)
+            .collect::<Vec<_>>(),
+        vec![path]
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

@@ -11,7 +11,7 @@ use crate::event::sync::{
     now_ns, DirectoryFingerprint, DirtyPriority, DirtyQueueEntry, DirtyReason, DirtyRepairCursor,
     DirtyRepairProgress, DirtyScope,
 };
-use crate::fs_policy::FsPolicy;
+use crate::fs_policy::{FsPolicy, SharedMountPolicyCounters};
 use crate::index::delta_buffer::SubtreeInvalidationSnapshot;
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
 use crate::index::PathFreshness;
@@ -2031,6 +2031,11 @@ impl TieredIndex {
         let mut seq = 0u64;
         let mut scanned_manifest = DirectoryManifestBuilder::default();
         let hidden_markers_enabled = project_markers.iter().any(|marker| marker.starts_with('.'));
+        // 每切片构建一次 FsPolicy 并复用计数器 Arc，避免每 entry 重复
+        // 克隆配置 Vec/PathBuf 与 Arc。挂载表在单个最多 512 条目的切片
+        // 处理期间保持快照一致。
+        let slice_fs_policy = FsPolicy::current_with_config(self.fs_policy_config());
+        let slice_mount_policy_counters = self.mount_policy_counters();
 
         for child in &slice.entries {
             let path = super::normalize_path(child.path.as_path());
@@ -2059,6 +2064,8 @@ impl TieredIndex {
                 &meta,
                 project_markers,
                 hidden_markers_enabled,
+                slice_fs_policy.as_ref(),
+                slice_mount_policy_counters.as_ref(),
             ) {
                 continue;
             }
@@ -2349,6 +2356,8 @@ impl TieredIndex {
         meta: &std::fs::Metadata,
         project_markers: &[String],
         hidden_markers_enabled: bool,
+        fs_policy: Option<&FsPolicy>,
+        mount_policy_counters: &SharedMountPolicyCounters,
     ) -> bool {
         if path_has_excluded_component(path, &self.exclude_dirs) {
             return false;
@@ -2363,11 +2372,12 @@ impl TieredIndex {
             return false;
         }
 
-        FsPolicy::current_with_config(self.fs_policy_config())
-            .as_ref()
+        // FsPolicy 由调用方按切片/summary 构建一次，共享计数器 Arc 获取一次
+        // 并复用；配置克隆若发生在每 entry 判定内，会形成分配与缺页放大。
+        fs_policy
             .map(|policy| {
                 policy
-                    .check_path_counted(path, Some(root), self.mount_policy_counters().as_ref())
+                    .check_path_counted(path, Some(root), mount_policy_counters)
                     .is_allowed()
             })
             .unwrap_or(true)
@@ -2534,6 +2544,8 @@ impl TieredIndex {
         max_entries: usize,
     ) -> Option<(DirectoryManifestSummary, bool)> {
         let hidden_markers_enabled = project_markers.iter().any(|marker| marker.starts_with('.'));
+        let bounded_fs_policy = FsPolicy::current_with_config(self.fs_policy_config());
+        let bounded_mount_policy_counters = self.mount_policy_counters();
         let mut manifest = DirectoryManifestBuilder::default();
         let mut seen = 0usize;
         let rd = match std::fs::read_dir(dir) {
@@ -2582,6 +2594,8 @@ impl TieredIndex {
                 &meta,
                 project_markers,
                 hidden_markers_enabled,
+                bounded_fs_policy.as_ref(),
+                bounded_mount_policy_counters.as_ref(),
             ) {
                 continue;
             }

@@ -11,10 +11,12 @@ use crate::event::sync::DirtyReason;
 use crate::fs_policy::FsPolicy;
 use crate::index::base_index::BaseIndexData;
 use crate::index::content_filter::ContentFilter;
+use crate::index::delta_buffer::OverlayMetaCache;
 use crate::index::l2_partition::{mtime_to_ns, PersistentIndex};
 use crate::index::IndexLayer;
 use crate::query::dsl::{compile_query, QueryCompileError};
 use crate::query::matcher::create_matcher;
+use roaring::RoaringBitmap;
 use xxhash_rust::xxh3::Xxh3;
 
 use super::arena::{path_deleted_by_any, PathArenaSet};
@@ -31,6 +33,18 @@ const CONTENT_DUPE_PARTIAL_BYTES: usize = 4096;
 const CONTENT_INDEX_UNSUPPORTED: &str =
     "content index is disabled; enable content_index before using content:/text:";
 type ContentMatcher<'a> = dyn Fn(&Path, &str) -> bool + 'a;
+
+fn overlay_trigram_candidates(plan: &QueryPlan, cache: &OverlayMetaCache) -> Option<RoaringBitmap> {
+    let mut combined = RoaringBitmap::new();
+    let mut constrained = false;
+    for anchor in plan.anchors() {
+        let hint = anchor.literal_hint()?;
+        let candidates = cache.trigram_candidates(hint)?;
+        combined |= candidates;
+        constrained = true;
+    }
+    constrained.then_some(combined)
+}
 
 /// Outcome of requesting one cold-result fs verification from the per-query budget.
 enum VerifyGrant {
@@ -464,6 +478,9 @@ impl TieredIndex {
             // the pre-publish (empty) base together with the post-publish (cleared)
             // overlay and return [] even though the index is fully populated — the
             // transient-empty-result race seen in the large-scale CI query test.
+            // 与 install_freeze_gate 使用相同锁序，原子捕获 gate + overlay 代数。
+            // 此查询按该 gate 快照线性化；冻结根在物化前跳过，避免断联挂载 IO。
+            let overlay_freeze_guard = self.recovery_quarantine.freeze_gate.lock();
             let db = self.delta_buffer.lock();
             let base = self.base.load_full();
             let mut del = PathArenaSet::default();
@@ -471,12 +488,12 @@ impl TieredIndex {
                 let _ = del.insert(p);
             }
             let overlay_cache_enabled = self.query_overlay_meta_cache_enabled();
-            let cached_overlay_metas = if overlay_cache_enabled {
+            let cached_overlay = if overlay_cache_enabled {
                 db.overlay_meta_cache()
             } else {
                 None
             };
-            let (pending_live_events, overlay_rebuild_epoch) = if cached_overlay_metas.is_none() {
+            let (pending_live_events, overlay_rebuild_epoch) = if cached_overlay.is_none() {
                 (
                     db.live_records().cloned().collect::<Vec<EventRecord>>(),
                     db.mutation_epoch(),
@@ -485,6 +502,8 @@ impl TieredIndex {
                 (Vec::new(), 0)
             };
             drop(db);
+            let overlay_freeze_gate = overlay_freeze_guard.clone();
+            drop(overlay_freeze_guard);
             let overlay_deleted = Arc::new(del);
             let mut blocked_paths = PathArenaSet::default();
             let deleted_sources: Vec<Arc<PathArenaSet>> = vec![overlay_deleted];
@@ -495,12 +514,18 @@ impl TieredIndex {
             // blocked 过滤保持逐查询执行（下方收集环本就重查这三项），meta 的
             // size/mtime 冻结在物化时刻，下一次事件即失效重建——与 base 层的
             // 快照语义一致。关闭 overlay_meta_cache_enabled 即回到逐查询物化。
-            let overlay_live_metas: Arc<Vec<FileMeta>> = match cached_overlay_metas {
-                Some(metas) => metas,
+            let (overlay_live_metas, overlay_candidate_cache): (
+                Arc<Vec<FileMeta>>,
+                Option<Arc<OverlayMetaCache>>,
+            ) = match cached_overlay {
+                Some(cache) => (cache.metas_arc(), Some(cache)),
                 None => {
                     let mut metas: Vec<FileMeta> = Vec::with_capacity(pending_live_events.len());
                     for ev in &pending_live_events {
-                        if ev.best_path().is_some_and(|path| self.path_is_frozen(path)) {
+                        if ev
+                            .best_path()
+                            .is_some_and(|path| overlay_freeze_gate.is_path_frozen(path))
+                        {
                             continue;
                         }
                         let Some(meta) = self.overlay_meta_for_event(ev) else {
@@ -516,13 +541,18 @@ impl TieredIndex {
                     }
                     let metas = Arc::new(metas);
                     if overlay_cache_enabled {
-                        // frozen 集时变，但收集环会再次过滤 frozen/deleted/blocked，
-                        // 缓存里多留的条目不影响结果正确性。
+                        let cache = Arc::new(OverlayMetaCache::new(Arc::clone(&metas)));
+                        // gate 与 overlay epoch 已按固定锁序原子捕获；冻结条目可安全
+                        // 省略，解冻前会先失效该代缓存，且不会触碰断联挂载。
                         self.delta_buffer
                             .lock()
-                            .store_overlay_meta_cache(overlay_rebuild_epoch, Arc::clone(&metas));
+                            .store_overlay_meta_cache(overlay_rebuild_epoch, Arc::clone(&cache));
+                        (metas, Some(cache))
+                    } else {
+                        // 显式关闭缓存时保持真正的线性参考路径：不构建 posting，
+                        // 每次查询按历史逻辑物化并全扫当前 metas。
+                        (metas, None)
                     }
-                    metas
                 }
             };
             let mut results: Vec<QueryResultMeta> = Vec::with_capacity(limit.min(128));
@@ -555,27 +585,51 @@ impl TieredIndex {
                 // Overlay upserts take precedence over the immutable base. This keeps
                 // delete+recreate and rename windows correct while base is only
                 // materialized at snapshot/rebuild boundaries.
-                for meta in overlay_live_metas.iter() {
-                    if results.len() >= scan_limit {
-                        break;
-                    }
-                    let path_str = meta.path.to_string_lossy();
-                    if self.path_is_frozen(meta.path.as_path()) {
-                        continue;
-                    }
-                    let matches_anchor = plan.anchors().iter().any(|a| a.matches(&path_str));
-                    if !matches_anchor {
-                        continue;
-                    }
-                    let path_bytes = meta.path.as_os_str().as_encoded_bytes();
-                    if blocked_paths.contains(path_bytes)
-                        || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
-                    {
-                        continue;
-                    }
-                    let _ = blocked_paths.insert(path_bytes);
-                    if self.plan_matches(plan, meta, content_matches) {
-                        results.push(QueryResultMeta::hot(meta.clone()));
+                {
+                    let mut collect_meta = |meta: &FileMeta| -> bool {
+                        if results.len() >= scan_limit {
+                            return false;
+                        }
+                        let path_str = meta.path.to_string_lossy();
+                        if overlay_freeze_gate.is_path_frozen(meta.path.as_path())
+                            || !plan
+                                .anchors()
+                                .iter()
+                                .any(|anchor| anchor.matches(&path_str))
+                        {
+                            return true;
+                        }
+                        let path_bytes = meta.path.as_os_str().as_encoded_bytes();
+                        if blocked_paths.contains(path_bytes)
+                            || path_deleted_by_any(path_bytes, deleted_sources.as_slice())
+                        {
+                            return true;
+                        }
+                        let _ = blocked_paths.insert(path_bytes);
+                        if self.plan_matches(plan, meta, content_matches) {
+                            results.push(QueryResultMeta::hot(meta.clone()));
+                        }
+                        true
+                    };
+
+                    let candidate_docids = overlay_candidate_cache
+                        .as_deref()
+                        .and_then(|cache| overlay_trigram_candidates(plan, cache));
+                    if let Some(docids) = candidate_docids {
+                        for docid in docids.iter() {
+                            let Some(meta) = overlay_live_metas.get(docid as usize) else {
+                                continue;
+                            };
+                            if !collect_meta(meta) {
+                                break;
+                            }
+                        }
+                    } else {
+                        for meta in overlay_live_metas.iter() {
+                            if !collect_meta(meta) {
+                                break;
+                            }
+                        }
                     }
                 }
 
