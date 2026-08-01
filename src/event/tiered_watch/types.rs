@@ -412,6 +412,8 @@ pub struct TieredWatchDebugSummary {
     pub ephemeral_watch_dirs: usize,
     pub ephemeral_watch_cost: u64,
     pub ephemeral_watch_budget: usize,
+    pub inotify_dirty_dirs_enqueued: u64,
+    pub inotify_dirty_dirs_suppressed: u64,
     pub rotating_cold_window_active_dirs: usize,
     pub rotating_cold_window_cycle_id: u64,
     pub rotating_cold_window_budget: usize,

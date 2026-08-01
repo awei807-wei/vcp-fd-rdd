@@ -1027,18 +1027,34 @@ fn mtime_record_skipped_on_stale_scan() {
         "dir mtime should change after adding file"
     );
 
-    // 第二次扫描：扫描过程中修改目标文件并推进 event_seq，触发逐路径复验失败。
+    // 第二次扫描：持续修改目标文件并推进 event_seq，直到扫描结束。
+    // 不能依赖固定 sleep；并行全量测试时调度延迟可能让扫描在线程恢复前完成。
     idx.enqueue_dirty_dirs(vec![root.clone()], DirtyReason::PeriodicColdScan);
+    let started = std::sync::atomic::AtomicBool::new(false);
+    let stop = std::sync::atomic::AtomicBool::new(false);
     let report = std::thread::scope(|s| {
-        let handle = s.spawn(|| mtime_precheck_pop_and_process(&idx, &skip_dirs).unwrap());
-        // 等扫描开始后改写整个目录，确保至少一个已采集元数据的路径发生冲突。
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        for i in 0..400 {
-            std::fs::write(root.join(format!("file_{:04}.txt", i)), b"changed-content").unwrap();
+        let started_ref = &started;
+        let stop_ref = &stop;
+        let root_ref = &root;
+        let idx_ref = &idx;
+        let mutator = s.spawn(move || {
+            let target = root_ref.join("file_0000.txt");
+            while !stop_ref.load(std::sync::atomic::Ordering::Acquire) {
+                std::fs::write(&target, b"changed-content").unwrap();
+                idx_ref
+                    .event_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                started_ref.store(true, std::sync::atomic::Ordering::Release);
+                std::thread::yield_now();
+            }
+        });
+        while !started.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
         }
-        idx.event_seq
-            .fetch_add(1_000_000, std::sync::atomic::Ordering::Relaxed);
-        handle.join().unwrap()
+        let report = mtime_precheck_pop_and_process(&idx, &skip_dirs);
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        mutator.join().unwrap();
+        report.unwrap()
     });
 
     // 验证 stale batch 被丢弃

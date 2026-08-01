@@ -10,7 +10,7 @@ use crate::config::{NetworkFastScanMode, TieredWatchConfig};
 use crate::fs_policy::MountTable;
 use crate::util::unix_secs;
 
-use super::unix_millis;
+use super::{path_is_under_or_equal, unix_millis};
 
 use super::types::*;
 use super::TieredWatchRuntime;
@@ -703,7 +703,16 @@ impl TieredWatchRuntime {
             config.network_stat_budget_per_tick
         };
         let mut checked_dirs = 0usize;
-
+        // Fixed lock order: ephemeral coverage is authoritative for the whole
+        // stat -> queue -> drain decision, so unwatch waits for this tick.
+        let ephemeral = self.ephemeral.read();
+        let confirmed_ephemeral_covers = |path: &Path| {
+            ephemeral.iter().any(|(root, lease)| {
+                !lease.pending_add
+                    && !lease.pending_remove
+                    && path_is_under_or_equal(path, root.as_path())
+            })
+        };
         let mut state = self.fast_scan_state.write();
         self.prune_expired_fast_scan_leases_locked(&mut state, now_secs);
         let stale_sentinels = state
@@ -831,7 +840,11 @@ impl TieredWatchRuntime {
                 lease.sentinel_state = sentinel_state;
             }
 
-            if changed && !state.changed_dir_queue.iter().any(|queued| queued == &path) {
+            let covered_by_ephemeral = confirmed_ephemeral_covers(path.as_path());
+            if changed
+                && !covered_by_ephemeral
+                && !state.changed_dir_queue.iter().any(|queued| queued == &path)
+            {
                 state.changed_dir_queue.push_back(path);
             }
         }
@@ -880,6 +893,9 @@ impl TieredWatchRuntime {
             let Some(path) = state.changed_dir_queue.pop_front() else {
                 break;
             };
+            if confirmed_ephemeral_covers(path.as_path()) {
+                continue;
+            }
             changed_dirs.push(path);
         }
         let pending = state.changed_dir_queue.len();

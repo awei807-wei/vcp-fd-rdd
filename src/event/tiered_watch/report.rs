@@ -573,6 +573,10 @@ impl TieredWatchRuntime {
             ephemeral_watch_budget_blocked: self
                 .ephemeral_watch_budget_blocked
                 .load(Ordering::Relaxed),
+            inotify_dirty_dirs_enqueued: self.inotify_dirty_dirs_enqueued.load(Ordering::Relaxed),
+            inotify_dirty_dirs_suppressed: self
+                .inotify_dirty_dirs_suppressed
+                .load(Ordering::Relaxed),
             rotating_cold_window_enabled,
             rotating_cold_window_active_dirs,
             rotating_cold_window_cycle_id: self
@@ -875,6 +879,12 @@ impl TieredWatchRuntime {
                 ephemeral_watch_dirs: ephemeral_paths.len(),
                 ephemeral_watch_cost: self.current_ephemeral_watch_cost.load(Ordering::Relaxed),
                 ephemeral_watch_budget: self.ephemeral_watch_budget as usize,
+                inotify_dirty_dirs_enqueued: self
+                    .inotify_dirty_dirs_enqueued
+                    .load(Ordering::Relaxed),
+                inotify_dirty_dirs_suppressed: self
+                    .inotify_dirty_dirs_suppressed
+                    .load(Ordering::Relaxed),
                 rotating_cold_window_active_dirs: rotating_paths.len(),
                 rotating_cold_window_cycle_id: self
                     .rotating_cold_window_cycle_id
