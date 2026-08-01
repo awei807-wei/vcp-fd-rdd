@@ -622,6 +622,15 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
+def _optional_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _file_sha256(path: Path) -> str:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -640,11 +649,17 @@ def analyze_sweep_integration(
     report_path = run_dir / "fixture-report.json"
     report = _read_json(report_path)
     config = _mapping(report, "config")
+    integration_options = _mapping(report, "integration_options")
+    watch_state = _mapping(report, "watch_state")
     burst = _mapping(report, "burst")
     deep = _mapping(report, "deep_modify")
     sweep_only = _mapping(report, "sweep_only_modify")
     cycles = report.get("cycles")
     cycles = cycles if isinstance(cycles, list) else []
+    watch_cycles = _optional_int(
+        watch_state.get("rotating_completed_cycles_observed")
+    )
+    cycles_observed = max(len(cycles), watch_cycles or 0)
     valid = bool(
         terminal.get("schema") == 1
         and terminal.get("status") == "completed"
@@ -664,7 +679,24 @@ def analyze_sweep_integration(
                 terminal.get("protocol_fingerprint", "")
             ),
             "cycles_requested": int(report.get("cycles_requested", 0) or 0),
-            "cycles_observed": len(cycles),
+            "cycles_observed": cycles_observed,
+            "syscall_cycles_observed": len(cycles),
+            "watch_cycles_observed": watch_cycles,
+            "watch_cycle_id_min": _optional_int(
+                watch_state.get("rotating_cycle_id_min")
+            ),
+            "watch_cycle_id_max": _optional_int(
+                watch_state.get("rotating_cycle_id_max")
+            ),
+            "watch_cycle_progress_pct_max": _optional_int(
+                watch_state.get("rotating_cycle_progress_pct_max")
+            ),
+            "allow_cycle_shortfall": bool(
+                integration_options.get("allow_cycle_shortfall")
+            ),
+            "burst_root_level": bool(
+                integration_options.get("burst_root_level")
+            ),
             "rotating_cold_window": bool(config.get("rotating_cold_window")),
             "fast_scan": bool(config.get("fast_scan")),
             "query_fast_scan_leases": bool(

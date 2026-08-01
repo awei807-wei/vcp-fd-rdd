@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import signal
 import tarfile
@@ -76,6 +77,16 @@ class SweepIntegrationTests(unittest.TestCase):
             {
                 "cycles_requested": 1,
                 "cycles": [{} for _ in range(cycles)],
+                "integration_options": {
+                    "allow_cycle_shortfall": True,
+                    "burst_root_level": True,
+                },
+                "watch_state": {
+                    "rotating_cycle_id_min": 0,
+                    "rotating_cycle_id_max": 7,
+                    "rotating_cycle_progress_pct_max": 100,
+                    "rotating_completed_cycles_observed": 7,
+                },
                 "config": {
                     "rotating_cold_window": True,
                     "fast_scan": True,
@@ -84,13 +95,17 @@ class SweepIntegrationTests(unittest.TestCase):
                     "rotating_tick_secs": 15,
                     "rotating_full_sweep_period_secs": 45,
                 },
-                "burst": {"enabled": True, "visible": True},
+                "burst": {
+                    "enabled": True,
+                    "visible": True,
+                    "root_level": True,
+                },
                 "deep_modify": {
                     "enabled": True,
                     "visible": True,
                     "flagged_secs": 0.5,
                     "repaired_secs": 46.0,
-                    "baseline_tier": "ColdMmap",
+                    "baseline_tier": "FrozenManifestOnly",
                     "updated_tier": "HotMemory",
                 },
                 "sweep_only_modify": {
@@ -126,13 +141,34 @@ class SweepIntegrationTests(unittest.TestCase):
         index = command.index("--rotating-full-sweep-period-secs")
         self.assertEqual(command[index + 1], "45")
         self.assertIn("--deep-modify-probe", command)
+        self.assertIn("--allow-cycle-shortfall", command)
+        self.assertIn("--burst-root-level", command)
+
+        payload = {
+            "schema": 1,
+            "cycles": 1,
+            "port": 6261,
+            "rotating_ttl_secs": 45,
+            "rotating_tick_secs": 15,
+            "rotating_full_sweep_period_secs": 45,
+            "settle_secs": 150.0,
+            "calibrate": False,
+            "allow_cycle_shortfall": True,
+            "burst": True,
+            "burst_root_level": True,
+            "deep_modify_probe": True,
+        }
+        expected = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.assertEqual(integration.protocol_fingerprint(spec), expected)
 
     def test_product_and_harness_identities_are_separate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = self._source_suite(root)
             output = root / "integration"
-            attempt = self._raw_attempt(output, source)
+            attempt = self._raw_attempt(output, source, cycles=0)
 
             summary = evidence.recompute_summary(output, source, attempt)
 
@@ -143,6 +179,30 @@ class SweepIntegrationTests(unittest.TestCase):
                 summary["harness"]["git_sha"],
             )
             self.assertEqual(summary["decision"], "pass")
+            self.assertEqual(
+                summary["integration"]["protocol"]["cycles_observed"], 7
+            )
+            self.assertEqual(
+                summary["integration"]["protocol"]["syscall_cycles_observed"],
+                0,
+            )
+
+    def test_watch_cycle_progress_is_required_when_shortfall_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source_suite(root)
+            output = root / "integration"
+            attempt = self._raw_attempt(output, source, cycles=0)
+            report_path = attempt / "fixture-report.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["watch_state"]["rotating_cycle_progress_pct_max"] = 99
+            report["watch_state"]["rotating_completed_cycles_observed"] = 0
+            self._write_json(report_path, report)
+
+            summary = evidence.recompute_summary(output, source, attempt)
+
+            self.assertEqual(summary["decision"], "fail")
+            self.assertTrue(any("progress 100%" in row for row in summary["reasons"]))
 
     def test_any_completed_attempt_is_terminal_even_when_product_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

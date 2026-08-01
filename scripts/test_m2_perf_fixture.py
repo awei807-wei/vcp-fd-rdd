@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import m2_perf_fixture as fixture
 import m2_perf_fixture_analysis as analysis
@@ -254,6 +255,68 @@ class DaemonNamespaceTests(unittest.TestCase):
         self.assertIn("rotating_full_sweep_period_secs = 0", content)
         self.assertIn("l1_l2_fast_scan_query_leases_enabled = false", content)
         self.assertIn("max_watch_dirs = 8", content)
+
+
+class IntegrationProbeTests(unittest.TestCase):
+    def test_integration_flags_are_opt_in(self) -> None:
+        defaults = fixture.parse_args([])
+        enabled = fixture.parse_args(
+            ["--allow-cycle-shortfall", "--burst-root-level"]
+        )
+
+        self.assertFalse(defaults.allow_cycle_shortfall)
+        self.assertFalse(defaults.burst_root_level)
+        self.assertTrue(enabled.allow_cycle_shortfall)
+        self.assertTrue(enabled.burst_root_level)
+
+    def test_watch_state_summary_uses_real_completed_cycle_progress(self) -> None:
+        rows = [
+            {
+                "rotating_cold_window_cycle_id": 0,
+                "rotating_cold_window_cycle_progress_pct": 100,
+            },
+            {
+                "rotating_cold_window_cycle_id": 1,
+                "rotating_cold_window_cycle_progress_pct": 50,
+            },
+            {
+                "rotating_cold_window_cycle_id": 1,
+                "rotating_cold_window_cycle_progress_pct": 100,
+            },
+            {
+                "rotating_cold_window_cycle_id": 2,
+                "rotating_cold_window_cycle_progress_pct": 100,
+            },
+        ]
+
+        summary = fixture._watch_state_summary(rows)
+
+        self.assertEqual(summary["rotating_cycle_id_min"], 0)
+        self.assertEqual(summary["rotating_cycle_id_max"], 2)
+        self.assertEqual(summary["rotating_cycle_progress_pct_max"], 100)
+        self.assertEqual(summary["rotating_completed_cycle_ids"], [1, 2])
+        self.assertEqual(summary["rotating_completed_cycles_observed"], 2)
+
+    def test_root_level_burst_does_not_change_default_probe_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cold_root = Path(tmp)
+            (cold_root / "d000").mkdir()
+            with mock.patch.object(
+                fixture.BENCH, "search_results", return_value=[]
+            ), mock.patch.object(
+                fixture.BENCH, "result_has_path", return_value=True
+            ):
+                default_probe = fixture._run_burst_probe(
+                    "http://fixture", cold_root, 0.01
+                )
+                root_probe = fixture._run_burst_probe(
+                    "http://fixture", cold_root, 0.01, root_level=True
+                )
+
+        self.assertEqual(Path(default_probe["path"]).parent.name, "d000")
+        self.assertEqual(Path(root_probe["path"]).parent, cold_root)
+        self.assertFalse(default_probe["root_level"])
+        self.assertTrue(root_probe["root_level"])
 
 
 if __name__ == "__main__":

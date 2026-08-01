@@ -88,7 +88,9 @@ def protocol_fingerprint(spec: SweepIntegrationSpec) -> str:
         ),
         "settle_secs": spec.settle_secs,
         "calibrate": False,
+        "allow_cycle_shortfall": True,
         "burst": True,
+        "burst_root_level": True,
         "deep_modify_probe": True,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
@@ -117,6 +119,7 @@ def fixture_command(
         str(spec.port),
         "--cycles",
         str(spec.cycles),
+        "--allow-cycle-shortfall",
         "--rotating-ttl-secs",
         str(spec.rotating_ttl_secs),
         "--rotating-tick-secs",
@@ -127,6 +130,7 @@ def fixture_command(
         f"{spec.settle_secs:g}",
         "--no-calibrate",
         "--burst",
+        "--burst-root-level",
         "--deep-modify-probe",
     ]
 

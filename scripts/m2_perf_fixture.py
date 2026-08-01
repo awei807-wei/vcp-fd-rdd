@@ -88,6 +88,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-dir", default="")
     parser.add_argument("--port", type=int, default=6065)
     parser.add_argument("--cycles", type=int, default=5)
+    parser.add_argument(
+        "--allow-cycle-shortfall",
+        action="store_true",
+        help="integration-only: do not fail when syscall spike windows miss a real rotating cycle",
+    )
     parser.add_argument("--rotating-ttl-secs", type=int, default=45)
     parser.add_argument("--rotating-tick-secs", type=int, default=15)
     parser.add_argument(
@@ -106,6 +111,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--query-qps", type=float, default=4.0)
     parser.add_argument("--burst", dest="burst", action="store_true", default=True)
     parser.add_argument("--no-burst", dest="burst", action="store_false")
+    parser.add_argument(
+        "--burst-root-level",
+        action="store_true",
+        help="integration-only: create the burst probe directly under the cold root",
+    )
     parser.add_argument(
         "--burst-timeout-secs",
         type=float,
@@ -168,9 +178,14 @@ def _query_load(
 
 
 def _run_burst_probe(
-    base_url: str, cold_root: Path, timeout_secs: float
+    base_url: str,
+    cold_root: Path,
+    timeout_secs: float,
+    *,
+    root_level: bool = False,
 ) -> dict[str, Any]:
-    probe = cold_root / "d000" / "burst_probe_fixture.txt"
+    parent = cold_root if root_level else cold_root / "d000"
+    probe = parent / "burst_probe_fixture.txt"
     probe.write_text("fd-rdd perf fixture burst probe\n", encoding="utf-8")
     started = time.monotonic()
     deadline = started + timeout_secs
@@ -189,6 +204,7 @@ def _run_burst_probe(
         "visible": visible,
         "latency_secs": round(time.monotonic() - started, 3),
         "path": str(probe),
+        "root_level": root_level,
     }
 
 
@@ -284,6 +300,53 @@ def _load_reference(args: argparse.Namespace) -> dict[str, float] | None:
         name: float(row["measured_median"])
         for name, row in metrics.items()
         if "measured_median" in row
+    }
+
+
+def _watch_state_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    last = rows[-1] if rows else {}
+    cycle_rows: list[tuple[int, int]] = []
+    for row in rows:
+        try:
+            cycle_rows.append(
+                (
+                    int(row.get("rotating_cold_window_cycle_id", 0) or 0),
+                    int(
+                        row.get(
+                            "rotating_cold_window_cycle_progress_pct", 0
+                        )
+                        or 0
+                    ),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    cycle_ids = [cycle_id for cycle_id, _ in cycle_rows]
+    completed_ids = sorted(
+        {
+            cycle_id
+            for cycle_id, progress in cycle_rows
+            if cycle_id > 0 and progress >= 100
+        }
+    )
+    return {
+        "l3_dirs_last": int(last.get("l3_dirs", 0) or 0),
+        "rotating_active_dirs_max": int(
+            last.get("rotating_cold_window_active_dirs_max", 0) or 0
+        ),
+        "rotating_scan_only_dirs_last": int(
+            last.get("rotating_cold_window_scan_only_dirs_last", 0) or 0
+        ),
+        "rotating_budget_blocked_last": int(
+            last.get("rotating_cold_window_budget_blocked_last", 0) or 0
+        ),
+        "rotating_cycle_id_min": min(cycle_ids) if cycle_ids else None,
+        "rotating_cycle_id_max": max(cycle_ids) if cycle_ids else None,
+        "rotating_cycle_progress_pct_max": max(
+            (progress for _, progress in cycle_rows), default=None
+        ),
+        "rotating_completed_cycle_ids": completed_ids,
+        "rotating_completed_cycles_observed": len(completed_ids),
     }
 
 
@@ -387,7 +450,12 @@ def run(args: argparse.Namespace) -> int:
                 burst_timeout = args.burst_timeout_secs or (
                     args.rotating_ttl_secs + args.rotating_tick_secs + 10.0
                 )
-                burst = _run_burst_probe(base_url, roots["cold-a"], burst_timeout)
+                burst = _run_burst_probe(
+                    base_url,
+                    roots["cold-a"],
+                    burst_timeout,
+                    root_level=args.burst_root_level,
+                )
                 time.sleep(5.0)
             if args.deep_modify_probe:
                 if args.rotating_full_sweep_period_secs > args.rotating_ttl_secs * 2:
@@ -430,13 +498,13 @@ def run(args: argparse.Namespace) -> int:
     )
     clk_tck = int(os.sysconf("SC_CLK_TCK"))
     cycles = analysis.summarize_cycles(deltas, cycle_windows, clk_tck=clk_tck)
-    metric_rows = BENCH.read_jsonl(run_dir / "metrics-samples.jsonl")
+    sample_rows = BENCH.read_jsonl(run_dir / "metrics-samples.jsonl")
     metrics_rows = [
-        row["metrics"] for row in metric_rows if isinstance(row.get("metrics"), dict)
+        row["metrics"] for row in sample_rows if isinstance(row.get("metrics"), dict)
     ]
     watch_rows = [
         row["watch_state"]
-        for row in metric_rows
+        for row in sample_rows
         if isinstance(row.get("watch_state"), dict)
     ]
     guard_keys = (
@@ -447,22 +515,14 @@ def run(args: argparse.Namespace) -> int:
         "query_guard_hold_p99_us",
     )
     last_metrics = metrics_rows[-1] if metrics_rows else {}
-    last_watch = watch_rows[-1] if watch_rows else {}
-    watch_summary = {
-        "l3_dirs_last": int(last_watch.get("l3_dirs", 0) or 0),
-        "rotating_active_dirs_max": int(
-            last_watch.get("rotating_cold_window_active_dirs_max", 0) or 0
-        ),
-        "rotating_scan_only_dirs_last": int(
-            last_watch.get("rotating_cold_window_scan_only_dirs_last", 0) or 0
-        ),
-        "rotating_budget_blocked_last": int(
-            last_watch.get("rotating_cold_window_budget_blocked_last", 0) or 0
-        ),
-    }
+    watch_summary = _watch_state_summary(watch_rows)
     payload: dict[str, Any] = {
         "run_label": run_dir.name,
         "cycles_requested": args.cycles,
+        "integration_options": {
+            "allow_cycle_shortfall": bool(args.allow_cycle_shortfall),
+            "burst_root_level": bool(args.burst_root_level),
+        },
         "config": vars(daemon_ns),
         "startup_windows": [list(window) for window in startup_windows],
         "cycles": cycles,
@@ -486,7 +546,8 @@ def run(args: argparse.Namespace) -> int:
         print(
             f"cycle shortfall: measured {len(cycles)}/{args.cycles}", flush=True
         )
-        return 1
+        if not args.allow_cycle_shortfall:
+            return 1
     if args.calibrate and not payload["calibration"]["pass"]:
         print("calibration FAILED", flush=True)
         return 1

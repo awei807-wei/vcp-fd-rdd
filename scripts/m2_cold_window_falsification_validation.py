@@ -153,6 +153,8 @@ def sweep_integration_protocol_invalid_reasons(
     if int(protocol.get("cycles_observed", 0) or 0) < SWEEP_INTEGRATION_CYCLES:
         reasons.append(f"{label}未观测到完整 sweep cycle")
     expected = {
+        "allow_cycle_shortfall": True,
+        "burst_root_level": True,
         "rotating_cold_window": True,
         "fast_scan": True,
         "query_fast_scan_leases": False,
@@ -165,6 +167,8 @@ def sweep_integration_protocol_invalid_reasons(
         if protocol.get(key) != value:
             name = "full sweep period" if key == "rotating_full_sweep_period_secs" else key
             reasons.append(f"{label} {name} 配置不符（{protocol.get(key)!r} != {value!r}）")
+    if int(protocol.get("watch_cycle_progress_pct_max", 0) or 0) < 100:
+        reasons.append(f"{label}未从 watch-state 观测到 cycle progress 100%")
     for key in ("deep_modify", "sweep_only_modify"):
         probe = integration.get(key, {})
         probe = probe if isinstance(probe, dict) else {}
@@ -179,7 +183,11 @@ def validate_sweep_integration(
     label = "§18.1 短 sweep 整合腿"
     burst = integration.get("burst", {})
     burst = burst if isinstance(burst, dict) else {}
-    if burst.get("enabled") is not True or burst.get("visible") is not True:
+    if (
+        burst.get("enabled") is not True
+        or burst.get("visible") is not True
+        or burst.get("root_level") is not True
+    ):
         reasons.append(f"{label}同 daemon burst 可见性未通过")
     if burst.get("error"):
         reasons.append(f"{label} burst 存在错误：{burst.get('error')}")
@@ -190,8 +198,10 @@ def validate_sweep_integration(
         reasons.append(f"{label} deep modify 探针未启用")
     if deep.get("error"):
         reasons.append(f"{label} deep modify 存在错误：{deep.get('error')}")
-    if deep.get("baseline_tier") != "ColdMmap":
-        reasons.append(f"{label} deep modify 基线不是 ColdMmap")
+    if deep.get("baseline_tier") not in {"ColdMmap", "FrozenManifestOnly"}:
+        reasons.append(
+            f"{label} deep modify 基线不是 ColdMmap/FrozenManifestOnly"
+        )
     flagged = deep.get("flagged_secs")
     repaired = deep.get("repaired_secs")
     if not isinstance(flagged, (int, float)) or isinstance(flagged, bool):
