@@ -914,6 +914,10 @@ impl TieredWatchRuntime {
             .store(config.rotating_cold_window_enabled, Ordering::Relaxed);
         self.rotating_cold_window_budget
             .store(config.rotating_cold_window_budget.max(1), Ordering::Relaxed);
+        self.rotating_cold_window_tick_secs.store(
+            config.rotating_cold_window_tick_secs.max(1),
+            Ordering::Relaxed,
+        );
         self.rotating_cold_window_ttl_secs.store(
             config.rotating_cold_window_ttl_secs.max(1),
             Ordering::Relaxed,

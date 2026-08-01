@@ -2265,6 +2265,77 @@ fn active_rotating_lease_retains_confirmed_ancestor_watcher() {
 }
 
 #[test]
+fn rotating_ephemeral_watcher_survives_reselection_grace() {
+    let root = temp_root("retain-rotating-watcher-during-reselection-grace");
+    std::fs::create_dir_all(&root).unwrap();
+    let rt = TieredWatchRuntime::new_with_ephemeral(
+        Vec::new(),
+        vec![(root.clone(), 4)],
+        1,
+        5_000,
+        20,
+        16,
+    );
+    let state = rt.state(&root).expect("cold dir should exist");
+    state.tier.store(WatchTier::L3.as_u8(), Ordering::Release);
+    state
+        .last_scan_unix_secs
+        .store(unix_secs().saturating_sub(600), Ordering::Relaxed);
+    let watcher_cfg = EphemeralWatchConfig {
+        budget: 16,
+        ttl_secs: 20,
+        repeat_threshold: 1,
+        max_cost_per_root: 16,
+        ..EphemeralWatchConfig::default()
+    };
+    assert_eq!(
+        rt.note_dirty_scope_at(root.clone(), 1, &[], &watcher_cfg, 100, 1),
+        EphemeralWatchDecision::Add(root.clone())
+    );
+    assert!(rt.confirm_ephemeral_added(root.as_path()));
+
+    let tick = rt.rotating_cold_window_tick(RotatingColdWindowConfig {
+        enabled: true,
+        budget: 1,
+        ttl_secs: 20,
+        max_cost_per_root: 64,
+        max_dirs_per_tick: 1,
+    });
+    assert_eq!(tick.actions.len(), 1);
+    assert_eq!(
+        tick.actions[0].action,
+        RotatingColdWindowActionKind::EphemeralWatch
+    );
+    let runtime_cfg = TieredWatchConfig {
+        rotating_cold_window_enabled: true,
+        rotating_cold_window_tick_secs: 30,
+        rotating_cold_window_ttl_secs: 20,
+        ..TieredWatchConfig::default()
+    };
+    rt.apply_rotating_cold_window_config(&runtime_cfg);
+    if let Some(lease) = rt.rotating_cold_window_leases.write().get_mut(&root) {
+        lease.expires_unix_secs = 100;
+        lease.expires_at = Instant::now();
+    }
+
+    assert!(
+        rt.expire_ephemeral_watches_at(130, 1, 20, 1).is_empty(),
+        "expiry maintenance must not remove a watcher before the next rotation can reselect it"
+    );
+    if let Some(lease) = rt.rotating_cold_window_leases.write().get_mut(&root) {
+        lease.expires_at = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(32))
+            .unwrap();
+    }
+    let removals = rt.expire_ephemeral_watches_at(130, 1, 20, 1);
+    assert_eq!(removals.len(), 1);
+    assert_eq!(removals[0].path, root);
+    assert_eq!(removals[0].reason, EphemeralWatchExpiry::Ttl);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn rotating_lease_caps_ephemeral_watch_created_after_rotation() {
     let path = temp_root("cap-new-rotating-lease");
     std::fs::create_dir_all(&path).unwrap();

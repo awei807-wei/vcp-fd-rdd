@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::util::unix_secs;
 
@@ -428,15 +428,32 @@ impl TieredWatchRuntime {
                 })
                 .collect::<Vec<_>>()
         };
-        let active_rotating_ephemeral_roots = {
+        let protected_rotating_ephemeral_roots = {
             let monotonic_now = Instant::now();
+            let enabled = self.rotating_cold_window_enabled.load(Ordering::Relaxed);
+            let reselection_grace_secs = self
+                .rotating_cold_window_tick_secs
+                .load(Ordering::Relaxed)
+                .max(1)
+                .saturating_add(1);
+            let reselection_grace = Duration::from_secs(reselection_grace_secs);
             self.rotating_cold_window_leases
                 .read()
                 .iter()
                 .filter_map(|(path, lease)| {
+                    let within_wall_clock_grace = lease.expires_unix_secs > 0
+                        && now
+                            <= lease
+                                .expires_unix_secs
+                                .saturating_add(reselection_grace_secs);
+                    let within_monotonic_grace = lease
+                        .expires_at
+                        .checked_add(reselection_grace)
+                        .is_some_and(|deadline| monotonic_now <= deadline);
                     (lease.action == RotatingColdWindowActionKind::EphemeralWatch
-                        && lease.is_active(now, monotonic_now))
-                    .then_some(path.clone())
+                        && (lease.is_active(now, monotonic_now)
+                            || (enabled && within_wall_clock_grace && within_monotonic_grace)))
+                        .then_some(path.clone())
                 })
                 .collect::<Vec<_>>()
         };
@@ -446,7 +463,7 @@ impl TieredWatchRuntime {
             if lease.pending_add || lease.pending_remove {
                 continue;
             }
-            if active_rotating_ephemeral_roots
+            if protected_rotating_ephemeral_roots
                 .iter()
                 .any(|path| path_is_under_or_equal(path.as_path(), lease.path.as_path()))
             {
