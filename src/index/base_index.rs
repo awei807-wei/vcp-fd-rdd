@@ -16,6 +16,14 @@ use crate::stats::BaseStats;
 use crate::storage::snapshot_v7::V7Snapshot;
 use crate::util::pathbuf_from_encoded_vec;
 
+// 对小映射反复 MADV_DONTNEED 会把每次目录修复变成可观测的缺页风暴，
+// 而保留这些页的最坏常驻成本不超过 256 KiB/segment。
+const COLD_SEGMENT_RETAIN_BYTES: usize = 256 * 1024;
+
+fn should_release_cold_segment_pages(mapped_len: usize) -> bool {
+    mapped_len > COLD_SEGMENT_RETAIN_BYTES
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MmapWarmupReport {
     pub pages: u64,
@@ -99,7 +107,7 @@ impl ColdSegment {
 
     fn query_keys(&self, matcher: &dyn Matcher) -> Vec<FileKey> {
         let result = self.snapshot.query_keys(matcher);
-        self.snapshot.advise_dontneed();
+        self.release_pages_after_access();
         result.unwrap_or_else(|e| {
             tracing::warn!(
                 "cold segment mmap query failed for {}: {}",
@@ -112,7 +120,7 @@ impl ColdSegment {
 
     fn query_metas(&self, matcher: &dyn Matcher) -> Vec<FileMeta> {
         let result = self.snapshot.query_metas(matcher);
-        self.snapshot.advise_dontneed();
+        self.release_pages_after_access();
         result.unwrap_or_else(|e| {
             tracing::warn!(
                 "cold segment mmap metadata query failed for {}: {}",
@@ -125,13 +133,13 @@ impl ColdSegment {
 
     fn get_meta(&self, key: FileKey) -> Option<FileMeta> {
         let result = self.snapshot.get_meta(key).ok().flatten();
-        self.snapshot.advise_dontneed();
+        self.release_pages_after_access();
         result
     }
 
     fn for_each_live_meta(&self, f: impl FnMut(FileMeta)) {
         let result = self.snapshot.for_each_live_meta(f);
-        self.snapshot.advise_dontneed();
+        self.release_pages_after_access();
         match result {
             Ok(()) => {}
             Err(e) => tracing::warn!(
@@ -151,7 +159,7 @@ impl ColdSegment {
             }
             keep_going
         });
-        self.snapshot.advise_dontneed();
+        self.release_pages_after_access();
         match result {
             Ok(()) => completed,
             Err(e) => {
@@ -167,14 +175,20 @@ impl ColdSegment {
 
     fn parent_candidates(&self, parent_path: &str) -> Vec<FileKey> {
         let result = self.snapshot.parent_candidates(parent_path);
-        self.snapshot.advise_dontneed();
+        self.release_pages_after_access();
         result.unwrap_or_default()
     }
 
     fn parent_metas(&self, parent_path: &str) -> Vec<FileMeta> {
         let result = self.snapshot.parent_metas(parent_path);
-        self.snapshot.advise_dontneed();
+        self.release_pages_after_access();
         result.unwrap_or_default()
+    }
+
+    fn release_pages_after_access(&self) {
+        if should_release_cold_segment_pages(self.snapshot.mapped_len()) {
+            self.snapshot.advise_dontneed();
+        }
     }
 
     fn manifest_bytes(&self) -> u64 {
@@ -959,6 +973,16 @@ mod tests {
 
         let snap = idx.snapshot();
         assert_eq!(snap.entries_by_key.len(), 1);
+    }
+
+    #[test]
+    fn cold_segment_page_release_keeps_small_maps_resident() {
+        assert!(!should_release_cold_segment_pages(
+            COLD_SEGMENT_RETAIN_BYTES
+        ));
+        assert!(should_release_cold_segment_pages(
+            COLD_SEGMENT_RETAIN_BYTES + 1
+        ));
     }
 
     #[test]
