@@ -85,15 +85,6 @@ impl TieredWatchRuntime {
         })
     }
 
-    pub(super) fn confirmed_ephemeral_watch_roots(&self) -> Vec<PathBuf> {
-        self.ephemeral
-            .read()
-            .iter()
-            .filter(|(_, lease)| !lease.pending_add && !lease.pending_remove)
-            .map(|(root, _)| root.clone())
-            .collect()
-    }
-
     pub fn constrain_ephemeral_watch_ttl(&self, path: &Path, ttl_secs: u64) -> bool {
         self.constrain_ephemeral_watch_ttl_at(path, ttl_secs, unix_secs())
     }

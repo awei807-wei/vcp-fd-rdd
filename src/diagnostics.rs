@@ -144,8 +144,6 @@ pub struct WatcherDiagnostics {
     pub fast_scan_apply_dropped_stale_batches: u64,
     pub fast_scan_scan_workers_active: u64,
     pub fast_scan_io_budget_limited_count: u64,
-    pub inotify_dirty_dirs_enqueued: u64,
-    pub inotify_dirty_dirs_suppressed: u64,
     pub fast_scan_coverage_lag_p95_ms: u64,
     pub fast_scan_budget_degraded: bool,
     pub fast_scan_last_degraded_reason: String,

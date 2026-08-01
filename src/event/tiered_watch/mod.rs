@@ -131,8 +131,6 @@ pub struct TieredWatchRuntime {
     ephemeral_watch_expired: AtomicU64,
     ephemeral_watch_evicted: AtomicU64,
     ephemeral_watch_budget_blocked: AtomicU64,
-    inotify_dirty_dirs_enqueued: AtomicU64,
-    inotify_dirty_dirs_suppressed: AtomicU64,
     rotating_cold_window_enabled: AtomicBool,
     rotating_cold_window_budget: AtomicUsize,
     rotating_cold_window_tick_secs: AtomicU64,
@@ -297,8 +295,6 @@ impl TieredWatchRuntime {
             ephemeral_watch_expired: AtomicU64::new(0),
             ephemeral_watch_evicted: AtomicU64::new(0),
             ephemeral_watch_budget_blocked: AtomicU64::new(0),
-            inotify_dirty_dirs_enqueued: AtomicU64::new(0),
-            inotify_dirty_dirs_suppressed: AtomicU64::new(0),
             rotating_cold_window_enabled: AtomicBool::new(false),
             rotating_cold_window_budget: AtomicUsize::new(128),
             rotating_cold_window_tick_secs: AtomicU64::new(30),
@@ -423,60 +419,44 @@ impl TieredWatchRuntime {
         let paths = paths.into_iter().collect::<Vec<_>>();
         self.record_ephemeral_events(&paths, now);
         self.record_rotating_cold_window_event_progress(&paths, now, Instant::now());
-        let confirmed_ephemeral_roots = self.confirmed_ephemeral_watch_roots();
         let dirs = self.dirs.read();
-        let mut dirty_dirs = HashSet::new();
-        let mut suppressed_dirs = HashSet::new();
-        let mut l0_event_lease_dirs = HashSet::new();
+        let mut dirty_dirs = Vec::new();
+        let mut l0_event_lease_dirs = Vec::new();
         for path in paths {
-            let Some(parent) = path.parent() else {
-                continue;
-            };
-            let mut enqueue_dirty = false;
-            let mut suppress_dirty = false;
             for (root, state) in dirs.iter() {
                 if !path_is_under_or_equal(path, root) {
                     continue;
                 }
                 if state.tier() == WatchTier::L0 {
-                    record_authoritative_event(state, now, true);
-                    l0_event_lease_dirs.insert(parent.to_path_buf());
-                } else if confirmed_ephemeral_roots
-                    .iter()
-                    .any(|watch_root| path_is_under_or_equal(root, watch_root))
-                {
-                    record_authoritative_event(state, now, false);
-                    suppress_dirty = true;
+                    state.last_event_unix_secs.store(now, Ordering::Relaxed);
+                    state.empty_scan_count.store(0, Ordering::Relaxed);
+                    state
+                        .event_score
+                        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |score| {
+                            Some(score.saturating_add(8).min(10_000))
+                        })
+                        .ok();
+                    state.dirty.store(false, Ordering::Relaxed);
+                    state.set_freshness(Freshness::Fresh);
+                    if let Some(parent) = path.parent() {
+                        l0_event_lease_dirs.push(parent.to_path_buf());
+                    }
                 } else {
                     state.dirty.store(true, Ordering::Relaxed);
                     state.dirty_since_unix_secs.store(now, Ordering::Relaxed);
                     state.set_freshness(Freshness::Dirty);
-                    enqueue_dirty = true;
+                    if let Some(parent) = path.parent() {
+                        dirty_dirs.push(parent.to_path_buf());
+                    }
                 }
-            }
-            if enqueue_dirty {
-                dirty_dirs.insert(parent.to_path_buf());
-            } else if suppress_dirty {
-                suppressed_dirs.insert(parent.to_path_buf());
             }
         }
         drop(dirs);
+        l0_event_lease_dirs.sort();
+        l0_event_lease_dirs.dedup();
         self.grant_fast_scan_leases(l0_event_lease_dirs, FastScanLeaseKind::L0Event, None, 2);
-        self.finish_event_dirty_dirs(dirty_dirs, suppressed_dirs)
-    }
-
-    fn finish_event_dirty_dirs(
-        &self,
-        dirty_dirs: HashSet<PathBuf>,
-        mut suppressed_dirs: HashSet<PathBuf>,
-    ) -> Vec<PathBuf> {
-        suppressed_dirs.retain(|path| !dirty_dirs.contains(path));
-        self.inotify_dirty_dirs_enqueued
-            .fetch_add(dirty_dirs.len() as u64, Ordering::Relaxed);
-        self.inotify_dirty_dirs_suppressed
-            .fetch_add(suppressed_dirs.len() as u64, Ordering::Relaxed);
-        let mut dirty_dirs = dirty_dirs.into_iter().collect::<Vec<_>>();
         dirty_dirs.sort();
+        dirty_dirs.dedup();
         dirty_dirs
     }
 
@@ -534,21 +514,6 @@ impl TieredWatchRuntime {
     pub(super) fn state(&self, path: &Path) -> Option<Arc<DirState>> {
         self.dirs.read().get(path).cloned()
     }
-}
-
-fn record_authoritative_event(state: &DirState, now: u64, score_event: bool) {
-    state.last_event_unix_secs.store(now, Ordering::Relaxed);
-    state.empty_scan_count.store(0, Ordering::Relaxed);
-    if score_event {
-        state
-            .event_score
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |score| {
-                Some(score.saturating_add(8).min(10_000))
-            })
-            .ok();
-    }
-    state.dirty.store(false, Ordering::Relaxed);
-    state.set_freshness(Freshness::Fresh);
 }
 
 pub(super) fn path_is_under_or_equal(path: &Path, root: &Path) -> bool {

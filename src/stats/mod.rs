@@ -264,8 +264,6 @@ pub struct WatchStateReport {
     pub ephemeral_watch_expired: u64,
     pub ephemeral_watch_evicted: u64,
     pub ephemeral_watch_budget_blocked: u64,
-    pub inotify_dirty_dirs_enqueued: u64,
-    pub inotify_dirty_dirs_suppressed: u64,
     pub rotating_cold_window_enabled: bool,
     pub rotating_cold_window_active_dirs: usize,
     pub rotating_cold_window_cycle_id: u64,

@@ -114,8 +114,6 @@ pub struct HealthTelemetry {
     pub fast_scan_apply_dropped_stale_batches: u64,
     pub fast_scan_scan_workers_active: u64,
     pub fast_scan_io_budget_limited_count: u64,
-    pub inotify_dirty_dirs_enqueued: u64,
-    pub inotify_dirty_dirs_suppressed: u64,
     pub fast_scan_coverage_lag_p95_ms: u64,
     pub fast_scan_budget_degraded: bool,
     pub fast_scan_last_degraded_reason: String,
@@ -282,8 +280,6 @@ pub struct HealthResponse {
     pub fast_scan_apply_dropped_stale_batches: u64,
     pub fast_scan_scan_workers_active: u64,
     pub fast_scan_io_budget_limited_count: u64,
-    pub inotify_dirty_dirs_enqueued: u64,
-    pub inotify_dirty_dirs_suppressed: u64,
     pub fast_scan_coverage_lag_p95_ms: u64,
     pub fast_scan_budget_degraded: bool,
     pub fast_scan_last_degraded_reason: String,
@@ -781,8 +777,6 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
     diagnostics.watchers.fast_scan_scan_workers_active = health.fast_scan_scan_workers_active;
     diagnostics.watchers.fast_scan_io_budget_limited_count =
         health.fast_scan_io_budget_limited_count;
-    diagnostics.watchers.inotify_dirty_dirs_enqueued = health.inotify_dirty_dirs_enqueued;
-    diagnostics.watchers.inotify_dirty_dirs_suppressed = health.inotify_dirty_dirs_suppressed;
     diagnostics.watchers.fast_scan_coverage_lag_p95_ms = health.fast_scan_coverage_lag_p95_ms;
     diagnostics.watchers.fast_scan_budget_degraded = health.fast_scan_budget_degraded;
     diagnostics.watchers.fast_scan_last_degraded_reason =
@@ -898,8 +892,6 @@ async fn health_handler(State(state): State<QueryServerState>) -> Json<HealthRes
         fast_scan_apply_dropped_stale_batches: health.fast_scan_apply_dropped_stale_batches,
         fast_scan_scan_workers_active: health.fast_scan_scan_workers_active,
         fast_scan_io_budget_limited_count: health.fast_scan_io_budget_limited_count,
-        inotify_dirty_dirs_enqueued: health.inotify_dirty_dirs_enqueued,
-        inotify_dirty_dirs_suppressed: health.inotify_dirty_dirs_suppressed,
         fast_scan_coverage_lag_p95_ms: health.fast_scan_coverage_lag_p95_ms,
         fast_scan_budget_degraded: health.fast_scan_budget_degraded,
         fast_scan_last_degraded_reason: health.fast_scan_last_degraded_reason,
@@ -1556,8 +1548,6 @@ mod tests {
             fast_scan_apply_dropped_stale_batches: 0,
             fast_scan_scan_workers_active: 0,
             fast_scan_io_budget_limited_count: 0,
-            inotify_dirty_dirs_enqueued: 0,
-            inotify_dirty_dirs_suppressed: 0,
             fast_scan_coverage_lag_p95_ms: 0,
             fast_scan_budget_degraded: false,
             fast_scan_last_degraded_reason: String::new(),
