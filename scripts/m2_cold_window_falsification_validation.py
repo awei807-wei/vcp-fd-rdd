@@ -32,6 +32,13 @@ EXPECTED_PROBES_PER_BURST = {
     "git_clone": 3,
     "subtree_rename": 8,
 }
+SWEEP_INTEGRATION_CYCLES = 1
+SWEEP_INTEGRATION_TTL_SECS = 45
+SWEEP_INTEGRATION_TICK_SECS = 15
+SWEEP_INTEGRATION_PERIOD_SECS = 45
+SWEEP_INTEGRATION_SETTLE_SECS = 150.0
+SWEEP_INTEGRATION_REPAIR_DEADLINE_SECS = 75.0
+SWEEP_INTEGRATION_SWEEP_ONLY_WAIT_SECS = 70.0
 
 
 def _timestamp(value: str) -> float | None:
@@ -89,6 +96,137 @@ def block_protocol_invalid_reasons(legs: list[dict[str, Any]]) -> list[str]:
         if gap > 1800.0:
             reasons.append(f"block 两腿启动间隔超过 30 分钟（{gap:.3f}s）")
     return reasons
+
+
+def sweep_integration_protocol_invalid_reasons(
+    integration: dict[str, Any],
+    *,
+    expected_product_git_sha: str,
+    expected_product_binary_sha256: str,
+    expected_product_receipt_sha256: str,
+    expected_protocol_fingerprint: str,
+) -> list[str]:
+    label = "§18.1 短 sweep 整合腿"
+    protocol = integration.get("protocol", {})
+    protocol = protocol if isinstance(protocol, dict) else {}
+    audit = integration.get("audit", {})
+    audit = audit if isinstance(audit, dict) else {}
+    reasons: list[str] = []
+    if integration.get("valid") is not True:
+        reasons.append(f"{label}缺少完整成功的 fixture 终态")
+    if audit.get("terminal_status") != "completed" or audit.get(
+        "process_exit_code"
+    ) != 0:
+        reasons.append(f"{label}进程终态无效")
+    if (
+        expected_product_git_sha
+        and audit.get("product_git_sha") != expected_product_git_sha
+    ):
+        reasons.append(f"{label} product Git SHA 不一致")
+    harness_git_sha = str(audit.get("harness_git_sha", ""))
+    if len(harness_git_sha) != 40 or any(
+        character not in "0123456789abcdef" for character in harness_git_sha
+    ):
+        reasons.append(f"{label} harness Git SHA 无效")
+    if audit.get("harness_worktree_dirty") is not False:
+        reasons.append(f"{label} harness worktree 必须为 clean")
+    if (
+        expected_product_binary_sha256
+        and audit.get("product_binary_sha256")
+        != expected_product_binary_sha256
+    ):
+        reasons.append(f"{label} product binary SHA256 不一致")
+    if (
+        expected_product_receipt_sha256
+        and audit.get("product_receipt_sha256")
+        != expected_product_receipt_sha256
+    ):
+        reasons.append(f"{label}构建回执 SHA256 不一致")
+    if (
+        not expected_protocol_fingerprint
+        or protocol.get("command_fingerprint") != expected_protocol_fingerprint
+        or audit.get("command_fingerprint") != expected_protocol_fingerprint
+    ):
+        reasons.append(f"{label}协议参数指纹不一致")
+    if int(protocol.get("cycles_requested", 0) or 0) != SWEEP_INTEGRATION_CYCLES:
+        reasons.append(f"{label} cycles 配置不是 {SWEEP_INTEGRATION_CYCLES}")
+    if int(protocol.get("cycles_observed", 0) or 0) < SWEEP_INTEGRATION_CYCLES:
+        reasons.append(f"{label}未观测到完整 sweep cycle")
+    expected = {
+        "rotating_cold_window": True,
+        "fast_scan": True,
+        "query_fast_scan_leases": False,
+        "rotating_ttl_secs": SWEEP_INTEGRATION_TTL_SECS,
+        "rotating_tick_secs": SWEEP_INTEGRATION_TICK_SECS,
+        "rotating_full_sweep_period_secs": SWEEP_INTEGRATION_PERIOD_SECS,
+        "settle_secs": SWEEP_INTEGRATION_SETTLE_SECS,
+    }
+    for key, value in expected.items():
+        if protocol.get(key) != value:
+            name = "full sweep period" if key == "rotating_full_sweep_period_secs" else key
+            reasons.append(f"{label} {name} 配置不符（{protocol.get(key)!r} != {value!r}）")
+    for key in ("deep_modify", "sweep_only_modify"):
+        probe = integration.get(key, {})
+        probe = probe if isinstance(probe, dict) else {}
+        if probe.get("skipped"):
+            reasons.append(f"{label} {key} 被跳过：{probe.get('skipped')}")
+    return list(dict.fromkeys(reasons))
+
+
+def validate_sweep_integration(
+    integration: dict[str, Any], reasons: list[str]
+) -> None:
+    label = "§18.1 短 sweep 整合腿"
+    burst = integration.get("burst", {})
+    burst = burst if isinstance(burst, dict) else {}
+    if burst.get("enabled") is not True or burst.get("visible") is not True:
+        reasons.append(f"{label}同 daemon burst 可见性未通过")
+    if burst.get("error"):
+        reasons.append(f"{label} burst 存在错误：{burst.get('error')}")
+
+    deep = integration.get("deep_modify", {})
+    deep = deep if isinstance(deep, dict) else {}
+    if deep.get("enabled") is not True:
+        reasons.append(f"{label} deep modify 探针未启用")
+    if deep.get("error"):
+        reasons.append(f"{label} deep modify 存在错误：{deep.get('error')}")
+    if deep.get("baseline_tier") != "ColdMmap":
+        reasons.append(f"{label} deep modify 基线不是 ColdMmap")
+    flagged = deep.get("flagged_secs")
+    repaired = deep.get("repaired_secs")
+    if not isinstance(flagged, (int, float)) or isinstance(flagged, bool):
+        reasons.append(f"{label} verify 通道缺少 changed 打标证据")
+    if deep.get("visible") is not True or not isinstance(
+        repaired, (int, float)
+    ) or isinstance(repaired, bool):
+        reasons.append(f"{label} sweep 通道未完成索引修复")
+    if deep.get("updated_tier") != "HotMemory":
+        reasons.append(f"{label} deep modify 修复后未进入 HotMemory")
+    if isinstance(flagged, (int, float)) and isinstance(repaired, (int, float)):
+        if float(flagged) < 0 or float(flagged) > float(repaired):
+            reasons.append(f"{label} verify/sweep 两相时间顺序无效")
+        if float(repaired) > SWEEP_INTEGRATION_REPAIR_DEADLINE_SECS:
+            reasons.append(
+                f"{label}修复超过 {SWEEP_INTEGRATION_REPAIR_DEADLINE_SECS:.0f} 秒加速门"
+            )
+
+    sweep_only = integration.get("sweep_only_modify", {})
+    sweep_only = sweep_only if isinstance(sweep_only, dict) else {}
+    if sweep_only.get("enabled") is not True:
+        reasons.append(f"{label} sweep-only 探针未启用")
+    if sweep_only.get("error"):
+        reasons.append(f"{label} sweep-only 存在错误：{sweep_only.get('error')}")
+    waited = sweep_only.get("waited_secs")
+    if not isinstance(waited, (int, float)) or isinstance(waited, bool) or float(
+        waited
+    ) < SWEEP_INTEGRATION_SWEEP_ONLY_WAIT_SECS:
+        reasons.append(f"{label} sweep-only 静默等待窗口不足")
+    if (
+        sweep_only.get("repaired_by_sweep") is not True
+        or sweep_only.get("first_query_freshness") != "fresh"
+        or sweep_only.get("first_query_tier") != "HotMemory"
+    ):
+        reasons.append(f"{label} sweep-only 首查未证明后台修复")
 
 
 def leg_label(leg: dict[str, Any]) -> str:

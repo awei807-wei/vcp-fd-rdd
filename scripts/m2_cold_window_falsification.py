@@ -26,6 +26,21 @@ class LegSpec:
     base_dir: Path
 
 
+@dataclass(frozen=True)
+class SweepIntegrationSpec:
+    base_dir: Path
+    port: int = 6261
+    cycles: int = 1
+    rotating_ttl_secs: int = 45
+    rotating_tick_secs: int = 15
+    rotating_full_sweep_period_secs: int = 45
+    settle_secs: float = 150.0
+
+
+def build_sweep_integration_spec(suite_dir: Path) -> SweepIntegrationSpec:
+    return SweepIntegrationSpec(suite_dir / "sweep-integration")
+
+
 def balanced_block_orders(seed: int) -> list[tuple[str, str]]:
     orders = [("a", "b"), ("a", "b"), ("b", "a"), ("b", "a")]
     random.Random(seed).shuffle(orders)
@@ -596,3 +611,99 @@ def analyze_leg(spec: LegSpec, run_dir: Path) -> dict[str, Any]:
     leg["protocol_invalid_reasons"] = protocol_invalid_reasons(leg)
     leg["protocol_valid"] = not leg["protocol_invalid_reasons"]
     return leg
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _file_sha256(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def analyze_sweep_integration(
+    run_dir: Path,
+    *,
+    result_name: str = "sweep-integration-result.json",
+    settle_secs: float = 150.0,
+) -> dict[str, Any]:
+    """Normalize the accelerated §18.1 integration proof without inventing evidence."""
+    terminal = _read_json(run_dir / result_name)
+    report_path = run_dir / "fixture-report.json"
+    report = _read_json(report_path)
+    config = _mapping(report, "config")
+    burst = _mapping(report, "burst")
+    deep = _mapping(report, "deep_modify")
+    sweep_only = _mapping(report, "sweep_only_modify")
+    cycles = report.get("cycles")
+    cycles = cycles if isinstance(cycles, list) else []
+    valid = bool(
+        terminal.get("schema") == 1
+        and terminal.get("status") == "completed"
+        and terminal.get("exit_code") == 0
+        and report
+    )
+    return {
+        "schema": 1,
+        "run_dir": str(run_dir),
+        "valid": valid,
+        "protocol_valid": False,
+        "correctness_passed": False,
+        "protocol_invalid_reasons": [],
+        "correctness_reasons": [],
+        "protocol": {
+            "command_fingerprint": str(
+                terminal.get("protocol_fingerprint", "")
+            ),
+            "cycles_requested": int(report.get("cycles_requested", 0) or 0),
+            "cycles_observed": len(cycles),
+            "rotating_cold_window": bool(config.get("rotating_cold_window")),
+            "fast_scan": bool(config.get("fast_scan")),
+            "query_fast_scan_leases": bool(
+                config.get("query_fast_scan_leases", True)
+            ),
+            "rotating_ttl_secs": int(config.get("rotating_ttl_secs", 0) or 0),
+            "rotating_tick_secs": int(config.get("rotating_tick_secs", 0) or 0),
+            "rotating_full_sweep_period_secs": int(
+                config.get("rotating_full_sweep_period_secs", 0) or 0
+            ),
+            "settle_secs": float(settle_secs),
+        },
+        "burst": dict(burst),
+        "deep_modify": {
+            **deep,
+            "flagged_secs": _optional_float(deep.get("flagged_secs")),
+            "repaired_secs": _optional_float(deep.get("repaired_secs")),
+        },
+        "sweep_only_modify": {
+            **sweep_only,
+            "waited_secs": _optional_float(sweep_only.get("waited_secs")),
+        },
+        "audit": {
+            "terminal_status": str(terminal.get("status", "")),
+            "process_exit_code": terminal.get("exit_code"),
+            "terminal_run_dir": str(terminal.get("run_dir", "")),
+            "product_git_sha": str(terminal.get("product_git_sha", "")),
+            "product_binary_sha256": str(
+                terminal.get("product_binary_sha256", "")
+            ),
+            "product_receipt_sha256": str(
+                terminal.get("product_receipt_sha256", "")
+            ),
+            "harness_git_sha": str(terminal.get("harness_git_sha", "")),
+            "harness_worktree_dirty": terminal.get("harness_worktree_dirty"),
+            "source_suite": str(terminal.get("source_suite", "")),
+            "fixture_report_sha256": _file_sha256(report_path),
+            "command_fingerprint": str(terminal.get("protocol_fingerprint", "")),
+            "started_at": str(terminal.get("started_at", "")),
+            "finished_at": str(terminal.get("finished_at", "")),
+        },
+    }
