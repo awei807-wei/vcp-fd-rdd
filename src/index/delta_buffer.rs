@@ -537,10 +537,6 @@ impl DeltaBuffer {
         matches!(self.entries.get(path), Some(DeltaState::Live(_)))
     }
 
-    pub(crate) fn is_overflowed(&self) -> bool {
-        self.overflowed
-    }
-
     /// 当前条目数
     pub fn len(&self) -> usize {
         self.entries.len()

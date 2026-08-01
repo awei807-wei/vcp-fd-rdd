@@ -543,7 +543,7 @@ fn read_dir_slice(
     })
 }
 
-pub(super) fn should_skip_dirty_dir(
+fn should_skip_dirty_dir(
     dir: &std::path::Path,
     ignore_prefixes: &[PathBuf],
     exclude_dirs: &[String],
@@ -580,10 +580,6 @@ pub(crate) struct FastSyncReport {
     pub(crate) dirs_scanned: usize,
     pub(crate) upsert_events: usize,
     pub(crate) delete_events: usize,
-    pub(crate) metadata_stats: usize,
-    pub(crate) generation_lookups_avoided: usize,
-    pub(crate) fallback_dirs: usize,
-    pub(crate) failed: bool,
 }
 
 impl TieredIndex {
@@ -1093,12 +1089,11 @@ impl TieredIndex {
                     return report;
                 }
                 if entry.reason == DirtyReason::FastScanChangedDir && !recursive_subtree_repair {
-                    let sync = self.fast_scan_namespace_sync(dirs, ignore_prefixes);
+                    let sync = self.fast_sync(entry.scope.clone(), ignore_prefixes);
                     report.dirs_scanned = sync.dirs_scanned;
                     report.fast_sync_upserts = sync.upsert_events;
                     report.fast_sync_deletes = sync.delete_events;
                     report.changed = sync.upsert_events.saturating_add(sync.delete_events);
-                    report.failed = sync.failed;
                     for dir in entry.scope.dir_paths() {
                         report.outcomes.push(DirtyScanOutcome {
                             dir: dir.clone(),
@@ -1110,7 +1105,7 @@ impl TieredIndex {
                             },
                             reason: entry.reason,
                             manifest_skipped: false,
-                            completion_ready: !sync.failed,
+                            completion_ready: true,
                         });
                     }
                     return report;
@@ -2326,10 +2321,19 @@ impl TieredIndex {
 
         let dirty_dirs = HashSet::from([dir.to_path_buf()]);
         let mut indexed_children = self
-            .fast_sync_delete_candidates(&dirty_dirs)
+            .base
+            .load_full()
+            .delete_alignment_with_parent_index(&dirty_dirs)
             .into_iter()
             .filter_map(|(_, path)| first_direct_child(dir, path.as_path()))
             .collect::<Vec<_>>();
+        indexed_children.extend(
+            self.l2
+                .load_full()
+                .delete_alignment_with_parent_index(&dirty_dirs)
+                .into_iter()
+                .filter_map(|(_, path)| first_direct_child(dir, path.as_path())),
+        );
         {
             let db = self.delta_buffer.lock();
             indexed_children.extend(
@@ -2874,7 +2878,7 @@ fn first_direct_child(root: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-pub(super) fn directory_read_fingerprint(
+fn directory_read_fingerprint(
     path: &Path,
     meta: &std::fs::Metadata,
 ) -> Option<DirectoryFingerprint> {
