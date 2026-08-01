@@ -15,6 +15,7 @@ from unittest import mock
 
 import m2_cold_window_falsification as falsification
 import m2_cold_window_falsification_runner as runner
+from m2_cold_window_build_receipt import SCHEMA as BUILD_RECEIPT_SCHEMA
 
 
 class EvidenceBundleTests(unittest.TestCase):
@@ -35,7 +36,10 @@ class EvidenceBundleTests(unittest.TestCase):
         suite_dir.mkdir()
         receipt_path = suite_dir / runner.BUILD_RECEIPT_NAME
         receipt_path.write_text(
-            json.dumps({"schema": 1, "build_succeeded": True}) + "\n",
+            json.dumps(
+                {"schema": BUILD_RECEIPT_SCHEMA, "build_succeeded": True}
+            )
+            + "\n",
             encoding="utf-8",
         )
         receipt_sha256 = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
@@ -278,6 +282,22 @@ class EvidenceBundleTests(unittest.TestCase):
                 for name, expected in checksums.items():
                     actual = hashlib.sha256(self._member_bytes(archive, name)).hexdigest()
                     self.assertEqual(actual, expected, name)
+
+    def test_line_delimited_metrics_with_json_suffix_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            suite_dir, summary, attempts = self._suite(Path(tmp))
+            metrics_dir = attempts[0] / "reports" / "metrics"
+            source = metrics_dir / "metrics.jsonl"
+            target = metrics_dir / "metrics_2026-08-01_06.json"
+            target.write_text(
+                source.read_text(encoding="utf-8") * 2,
+                encoding="utf-8",
+            )
+            source.unlink()
+
+            bundle = self._write_outputs(suite_dir, summary)
+
+            self.assertIsNotNone(bundle)
 
     def test_missing_required_leg_member_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -12,6 +12,7 @@ from m2_cold_window_ab_result import (
     WRAPPER_RESULT_NAME,
     WRAPPER_RESULT_SCHEMA,
 )
+from m2_cold_window_build_receipt import SCHEMA as BUILD_RECEIPT_SCHEMA
 from m2_cold_window_build_receipt import sha256_file
 from m2_cold_window_falsification import LegSpec, analyze_leg
 
@@ -228,8 +229,12 @@ def _validate_metric(path: Path) -> None:
     description = f"metrics {path.name}"
     if path.suffix == ".jsonl":
         strict_jsonl(path, description)
-    else:
+        return
+    try:
         strict_json(path, description)
+    except EvidenceBundleError:
+        # fd-rdd 的按小时 metrics 文件使用 .json 后缀，但内容是逐行 JSON。
+        strict_jsonl(path, description)
 
 
 def _metric_paths(attempt: Path) -> tuple[Path, ...]:
@@ -319,7 +324,10 @@ def _expected_receipt_sha256(summary: dict[str, Any]) -> str:
 
 def validate_build_receipt(path: Path, summary: dict[str, Any]) -> None:
     receipt = strict_json(path, BUILD_RECEIPT_NAME)
-    if receipt.get("schema") != 1 or receipt.get("build_succeeded") is not True:
+    if (
+        receipt.get("schema") not in {1, 3, BUILD_RECEIPT_SCHEMA}
+        or receipt.get("build_succeeded") is not True
+    ):
         raise EvidenceBundleError(f"构建回执终态无效: {path}")
     expected_digest = _expected_receipt_sha256(summary)
     try:
