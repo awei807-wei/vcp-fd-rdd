@@ -3250,6 +3250,45 @@ async fn fast_sync_skips_unchanged_base_paths() {
     let _ = std::fs::remove_dir_all(&state);
 }
 
+#[tokio::test]
+async fn fast_sync_deletion_candidates_union_cold_base_and_delta_paths() {
+    let root = unique_tmp_dir("fast-sync-base-delta-delete");
+    let state = unique_tmp_dir("fast-sync-base-delta-delete-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let base_path = root.join("cold_base_delete_match.txt");
+    std::fs::write(&base_path, b"base").unwrap();
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, base_path.clone())]);
+    idx.snapshot_now(Arc::new(SnapshotStore::new(state.join("index.db"))))
+        .await
+        .unwrap();
+
+    let delta_path = root.join("delta_delete_match.txt");
+    std::fs::write(&delta_path, b"delta").unwrap();
+    idx.apply_events(&[mk_event(2, EventType::Create, delta_path.clone())]);
+    assert!(!idx.query("cold_base_delete_match").is_empty());
+    assert!(!idx.query("delta_delete_match").is_empty());
+
+    std::fs::remove_file(&base_path).unwrap();
+    std::fs::remove_file(&delta_path).unwrap();
+    let report = idx.fast_sync(
+        DirtyScope::Dirs {
+            cutoff_ns: 0,
+            dirs: vec![root.clone()],
+        },
+        &[],
+    );
+
+    assert_eq!(report.delete_events, 2, "unexpected report: {report:?}");
+    assert!(idx.query("cold_base_delete_match").is_empty());
+    assert!(idx.query("delta_delete_match").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
 #[test]
 fn fast_sync_and_immediate_scan_consume_io_governor() {
     let root = unique_tmp_dir("io-governor-sync");

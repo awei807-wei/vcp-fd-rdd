@@ -1527,26 +1527,7 @@ impl TieredIndex {
         //    避免逐文件 stat() 风暴。HashSet 在每个目录处理完后立即 drop，不跨目录累积。
         let mut delete_events: Vec<EventRecord> = Vec::new();
 
-        let base = self.base.load_full();
-        let to_delete = if base.file_count() > 0 {
-            base.delete_alignment_with_parent_index(&dirty_dirs)
-        } else if !self.rebuild_in_progress() {
-            let mut l2_doc_id = 0u64;
-            let mut candidates = Vec::new();
-            self.l2.load_full().for_each_live_meta(|meta| {
-                if meta
-                    .path
-                    .parent()
-                    .is_some_and(|parent| dirty_dirs.contains(parent))
-                {
-                    candidates.push((l2_doc_id, meta.path));
-                    l2_doc_id = l2_doc_id.saturating_add(1);
-                }
-            });
-            candidates
-        } else {
-            Vec::new()
-        };
+        let to_delete = self.fast_sync_delete_candidates(&dirty_dirs);
 
         // v2: 按 parent dir 分组，readdir + HashSet 差集检测删除（见 `readdir_delete_alignment`）。
         let deleted_paths = readdir_delete_alignment(to_delete, Some(io_governor));
@@ -1569,6 +1550,82 @@ impl TieredIndex {
         self.mark_clock_reconciled();
         self.stats.record_fast_sync();
         report
+    }
+
+    /// Return exact-path deletion candidates for dirty direct-child directories.
+    ///
+    /// Cold base segments must use their persisted parent posting. Falling back
+    /// to `for_each_live_meta` touches the complete mmap segment for every
+    /// changed directory and turns a shallow namespace repair into an O(index)
+    /// page-fault source. Mutable L2 and Delta paths are unioned because the L2
+    /// parent index is rebuilt lazily and cannot be the sole source for entries
+    /// created after the current base snapshot.
+    fn fast_sync_delete_candidates(&self, dirty_dirs: &HashSet<PathBuf>) -> Vec<(u64, PathBuf)> {
+        let base = self.base.load_full();
+        let mut paths = Vec::new();
+
+        if base.file_count() > 0 {
+            let mut used_parent_postings = true;
+            for dir in dirty_dirs {
+                let Some(parent) = dir.to_str() else {
+                    used_parent_postings = false;
+                    break;
+                };
+                paths.extend(
+                    base.parent_query_metas(parent)
+                        .into_iter()
+                        .map(|hit| hit.meta.path),
+                );
+            }
+            if !used_parent_postings {
+                paths.clear();
+                paths.extend(
+                    base.delete_alignment_with_parent_index(dirty_dirs)
+                        .into_iter()
+                        .map(|(_, path)| path),
+                );
+            }
+        }
+
+        let include_mutable_candidates = !self.rebuild_in_progress();
+        if include_mutable_candidates {
+            paths.extend(
+                self.l2
+                    .load_full()
+                    .delete_alignment_with_parent_index(dirty_dirs)
+                    .into_iter()
+                    .map(|(_, path)| path),
+            );
+        }
+
+        if include_mutable_candidates {
+            let deleted_paths = {
+                let delta = self.delta_buffer.lock();
+                paths.extend(
+                    delta
+                        .live_records()
+                        .filter_map(EventRecord::best_path)
+                        .filter(|path| {
+                            path.parent()
+                                .is_some_and(|parent| dirty_dirs.contains(parent))
+                        })
+                        .map(Path::to_path_buf),
+                );
+                delta
+                    .deleted_paths()
+                    .map(<[u8]>::to_vec)
+                    .collect::<HashSet<_>>()
+            };
+
+            paths.retain(|path| !deleted_paths.contains(path.as_os_str().as_encoded_bytes()));
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+            .into_iter()
+            .enumerate()
+            .map(|(doc_id, path)| (doc_id as u64, path))
+            .collect()
     }
 
     fn scan_dirs_with_depth(
