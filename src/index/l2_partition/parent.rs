@@ -10,6 +10,19 @@ use super::parent_path::{CompactPathTable, ParentPathLookup};
 use super::{DocId, PersistentIndex};
 
 impl PersistentIndex {
+    pub(crate) fn meta_by_path(&self, path: &Path) -> Option<crate::core::FileMeta> {
+        let docid = self.lookup_docid_by_path(path)?;
+        let tombstones = self.tombstones.read();
+        if tombstones.contains(docid) {
+            return None;
+        }
+        let entries = self.entries.read();
+        let paths = self.paths.read();
+        let entry = entries.get(docid as usize)?;
+        let path_bytes = paths.get_bytes(docid)?;
+        Some(Self::meta_from_entry_and_path(entry, path_bytes))
+    }
+
     pub fn hardlink_groups(&self, min_links: usize, prefix: Option<&Path>) -> Vec<HardlinkGroup> {
         let min_links = min_links.max(2);
         let mut groups = self

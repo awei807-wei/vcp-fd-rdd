@@ -91,7 +91,7 @@ impl PersistentIndex {
         }
     }
 
-    fn meta_from_entry_and_path(entry: &FileEntry, path_bytes: &[u8]) -> FileMeta {
+    pub(super) fn meta_from_entry_and_path(entry: &FileEntry, path_bytes: &[u8]) -> FileMeta {
         FileMeta {
             file_key: entry.file_key(),
             path: pathbuf_from_encoded_vec(path_bytes.to_vec()),

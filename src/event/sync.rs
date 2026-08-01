@@ -715,7 +715,9 @@ impl DirtyQueue {
         if entry.attempts > self.max_attempts {
             return false;
         }
-        if !entry.requires_recursive_subtree_repair() {
+        if !entry.requires_recursive_subtree_repair()
+            && entry.reason != DirtyReason::FastScanChangedDir
+        {
             entry.scope = entry.scope.expanded_for_retry();
         }
         entry.repair_cursor = None;
@@ -1396,6 +1398,23 @@ mod tests {
         let second = q.pop_ready(40_000_000, 1).pop().unwrap();
         assert_eq!(second.scope.dir_paths(), &[PathBuf::from("/tmp")]);
         assert!(!q.retry(second, 50_000_000));
+    }
+
+    #[test]
+    fn fast_scan_changed_dir_retry_keeps_exact_scope() {
+        let mut q = DirtyQueue::new(Duration::ZERO).with_retry_policy(Duration::ZERO, 2);
+        let dir = PathBuf::from("/tmp/index-root/cold");
+        q.enqueue(
+            DirtyScope::dirs(0, vec![dir.clone()]),
+            DirtyReason::FastScanChangedDir,
+            DirtyPriority::Low,
+            1,
+        );
+
+        let entry = q.pop_ready(1, 1).pop().unwrap();
+        assert!(q.retry(entry, 2));
+        let retry = q.pop_ready(2, 1).pop().unwrap();
+        assert_eq!(retry.scope.dir_paths(), std::slice::from_ref(&dir));
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub(crate) mod arena;
 mod content;
 mod directory_manifest;
 pub(crate) mod events;
+mod fast_scan_namespace;
 mod lazy_validation;
 pub(crate) mod load;
 mod memory;

@@ -3289,6 +3289,373 @@ async fn fast_sync_deletion_candidates_union_cold_base_and_delta_paths() {
     let _ = std::fs::remove_dir_all(&state);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn fast_scan_namespace_stats_only_new_or_replaced_children() {
+    let root = unique_tmp_dir("fast-scan-namespace-stat");
+    let state = unique_tmp_dir("fast-scan-namespace-stat-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    for index in 0..128 {
+        std::fs::write(root.join(format!("stable-{index:03}.txt")), b"stable").unwrap();
+    }
+    let replaced = root.join("replace_match.txt");
+    std::fs::write(&replaced, b"old").unwrap();
+
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    let mut events = Vec::new();
+    for (seq, entry) in std::fs::read_dir(&root).unwrap().enumerate() {
+        let path = entry.unwrap().path();
+        events.push(mk_event(seq as u64 + 1, EventType::Create, path));
+    }
+    idx.apply_events(&events);
+    idx.snapshot_now(Arc::new(SnapshotStore::new(state.join("index.db"))))
+        .await
+        .unwrap();
+
+    let old_key = file_meta_from_path(replaced.clone()).file_key;
+    let replacement_source = root.join("replacement-source.tmp");
+    std::fs::write(&replacement_source, b"new").unwrap();
+    std::fs::rename(&replacement_source, &replaced).unwrap();
+    let new_key = file_meta_from_path(replaced.clone()).file_key;
+    assert_ne!(old_key, new_key);
+
+    let added = root.join("added_match.txt");
+    std::fs::write(&added, b"added").unwrap();
+    let report = idx.fast_scan_namespace_sync(std::slice::from_ref(&root), &[]);
+
+    assert!(!report.failed, "unexpected report: {report:?}");
+    assert_eq!(report.fallback_dirs, 0, "unexpected report: {report:?}");
+    assert_eq!(report.metadata_stats, 130, "unexpected report: {report:?}");
+    assert_eq!(
+        report.generation_lookups_avoided, 128,
+        "unexpected report: {report:?}"
+    );
+    assert_eq!(report.upsert_events, 2, "unexpected report: {report:?}");
+    assert!(idx
+        .query("added_match")
+        .iter()
+        .any(|meta| meta.path == added));
+    assert!(idx
+        .query("replace_match")
+        .iter()
+        .any(|meta| meta.path == replaced && meta.file_key == new_key));
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fast_scan_namespace_delete_keeps_other_hardlink_alias() {
+    let root = unique_tmp_dir("fast-scan-namespace-hardlink");
+    let state = unique_tmp_dir("fast-scan-namespace-hardlink-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let kept = root.join("kept_alias_match.txt");
+    let removed = root.join("removed_alias_match.txt");
+    std::fs::write(&kept, b"linked").unwrap();
+    std::fs::hard_link(&kept, &removed).unwrap();
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, kept.clone()),
+        mk_event(2, EventType::Create, removed.clone()),
+    ]);
+    idx.snapshot_now(Arc::new(SnapshotStore::new(state.join("index.db"))))
+        .await
+        .unwrap();
+
+    std::fs::remove_file(&removed).unwrap();
+    let report = idx.fast_scan_namespace_sync(std::slice::from_ref(&root), &[]);
+
+    assert!(!report.failed, "unexpected report: {report:?}");
+    assert_eq!(report.delete_events, 1, "unexpected report: {report:?}");
+    assert!(!idx.query("kept_alias_match").is_empty());
+    assert!(idx.query("removed_alias_match").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[cfg(unix)]
+#[test]
+fn fast_scan_namespace_apply_rejects_event_or_invalidation_advance() {
+    let root = unique_tmp_dir("fast-scan-namespace-fence");
+    std::fs::create_dir_all(&root).unwrap();
+    let target = root.join("fenced_target_match.txt");
+    std::fs::write(&target, b"target").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    let dir_meta = std::fs::symlink_metadata(&root).unwrap();
+    let fingerprint =
+        crate::index::tiered::sync::directory_read_fingerprint(&root, &dir_meta).unwrap();
+    let expected_event_seq = idx.event_seq.load(Ordering::Relaxed);
+    let expected_invalidation_epoch = idx.delta_buffer.lock().invalidation_epoch();
+    let meta = file_meta_from_path(target.clone());
+    let event = mk_event(1, EventType::Modify, target.clone());
+
+    idx.apply_events(&[mk_event(
+        2,
+        EventType::Delete,
+        root.join("unrelated-delete.txt"),
+    )]);
+    let mut metas = vec![meta];
+    let fence = super::fast_scan_namespace::NamespaceFence::new(
+        fingerprint,
+        expected_event_seq,
+        expected_invalidation_epoch,
+    );
+    let applied =
+        idx.apply_fast_scan_namespace_changes_if_fenced(&root, fence, &[event], &mut metas, &[]);
+
+    assert!(applied.is_none());
+    assert!(metas.is_empty());
+    assert!(idx.query("fenced_target_match").is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn fast_scan_namespace_falls_back_without_cold_base() {
+    let root = unique_tmp_dir("fast-scan-namespace-no-base");
+    std::fs::create_dir_all(&root).unwrap();
+    let target = root.join("fallback_no_base_match.txt");
+    std::fs::write(&target, b"target").unwrap();
+    let idx = TieredIndex::empty(vec![root.clone()]);
+
+    let report = idx.fast_scan_namespace_sync(std::slice::from_ref(&root), &[]);
+
+    assert!(!report.failed, "unexpected report: {report:?}");
+    assert_eq!(report.fallback_dirs, 1, "unexpected report: {report:?}");
+    assert!(!idx.query("fallback_no_base_match").is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fast_scan_namespace_falls_back_during_rebuild() {
+    let root = unique_tmp_dir("fast-scan-namespace-rebuild");
+    let state = unique_tmp_dir("fast-scan-namespace-rebuild-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let base_path = root.join("rebuild_base_match.txt");
+    std::fs::write(&base_path, b"base").unwrap();
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, base_path)]);
+    idx.snapshot_now(Arc::new(SnapshotStore::new(state.join("index.db"))))
+        .await
+        .unwrap();
+    assert!(idx.try_start_rebuild_force());
+
+    let target = root.join("fallback_rebuild_match.txt");
+    std::fs::write(&target, b"target").unwrap();
+    let report = idx.fast_scan_namespace_sync(std::slice::from_ref(&root), &[]);
+
+    assert!(!report.failed, "unexpected report: {report:?}");
+    assert_eq!(report.fallback_dirs, 1, "unexpected report: {report:?}");
+    assert!(!idx.query("fallback_rebuild_match").is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fast_scan_namespace_merges_delta_live_and_deleted_paths() {
+    let root = unique_tmp_dir("fast-scan-namespace-delta");
+    let state = unique_tmp_dir("fast-scan-namespace-delta-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let deleted = root.join("delta_deleted_match.txt");
+    let stable = root.join("delta_stable_match.txt");
+    std::fs::write(&deleted, b"deleted").unwrap();
+    std::fs::write(&stable, b"stable").unwrap();
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[
+        mk_event(1, EventType::Create, deleted.clone()),
+        mk_event(2, EventType::Create, stable.clone()),
+    ]);
+    idx.snapshot_now(Arc::new(SnapshotStore::new(state.join("index.db"))))
+        .await
+        .unwrap();
+
+    std::fs::remove_file(&deleted).unwrap();
+    idx.apply_events(&[mk_event(3, EventType::Delete, deleted.clone())]);
+    let live = root.join("delta_live_match.txt");
+    std::fs::write(&live, b"live").unwrap();
+    idx.apply_events(&[mk_event(4, EventType::Create, live.clone())]);
+
+    let report = idx.fast_scan_namespace_sync(std::slice::from_ref(&root), &[]);
+
+    assert!(!report.failed, "unexpected report: {report:?}");
+    assert_eq!(report.fallback_dirs, 0, "unexpected report: {report:?}");
+    assert_eq!(report.metadata_stats, 2, "unexpected report: {report:?}");
+    assert_eq!(
+        report.generation_lookups_avoided, 2,
+        "unexpected report: {report:?}"
+    );
+    assert!(idx.query("delta_deleted_match").is_empty());
+    assert!(!idx.query("delta_stable_match").is_empty());
+    assert!(!idx.query("delta_live_match").is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fast_scan_namespace_keeps_filtered_existing_child() {
+    let root = unique_tmp_dir("fast-scan-namespace-filtered");
+    let state = unique_tmp_dir("fast-scan-namespace-filtered-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let hidden = root.join(".hidden_keep_match.txt");
+    std::fs::write(&hidden, b"hidden").unwrap();
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, hidden.clone())]);
+    idx.snapshot_now(Arc::new(SnapshotStore::new(state.join("index.db"))))
+        .await
+        .unwrap();
+
+    let report = idx.fast_scan_namespace_sync(std::slice::from_ref(&root), &[]);
+
+    assert!(!report.failed, "unexpected report: {report:?}");
+    assert_eq!(report.delete_events, 0, "unexpected report: {report:?}");
+    assert!(idx
+        .query("hidden_keep_match")
+        .iter()
+        .any(|meta| meta.path == hidden));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fast_scan_namespace_deletes_missing_direct_child_from_deep_delta() {
+    let root = unique_tmp_dir("fast-scan-namespace-deep-delta");
+    let state = unique_tmp_dir("fast-scan-namespace-deep-delta-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let seed = root.join("seed.txt");
+    std::fs::write(&seed, b"seed").unwrap();
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, seed)]);
+    idx.snapshot_now(Arc::new(SnapshotStore::new(state.join("index.db"))))
+        .await
+        .unwrap();
+
+    let removed_dir = root.join("removed_tree_match");
+    let removed_child = removed_dir.join("deep_delta_match.txt");
+    std::fs::create_dir_all(&removed_dir).unwrap();
+    std::fs::write(&removed_child, b"delta").unwrap();
+    idx.apply_events(&[mk_event(2, EventType::Create, removed_child.clone())]);
+    assert!(!idx.query("deep_delta_match").is_empty());
+    std::fs::remove_dir_all(&removed_dir).unwrap();
+
+    let report = idx.fast_scan_namespace_sync(std::slice::from_ref(&root), &[]);
+
+    assert!(!report.failed, "unexpected report: {report:?}");
+    assert_eq!(report.delete_events, 1, "unexpected report: {report:?}");
+    assert!(idx.query("deep_delta_match").is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fast_scan_namespace_reports_directory_replaced_by_file() {
+    let root = unique_tmp_dir("fast-scan-namespace-root-replaced");
+    let state = unique_tmp_dir("fast-scan-namespace-root-replaced-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let seed = root.join("seed.txt");
+    std::fs::write(&seed, b"seed").unwrap();
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, seed.clone())]);
+    idx.snapshot_now(Arc::new(SnapshotStore::new(state.join("index.db"))))
+        .await
+        .unwrap();
+
+    std::fs::remove_file(seed).unwrap();
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::write(&root, b"not a directory").unwrap();
+    let report = idx.fast_scan_namespace_sync(std::slice::from_ref(&root), &[]);
+
+    assert!(report.failed, "unexpected report: {report:?}");
+    assert_eq!(report.fallback_dirs, 0, "unexpected report: {report:?}");
+    std::fs::remove_file(&root).unwrap();
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fast_scan_namespace_removes_regular_file_replaced_by_symlink() {
+    let root = unique_tmp_dir("fast-scan-namespace-symlink");
+    let state = unique_tmp_dir("fast-scan-namespace-symlink-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let replaced = root.join("symlink_replace_match.txt");
+    let target = state.join("target.txt");
+    std::fs::write(&replaced, b"old").unwrap();
+    std::fs::write(&target, b"target").unwrap();
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, replaced.clone())]);
+    idx.snapshot_now(Arc::new(SnapshotStore::new(state.join("index.db"))))
+        .await
+        .unwrap();
+
+    std::fs::remove_file(&replaced).unwrap();
+    std::os::unix::fs::symlink(&target, &replaced).unwrap();
+    let report = idx.fast_scan_namespace_sync(std::slice::from_ref(&root), &[]);
+
+    assert!(!report.failed, "unexpected report: {report:?}");
+    assert_eq!(report.delete_events, 1, "unexpected report: {report:?}");
+    assert!(idx.query("symlink_replace_match").is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fast_scan_namespace_new_directory_enqueues_recursive_repair() {
+    let root = unique_tmp_dir("fast-scan-namespace-new-dir");
+    let state = unique_tmp_dir("fast-scan-namespace-new-dir-state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let seed = root.join("seed.txt");
+    std::fs::write(&seed, b"seed").unwrap();
+    let idx = Arc::new(TieredIndex::empty(vec![root.clone()]));
+    idx.apply_events(&[mk_event(1, EventType::Create, seed)]);
+    idx.snapshot_now(Arc::new(SnapshotStore::new(state.join("index.db"))))
+        .await
+        .unwrap();
+
+    let new_dir = root.join("new_tree_match");
+    let child = new_dir.join("deep_child_match.txt");
+    std::fs::create_dir_all(&new_dir).unwrap();
+    std::fs::write(&child, b"child").unwrap();
+    let report = idx.fast_scan_namespace_sync(std::slice::from_ref(&root), &[]);
+    assert!(!report.failed, "unexpected report: {report:?}");
+    assert!(idx
+        .query("new_tree_match")
+        .iter()
+        .any(|meta| meta.path == new_dir));
+
+    let queued = idx.dirty_queue.lock().pop_ready(u64::MAX, 1);
+    assert_eq!(queued.len(), 1);
+    assert!(queued[0].requires_recursive_subtree_repair());
+    let repair = idx.process_dirty_entry(queued.into_iter().next().unwrap(), &[]);
+    assert!(!repair.failed, "recursive repair failed: {repair:?}");
+    assert!(idx
+        .query("deep_child_match")
+        .iter()
+        .any(|meta| meta.path == child));
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
 #[test]
 fn fast_sync_and_immediate_scan_consume_io_governor() {
     let root = unique_tmp_dir("io-governor-sync");
