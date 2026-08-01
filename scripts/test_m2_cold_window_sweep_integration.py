@@ -80,11 +80,14 @@ class SweepIntegrationTests(unittest.TestCase):
                 "integration_options": {
                     "allow_cycle_shortfall": True,
                     "burst_root_level": True,
+                    "sweep_completion_fence": True,
+                    "integration_repair_deadline_secs": 75.0,
                 },
                 "watch_state": {
                     "rotating_cycle_id_min": 0,
                     "rotating_cycle_id_max": 7,
                     "rotating_cycle_progress_pct_max": 100,
+                    "rotating_completed_cycle_ids": list(range(1, 8)),
                     "rotating_completed_cycles_observed": 7,
                 },
                 "config": {
@@ -110,7 +113,29 @@ class SweepIntegrationTests(unittest.TestCase):
                 },
                 "sweep_only_modify": {
                     "enabled": True,
-                    "waited_secs": 70.0,
+                    "path": "/fixture/cold-a/d150/file_150.txt",
+                    "completion_fence": True,
+                    "completion_fence_endpoint": "/debug/tiered-watch",
+                    "completion_fence_predicate": (
+                        "last_scan_seq > post_mutation_last_scan_seq and "
+                        "last_scan_cycle_id > post_mutation_cycle_id"
+                    ),
+                    "completion_fence_timeout_formula": "period+ttl+2*tick+30",
+                    "completion_fence_timeout_secs": 150.0,
+                    "completion_fence_observed": True,
+                    "repair_deadline_secs": 75.0,
+                    "probe_events_file": integration.PROBE_EVENTS_NAME,
+                    "pre_mutation_last_scan_seq": 10,
+                    "pre_mutation_last_scan_cycle_id": 7,
+                    "pre_mutation_cycle_id": 7,
+                    "post_mutation_last_scan_seq": 10,
+                    "post_mutation_last_scan_cycle_id": 7,
+                    "post_mutation_cycle_id": 8,
+                    "completion_last_scan_seq": 11,
+                    "completion_last_scan_cycle_id": 9,
+                    "searches_before_fence": 0,
+                    "first_query_count": 1,
+                    "waited_secs": 46.1,
                     "first_query_freshness": "fresh",
                     "first_query_tier": "HotMemory",
                     "repaired_by_sweep": True,
@@ -120,7 +145,78 @@ class SweepIntegrationTests(unittest.TestCase):
         (attempt / "FIXTURE-REPORT.md").write_text("# raw\n", encoding="utf-8")
         (attempt / "fd-rdd.log").write_text("fd-rdd ready.\n", encoding="utf-8")
         (attempt / "process-samples.jsonl").write_text("{}\n", encoding="utf-8")
-        (attempt / "metrics-samples.jsonl").write_text("{}\n", encoding="utf-8")
+        metrics_rows = [
+            {
+                "watch_state": {
+                    "rotating_cold_window_cycle_id": 0,
+                    "rotating_cold_window_cycle_progress_pct": 0,
+                }
+            },
+            *[
+                {
+                    "watch_state": {
+                        "rotating_cold_window_cycle_id": cycle_id,
+                        "rotating_cold_window_cycle_progress_pct": 100,
+                    }
+                }
+                for cycle_id in range(1, 8)
+            ],
+        ]
+        (attempt / "metrics-samples.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in metrics_rows),
+            encoding="utf-8",
+        )
+        probe_rows = [
+            {
+                "schema": 1,
+                "phase": "pre_mutation_debug",
+                "monotonic_secs": 100.0,
+                "success": True,
+                "repair_deadline_secs": 75.0,
+                "last_scan_seq": 10,
+                "last_scan_cycle_id": 7,
+                "cycle_id": 7,
+            },
+            {
+                "schema": 1,
+                "phase": "mutation_written",
+                "monotonic_secs": 100.1,
+                "success": True,
+                "path": "/fixture/cold-a/d150/file_150.txt",
+            },
+            {
+                "schema": 1,
+                "phase": "post_mutation_debug",
+                "monotonic_secs": 100.2,
+                "success": True,
+                "last_scan_seq": 10,
+                "last_scan_cycle_id": 7,
+                "cycle_id": 8,
+            },
+            {
+                "schema": 1,
+                "phase": "poll_debug",
+                "monotonic_secs": 146.2,
+                "success": True,
+                "last_scan_seq": 11,
+                "last_scan_cycle_id": 9,
+                "cycle_id": 9,
+            },
+            {
+                "schema": 1,
+                "phase": "search",
+                "monotonic_secs": 146.3,
+                "success": True,
+                "path": "/fixture/cold-a/d150/file_150.txt",
+                "query": "file_150.txt",
+                "freshness": "fresh",
+                "index_tier": "HotMemory",
+            },
+        ]
+        (attempt / integration.PROBE_EVENTS_NAME).write_text(
+            "".join(json.dumps(row) + "\n" for row in probe_rows),
+            encoding="utf-8",
+        )
         config = attempt / "config-home/fd-rdd/config.toml"
         config.parent.mkdir(parents=True)
         config.write_text("[general]\n", encoding="utf-8")
@@ -143,6 +239,9 @@ class SweepIntegrationTests(unittest.TestCase):
         self.assertIn("--deep-modify-probe", command)
         self.assertIn("--allow-cycle-shortfall", command)
         self.assertIn("--burst-root-level", command)
+        self.assertIn("--sweep-completion-fence", command)
+        deadline_index = command.index("--integration-repair-deadline-secs")
+        self.assertEqual(command[deadline_index + 1], "75")
 
         payload = {
             "schema": 1,
@@ -152,11 +251,22 @@ class SweepIntegrationTests(unittest.TestCase):
             "rotating_tick_secs": 15,
             "rotating_full_sweep_period_secs": 45,
             "settle_secs": 150.0,
+            "repair_deadline_secs": 75.0,
             "calibrate": False,
             "allow_cycle_shortfall": True,
             "burst": True,
             "burst_root_level": True,
             "deep_modify_probe": True,
+            "sweep_completion_fence": {
+                "enabled": True,
+                "endpoint": "/debug/tiered-watch",
+                "predicate": (
+                    "last_scan_seq>post_mutation_last_scan_seq && "
+                    "last_scan_cycle_id>post_mutation_cycle_id"
+                ),
+                "timeout_formula": "period+ttl+2*tick+30",
+                "first_search": "once_after_fence",
+            },
         }
         expected = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -202,7 +312,127 @@ class SweepIntegrationTests(unittest.TestCase):
             summary = evidence.recompute_summary(output, source, attempt)
 
             self.assertEqual(summary["decision"], "fail")
-            self.assertTrue(any("progress 100%" in row for row in summary["reasons"]))
+            self.assertTrue(
+                any("与原始 metrics 不一致" in row for row in summary["reasons"])
+            )
+
+    def test_completion_fence_must_cross_mutation_cycle_before_first_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source_suite(root)
+            output = root / "integration"
+            attempt = self._raw_attempt(output, source)
+            events_path = attempt / integration.PROBE_EVENTS_NAME
+            rows = [
+                json.loads(line)
+                for line in events_path.read_text(encoding="utf-8").splitlines()
+            ]
+            poll = next(row for row in rows if row["phase"] == "poll_debug")
+            poll["last_scan_cycle_id"] = 8
+            events_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            summary = evidence.recompute_summary(output, source, attempt)
+
+        self.assertEqual(summary["decision"], "fail")
+        self.assertTrue(
+            any("未观测到 post-mutation completion fence" in row for row in summary["reasons"])
+        )
+
+    def test_completion_fence_must_finish_within_accelerated_sla(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source_suite(root)
+            output = root / "integration"
+            attempt = self._raw_attempt(output, source)
+            events_path = attempt / integration.PROBE_EVENTS_NAME
+            rows = [
+                json.loads(line)
+                for line in events_path.read_text(encoding="utf-8").splitlines()
+            ]
+            for row in rows:
+                if row["phase"] == "poll_debug":
+                    row["monotonic_secs"] = 175.1004
+                elif row["phase"] == "search":
+                    row["monotonic_secs"] = 175.1005
+            events_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            report_path = attempt / "fixture-report.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["sweep_only_modify"]["waited_secs"] = 75.0004
+            self._write_json(report_path, report)
+
+            summary = evidence.recompute_summary(output, source, attempt)
+
+        self.assertEqual(summary["decision"], "fail")
+        self.assertTrue(
+            any("原始 probe 后台修复超过 75 秒" in row for row in summary["reasons"])
+        )
+
+    def test_forged_report_cannot_hide_search_before_raw_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source_suite(root)
+            output = root / "integration"
+            attempt = self._raw_attempt(output, source)
+            events_path = attempt / integration.PROBE_EVENTS_NAME
+            rows = [
+                json.loads(line)
+                for line in events_path.read_text(encoding="utf-8").splitlines()
+            ]
+            search = next(row for row in rows if row["phase"] == "search")
+            rows.remove(search)
+            rows.insert(3, search | {"monotonic_secs": 120.0})
+            events_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            summary = evidence.recompute_summary(output, source, attempt)
+
+        self.assertEqual(summary["decision"], "fail")
+        self.assertTrue(
+            any("fence 前发生查询" in row for row in summary["reasons"])
+        )
+        self.assertTrue(
+            any("与原始 JSONL 不一致" in row for row in summary["reasons"])
+        )
+
+    def test_forged_report_cycles_cannot_replace_raw_metrics_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source_suite(root)
+            output = root / "integration"
+            attempt = self._raw_attempt(output, source, cycles=0)
+            (attempt / "metrics-samples.jsonl").write_text(
+                json.dumps(
+                    {
+                        "watch_state": {
+                            "rotating_cold_window_cycle_id": 0,
+                            "rotating_cold_window_cycle_progress_pct": 0,
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = evidence.recompute_summary(output, source, attempt)
+
+            self.assertEqual(summary["decision"], "fail")
+            protocol = summary["integration"]["protocol"]
+            self.assertEqual(protocol["watch_cycles_observed"], 0)
+            self.assertEqual(protocol["cycles_observed"], 0)
+            self.assertTrue(
+                any("与原始 metrics 不一致" in row for row in summary["reasons"])
+            )
+            self.assertTrue(
+                any("原始 metrics 未观测到完成 cycle" in row for row in summary["reasons"])
+            )
 
     def test_any_completed_attempt_is_terminal_even_when_product_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,6 +491,10 @@ class SweepIntegrationTests(unittest.TestCase):
             self.assertTrue(any("终态" in reason for reason in persisted["reasons"]))
             with tarfile.open(bundle, "r:gz") as archive:
                 self.assertIn("product/fd-rdd", archive.getnames())
+                self.assertIn(
+                    f"attempt/{integration.PROBE_EVENTS_NAME}",
+                    archive.getnames(),
+                )
                 bundled = json.load(archive.extractfile(integration.SUMMARY_NAME))
             self.assertEqual(bundled["decision"], "fail")
 

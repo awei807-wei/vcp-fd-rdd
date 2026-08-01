@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -261,13 +262,23 @@ class IntegrationProbeTests(unittest.TestCase):
     def test_integration_flags_are_opt_in(self) -> None:
         defaults = fixture.parse_args([])
         enabled = fixture.parse_args(
-            ["--allow-cycle-shortfall", "--burst-root-level"]
+            [
+                "--allow-cycle-shortfall",
+                "--burst-root-level",
+                "--sweep-completion-fence",
+                "--integration-repair-deadline-secs",
+                "75",
+            ]
         )
 
         self.assertFalse(defaults.allow_cycle_shortfall)
         self.assertFalse(defaults.burst_root_level)
+        self.assertFalse(defaults.sweep_completion_fence)
+        self.assertEqual(defaults.integration_repair_deadline_secs, 0.0)
         self.assertTrue(enabled.allow_cycle_shortfall)
         self.assertTrue(enabled.burst_root_level)
+        self.assertTrue(enabled.sweep_completion_fence)
+        self.assertEqual(enabled.integration_repair_deadline_secs, 75.0)
 
     def test_watch_state_summary_uses_real_completed_cycle_progress(self) -> None:
         rows = [
@@ -317,6 +328,158 @@ class IntegrationProbeTests(unittest.TestCase):
         self.assertEqual(Path(root_probe["path"]).parent, cold_root)
         self.assertFalse(default_probe["root_level"])
         self.assertTrue(root_probe["root_level"])
+
+    def test_sweep_completion_fence_uses_debug_only_before_single_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cold_root = Path(tmp)
+            target = cold_root / "d150" / "file_150.txt"
+            target.parent.mkdir()
+            target.write_text("baseline\n", encoding="utf-8")
+            debug_rows = [
+                {
+                    "dirs": [
+                        {
+                            "path": str(cold_root),
+                            "rotating_cold_window_cycle_id": 7,
+                            "rotating_cold_window_last_scan_seq": 10,
+                            "rotating_cold_window_last_scan_cycle_id": 7,
+                        }
+                    ]
+                },
+                {
+                    "dirs": [
+                        {
+                            "path": str(cold_root),
+                            "rotating_cold_window_cycle_id": 8,
+                            "rotating_cold_window_last_scan_seq": 10,
+                            "rotating_cold_window_last_scan_cycle_id": 7,
+                        }
+                    ]
+                },
+                {
+                    "dirs": [
+                        {
+                            "path": str(cold_root),
+                            "rotating_cold_window_cycle_id": 9,
+                            "rotating_cold_window_last_scan_seq": 11,
+                            "rotating_cold_window_last_scan_cycle_id": 9,
+                        }
+                    ]
+                },
+            ]
+            events_path = cold_root / "probe.jsonl"
+            with mock.patch.object(
+                fixture.BENCH, "debug_tiered_watch", side_effect=debug_rows
+            ) as debug, mock.patch.object(
+                fixture, "_search_entry",
+                return_value={"freshness": "fresh", "index_tier": "HotMemory"},
+            ) as search, mock.patch.object(
+                fixture.time,
+                "monotonic",
+                side_effect=[100.0, 100.1, 100.2, 100.3, 100.4, 101.0],
+            ), mock.patch.object(fixture.time, "sleep"):
+                result = fixture._run_sweep_only_modify_probe(
+                    "http://fixture",
+                    cold_root,
+                    70.0,
+                    completion_fence=True,
+                    full_sweep_period_secs=45,
+                    ttl_secs=45,
+                    tick_secs=15,
+                    repair_deadline_secs=75,
+                    probe_events_path=events_path,
+                )
+            events = [
+                json.loads(line)
+                for line in events_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(debug.call_count, 3)
+        search.assert_called_once_with("http://fixture", target)
+        self.assertTrue(result["completion_fence_observed"])
+        self.assertEqual(result["pre_mutation_last_scan_seq"], 10)
+        self.assertEqual(result["post_mutation_last_scan_seq"], 10)
+        self.assertEqual(result["post_mutation_cycle_id"], 8)
+        self.assertEqual(result["completion_last_scan_seq"], 11)
+        self.assertEqual(result["completion_last_scan_cycle_id"], 9)
+        self.assertEqual(result["completion_fence_timeout_secs"], 150.0)
+        self.assertEqual(result["repair_deadline_secs"], 75)
+        self.assertEqual(result["searches_before_fence"], 0)
+        self.assertEqual(result["first_query_count"], 1)
+        self.assertTrue(result["repaired_by_sweep"])
+        self.assertEqual(
+            [row["phase"] for row in events],
+            [
+                "pre_mutation_debug",
+                "mutation_written",
+                "post_mutation_debug",
+                "poll_debug",
+                "search",
+            ],
+        )
+
+    def test_sweep_completion_fence_times_out_without_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cold_root = Path(tmp)
+            target = cold_root / "d150" / "file_150.txt"
+            target.parent.mkdir()
+            target.write_text("baseline\n", encoding="utf-8")
+            debug_row = {
+                "dirs": [
+                    {
+                        "path": str(cold_root),
+                        "rotating_cold_window_cycle_id": 7,
+                        "rotating_cold_window_last_scan_seq": 10,
+                        "rotating_cold_window_last_scan_cycle_id": 7,
+                    }
+                ]
+            }
+            events_path = cold_root / "probe.jsonl"
+            with mock.patch.object(
+                fixture.BENCH, "debug_tiered_watch", return_value=debug_row
+            ), mock.patch.object(fixture, "_search_entry") as search, mock.patch.object(
+                fixture.time,
+                "monotonic",
+                side_effect=[100.0, 100.1, 100.2, 175.2, 175.2],
+            ), mock.patch.object(fixture.time, "sleep"):
+                result = fixture._run_sweep_only_modify_probe(
+                    "http://fixture",
+                    cold_root,
+                    70.0,
+                    completion_fence=True,
+                    full_sweep_period_secs=45,
+                    ttl_secs=45,
+                    tick_secs=15,
+                    repair_deadline_secs=75,
+                    probe_events_path=events_path,
+                )
+
+        search.assert_not_called()
+        self.assertFalse(result["completion_fence_observed"])
+        self.assertEqual(result["first_query_count"], 0)
+        self.assertIn("timed out", result["error"])
+        self.assertGreaterEqual(result["waited_secs"], 75.0)
+
+    def test_default_sweep_probe_keeps_fixed_wait_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cold_root = Path(tmp)
+            target = cold_root / "d150" / "file_150.txt"
+            target.parent.mkdir()
+            target.write_text("baseline\n", encoding="utf-8")
+            with mock.patch.object(
+                fixture.BENCH, "debug_tiered_watch"
+            ) as debug, mock.patch.object(
+                fixture, "_search_entry",
+                return_value={"freshness": "fresh", "index_tier": "HotMemory"},
+            ) as search, mock.patch.object(fixture.time, "sleep") as sleep:
+                result = fixture._run_sweep_only_modify_probe(
+                    "http://fixture", cold_root, 70.0
+                )
+
+        debug.assert_not_called()
+        sleep.assert_called_once_with(70.0)
+        search.assert_called_once_with("http://fixture", target)
+        self.assertFalse(result["completion_fence"])
 
 
 if __name__ == "__main__":

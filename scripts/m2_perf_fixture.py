@@ -117,6 +117,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="integration-only: create the burst probe directly under the cold root",
     )
     parser.add_argument(
+        "--sweep-completion-fence",
+        action="store_true",
+        help=(
+            "integration-only: gate the sweep-only probe on a newer "
+            "/debug/tiered-watch root scan before its single search"
+        ),
+    )
+    parser.add_argument(
+        "--integration-repair-deadline-secs",
+        type=float,
+        default=0.0,
+        help=(
+            "integration-only: maximum monotonic seconds from the post-mutation "
+            "watermark to the completion fence; 0 leaves the normal fixture unchanged"
+        ),
+    )
+    parser.add_argument(
         "--burst-timeout-secs",
         type=float,
         default=0.0,
@@ -268,27 +285,382 @@ def _run_deep_modify_probe(
     }
 
 
-def _run_sweep_only_modify_probe(
-    base_url: str, cold_root: Path, wait_secs: float
+def _debug_tiered_watch_root_entry(
+    base_url: str, cold_root: Path
+) -> dict[str, Any] | None:
+    dump = BENCH.debug_tiered_watch(base_url, cold_root)
+    dirs = dump.get("dirs")
+    if not isinstance(dirs, list):
+        raise RuntimeError("debug tiered-watch response has no dirs array")
+    root_str = str(cold_root)
+    return next(
+        (
+            item
+            for item in dirs
+            if isinstance(item, dict) and item.get("path") == root_str
+        ),
+        None,
+    )
+
+
+def _append_probe_event(
+    events_path: Path,
+    *,
+    phase: str,
+    monotonic_secs: float,
+    **fields: Any,
+) -> None:
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "schema": 1,
+        "phase": phase,
+        "monotonic_secs": monotonic_secs,
+        **fields,
+    }
+    with events_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+        handle.flush()
+
+
+def _root_scan_watermark(entry: dict[str, Any]) -> dict[str, int]:
+    return {
+        "last_scan_seq": int(
+            entry.get("rotating_cold_window_last_scan_seq", 0) or 0
+        ),
+        "last_scan_cycle_id": int(
+            entry.get("rotating_cold_window_last_scan_cycle_id", 0) or 0
+        ),
+        "cycle_id": int(entry.get("rotating_cold_window_cycle_id", 0) or 0),
+    }
+
+
+def _observe_root_for_probe(
+    base_url: str,
+    cold_root: Path,
+    events_path: Path,
+    phase: str,
+    **event_fields: Any,
+) -> dict[str, Any] | None:
+    try:
+        entry = _debug_tiered_watch_root_entry(base_url, cold_root)
+        observed_at = time.monotonic()
+        if entry is None:
+            _append_probe_event(
+                events_path,
+                phase=phase,
+                monotonic_secs=observed_at,
+                success=False,
+                error="root entry missing",
+                **event_fields,
+            )
+            return None
+        watermark = _root_scan_watermark(entry)
+        _append_probe_event(
+            events_path,
+            phase=phase,
+            monotonic_secs=observed_at,
+            success=True,
+            **watermark,
+            **event_fields,
+        )
+        observed = dict(entry)
+        observed["_probe_monotonic_secs"] = observed_at
+        return observed
+    except Exception as exc:  # noqa: BLE001 - raw probe evidence fails closed
+        observed_at = time.monotonic()
+        _append_probe_event(
+            events_path,
+            phase=phase,
+            monotonic_secs=observed_at,
+            success=False,
+            error=repr(exc),
+            **event_fields,
+        )
+        raise
+
+
+def _sweep_first_query_result(
+    evidence: dict[str, Any], entry: dict[str, Any] | None
 ) -> dict[str, Any]:
-    """§18.1 纯 sweep 通道：改写一个不被任何查询触碰的深层文件，静默等待
-    一个轮转周期后单次查询——若 sweep 检出并修复，首查即 fresh/overlay；
-    若首查报 changed，说明修复来自本次查询而非 sweep（§18.1 违约信号）。"""
+    if entry is None:
+        suffix = (
+            " after completion fence" if evidence.get("completion_fence") else ""
+        )
+        evidence.update(
+            {
+                "repaired_by_sweep": False,
+                "error": f"entry missing{suffix}",
+            }
+        )
+        return evidence
+    freshness = str(entry.get("freshness", ""))
+    evidence.update(
+        {
+            "first_query_freshness": freshness,
+            "first_query_tier": entry.get("index_tier"),
+            "repaired_by_sweep": freshness != "changed"
+            and entry.get("index_tier") == "HotMemory",
+        }
+    )
+    return evidence
+
+
+def _completion_fence_evidence(
+    target: Path,
+    timeout_secs: float,
+    repair_deadline_secs: float,
+    events_path: Path,
+) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "completion_fence": True,
+        "completion_fence_endpoint": "/debug/tiered-watch",
+        "completion_fence_predicate": (
+            "last_scan_seq > post_mutation_last_scan_seq and "
+            "last_scan_cycle_id > post_mutation_cycle_id"
+        ),
+        "completion_fence_timeout_formula": "period+ttl+2*tick+30",
+        "completion_fence_timeout_secs": timeout_secs,
+        "completion_fence_poll_interval_secs": 0.5,
+        "completion_fence_polls": 0,
+        "completion_fence_debug_successes": 0,
+        "completion_fence_debug_errors": 0,
+        "completion_fence_observations": [],
+        "completion_fence_observed": False,
+        "repair_deadline_secs": repair_deadline_secs,
+        "probe_events_file": events_path.name,
+        "searches_before_fence": 0,
+        "first_query_count": 0,
+        "path": str(target),
+    }
+
+
+def _poll_sweep_completion(
+    base_url: str,
+    cold_root: Path,
+    evidence: dict[str, Any],
+    post_mutation_last_scan_seq: int,
+    post_mutation_cycle_id: int,
+    timeout_secs: float,
+    repair_deadline_secs: float,
+    events_path: Path,
+    started_at: float,
+) -> bool:
+    deadline = started_at + min(timeout_secs, repair_deadline_secs)
+    finished_at = started_at
+    while time.monotonic() < deadline:
+        evidence["completion_fence_polls"] += 1
+        try:
+            current = _observe_root_for_probe(
+                base_url,
+                cold_root,
+                events_path,
+                "poll_debug",
+            )
+            if current is None:
+                evidence["completion_fence_last_error"] = "root entry missing"
+            else:
+                evidence["completion_fence_debug_successes"] += 1
+                watermark = _root_scan_watermark(current)
+                scan_seq = watermark["last_scan_seq"]
+                scan_cycle = watermark["last_scan_cycle_id"]
+                evidence["completion_last_scan_seq"] = scan_seq
+                evidence["completion_last_scan_cycle_id"] = scan_cycle
+                evidence["completion_fence_observations"].append(
+                    {
+                        "poll": evidence["completion_fence_polls"],
+                        "last_scan_seq": scan_seq,
+                        "last_scan_cycle_id": scan_cycle,
+                    }
+                )
+                if (
+                    scan_seq > post_mutation_last_scan_seq
+                    and scan_cycle > post_mutation_cycle_id
+                ):
+                    evidence["completion_fence_observed"] = True
+                    observed_at = current.get("_probe_monotonic_secs")
+                    finished_at = (
+                        float(observed_at)
+                        if isinstance(observed_at, (int, float))
+                        and not isinstance(observed_at, bool)
+                        else time.monotonic()
+                    )
+                    break
+        except Exception as exc:  # noqa: BLE001 - transient debug failures are evidence
+            evidence["completion_fence_debug_errors"] += 1
+            evidence["completion_fence_last_error"] = repr(exc)
+        time.sleep(0.5)
+    if not evidence["completion_fence_observed"]:
+        finished_at = time.monotonic()
+    evidence["waited_secs"] = finished_at - started_at
+    return bool(evidence["completion_fence_observed"])
+
+
+def _run_completion_fenced_sweep_probe(
+    base_url: str,
+    cold_root: Path,
+    target: Path,
+    timeout_secs: float,
+    repair_deadline_secs: float,
+    events_path: Path,
+) -> dict[str, Any]:
+    events_path.unlink(missing_ok=True)
+    evidence = _completion_fence_evidence(
+        target,
+        timeout_secs,
+        repair_deadline_secs,
+        events_path,
+    )
+    try:
+        baseline = _observe_root_for_probe(
+            base_url,
+            cold_root,
+            events_path,
+            "pre_mutation_debug",
+            repair_deadline_secs=repair_deadline_secs,
+        )
+    except Exception as exc:  # noqa: BLE001 - fence evidence fails closed
+        evidence.update(
+            {
+                "repaired_by_sweep": False,
+                "error": f"baseline debug tiered-watch failed: {exc!r}",
+            }
+        )
+        return evidence
+    if baseline is None:
+        evidence.update(
+            {
+                "repaired_by_sweep": False,
+                "error": "baseline debug tiered-watch root entry missing",
+            }
+        )
+        return evidence
+    baseline_watermark = _root_scan_watermark(baseline)
+    evidence.update(
+        {
+            "pre_mutation_last_scan_seq": baseline_watermark["last_scan_seq"],
+            "pre_mutation_last_scan_cycle_id": baseline_watermark[
+                "last_scan_cycle_id"
+            ],
+            "pre_mutation_cycle_id": baseline_watermark["cycle_id"],
+        }
+    )
+    target.write_text("sweep-only deep modify payload\n", encoding="utf-8")
+    mutation_at = time.monotonic()
+    _append_probe_event(
+        events_path,
+        phase="mutation_written",
+        monotonic_secs=mutation_at,
+        success=True,
+        path=str(target),
+    )
+    try:
+        post_mutation = _observe_root_for_probe(
+            base_url, cold_root, events_path, "post_mutation_debug"
+        )
+    except Exception as exc:  # noqa: BLE001 - fence evidence fails closed
+        evidence.update(
+            {
+                "repaired_by_sweep": False,
+                "error": f"post-mutation debug tiered-watch failed: {exc!r}",
+            }
+        )
+        return evidence
+    if post_mutation is None:
+        evidence.update(
+            {
+                "repaired_by_sweep": False,
+                "error": "post-mutation debug tiered-watch root entry missing",
+            }
+        )
+        return evidence
+    post_watermark = _root_scan_watermark(post_mutation)
+    evidence.update(
+        {
+            "post_mutation_last_scan_seq": post_watermark["last_scan_seq"],
+            "post_mutation_last_scan_cycle_id": post_watermark[
+                "last_scan_cycle_id"
+            ],
+            "post_mutation_cycle_id": post_watermark["cycle_id"],
+        }
+    )
+    completed = _poll_sweep_completion(
+        base_url,
+        cold_root,
+        evidence,
+        post_watermark["last_scan_seq"],
+        post_watermark["cycle_id"],
+        timeout_secs,
+        repair_deadline_secs,
+        events_path,
+        mutation_at,
+    )
+    if not completed:
+        evidence.update(
+            {
+                "repaired_by_sweep": False,
+                "error": "completion fence timed out before a newer sweep",
+            }
+        )
+        return evidence
+    search_at = time.monotonic()
+    entry = _search_entry(base_url, target)
+    _append_probe_event(
+        events_path,
+        phase="search",
+        monotonic_secs=search_at,
+        success=entry is not None,
+        path=str(target),
+        query=target.name,
+        freshness=entry.get("freshness") if entry else None,
+        index_tier=entry.get("index_tier") if entry else None,
+    )
+    evidence["first_query_count"] = 1
+    return _sweep_first_query_result(evidence, entry)
+
+
+def _run_sweep_only_modify_probe(
+    base_url: str,
+    cold_root: Path,
+    wait_secs: float,
+    *,
+    completion_fence: bool = False,
+    full_sweep_period_secs: float = 0.0,
+    ttl_secs: float = 0.0,
+    tick_secs: float = 0.0,
+    repair_deadline_secs: float = 0.0,
+    probe_events_path: Path | None = None,
+) -> dict[str, Any]:
+    """改写未被查询的深层文件；整合模式以后台扫描完成栅栏后唯一首查。"""
     target = cold_root / "d150" / "file_150.txt"
+    if completion_fence:
+        if repair_deadline_secs <= 0 or probe_events_path is None:
+            return {
+                "enabled": True,
+                "completion_fence": True,
+                "repaired_by_sweep": False,
+                "error": "integration completion fence requires a positive repair deadline and probe events path",
+            }
+        timeout_secs = full_sweep_period_secs + ttl_secs + 2 * tick_secs + 30
+        return _run_completion_fenced_sweep_probe(
+            base_url,
+            cold_root,
+            target,
+            timeout_secs,
+            repair_deadline_secs,
+            probe_events_path,
+        )
     target.write_text("sweep-only deep modify payload\n", encoding="utf-8")
     time.sleep(wait_secs)
     entry = _search_entry(base_url, target)
-    if entry is None:
-        return {"enabled": True, "repaired_by_sweep": False, "error": "entry missing"}
-    freshness = str(entry.get("freshness", ""))
-    return {
+    evidence = {
         "enabled": True,
+        "completion_fence": False,
         "waited_secs": wait_secs,
-        "first_query_freshness": freshness,
-        "first_query_tier": entry.get("index_tier"),
-        "repaired_by_sweep": freshness != "changed"
-        and entry.get("index_tier") == "HotMemory",
     }
+    if entry is None:
+        evidence["error"] = "entry missing"
+    return _sweep_first_query_result(evidence, entry)
 
 
 def _load_reference(args: argparse.Namespace) -> dict[str, float] | None:
@@ -474,6 +846,18 @@ def run(args: argparse.Namespace) -> int:
                         base_url,
                         roots["cold-a"],
                         args.rotating_ttl_secs + args.rotating_tick_secs + 10.0,
+                        completion_fence=args.sweep_completion_fence,
+                        full_sweep_period_secs=(
+                            args.rotating_full_sweep_period_secs
+                        ),
+                        ttl_secs=args.rotating_ttl_secs,
+                        tick_secs=args.rotating_tick_secs,
+                        repair_deadline_secs=(
+                            args.integration_repair_deadline_secs
+                        ),
+                        probe_events_path=(
+                            run_dir / "sweep-probe-events.jsonl"
+                        ),
                     )
                     time.sleep(2.0)
         finally:
@@ -522,6 +906,10 @@ def run(args: argparse.Namespace) -> int:
         "integration_options": {
             "allow_cycle_shortfall": bool(args.allow_cycle_shortfall),
             "burst_root_level": bool(args.burst_root_level),
+            "sweep_completion_fence": bool(args.sweep_completion_fence),
+            "integration_repair_deadline_secs": float(
+                args.integration_repair_deadline_secs
+            ),
         },
         "config": vars(daemon_ns),
         "startup_windows": [list(window) for window in startup_windows],

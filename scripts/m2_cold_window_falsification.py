@@ -35,6 +35,7 @@ class SweepIntegrationSpec:
     rotating_tick_secs: int = 15
     rotating_full_sweep_period_secs: int = 45
     settle_secs: float = 150.0
+    repair_deadline_secs: float = 75.0
 
 
 def build_sweep_integration_spec(suite_dir: Path) -> SweepIntegrationSpec:
@@ -696,6 +697,12 @@ def analyze_sweep_integration(
             ),
             "burst_root_level": bool(
                 integration_options.get("burst_root_level")
+            ),
+            "sweep_completion_fence": bool(
+                integration_options.get("sweep_completion_fence")
+            ),
+            "integration_repair_deadline_secs": _optional_float(
+                integration_options.get("integration_repair_deadline_secs")
             ),
             "rotating_cold_window": bool(config.get("rotating_cold_window")),
             "fast_scan": bool(config.get("fast_scan")),

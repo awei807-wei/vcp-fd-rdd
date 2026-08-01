@@ -30,6 +30,7 @@ SUMMARY_NAME = "integration-summary.json"
 MANIFEST_NAME = "manifest.json"
 EVIDENCE_MANIFEST_NAME = "evidence-manifest.json"
 CHECKSUMS_NAME = "SHA256SUMS"
+PROBE_EVENTS_NAME = "sweep-probe-events.jsonl"
 RAW_ATTEMPT_FILES = (
     RESULT_NAME,
     "fixture-report.json",
@@ -37,6 +38,7 @@ RAW_ATTEMPT_FILES = (
     "fd-rdd.log",
     "process-samples.jsonl",
     "metrics-samples.jsonl",
+    PROBE_EVENTS_NAME,
     "config-home/fd-rdd/config.toml",
 )
 READY_MARKERS = ("fd-rdd ready.", "HTTP Query Server listening")
@@ -87,11 +89,22 @@ def protocol_fingerprint(spec: SweepIntegrationSpec) -> str:
             spec.rotating_full_sweep_period_secs
         ),
         "settle_secs": spec.settle_secs,
+        "repair_deadline_secs": spec.repair_deadline_secs,
         "calibrate": False,
         "allow_cycle_shortfall": True,
         "burst": True,
         "burst_root_level": True,
         "deep_modify_probe": True,
+        "sweep_completion_fence": {
+            "enabled": True,
+            "endpoint": "/debug/tiered-watch",
+            "predicate": (
+                "last_scan_seq>post_mutation_last_scan_seq && "
+                "last_scan_cycle_id>post_mutation_cycle_id"
+            ),
+            "timeout_formula": "period+ttl+2*tick+30",
+            "first_search": "once_after_fence",
+        },
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
@@ -132,6 +145,9 @@ def fixture_command(
         "--burst",
         "--burst-root-level",
         "--deep-modify-probe",
+        "--sweep-completion-fence",
+        "--integration-repair-deadline-secs",
+        f"{spec.repair_deadline_secs:g}",
     ]
 
 

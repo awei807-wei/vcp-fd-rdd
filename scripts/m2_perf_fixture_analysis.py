@@ -289,12 +289,16 @@ def render_report(payload: dict[str, Any]) -> str:
         lines.append("- deep modify probe disabled")
     sweep_only = payload.get("sweep_only_modify", {})
     if sweep_only.get("enabled"):
+        repair_deadline = payload.get("integration_options", {}).get(
+            "integration_repair_deadline_secs", 0
+        )
         lines.append(
             f"- sweep-only channel repaired before first query: "
             f"{sweep_only.get('repaired_by_sweep')} "
             f"(waited {sweep_only.get('waited_secs')} s, first query "
             f"{sweep_only.get('first_query_freshness')}/"
-            f"{sweep_only.get('first_query_tier')})"
+            f"{sweep_only.get('first_query_tier')}, repair deadline "
+            f"{repair_deadline} s)"
         )
     lines.append("")
     return "\n".join(lines)

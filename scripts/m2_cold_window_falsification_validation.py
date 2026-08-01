@@ -38,7 +38,12 @@ SWEEP_INTEGRATION_TICK_SECS = 15
 SWEEP_INTEGRATION_PERIOD_SECS = 45
 SWEEP_INTEGRATION_SETTLE_SECS = 150.0
 SWEEP_INTEGRATION_REPAIR_DEADLINE_SECS = 75.0
-SWEEP_INTEGRATION_SWEEP_ONLY_WAIT_SECS = 70.0
+SWEEP_INTEGRATION_COMPLETION_FENCE_TIMEOUT_SECS = (
+    SWEEP_INTEGRATION_PERIOD_SECS
+    + SWEEP_INTEGRATION_TTL_SECS
+    + 2 * SWEEP_INTEGRATION_TICK_SECS
+    + 30
+)
 
 
 def _timestamp(value: str) -> float | None:
@@ -155,6 +160,10 @@ def sweep_integration_protocol_invalid_reasons(
     expected = {
         "allow_cycle_shortfall": True,
         "burst_root_level": True,
+        "sweep_completion_fence": True,
+        "integration_repair_deadline_secs": (
+            SWEEP_INTEGRATION_REPAIR_DEADLINE_SECS
+        ),
         "rotating_cold_window": True,
         "fast_scan": True,
         "query_fast_scan_leases": False,
@@ -226,11 +235,80 @@ def validate_sweep_integration(
         reasons.append(f"{label} sweep-only 探针未启用")
     if sweep_only.get("error"):
         reasons.append(f"{label} sweep-only 存在错误：{sweep_only.get('error')}")
+    if sweep_only.get("completion_fence") is not True:
+        reasons.append(f"{label} sweep-only completion fence 未启用")
+    if sweep_only.get("completion_fence_endpoint") != "/debug/tiered-watch":
+        reasons.append(f"{label} sweep-only completion fence 端点不符")
+    if (
+        sweep_only.get("completion_fence_predicate")
+        != "last_scan_seq > post_mutation_last_scan_seq and last_scan_cycle_id > post_mutation_cycle_id"
+    ):
+        reasons.append(f"{label} sweep-only completion fence 判定语义不符")
+    timeout_secs = sweep_only.get("completion_fence_timeout_secs")
+    if (
+        sweep_only.get("completion_fence_timeout_formula")
+        != "period+ttl+2*tick+30"
+        or not isinstance(timeout_secs, (int, float))
+        or isinstance(timeout_secs, bool)
+        or float(timeout_secs) != SWEEP_INTEGRATION_COMPLETION_FENCE_TIMEOUT_SECS
+    ):
+        reasons.append(f"{label} sweep-only completion fence 超时配置不符")
+    pre_seq = sweep_only.get("pre_mutation_last_scan_seq")
+    pre_cycle = sweep_only.get("pre_mutation_cycle_id")
+    post_seq = sweep_only.get("post_mutation_last_scan_seq")
+    post_cycle = sweep_only.get("post_mutation_cycle_id")
+    completion_seq = sweep_only.get("completion_last_scan_seq")
+    completion_cycle = sweep_only.get("completion_last_scan_cycle_id")
+    fence_numbers = (
+        pre_seq,
+        pre_cycle,
+        post_seq,
+        post_cycle,
+        completion_seq,
+        completion_cycle,
+    )
+    if any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in fence_numbers
+    ):
+        reasons.append(f"{label} sweep-only completion fence 缺少序列证据")
+    elif not (
+        int(completion_seq) > int(post_seq)
+        and int(completion_cycle) > int(post_cycle)
+    ):
+        reasons.append(f"{label} sweep-only completion fence 未跨越 post-mutation 水位")
+    if sweep_only.get("completion_fence_observed") is not True:
+        reasons.append(f"{label} sweep-only 未观测到 completion fence")
     waited = sweep_only.get("waited_secs")
-    if not isinstance(waited, (int, float)) or isinstance(waited, bool) or float(
-        waited
-    ) < SWEEP_INTEGRATION_SWEEP_ONLY_WAIT_SECS:
-        reasons.append(f"{label} sweep-only 静默等待窗口不足")
+    repair_deadline = sweep_only.get("repair_deadline_secs")
+    if (
+        not isinstance(repair_deadline, (int, float))
+        or isinstance(repair_deadline, bool)
+        or float(repair_deadline) != SWEEP_INTEGRATION_REPAIR_DEADLINE_SECS
+    ):
+        reasons.append(f"{label} sweep-only repair deadline 配置不符")
+    if not isinstance(waited, (int, float)) or isinstance(waited, bool):
+        reasons.append(f"{label} sweep-only 缺少 completion fence 等待时间")
+    elif (
+        float(waited) < 0
+        or not isinstance(repair_deadline, (int, float))
+        or isinstance(repair_deadline, bool)
+        or float(waited) > float(repair_deadline)
+    ):
+        reasons.append(
+            f"{label} sweep-only 后台修复超过 "
+            f"{SWEEP_INTEGRATION_REPAIR_DEADLINE_SECS:.0f} 秒加速门"
+        )
+    searches_before = sweep_only.get("searches_before_fence")
+    if not isinstance(searches_before, int) or isinstance(
+        searches_before, bool
+    ) or searches_before != 0:
+        reasons.append(f"{label} sweep-only completion fence 前发生查询")
+    first_query_count = sweep_only.get("first_query_count")
+    if not isinstance(first_query_count, int) or isinstance(
+        first_query_count, bool
+    ) or first_query_count != 1:
+        reasons.append(f"{label} sweep-only completion fence 后不是唯一首查")
     if (
         sweep_only.get("repaired_by_sweep") is not True
         or sweep_only.get("first_query_freshness") != "fresh"
